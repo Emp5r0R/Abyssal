@@ -1,16 +1,22 @@
 # Local agent and editor state
 .agents/
 .codex/
-.idea/
 .vscode/
 *.swp
 *.swo
 
-# Android local/build state
+# Gradle and Android build state
+.gradle/
+build/
 android/.gradle/
 android/local.properties
 android/app/build/
 android/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+output-metadata.json
 
 # Local Android SDK and downloaded toolchains
 android-sdk/
@@ -25,6 +31,20 @@ build-outputs/
 *.apk
 *.aab
 
-# OS files
+# IntelliJ / Android Studio
+*.iml
+.idea/
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# Secrets and service configs
+*.jks
+*.keystore
+google-services.json
+
+# Logs, profiling, and OS files
+*.log
+*.hprof
 .DS_Store
 Thumbs.db
