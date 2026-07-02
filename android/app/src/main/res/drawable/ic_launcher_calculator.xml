@@ -1,0 +1,22 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Flat calculator body background -->
+    <path
+        android:fillColor="#FF212121"
+        android:pathData="M16,16h76v76h-76z"/>
+    <!-- Simulated screen window -->
+    <path
+        android:fillColor="#FF37474F"
+        android:pathData="M24,24h60v16h-60z"/>
+    <!-- Orange function key indicators -->
+    <path
+        android:fillColor="#FFF57C00"
+        android:pathData="M68,48h16v10h-16z M68,64h16v18h-16z"/>
+    <!-- Basic keypad grid -->
+    <path
+        android:fillColor="#FFB0BEC5"
+        android:pathData="M24,48h10v10h-10z M38,48h10v10h-10z M52,48h10v10h-10z M24,62h10v10h-10z M38,62h10v10h-10z M52,62h10v10h-10z M24,76h10v10h-10z M38,76h10v10h-10z M52,76h10v10h-10z"/>
+</vector>

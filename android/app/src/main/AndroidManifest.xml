@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@drawable/ic_launcher_abyssal"
+        android:label="Abyssal"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.NoTitleBar">
+        
+        <!-- Main activity (not launcher directly, launcher is delegated to aliases) -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoTitleBar"
+            android:windowSoftInputMode="adjustResize">
+        </activity>
+
+        <!-- Default launcher alias: Abyssal Portal -->
+        <activity-alias
+            android:name=".LauncherAbyssal"
+            android:targetActivity=".MainActivity"
+            android:label="Abyssal"
+            android:icon="@drawable/ic_launcher_abyssal"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Disguise launcher alias: Calculator Cover -->
+        <activity-alias
+            android:name=".LauncherCalculator"
+            android:targetActivity=".MainActivity"
+            android:label="Calculator"
+            android:icon="@drawable/ic_launcher_calculator" 
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+    </application>
+
+</manifest>
