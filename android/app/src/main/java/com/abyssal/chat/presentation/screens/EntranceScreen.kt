@@ -1,10 +1,5 @@
 package com.abyssal.chat.presentation.screens
 
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,7 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -39,19 +34,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -79,7 +70,7 @@ fun EntranceScreen(viewModel: ChatViewModel) {
         isVerifying = isVerifying,
         error = error,
         status = status,
-        onSubmit = viewModel::submitInviteCode
+        onSubmit = viewModel::submitAccount
     )
 }
 
@@ -88,25 +79,13 @@ private fun EntranceContent(
     isVerifying: Boolean,
     error: String?,
     status: ServerStatus,
-    onSubmit: (String, String) -> Unit
+    onSubmit: (String, String, String, Boolean) -> Unit
 ) {
     var inviteCode by remember { mutableStateOf("") }
     var nodeUrl by remember { mutableStateOf("") }
-    val canSubmit = inviteCode.length == 14 && nodeUrl.isNotBlank() && !isVerifying
-
-    val infiniteTransition = rememberInfiniteTransition(label = "biometric_pulse")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.98f,
-        targetValue = 1.04f,
-        animationSpec = infiniteRepeatable(tween(1600), RepeatMode.Reverse),
-        label = "biometric_scale"
-    )
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.55f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1600), RepeatMode.Reverse),
-        label = "biometric_alpha"
-    )
+    var password by remember { mutableStateOf("") }
+    var createAccount by remember { mutableStateOf(true) }
+    val canSubmit = inviteCode.length >= 12 && nodeUrl.isNotBlank() && password.length >= 8 && !isVerifying
 
     MirageBackground {
         Column(
@@ -124,7 +103,7 @@ private fun EntranceContent(
             Spacer(modifier = Modifier.height(18.dp))
 
             Text(
-                text = "MIRAGE",
+                text = "ABYSSAL",
                 color = NeonCyan,
                 fontSize = 36.sp,
                 fontWeight = FontWeight.Bold,
@@ -132,7 +111,7 @@ private fun EntranceContent(
                 textAlign = TextAlign.Center
             )
             Text(
-                text = "Private access for ephemeral rooms",
+                text = "Private access for RAM-only rooms",
                 color = SteelMuted,
                 fontSize = 13.sp,
                 textAlign = TextAlign.Center,
@@ -146,7 +125,7 @@ private fun EntranceContent(
                 ) {
                     SectionLabel("ACCESS CODE")
                     Text(
-                        text = "Use your invite code and node URL to create a temporary identity.",
+                        text = "Use your node code and password to create or enter a RAM-only account.",
                         color = SteelMuted,
                         fontSize = 13.sp,
                         textAlign = TextAlign.Center,
@@ -160,7 +139,7 @@ private fun EntranceContent(
                         },
                         placeholder = {
                             Text(
-                                "MIRA-4729-ZX00",
+                                "ABY7-KQ29-X4PZ",
                                 color = SteelMuted.copy(alpha = 0.45f),
                                 fontFamily = FontFamily.Monospace,
                                 textAlign = TextAlign.Center,
@@ -190,7 +169,7 @@ private fun EntranceContent(
                         ),
                         keyboardActions = KeyboardActions(
                             onDone = {
-                                if (canSubmit) onSubmit(inviteCode, nodeUrl)
+                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password, createAccount)
                             }
                         ),
                         modifier = Modifier.fillMaxWidth()
@@ -233,11 +212,75 @@ private fun EntranceContent(
                         ),
                         keyboardActions = KeyboardActions(
                             onDone = {
-                                if (canSubmit) onSubmit(inviteCode, nodeUrl)
+                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password, createAccount)
                             }
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    SectionLabel("PASSWORD")
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        placeholder = {
+                            Text(
+                                "Minimum 8 characters",
+                                color = SteelMuted.copy(alpha = 0.45f),
+                                fontFamily = FontFamily.Monospace,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        },
+                        textStyle = TextStyle(
+                            color = PureWhite,
+                            fontSize = 14.sp,
+                            fontFamily = FontFamily.Monospace,
+                            textAlign = TextAlign.Center
+                        ),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = NeonGreen,
+                            unfocusedBorderColor = GlassBorder,
+                            cursorColor = NeonGreen,
+                            focusedTextColor = PureWhite,
+                            unfocusedTextColor = PureWhite
+                        ),
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        isError = error != null,
+                        keyboardOptions = KeyboardOptions(
+                            capitalization = KeyboardCapitalization.None,
+                            keyboardType = KeyboardType.Password,
+                            imeAction = ImeAction.Done
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onDone = {
+                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password, createAccount)
+                            }
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        ModeChip(
+                            label = "Create",
+                            selected = createAccount,
+                            modifier = Modifier.weight(1f),
+                            onClick = { createAccount = true }
+                        )
+                        ModeChip(
+                            label = "Login",
+                            selected = !createAccount,
+                            modifier = Modifier.weight(1f),
+                            onClick = { createAccount = false }
+                        )
+                    }
 
                     if (error != null) {
                         Text(
@@ -250,8 +293,8 @@ private fun EntranceContent(
                     }
 
                     MiragePrimaryButton(
-                        text = "Create identity",
-                        onClick = { onSubmit(inviteCode, nodeUrl) },
+                        text = if (createAccount) "Create account" else "Login",
+                        onClick = { onSubmit(inviteCode, nodeUrl, password, createAccount) },
                         enabled = canSubmit,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -265,7 +308,7 @@ private fun EntranceContent(
                             )
                         } else {
                             Text(
-                                text = "Create identity",
+                                text = if (createAccount) "Create account" else "Login",
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
@@ -274,44 +317,6 @@ private fun EntranceContent(
                     }
                 }
             }
-
-            Text(
-                text = "or",
-                color = SteelMuted,
-                fontSize = 13.sp,
-                modifier = Modifier.padding(top = 26.dp, bottom = 18.dp)
-            )
-
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .scale(pulseScale)
-                    .size(82.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.06f))
-                    .border(BorderStroke(1.dp, NeonGreen.copy(alpha = 0.75f)), CircleShape)
-                    .semantics { contentDescription = "Authenticate with biometrics" }
-                    .clickable(role = Role.Button) {
-                        if (nodeUrl.isNotBlank()) onSubmit("BIOM-ETRI-CAUT", nodeUrl)
-                    }
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(68.dp)
-                        .alpha(pulseAlpha)
-                        .clip(CircleShape)
-                        .border(BorderStroke(2.dp, NeonGreen.copy(alpha = 0.32f)), CircleShape)
-                )
-                BiometricScannerIcon(modifier = Modifier.size(36.dp))
-            }
-
-            Text(
-                text = "Biometric shortcut",
-                color = SteelMuted,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(top = 14.dp, bottom = 28.dp)
-            )
 
             StatusPill(
                 label = "${status.state}  ${status.latencyMs}ms  ${status.nodeId}",
@@ -323,16 +328,38 @@ private fun EntranceContent(
 }
 
 private fun formatInviteCode(input: String): String {
-    val clean = input
-        .filter { it.isLetterOrDigit() }
-        .take(12)
+    return input
+        .filter { it.isLetterOrDigit() || it == '-' }
+        .take(24)
         .uppercase(Locale.ROOT)
+}
 
-    return buildString {
-        clean.forEachIndexed { index, char ->
-            if (index == 4 || index == 8) append("-")
-            append(char)
-        }
+@Composable
+private fun ModeChip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val borderColor = if (selected) NeonCyan else GlassBorder
+    val background = if (selected) NeonCyan.copy(alpha = 0.16f) else Color.White.copy(alpha = 0.03f)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .height(44.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(background)
+            .border(BorderStroke(1.dp, borderColor), RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Text(
+            text = label,
+            color = if (selected) NeonCyan else SteelMuted,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -343,6 +370,6 @@ private fun EntranceContentPreview() {
         isVerifying = false,
         error = null,
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
-        onSubmit = { _, _ -> }
+        onSubmit = { _, _, _, _ -> }
     )
 }

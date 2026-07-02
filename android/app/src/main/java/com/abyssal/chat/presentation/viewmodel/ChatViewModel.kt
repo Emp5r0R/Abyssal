@@ -11,12 +11,14 @@ import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.DisguiseSettings
+import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IIdentityService
 import com.abyssal.chat.domain.repository.IMessageRepository
 import com.abyssal.chat.domain.repository.IMessageSender
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
 import com.abyssal.chat.domain.repository.INodeConfigService
+import java.security.SecureRandom
 import java.util.UUID
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,11 +56,17 @@ class ChatViewModel(
     val serverStatus: StateFlow<ServerStatus> = chatTransport.getServerStatus()
         .stateIn(viewModelScope, SharingStarted.Lazily, ServerStatus("DISCONNECTED", "No node", 0))
 
+    val presence: StateFlow<List<UserPresence>> = chatTransport.getPresence()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     private val _inviteCodeError = mutableStateOf<String?>(null)
     val inviteCodeError: State<String?> = _inviteCodeError
 
     private val _isVerifyingCode = mutableStateOf(false)
     val isVerifyingCode: State<Boolean> = _isVerifyingCode
+
+    private val _showCamouflagePinPrompt = mutableStateOf(false)
+    val showCamouflagePinPrompt: State<Boolean> = _showCamouflagePinPrompt
 
     // Camouflage disguise states
     private val _isLocked = MutableStateFlow(false)
@@ -72,7 +80,7 @@ class ChatViewModel(
 
     // Observe active sessions directly from repository
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
-        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     // Track active chat messages reactively
     private val _activeChatId = MutableStateFlow<String?>(null)
@@ -98,11 +106,16 @@ class ChatViewModel(
 
         viewModelScope.launch {
             chatTransport.getIncomingPayloads().collect { incoming ->
+                val decryptedContent = runCatching {
+                    payloadCipher.decrypt(incoming.payload)
+                }.getOrElse {
+                    "Encrypted payload received. Re-enter the matching invite code to decrypt."
+                }
                 val message = Message(
                     id = UUID.randomUUID().toString(),
                     sender = "Remote node",
                     receiver = "You",
-                    content = "Encrypted payload received. Awaiting session key.",
+                    content = decryptedContent,
                     timestampMs = System.currentTimeMillis(),
                     selfDestructDurationSec = 10
                 )
@@ -123,34 +136,51 @@ class ChatViewModel(
         }
     }
 
-    fun submitInviteCode(code: String, nodeUrl: String) {
+    fun submitAccount(code: String, nodeUrl: String, password: String, createAccount: Boolean) {
         viewModelScope.launch {
             _isVerifyingCode.value = true
             _inviteCodeError.value = null
 
             val endpoint = nodeConfigService.normalizeNodeUrl(nodeUrl).getOrElse {
-                _inviteCodeError.value = it.message ?: "Invalid node URL."
+                _inviteCodeError.value = "Wrong information."
                 _isVerifyingCode.value = false
                 return@launch
             }
 
-            val validation = identityService.validateInviteCode(code, endpoint)
+            val validation = if (createAccount) {
+                identityService.createAccount(code, password, endpoint)
+            } else {
+                identityService.login(code, password, endpoint)
+            }
             if (validation.accepted && validation.token != null) {
-                val generatedIdentity = identityService.generateRandomIdentity()
-                val identity = generatedIdentity.copy(isAdmin = validation.isAdmin)
+                val nodeId = validation.nodeId ?: endpoint.displayHost
+                val identity = User(
+                    username = validation.username ?: "AbyssalUser",
+                    publicKey = ByteArray(32).also { SecureRandom().nextBytes(it) },
+                    isAdmin = validation.isAdmin
+                )
+                identityService.setCurrentUser(identity)
+                payloadCipher.deriveSessionKey(code, nodeId, password)
                 nodeConfigService.setActiveSession(
                     NodeSession(
                         endpoint = endpoint,
                         token = validation.token,
-                        nodeId = validation.nodeId ?: endpoint.displayHost,
+                        nodeId = nodeId,
                         isAdmin = validation.isAdmin
                     )
                 )
                 _currentUser.value = identity
+                if (validation.created) {
+                    disguiseManager.setDisguiseEnabled(true)
+                    _disguiseSettings.value = DisguiseSettings(isDisguised = true, pin = "")
+                    _isLocked.value = false
+                    _showCamouflagePinPrompt.value = true
+                }
                 chatTransport.connect()
+                joinAvailableSessions()
                 _currentScreen.value = Screen.Dashboard
             } else {
-                _inviteCodeError.value = validation.error ?: "Access denied by node."
+                _inviteCodeError.value = "Wrong information."
             }
             _isVerifyingCode.value = false
         }
@@ -210,6 +240,13 @@ class ChatViewModel(
                 allowFiles = allowFiles
             )
             messageRepository.createForumSession(session)
+            chatTransport.joinChat(forumId)
+        }
+    }
+
+    private suspend fun joinAvailableSessions() {
+        sessions.value.forEach { session ->
+            chatTransport.joinChat(session.id)
         }
     }
 
@@ -220,9 +257,24 @@ class ChatViewModel(
         _disguiseSettings.value = DisguiseSettings(enabled, pin)
     }
 
+    fun completeCamouflagePinSetup(pin: String) {
+        val safePin = pin.ifBlank { "2026" }
+        disguiseManager.setDisguiseEnabled(true)
+        disguiseManager.savePin(safePin)
+        _disguiseSettings.value = DisguiseSettings(isDisguised = true, pin = safePin)
+        _showCamouflagePinPrompt.value = false
+    }
+
     fun lockApp() {
         if (disguiseSettings.value.isDisguised) {
             _isLocked.value = true
+        }
+    }
+
+    fun logoutForLifecycleExit() {
+        viewModelScope.launch {
+            logoutLocal()
+            _isLocked.value = disguiseSettings.value.isDisguised
         }
     }
 
@@ -293,15 +345,23 @@ class ChatViewModel(
     }
 
     private suspend fun executeLocalMemoryPurge() {
+        logoutLocal()
+        _isLocked.value = false
+    }
+
+    private suspend fun logoutLocal() {
         messageRepository.clearAllData()
         identityService.logout()
         nodeConfigService.clear()
+        payloadCipher.clear()
         chatTransport.disconnect()
         _currentUser.value = null
         _currentScreen.value = Screen.Entrance
+        _showCamouflagePinPrompt.value = false
     }
 
     override fun onCleared() {
+        payloadCipher.clear()
         chatTransport.disconnect()
         super.onCleared()
     }

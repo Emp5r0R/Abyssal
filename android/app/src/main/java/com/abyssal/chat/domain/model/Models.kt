@@ -79,8 +79,10 @@ data class NodeSession(
 
 data class IdentityValidationResult(
     val accepted: Boolean,
+    val created: Boolean = false,
     val token: String? = null,
     val nodeId: String? = null,
+    val username: String? = null,
     val isAdmin: Boolean = false,
     val error: String? = null
 )
@@ -104,5 +106,10 @@ data class IncomingTransportPayload(
 
 data class DisguiseSettings(
     val isDisguised: Boolean = false,
-    val pin: String = "1234" // Default PIN
+    val pin: String = "2026" // Default RAM-only unlock PIN
+)
+
+data class UserPresence(
+    val username: String,
+    val connected: Boolean
 )

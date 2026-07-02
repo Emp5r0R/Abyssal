@@ -96,14 +96,12 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        // Lifecycle pause event: automatically switch back to calculator cover
-        viewModel.lockApp()
+        viewModel.logoutForLifecycleExit()
         super.onPause()
     }
 
     override fun onStop() {
-        // Lifecycle stop event: lock access state
-        viewModel.lockApp()
+        viewModel.logoutForLifecycleExit()
         super.onStop()
     }
 }

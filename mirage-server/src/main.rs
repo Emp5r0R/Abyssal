@@ -5,6 +5,12 @@ use std::{
     sync::Arc,
 };
 
+use argon2::{
+    password_hash::{
+        rand_core::OsRng as SaltOsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
+    Argon2,
+};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -16,6 +22,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tower_http::trace::TraceLayer;
@@ -25,8 +32,9 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     node_id: String,
-    invite_codes: Arc<HashSet<String>>,
-    admin_codes: Arc<HashSet<String>>,
+    account_ops: Arc<Mutex<()>>,
+    available_codes: Arc<Mutex<HashMap<String, CodeGrant>>>,
+    accounts: Arc<Mutex<HashMap<String, Account>>>,
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
@@ -34,26 +42,45 @@ struct AppState {
 }
 
 #[derive(Clone)]
+struct CodeGrant {
+    admin: bool,
+}
+
+#[derive(Clone)]
+struct Account {
+    username: String,
+    password_hash: String,
+    admin: bool,
+    connected: bool,
+}
+
+#[derive(Clone)]
 struct AuthSession {
+    code: String,
+    username: String,
     admin: bool,
 }
 
 #[derive(Clone)]
 struct ClientHandle {
+    code: String,
     admin: bool,
     tx: mpsc::UnboundedSender<Message>,
 }
 
 #[derive(Deserialize)]
-struct InviteRequest {
+struct AccountRequest {
     code: String,
+    password: String,
 }
 
 #[derive(Serialize)]
-struct InviteResponse {
+struct AccountResponse {
     accepted: bool,
+    created: bool,
     token: Option<String>,
     node_id: String,
+    username: Option<String>,
     admin: bool,
     error: Option<String>,
 }
@@ -63,6 +90,8 @@ struct HealthResponse {
     ok: bool,
     node_id: String,
     storage: &'static str,
+    available_codes: usize,
+    accounts: usize,
 }
 
 #[derive(Deserialize)]
@@ -104,8 +133,16 @@ enum OutboundFrame {
         chat_id: String,
         message_id: Option<String>,
     },
+    #[serde(rename = "presence")]
+    Presence { users: Vec<PresenceUser> },
     #[serde(rename = "GLOBAL_WIPE")]
     GlobalWipe,
+}
+
+#[derive(Clone, Serialize)]
+struct PresenceUser {
+    username: String,
+    connected: bool,
 }
 
 #[tokio::main]
@@ -118,37 +155,82 @@ async fn main() {
         .init();
 
     let state = AppState::from_env();
-    let bind_addr: SocketAddr = env::var("MIRAGE_BIND_ADDR")
+    state.print_boot_codes().await;
+
+    let bind_addr: SocketAddr = env::var("ABYSSAL_BIND_ADDR")
+        .or_else(|_| env::var("MIRAGE_BIND_ADDR"))
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()
-        .expect("MIRAGE_BIND_ADDR must be a valid socket address");
+        .expect("ABYSSAL_BIND_ADDR must be a valid socket address");
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/v1/invite/validate", post(validate_invite))
+        .route("/v1/account/create", post(create_account))
+        .route("/v1/account/login", post(login_account))
+        .route("/v1/invite/validate", post(login_account))
         .route("/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
-        .expect("failed to bind MIRAGE_BIND_ADDR");
+        .expect("failed to bind ABYSSAL_BIND_ADDR");
 
-    info!("mirage server listening on {bind_addr}");
+    info!("abyssal relay listening on {bind_addr}");
     axum::serve(listener, app).await.expect("server failed");
 }
 
 impl AppState {
     fn from_env() -> Self {
-        let invite_codes = parse_codes("MIRAGE_INVITE_CODES", "MIRA-4729-ZX00");
-        let admin_codes = parse_codes("MIRAGE_ADMIN_CODES", "");
-        let node_id = env::var("MIRAGE_NODE_ID")
-            .unwrap_or_else(|_| format!("mirage-{}", Uuid::new_v4().simple()));
+        let node_id = env::var("ABYSSAL_NODE_ID")
+            .or_else(|_| env::var("MIRAGE_NODE_ID"))
+            .unwrap_or_else(|_| format!("abyssal-{}", Uuid::new_v4().simple()));
+
+        let user_count = read_usize_env("ABYSSAL_CODE_COUNT", 5);
+        let admin_count = read_usize_env("ABYSSAL_ADMIN_CODE_COUNT", 1);
+        let min_len = read_usize_env("ABYSSAL_CODE_MIN_LEN", 12).max(12);
+        let requested_max_len =
+            read_usize_env("ABYSSAL_CODE_MAX_LEN", min_len + user_count + admin_count);
+        let max_len = requested_max_len.max(min_len + user_count + admin_count);
+        let mut available_codes = HashMap::new();
+        let mut generated_lengths = HashSet::new();
+
+        for code in parse_codes_from_env("ABYSSAL_INVITE_CODES")
+            .into_iter()
+            .chain(parse_codes_from_env("MIRAGE_INVITE_CODES"))
+        {
+            available_codes.insert(code, CodeGrant { admin: false });
+        }
+
+        for code in parse_codes_from_env("ABYSSAL_ADMIN_CODES")
+            .into_iter()
+            .chain(parse_codes_from_env("MIRAGE_ADMIN_CODES"))
+        {
+            available_codes.insert(code, CodeGrant { admin: true });
+        }
+
+        generate_codes(
+            &mut available_codes,
+            &mut generated_lengths,
+            user_count,
+            false,
+            min_len,
+            max_len,
+        );
+        generate_codes(
+            &mut available_codes,
+            &mut generated_lengths,
+            admin_count,
+            true,
+            min_len,
+            max_len,
+        );
 
         Self {
             node_id,
-            invite_codes: Arc::new(invite_codes),
-            admin_codes: Arc::new(admin_codes),
+            account_ops: Arc::new(Mutex::new(())),
+            available_codes: Arc::new(Mutex::new(available_codes)),
+            accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
@@ -156,33 +238,167 @@ impl AppState {
         }
     }
 
-    fn accepts_invite(&self, code: &str) -> bool {
-        self.invite_codes.contains(&normalize_code(code))
-            || self.admin_codes.contains(&normalize_code(code))
-    }
-
-    fn is_admin_code(&self, code: &str) -> bool {
-        self.admin_codes.contains(&normalize_code(code))
+    async fn print_boot_codes(&self) {
+        let codes = self.available_codes.lock().await;
+        info!("ABYSSAL RAM-ONLY ACCESS CODES - copy these now; they are not written to disk");
+        for (code, grant) in codes.iter() {
+            let role = if grant.admin { "admin" } else { "user" };
+            info!("ABYSSAL_CODE role={role} code={code}");
+        }
     }
 }
 
-fn parse_codes(key: &str, fallback: &str) -> HashSet<String> {
+fn read_usize_env(key: &str, fallback: usize) -> usize {
     env::var(key)
-        .unwrap_or_else(|_| fallback.to_string())
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(fallback)
+}
+
+fn parse_codes_from_env(key: &str) -> Vec<String> {
+    env::var(key)
+        .unwrap_or_default()
         .split(',')
-        .filter_map(|code| {
-            let normalized = normalize_code(code);
-            if normalized.is_empty() {
-                None
-            } else {
-                Some(normalized)
-            }
-        })
+        .filter_map(|code| normalize_code(code).ok())
         .collect()
 }
 
-fn normalize_code(code: &str) -> String {
-    code.trim().to_ascii_uppercase()
+fn generate_codes(
+    codes: &mut HashMap<String, CodeGrant>,
+    generated_lengths: &mut HashSet<usize>,
+    count: usize,
+    admin: bool,
+    min_len: usize,
+    max_len: usize,
+) {
+    let mut rng = OsRng;
+    for _ in 0..count {
+        loop {
+            let len = next_unique_length(&mut rng, generated_lengths, min_len, max_len);
+            let code = generate_code(&mut rng, len);
+            if !codes.contains_key(&code) {
+                codes.insert(code, CodeGrant { admin });
+                break;
+            }
+        }
+    }
+}
+
+fn next_unique_length(
+    rng: &mut OsRng,
+    generated_lengths: &mut HashSet<usize>,
+    min_len: usize,
+    max_len: usize,
+) -> usize {
+    let available = (min_len..=max_len)
+        .filter(|len| !generated_lengths.contains(len))
+        .collect::<Vec<_>>();
+    let len = if available.is_empty() {
+        max_len + generated_lengths.len() + 1
+    } else {
+        available[rng.gen_range(0..available.len())]
+    };
+    generated_lengths.insert(len);
+    len
+}
+
+fn generate_code(rng: &mut OsRng, len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let dash_count = if len >= 16 { 2 } else { 1 };
+    let char_count = len - dash_count;
+    let mut raw = String::with_capacity(char_count);
+    for _ in 0..char_count {
+        let idx = (rng.next_u32() as usize) % ALPHABET.len();
+        raw.push(ALPHABET[idx] as char);
+    }
+
+    let first_dash = char_count / 3;
+    let second_dash = (char_count * 2) / 3;
+    let mut out = String::with_capacity(len);
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx == first_dash || (dash_count == 2 && idx == second_dash) {
+            out.push('-');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn normalize_code(code: &str) -> Result<String, String> {
+    let normalized = code.trim().to_ascii_uppercase();
+    if !valid_code_shape(&normalized) {
+        return Err(
+            "Code must be at least 12 characters and contain only letters, numbers, and dashes."
+                .to_string(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn valid_code_shape(code: &str) -> bool {
+    code.len() >= 12
+        && !code.starts_with('-')
+        && !code.ends_with('-')
+        && code.chars().any(|ch| ch.is_ascii_alphanumeric())
+        && code
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+fn validate_password(password: &str) -> Result<(), String> {
+    if password.len() < 8 {
+        return Err("Password must be at least 8 characters.".to_string());
+    }
+    if password.len() > 256 {
+        return Err("Password is too long.".to_string());
+    }
+    Ok(())
+}
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut SaltOsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| err.to_string())
+}
+
+fn verify_password(password: &str, encoded_hash: &str) -> bool {
+    let parsed_hash = match PasswordHash::new(encoded_hash) {
+        Ok(hash) => hash,
+        Err(_) => return false,
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok()
+}
+
+fn random_username() -> String {
+    const PREFIXES: &[&str] = &[
+        "Silent",
+        "Nebula",
+        "Quantum",
+        "Vortex",
+        "Solar",
+        "Cosmic",
+        "Lunar",
+        "Alpha",
+        "Shadow",
+        "Ghost",
+        "Starlight",
+        "Obsidian",
+        "Frozen",
+        "Electric",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "Wolf", "Tiger", "Fox", "Eagle", "Falcon", "Leopard", "Spectre", "Titan", "Node", "Warp",
+        "Core", "Entity", "Daemon", "Vector",
+    ];
+    let mut rng = OsRng;
+    let prefix = PREFIXES[rng.gen_range(0..PREFIXES.len())];
+    let suffix = SUFFIXES[rng.gen_range(0..SUFFIXES.len())];
+    let number = rng.gen_range(100..1000);
+    format!("{prefix}{suffix}{number}")
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -190,68 +406,145 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         ok: true,
         node_id: state.node_id.clone(),
         storage: "ram-only",
+        available_codes: state.available_codes.lock().await.len(),
+        accounts: state.accounts.lock().await.len(),
     })
 }
 
-async fn validate_invite(
+async fn create_account(
     State(state): State<AppState>,
-    Json(request): Json<InviteRequest>,
+    Json(request): Json<AccountRequest>,
 ) -> impl IntoResponse {
-    let code = normalize_code(&request.code);
-    if !valid_invite_shape(&code) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(InviteResponse {
-                accepted: false,
-                token: None,
-                node_id: state.node_id.clone(),
-                admin: false,
-                error: Some("Invite code must be XXXX-XXXX-XXXX.".to_string()),
-            }),
-        );
+    let _account_guard = state.account_ops.lock().await;
+    let code = match normalize_code(&request.code) {
+        Ok(code) => code,
+        Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
+    };
+    if let Err(error) = validate_password(&request.password) {
+        return account_error(StatusCode::BAD_REQUEST, &state, error).await;
     }
 
-    if !state.accepts_invite(&code) {
-        return (
+    let grant = match state.available_codes.lock().await.remove(&code) {
+        Some(grant) => grant,
+        None => {
+            if state.accounts.lock().await.contains_key(&code) {
+                return account_error(
+                    StatusCode::CONFLICT,
+                    &state,
+                    "Code already has an account. Use login.".to_string(),
+                )
+                .await;
+            }
+            return account_error(
+                StatusCode::UNAUTHORIZED,
+                &state,
+                "Code rejected.".to_string(),
+            )
+            .await;
+        }
+    };
+
+    let password_hash = match hash_password(&request.password) {
+        Ok(hash) => hash,
+        Err(error) => return account_error(StatusCode::INTERNAL_SERVER_ERROR, &state, error).await,
+    };
+    let username = random_username();
+    state.accounts.lock().await.insert(
+        code.clone(),
+        Account {
+            username: username.clone(),
+            password_hash,
+            admin: grant.admin,
+            connected: false,
+        },
+    );
+
+    issue_session(&state, code, username, grant.admin, true).await
+}
+
+async fn login_account(
+    State(state): State<AppState>,
+    Json(request): Json<AccountRequest>,
+) -> impl IntoResponse {
+    let code = match normalize_code(&request.code) {
+        Ok(code) => code,
+        Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
+    };
+    if let Err(error) = validate_password(&request.password) {
+        return account_error(StatusCode::BAD_REQUEST, &state, error).await;
+    }
+
+    let account = match state.accounts.lock().await.get(&code).cloned() {
+        Some(account) => account,
+        None => {
+            return account_error(
+                StatusCode::UNAUTHORIZED,
+                &state,
+                "No RAM account for this code. Create it first or restart generated a new code set.".to_string(),
+            )
+            .await;
+        }
+    };
+
+    if !verify_password(&request.password, &account.password_hash) {
+        return account_error(
             StatusCode::UNAUTHORIZED,
-            Json(InviteResponse {
-                accepted: false,
-                token: None,
-                node_id: state.node_id.clone(),
-                admin: false,
-                error: Some("Invite code rejected.".to_string()),
-            }),
-        );
+            &state,
+            "Invalid password.".to_string(),
+        )
+        .await;
     }
 
-    let token = Uuid::new_v4().to_string();
-    let admin = state.is_admin_code(&code);
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(token.clone(), AuthSession { admin });
+    issue_session(&state, code, account.username, account.admin, false).await
+}
 
+async fn account_error(
+    status: StatusCode,
+    state: &AppState,
+    error: String,
+) -> (StatusCode, Json<AccountResponse>) {
     (
-        StatusCode::OK,
-        Json(InviteResponse {
-            accepted: true,
-            token: Some(token),
+        status,
+        Json(AccountResponse {
+            accepted: false,
+            created: false,
+            token: None,
             node_id: state.node_id.clone(),
-            admin,
-            error: None,
+            username: None,
+            admin: false,
+            error: Some(error),
         }),
     )
 }
 
-fn valid_invite_shape(code: &str) -> bool {
-    let mut parts = code.split('-');
-    matches!(
-        (parts.next(), parts.next(), parts.next(), parts.next()),
-        (Some(a), Some(b), Some(c), None)
-            if [a, b, c].iter().all(|part| {
-                part.len() == 4 && part.chars().all(|ch| ch.is_ascii_alphanumeric())
-            })
+async fn issue_session(
+    state: &AppState,
+    code: String,
+    username: String,
+    admin: bool,
+    created: bool,
+) -> (StatusCode, Json<AccountResponse>) {
+    let token = Uuid::new_v4().to_string();
+    state.sessions.lock().await.insert(
+        token.clone(),
+        AuthSession {
+            code,
+            username: username.clone(),
+            admin,
+        },
+    );
+
+    (
+        StatusCode::OK,
+        Json(AccountResponse {
+            accepted: true,
+            created,
+            token: Some(token),
+            node_id: state.node_id.clone(),
+            username: Some(username),
+            admin,
+            error: None,
+        }),
     )
 }
 
@@ -281,10 +574,16 @@ async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
     state.clients.lock().await.insert(
         client_id,
         ClientHandle {
+            code: auth.code.clone(),
             admin: auth.admin,
             tx,
         },
     );
+    if let Some(account) = state.accounts.lock().await.get_mut(&auth.code) {
+        account.connected = true;
+    }
+    info!("{} connected", auth.username);
+    broadcast_presence(&state).await;
 
     let writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
@@ -415,7 +714,7 @@ async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String>
         .unwrap_or(false);
 
     if !sender_admin {
-        return Err("global wipe requires an admin invite".to_string());
+        return Err("global wipe requires an admin account".to_string());
     }
 
     state.pending.lock().await.clear();
@@ -430,6 +729,30 @@ async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String>
         send_to_client(state, client_id, &OutboundFrame::GlobalWipe).await;
     }
     Ok(())
+}
+
+async fn broadcast_presence(state: &AppState) {
+    let users = state
+        .accounts
+        .lock()
+        .await
+        .values()
+        .map(|account| PresenceUser {
+            username: account.username.clone(),
+            connected: account.connected,
+        })
+        .collect::<Vec<_>>();
+    let frame = OutboundFrame::Presence { users };
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for client_id in clients {
+        send_to_client(state, client_id, &frame).await;
+    }
 }
 
 async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame) {
@@ -447,10 +770,29 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
 }
 
 async fn cleanup_client(state: &AppState, client_id: Uuid) {
-    state.clients.lock().await.remove(&client_id);
+    let code = state
+        .clients
+        .lock()
+        .await
+        .remove(&client_id)
+        .map(|client| client.code);
     for members in state.rooms.lock().await.values_mut() {
         members.remove(&client_id);
     }
+    if let Some(code) = code {
+        let still_connected = state
+            .clients
+            .lock()
+            .await
+            .values()
+            .any(|client| client.code == code);
+        if !still_connected {
+            if let Some(account) = state.accounts.lock().await.get_mut(&code) {
+                account.connected = false;
+            }
+        }
+    }
+    broadcast_presence(state).await;
 }
 
 #[cfg(test)]
@@ -458,21 +800,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invite_shape_requires_three_groups_of_four() {
-        assert!(valid_invite_shape("MIRA-4729-ZX00"));
-        assert!(!valid_invite_shape("MIRA-4729-ZX"));
-        assert!(!valid_invite_shape("MIRA-4729-ZX00-AAAA"));
-        assert!(!valid_invite_shape("MIRA-4729-ZX!!"));
+    fn generated_codes_are_at_least_minimum_length() {
+        let mut rng = OsRng;
+        for len in 12..=20 {
+            let code = generate_code(&mut rng, len);
+            assert_eq!(len, code.len());
+            assert!(valid_code_shape(&code));
+        }
     }
 
     #[test]
-    fn code_parser_normalizes_and_skips_blanks() {
-        env::set_var("MIRAGE_TEST_CODES", " mira-4729-zx00, ,admin-1111-root ");
-        let codes = parse_codes("MIRAGE_TEST_CODES", "");
+    fn generated_code_lengths_are_unique() {
+        let mut codes = HashMap::new();
+        let mut lengths = HashSet::new();
+        generate_codes(&mut codes, &mut lengths, 8, false, 12, 20);
+        generate_codes(&mut codes, &mut lengths, 3, true, 12, 20);
 
-        assert!(codes.contains("MIRA-4729-ZX00"));
-        assert!(codes.contains("ADMIN-1111-ROOT"));
-        assert_eq!(2, codes.len());
-        env::remove_var("MIRAGE_TEST_CODES");
+        let unique_lengths = codes.keys().map(|code| code.len()).collect::<HashSet<_>>();
+        assert_eq!(codes.len(), unique_lengths.len());
+    }
+
+    #[test]
+    fn code_parser_accepts_variable_lengths() {
+        assert!(valid_code_shape("ABCD-1234-WXYZ"));
+        assert!(valid_code_shape("ABC-12345678"));
+        assert!(!valid_code_shape("SHORT-1"));
+        assert!(!valid_code_shape("-ABCD12345678"));
+        assert!(!valid_code_shape("ABCD12345678-"));
+        assert!(!valid_code_shape("ABCD_12345678"));
+    }
+
+    #[test]
+    fn password_hash_round_trips() {
+        let hash = hash_password("strong-password").expect("hash");
+        assert!(verify_password("strong-password", &hash));
+        assert!(!verify_password("wrong-password", &hash));
     }
 }
