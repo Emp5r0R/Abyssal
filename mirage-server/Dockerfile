@@ -15,8 +15,8 @@ RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nolog
 COPY --from=builder /app/target/release/mirage-server /usr/local/bin/mirage-server
 
 USER mirage:mirage
-EXPOSE 8080
+EXPOSE 4020
 
-ENV ABYSSAL_BIND_ADDR=0.0.0.0:8080
+ENV ABYSSAL_BIND_ADDR=0.0.0.0:4020
 
 ENTRYPOINT ["/usr/local/bin/mirage-server"]

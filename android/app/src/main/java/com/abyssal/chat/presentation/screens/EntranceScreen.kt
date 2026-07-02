@@ -1,13 +1,7 @@
 package com.abyssal.chat.presentation.screens
 
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,7 +12,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -34,8 +27,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -52,7 +43,6 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.theme.DeepBlack
 import com.abyssal.chat.theme.GlassBorder
-import com.abyssal.chat.theme.MutedWhite
 import com.abyssal.chat.theme.NeonCyan
 import com.abyssal.chat.theme.NeonGreen
 import com.abyssal.chat.theme.PureWhite
@@ -79,12 +69,11 @@ private fun EntranceContent(
     isVerifying: Boolean,
     error: String?,
     status: ServerStatus,
-    onSubmit: (String, String, String, Boolean) -> Unit
+    onSubmit: (String, String, String) -> Unit
 ) {
     var inviteCode by remember { mutableStateOf("") }
     var nodeUrl by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var createAccount by remember { mutableStateOf(true) }
     val canSubmit = inviteCode.length >= 12 && nodeUrl.isNotBlank() && password.length >= 8 && !isVerifying
 
     MirageBackground {
@@ -125,7 +114,7 @@ private fun EntranceContent(
                 ) {
                     SectionLabel("ACCESS CODE")
                     Text(
-                        text = "Use your node code and password to create or enter a RAM-only account.",
+                        text = "Enter node code and password. New codes create account; existing codes login.",
                         color = SteelMuted,
                         fontSize = 13.sp,
                         textAlign = TextAlign.Center,
@@ -169,7 +158,7 @@ private fun EntranceContent(
                         ),
                         keyboardActions = KeyboardActions(
                             onDone = {
-                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password, createAccount)
+                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password)
                             }
                         ),
                         modifier = Modifier.fillMaxWidth()
@@ -212,7 +201,7 @@ private fun EntranceContent(
                         ),
                         keyboardActions = KeyboardActions(
                             onDone = {
-                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password, createAccount)
+                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password)
                             }
                         ),
                         modifier = Modifier.fillMaxWidth()
@@ -256,31 +245,11 @@ private fun EntranceContent(
                         ),
                         keyboardActions = KeyboardActions(
                             onDone = {
-                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password, createAccount)
+                                if (canSubmit) onSubmit(inviteCode, nodeUrl, password)
                             }
                         ),
                         modifier = Modifier.fillMaxWidth()
                     )
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        ModeChip(
-                            label = "Create",
-                            selected = createAccount,
-                            modifier = Modifier.weight(1f),
-                            onClick = { createAccount = true }
-                        )
-                        ModeChip(
-                            label = "Login",
-                            selected = !createAccount,
-                            modifier = Modifier.weight(1f),
-                            onClick = { createAccount = false }
-                        )
-                    }
 
                     if (error != null) {
                         Text(
@@ -293,8 +262,8 @@ private fun EntranceContent(
                     }
 
                     MiragePrimaryButton(
-                        text = if (createAccount) "Create account" else "Login",
-                        onClick = { onSubmit(inviteCode, nodeUrl, password, createAccount) },
+                        text = "Enter",
+                        onClick = { onSubmit(inviteCode, nodeUrl, password) },
                         enabled = canSubmit,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -308,7 +277,7 @@ private fun EntranceContent(
                             )
                         } else {
                             Text(
-                                text = if (createAccount) "Create account" else "Login",
+                                text = "Enter",
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
@@ -334,35 +303,6 @@ private fun formatInviteCode(input: String): String {
         .uppercase(Locale.ROOT)
 }
 
-@Composable
-private fun ModeChip(
-    label: String,
-    selected: Boolean,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    val borderColor = if (selected) NeonCyan else GlassBorder
-    val background = if (selected) NeonCyan.copy(alpha = 0.16f) else Color.White.copy(alpha = 0.03f)
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = modifier
-            .height(44.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(background)
-            .border(BorderStroke(1.dp, borderColor), RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
-    ) {
-        Text(
-            text = label,
-            color = if (selected) NeonCyan else SteelMuted,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-    }
-}
-
 @Preview
 @Composable
 private fun EntranceContentPreview() {
@@ -370,6 +310,6 @@ private fun EntranceContentPreview() {
         isVerifying = false,
         error = null,
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
-        onSubmit = { _, _, _, _ -> }
+        onSubmit = { _, _, _ -> }
     )
 }

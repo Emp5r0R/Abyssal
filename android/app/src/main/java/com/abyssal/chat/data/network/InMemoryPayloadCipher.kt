@@ -12,29 +12,37 @@ class InMemoryPayloadCipher {
     private var key: SecretKey? = null
     private val random = SecureRandom()
 
-    fun deriveSessionKey(inviteCode: String, nodeId: String, password: String) {
-        val material = "${normalize(inviteCode)}:${normalize(nodeId)}:${password}"
+    fun deriveSessionKey(nodeId: String) {
+        val material = "ABYSSAL_NODE_PAYLOAD_V1:${normalize(nodeId)}"
         val digest = MessageDigest.getInstance("SHA-256")
             .digest(material.toByteArray(Charsets.UTF_8))
         key = SecretKeySpec(digest, "AES")
     }
 
     fun encrypt(plainText: String): ByteArray {
+        return encryptBytes(plainText.toByteArray(Charsets.UTF_8))
+    }
+
+    fun decrypt(payload: ByteArray): String {
+        return String(decryptBytes(payload), Charsets.UTF_8)
+    }
+
+    fun encryptBytes(plainBytes: ByteArray): ByteArray {
         val nonce = ByteArray(12)
         random.nextBytes(nonce)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, requireKey(), GCMParameterSpec(128, nonce))
-        val ciphertext = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+        val ciphertext = cipher.doFinal(plainBytes)
         return nonce + ciphertext
     }
 
-    fun decrypt(payload: ByteArray): String {
+    fun decryptBytes(payload: ByteArray): ByteArray {
         require(payload.size > NONCE_SIZE_BYTES) { "Encrypted payload is too short." }
         val nonce = payload.copyOfRange(0, NONCE_SIZE_BYTES)
         val ciphertext = payload.copyOfRange(NONCE_SIZE_BYTES, payload.size)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, requireKey(), GCMParameterSpec(128, nonce))
-        return String(cipher.doFinal(ciphertext), Charsets.UTF_8)
+        return cipher.doFinal(ciphertext)
     }
 
     fun clear() {
