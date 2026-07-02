@@ -8,9 +8,9 @@ services:
       - path: ../mirage-server/.env
         required: false
     environment:
-      ABYSSAL_BIND_ADDR: 0.0.0.0:8080
+      ABYSSAL_BIND_ADDR: 0.0.0.0:4020
     ports:
-      - "8080:8080"
+      - "4020:4020"
     read_only: true
     tmpfs:
       - /tmp

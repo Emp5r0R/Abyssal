@@ -14,6 +14,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import com.abyssal.chat.data.network.CloudflareFallbackDns
+import com.abyssal.chat.data.network.EncryptedAttachmentService
 import com.abyssal.chat.data.network.InMemoryNodeConfigService
 import com.abyssal.chat.data.network.NetworkIdentityService
 import com.abyssal.chat.data.network.RealChatTransport
@@ -44,6 +46,7 @@ class MainActivity : ComponentActivity() {
 
         // Singletons injected adhering to DIP
         val httpClient = OkHttpClient.Builder()
+            .dns(CloudflareFallbackDns())
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(10, TimeUnit.SECONDS)
@@ -52,6 +55,7 @@ class MainActivity : ComponentActivity() {
         val identityService = NetworkIdentityService(httpClient)
         val messageRepository = InMemoryMessageRepository()
         val chatTransport = RealChatTransport(nodeConfigService, httpClient)
+        val attachmentService = EncryptedAttachmentService(applicationContext, nodeConfigService, httpClient)
         val disguiseManager = AndroidDisguiseManager(this)
         
         viewModel = ChatViewModel(
@@ -60,6 +64,7 @@ class MainActivity : ComponentActivity() {
             messageRepository = messageRepository,
             messageSender = messageRepository,
             chatTransport = chatTransport,
+            attachmentService = attachmentService,
             disguiseManager = disguiseManager
         )
 

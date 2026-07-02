@@ -6,11 +6,11 @@ import org.junit.Test
 
 class InMemoryPayloadCipherTest {
     @Test
-    fun sameInviteAndNodeDecryptPayload() {
+    fun sameNodeDecryptsPayloadAcrossAccounts() {
         val sender = InMemoryPayloadCipher()
         val receiver = InMemoryPayloadCipher()
-        sender.deriveSessionKey("mira-4729-zx00", "oracle-1", "strong-password")
-        receiver.deriveSessionKey("MIRA-4729-ZX00", "ORACLE-1", "strong-password")
+        sender.deriveSessionKey("oracle-1")
+        receiver.deriveSessionKey("ORACLE-1")
 
         val encrypted = sender.encrypt("hello from RAM")
 
@@ -18,11 +18,11 @@ class InMemoryPayloadCipherTest {
     }
 
     @Test
-    fun differentInviteCannotDecryptPayload() {
+    fun differentNodeCannotDecryptPayload() {
         val sender = InMemoryPayloadCipher()
         val receiver = InMemoryPayloadCipher()
-        sender.deriveSessionKey("MIRA-4729-ZX00", "oracle-1", "strong-password")
-        receiver.deriveSessionKey("MIRA-0000-ZX00", "oracle-1", "strong-password")
+        sender.deriveSessionKey("oracle-1")
+        receiver.deriveSessionKey("oracle-2")
 
         val encrypted = sender.encrypt("secret")
         val failed = runCatching { receiver.decrypt(encrypted) }.isFailure
@@ -31,15 +31,15 @@ class InMemoryPayloadCipherTest {
     }
 
     @Test
-    fun differentPasswordCannotDecryptPayload() {
+    fun encryptedBytesRoundTrip() {
         val sender = InMemoryPayloadCipher()
         val receiver = InMemoryPayloadCipher()
-        sender.deriveSessionKey("MIRA-4729-ZX00", "oracle-1", "strong-password")
-        receiver.deriveSessionKey("MIRA-4729-ZX00", "oracle-1", "wrong-password")
+        sender.deriveSessionKey("oracle-1")
+        receiver.deriveSessionKey("oracle-1")
 
-        val encrypted = sender.encrypt("secret")
-        val failed = runCatching { receiver.decrypt(encrypted) }.isFailure
+        val encrypted = sender.encryptBytes(byteArrayOf(1, 2, 3, 4))
+        val decrypted = receiver.decryptBytes(encrypted)
 
-        assertTrue(failed)
+        assertTrue(byteArrayOf(1, 2, 3, 4).contentEquals(decrypted))
     }
 }

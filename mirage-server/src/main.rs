@@ -3,6 +3,7 @@ use std::{
     env,
     net::SocketAddr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use argon2::{
@@ -12,11 +13,12 @@ use argon2::{
     Argon2,
 };
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket},
-        Query, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -39,6 +41,7 @@ struct AppState {
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     pending: Arc<Mutex<HashMap<String, Vec<OutboundFrame>>>>,
+    attachments: Arc<Mutex<HashMap<Uuid, AttachmentRecord>>>,
 }
 
 #[derive(Clone)]
@@ -68,10 +71,25 @@ struct ClientHandle {
     tx: mpsc::UnboundedSender<Message>,
 }
 
+struct AttachmentRecord {
+    encrypted_bytes: Vec<u8>,
+    one_time: bool,
+    delete_after_download: bool,
+    expires_at_ms: Option<u64>,
+}
+
 #[derive(Deserialize)]
 struct AccountRequest {
     code: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct AttachmentQuery {
+    chat_id: String,
+    one_time: Option<bool>,
+    delete_after_download: Option<bool>,
+    ttl_sec: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -159,7 +177,7 @@ async fn main() {
 
     let bind_addr: SocketAddr = env::var("ABYSSAL_BIND_ADDR")
         .or_else(|_| env::var("MIRAGE_BIND_ADDR"))
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+        .unwrap_or_else(|_| "0.0.0.0:4020".to_string())
         .parse()
         .expect("ABYSSAL_BIND_ADDR must be a valid socket address");
 
@@ -167,7 +185,11 @@ async fn main() {
         .route("/health", get(health))
         .route("/v1/account/create", post(create_account))
         .route("/v1/account/login", post(login_account))
+        .route("/v1/account/enter", post(enter_account))
+        .route("/v1/attachment", post(upload_attachment))
+        .route("/v1/attachment/:id", get(download_attachment))
         .route("/v1/invite/validate", post(login_account))
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .route("/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -235,6 +257,7 @@ impl AppState {
             clients: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            attachments: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -246,6 +269,13 @@ impl AppState {
             info!("ABYSSAL_CODE role={role} code={code}");
         }
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn read_usize_env(key: &str, fallback: usize) -> usize {
@@ -355,6 +385,12 @@ fn validate_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn code_log_label(code: &str) -> String {
+    let suffix_rev: String = code.chars().rev().take(4).collect();
+    let suffix: String = suffix_rev.chars().rev().collect();
+    format!("len={} suffix={suffix}", code.len())
+}
+
 fn hash_password(password: &str) -> Result<String, String> {
     let salt = SaltString::generate(&mut SaltOsRng);
     Argon2::default()
@@ -420,7 +456,12 @@ async fn create_account(
         Ok(code) => code,
         Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
     };
+    info!("account_create_attempt {}", code_log_label(&code));
     if let Err(error) = validate_password(&request.password) {
+        warn!(
+            "account_create_rejected {} reason=password_shape",
+            code_log_label(&code)
+        );
         return account_error(StatusCode::BAD_REQUEST, &state, error).await;
     }
 
@@ -428,6 +469,10 @@ async fn create_account(
         Some(grant) => grant,
         None => {
             if state.accounts.lock().await.contains_key(&code) {
+                warn!(
+                    "account_create_rejected {} reason=already_created",
+                    code_log_label(&code)
+                );
                 return account_error(
                     StatusCode::CONFLICT,
                     &state,
@@ -435,6 +480,10 @@ async fn create_account(
                 )
                 .await;
             }
+            warn!(
+                "account_create_rejected {} reason=unknown_code",
+                code_log_label(&code)
+            );
             return account_error(
                 StatusCode::UNAUTHORIZED,
                 &state,
@@ -458,6 +507,12 @@ async fn create_account(
             connected: false,
         },
     );
+    info!(
+        "account_create_accepted {} username={} admin={}",
+        code_log_label(&code),
+        username,
+        grant.admin
+    );
 
     issue_session(&state, code, username, grant.admin, true).await
 }
@@ -470,13 +525,22 @@ async fn login_account(
         Ok(code) => code,
         Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
     };
+    info!("account_login_attempt {}", code_log_label(&code));
     if let Err(error) = validate_password(&request.password) {
+        warn!(
+            "account_login_rejected {} reason=password_shape",
+            code_log_label(&code)
+        );
         return account_error(StatusCode::BAD_REQUEST, &state, error).await;
     }
 
     let account = match state.accounts.lock().await.get(&code).cloned() {
         Some(account) => account,
         None => {
+            warn!(
+                "account_login_rejected {} reason=no_account",
+                code_log_label(&code)
+            );
             return account_error(
                 StatusCode::UNAUTHORIZED,
                 &state,
@@ -487,6 +551,10 @@ async fn login_account(
     };
 
     if !verify_password(&request.password, &account.password_hash) {
+        warn!(
+            "account_login_rejected {} reason=bad_password",
+            code_log_label(&code)
+        );
         return account_error(
             StatusCode::UNAUTHORIZED,
             &state,
@@ -495,7 +563,188 @@ async fn login_account(
         .await;
     }
 
+    info!(
+        "account_login_accepted {} username={} admin={}",
+        code_log_label(&code),
+        account.username,
+        account.admin
+    );
     issue_session(&state, code, account.username, account.admin, false).await
+}
+
+async fn enter_account(
+    State(state): State<AppState>,
+    Json(request): Json<AccountRequest>,
+) -> impl IntoResponse {
+    let _account_guard = state.account_ops.lock().await;
+    let code = match normalize_code(&request.code) {
+        Ok(code) => code,
+        Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
+    };
+    info!("account_enter_attempt {}", code_log_label(&code));
+    if let Err(error) = validate_password(&request.password) {
+        warn!(
+            "account_enter_rejected {} reason=password_shape",
+            code_log_label(&code)
+        );
+        return account_error(StatusCode::BAD_REQUEST, &state, error).await;
+    }
+
+    if let Some(account) = state.accounts.lock().await.get(&code).cloned() {
+        if !verify_password(&request.password, &account.password_hash) {
+            warn!(
+                "account_enter_rejected {} reason=bad_password",
+                code_log_label(&code)
+            );
+            return account_error(
+                StatusCode::UNAUTHORIZED,
+                &state,
+                "Wrong information.".to_string(),
+            )
+            .await;
+        }
+
+        info!(
+            "account_enter_login {} username={} admin={}",
+            code_log_label(&code),
+            account.username,
+            account.admin
+        );
+        return issue_session(&state, code, account.username, account.admin, false).await;
+    }
+
+    let grant = match state.available_codes.lock().await.remove(&code) {
+        Some(grant) => grant,
+        None => {
+            warn!(
+                "account_enter_rejected {} reason=unknown_code",
+                code_log_label(&code)
+            );
+            return account_error(
+                StatusCode::UNAUTHORIZED,
+                &state,
+                "Wrong information.".to_string(),
+            )
+            .await;
+        }
+    };
+
+    let password_hash = match hash_password(&request.password) {
+        Ok(hash) => hash,
+        Err(error) => return account_error(StatusCode::INTERNAL_SERVER_ERROR, &state, error).await,
+    };
+    let username = random_username();
+    state.accounts.lock().await.insert(
+        code.clone(),
+        Account {
+            username: username.clone(),
+            password_hash,
+            admin: grant.admin,
+            connected: false,
+        },
+    );
+    info!(
+        "account_enter_created {} username={} admin={}",
+        code_log_label(&code),
+        username,
+        grant.admin
+    );
+
+    issue_session(&state, code, username, grant.admin, true).await
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn auth_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthSession, StatusCode> {
+    let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    state
+        .sessions
+        .lock()
+        .await
+        .get(&token)
+        .cloned()
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+async fn upload_attachment(
+    State(state): State<AppState>,
+    Query(query): Query<AttachmentQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(status) = auth_from_headers(&state, &headers).await {
+        return status.into_response();
+    }
+    if query.chat_id.trim().is_empty() || body.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let id = Uuid::new_v4();
+    let ttl_ms = query
+        .ttl_sec
+        .filter(|ttl| *ttl > 0)
+        .map(|ttl| now_ms().saturating_add(ttl.saturating_mul(1000)));
+    let one_time = query.one_time.unwrap_or(false);
+    state.attachments.lock().await.insert(
+        id,
+        AttachmentRecord {
+            encrypted_bytes: body.to_vec(),
+            one_time,
+            delete_after_download: query.delete_after_download.unwrap_or(one_time),
+            expires_at_ms: ttl_ms,
+        },
+    );
+
+    Json(serde_json::json!({
+        "accepted": true,
+        "attachment_id": id,
+        "storage": "ram-only"
+    }))
+    .into_response()
+}
+
+async fn download_attachment(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(status) = auth_from_headers(&state, &headers).await {
+        return status.into_response();
+    }
+
+    let mut attachments = state.attachments.lock().await;
+    let Some(record) = attachments.get(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if record
+        .expires_at_ms
+        .is_some_and(|expires| now_ms() >= expires)
+    {
+        attachments.remove(&id);
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let bytes = record.encrypted_bytes.clone();
+    if record.one_time || record.delete_after_download {
+        attachments.remove(&id);
+    }
+
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
 }
 
 async fn account_error(

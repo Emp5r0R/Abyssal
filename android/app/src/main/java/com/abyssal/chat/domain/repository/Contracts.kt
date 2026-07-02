@@ -1,6 +1,8 @@
 package com.abyssal.chat.domain.repository
 
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.AttachmentUploadResult
+import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.Message
@@ -12,6 +14,7 @@ import com.abyssal.chat.domain.model.UserPresence
 import kotlinx.coroutines.flow.Flow
 
 interface IIdentityService {
+    suspend fun enterAccount(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
     suspend fun createAccount(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
     suspend fun login(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
     fun setCurrentUser(user: User)
@@ -28,7 +31,7 @@ interface INodeConfigService {
 
 interface IMessageSender {
     suspend fun sendMessage(chatId: String, content: String, selfDestructSec: Int)
-    suspend fun sendMediaMessage(chatId: String, mediaType: String, fileName: String, sizeMb: Int, selfDestructSec: Int)
+    suspend fun saveLocalAttachmentMessage(chatId: String, message: Message)
 }
 
 interface IMessageRepository {
@@ -56,6 +59,19 @@ interface IChatTransport {
     suspend fun joinChat(chatId: String)
     suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray)
     suspend fun broadcastGlobalWipe()
+}
+
+interface IEncryptedAttachmentService {
+    suspend fun uploadEncryptedAttachment(
+        chatId: String,
+        encryptedBytes: ByteArray,
+        oneTimeView: Boolean,
+        deleteAfterDownload: Boolean,
+        ttlSec: Int
+    ): AttachmentUploadResult
+
+    suspend fun downloadEncryptedAttachment(attachmentId: String): ByteArray?
+    suspend fun saveDecryptedAttachment(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
 }
 
 interface IDisguiseManager {

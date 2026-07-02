@@ -159,20 +159,8 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         saveMessage(chatId, newMsg)
     }
 
-    override suspend fun sendMediaMessage(chatId: String, mediaType: String, fileName: String, sizeMb: Int, selfDestructSec: Int) {
-        val newMsg = Message(
-            id = UUID.randomUUID().toString(),
-            sender = "You",
-            receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
-            content = "Sent $mediaType ($sizeMb MB): $fileName",
-            timestampMs = System.currentTimeMillis(),
-            selfDestructDurationSec = selfDestructSec,
-            isMedia = true,
-            mediaType = mediaType,
-            mediaSizeMb = sizeMb
-        )
-
-        saveMessage(chatId, newMsg)
+    override suspend fun saveLocalAttachmentMessage(chatId: String, message: Message) {
+        saveMessage(chatId, message)
     }
 
     override suspend fun markAsRead(chatId: String, messageId: String) {

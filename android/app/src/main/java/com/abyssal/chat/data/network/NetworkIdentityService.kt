@@ -18,6 +18,20 @@ class NetworkIdentityService(
 ) : IIdentityService {
     private var currentUser: User? = null
 
+    override suspend fun enterAccount(
+        code: String,
+        password: String,
+        endpoint: NodeEndpoint
+    ): IdentityValidationResult {
+        val unified = authenticate(endpoint, "/v1/account/enter", code, password)
+        if (unified.accepted) return unified
+
+        val login = authenticate(endpoint, "/v1/account/login", code, password)
+        if (login.accepted) return login
+
+        return authenticate(endpoint, "/v1/account/create", code, password)
+    }
+
     override suspend fun createAccount(
         code: String,
         password: String,

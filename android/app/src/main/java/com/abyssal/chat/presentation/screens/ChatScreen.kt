@@ -1,5 +1,11 @@
 package com.abyssal.chat.presentation.screens
 
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -33,6 +39,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.Checkbox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -40,15 +47,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.foundation.Image
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -61,6 +71,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
@@ -68,29 +79,38 @@ import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.DeepBlack
 import com.abyssal.chat.theme.DeepBlue
 import com.abyssal.chat.theme.GlassBorder
-import com.abyssal.chat.theme.MutedWhite
 import com.abyssal.chat.theme.NeonCyan
 import com.abyssal.chat.theme.NeonGreen
 import com.abyssal.chat.theme.PureWhite
 import com.abyssal.chat.theme.SelfDestructAmber
 import com.abyssal.chat.theme.SteelMuted
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
     val messages by viewModel.activeMessages.collectAsState()
     val sessions by viewModel.sessions.collectAsState()
     val status by viewModel.serverStatus.collectAsState()
+    val attachmentPreview by viewModel.attachmentPreview.collectAsState()
+    val attachmentError = viewModel.attachmentError.value
     val currentSession = remember(sessions, sessionId) { sessions.find { it.id == sessionId } }
 
     ChatContent(
         session = currentSession,
         messages = messages,
         status = status,
+        attachmentPreview = attachmentPreview,
+        attachmentError = attachmentError,
         onBack = { viewModel.navigateTo(Screen.Dashboard) },
         onSendMessage = viewModel::sendMessage,
-        onSendMedia = viewModel::sendMedia,
-        onMessageVisible = viewModel::markMessageAsRead
+        onSendAttachment = viewModel::sendAttachment,
+        onMessageVisible = viewModel::markMessageAsRead,
+        onViewAttachment = viewModel::viewAttachment,
+        onSaveAttachment = viewModel::saveAttachment,
+        onDismissAttachmentPreview = viewModel::dismissAttachmentPreview
     )
 }
 
@@ -99,14 +119,25 @@ private fun ChatContent(
     session: ChatSession?,
     messages: List<Message>,
     status: ServerStatus,
+    attachmentPreview: DecryptedAttachment?,
+    attachmentError: String?,
     onBack: () -> Unit,
     onSendMessage: (String, Int) -> Unit,
-    onSendMedia: (String, String, Int, Int) -> Unit,
-    onMessageVisible: (String) -> Unit
+    onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean) -> Unit,
+    onMessageVisible: (String) -> Unit,
+    onViewAttachment: (Message) -> Unit,
+    onSaveAttachment: (Message, Uri) -> Unit,
+    onDismissAttachmentPreview: () -> Unit
 ) {
     var textInput by remember { mutableStateOf("") }
     var selectedTimerSec by remember(session) { mutableIntStateOf(session?.selfDestructTimerSec ?: 5) }
     var showAttachmentDialog by remember { mutableStateOf(false) }
+    var saveTargetMessage by remember { mutableStateOf<Message?>(null) }
+    val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+        val message = saveTargetMessage
+        if (uri != null && message != null) onSaveAttachment(message, uri)
+        saveTargetMessage = null
+    }
 
     MirageBackground {
         Column(
@@ -139,7 +170,12 @@ private fun ChatContent(
                     items(messages, key = { it.id }) { message ->
                         MessageBubbleItem(
                             message = message,
-                            onBecomeVisible = { onMessageVisible(message.id) }
+                            onBecomeVisible = { onMessageVisible(message.id) },
+                            onViewAttachment = { onViewAttachment(message) },
+                            onSaveAttachment = {
+                                saveTargetMessage = message
+                                saveLauncher.launch(message.attachmentName ?: "attachment")
+                            }
                         )
                     }
                 }
@@ -169,11 +205,19 @@ private fun ChatContent(
             AttachmentDialog(
                 session = session,
                 selectedTimerSec = selectedTimerSec,
+                attachmentError = attachmentError,
                 onDismiss = { showAttachmentDialog = false },
-                onSendMedia = { type, name, size ->
-                    onSendMedia(type, name, size, selectedTimerSec)
+                onSendAttachment = { type, name, mime, bytes, oneTime, deleteAfterDownload ->
+                    onSendAttachment(type, name, mime, bytes, selectedTimerSec, oneTime, deleteAfterDownload)
                     showAttachmentDialog = false
                 }
+            )
+        }
+
+        if (attachmentPreview != null) {
+            AttachmentPreviewDialog(
+                attachment = attachmentPreview,
+                onDismiss = onDismissAttachmentPreview
             )
         }
     }
@@ -334,26 +378,58 @@ private fun ChatInputBar(
 private fun AttachmentDialog(
     session: ChatSession?,
     selectedTimerSec: Int,
+    attachmentError: String?,
     onDismiss: () -> Unit,
-    onSendMedia: (String, String, Int) -> Unit
+    onSendAttachment: (String, String, String, ByteArray, Boolean, Boolean) -> Unit
 ) {
-    var attachmentError by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var localError by remember { mutableStateOf<String?>(null) }
+    var oneTimeView by remember { mutableStateOf(false) }
+    var deleteAfterDownload by remember { mutableStateOf(false) }
     val imagesOk = session?.allowImages != false
     val videosOk = session?.allowVideos != false
     val filesOk = session?.allowFiles != false
+    fun handlePicked(uri: Uri?, mediaType: String, allowOneTime: Boolean) {
+        if (uri == null) return
+        scope.launch {
+            val picked = withContext(Dispatchers.IO) { context.readPickedAttachment(uri, mediaType) }
+            if (picked == null) {
+                localError = "Wrong information."
+            } else {
+                onSendAttachment(
+                    picked.mediaType,
+                    picked.name,
+                    picked.mimeType,
+                    picked.bytes,
+                    oneTimeView && allowOneTime,
+                    deleteAfterDownload || (oneTimeView && allowOneTime)
+                )
+            }
+        }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        handlePicked(uri, "IMAGE", true)
+    }
+    val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        handlePicked(uri, "VIDEO", true)
+    }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        handlePicked(uri, "FILE", false)
+    }
 
     MirageDialog(title = "Add attachment", onDismiss = onDismiss) {
         Text(
-            text = "Mock payloads inherit the selected ${selectedTimerSec}s retention timer.",
+            text = "Encrypted upload. ${selectedTimerSec}s retention after read.",
             color = SteelMuted,
             fontSize = 13.sp,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             lineHeight = 18.sp
         )
 
-        if (attachmentError != null) {
+        if (attachmentError != null || localError != null) {
             Text(
-                text = attachmentError!!,
+                text = attachmentError ?: localError ?: "",
                 color = SelfDestructAmber,
                 fontSize = 13.sp,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -361,35 +437,42 @@ private fun AttachmentDialog(
             )
         }
 
+        AttachmentOptionToggle(
+            label = "One-time view",
+            detail = "Images and videos only. Save disabled.",
+            checked = oneTimeView,
+            onCheckedChange = { oneTimeView = it },
+            modifier = Modifier.padding(top = 16.dp)
+        )
+        AttachmentOptionToggle(
+            label = "Delete after download",
+            detail = "Server removes encrypted bytes after first fetch.",
+            checked = deleteAfterDownload,
+            onCheckedChange = { deleteAfterDownload = it },
+            modifier = Modifier.padding(top = 8.dp)
+        )
+
         Column(
-            modifier = Modifier.padding(top = 18.dp),
+            modifier = Modifier.padding(top = 14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             AttachmentRow(
                 label = "Image",
-                detail = "payload_capture.png  |  12 MB",
+                detail = "Pick image from device",
                 enabled = imagesOk,
-                onClick = { onSendMedia("IMAGE", "payload_capture.png", 12) }
+                onClick = { imagePicker.launch("image/*") }
             )
             AttachmentRow(
                 label = "Video",
-                detail = "quantum_nodes.mp4  |  88 MB",
+                detail = "Pick video from device",
                 enabled = videosOk,
-                onClick = { onSendMedia("VIDEO", "quantum_nodes.mp4", 88) }
+                onClick = { videoPicker.launch("video/*") }
             )
             AttachmentRow(
                 label = "Document",
-                detail = "volatile_cipher.keys  |  4 MB",
+                detail = "Pick file up to 100 MB",
                 enabled = filesOk,
-                onClick = { onSendMedia("FILE", "volatile_cipher.keys", 4) }
-            )
-            AttachmentRow(
-                label = "Large package",
-                detail = "firmware_sys.img  |  140 MB",
-                enabled = filesOk,
-                onClick = {
-                    attachmentError = "Blocked: attachments are limited to 100 MB."
-                }
+                onClick = { filePicker.launch("*/*") }
             )
         }
 
@@ -400,6 +483,26 @@ private fun AttachmentDialog(
                 .fillMaxWidth()
                 .padding(top = 18.dp)
         )
+    }
+}
+
+@Composable
+private fun AttachmentOptionToggle(
+    label: String,
+    detail: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+        Column(modifier = Modifier.padding(start = 6.dp)) {
+            Text(label, color = PureWhite, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text(detail, color = SteelMuted, fontSize = 11.sp)
+        }
     }
 }
 
@@ -451,7 +554,12 @@ private fun AttachmentRow(
 }
 
 @Composable
-private fun MessageBubbleItem(message: Message, onBecomeVisible: () -> Unit) {
+private fun MessageBubbleItem(
+    message: Message,
+    onBecomeVisible: () -> Unit,
+    onViewAttachment: () -> Unit,
+    onSaveAttachment: () -> Unit
+) {
     val isMine = message.sender == "You"
 
     LaunchedEffect(message.id) {
@@ -515,7 +623,11 @@ private fun MessageBubbleItem(message: Message, onBecomeVisible: () -> Unit) {
             ) {
                 Column(modifier = Modifier.padding(13.dp)) {
                     if (message.isMedia) {
-                        MediaMessageContent(message = message)
+                        MediaMessageContent(
+                            message = message,
+                            onViewAttachment = onViewAttachment,
+                            onSaveAttachment = onSaveAttachment
+                        )
                     } else {
                         Text(
                             text = message.content,
@@ -539,9 +651,12 @@ private fun MessageBubbleItem(message: Message, onBecomeVisible: () -> Unit) {
 }
 
 @Composable
-private fun MediaMessageContent(message: Message) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
+private fun MediaMessageContent(
+    message: Message,
+    onViewAttachment: () -> Unit,
+    onSaveAttachment: () -> Unit
+) {
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
@@ -549,36 +664,56 @@ private fun MediaMessageContent(message: Message) {
             .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
             .padding(10.dp)
     ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier
-                .size(36.dp)
-                .clip(CircleShape)
-                .background(Color.White.copy(alpha = 0.06f))
-        ) {
-            MediaFileIcon(modifier = Modifier.size(16.dp), color = NeonCyan)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(Color.White.copy(alpha = 0.06f))
+            ) {
+                MediaFileIcon(modifier = Modifier.size(16.dp), color = NeonCyan)
+            }
+            Column(modifier = Modifier.padding(start = 10.dp).weight(1f)) {
+                Text(
+                    text = message.mediaType ?: "FILE",
+                    color = NeonCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = message.attachmentName ?: message.content,
+                    color = PureWhite,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${message.mediaSizeMb} MB  |  ${if (message.oneTimeView) "one-time view" else "RAM encrypted"}",
+                    color = SteelMuted,
+                    fontSize = 11.sp
+                )
+            }
         }
-        Column(modifier = Modifier.padding(start = 10.dp)) {
-            Text(
-                text = message.mediaType ?: "FILE",
-                color = NeonCyan,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace
+
+        Row(
+            modifier = Modifier.padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            MirageSecondaryButton(
+                text = if (message.oneTimeView) "View once" else "Open",
+                onClick = onViewAttachment,
+                modifier = Modifier.weight(1f)
             )
-            Text(
-                text = message.content.substringAfterLast(": ").ifBlank { message.content },
-                color = PureWhite,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Text(
-                text = "${message.mediaSizeMb} MB  |  RAM encrypted",
-                color = SteelMuted,
-                fontSize = 11.sp
-            )
+            if (message.saveAllowed) {
+                MirageSecondaryButton(
+                    text = "Save",
+                    onClick = onSaveAttachment,
+                    modifier = Modifier.weight(1f)
+                )
+            }
         }
     }
 }
@@ -633,6 +768,92 @@ private fun CountdownRow(
     }
 }
 
+@Composable
+private fun AttachmentPreviewDialog(
+    attachment: DecryptedAttachment,
+    onDismiss: () -> Unit
+) {
+    MirageDialog(title = attachment.name, onDismiss = onDismiss) {
+        val bitmap = remember(attachment.bytes, attachment.mimeType) {
+            if (attachment.mimeType.startsWith("image/")) {
+                BitmapFactory.decodeByteArray(attachment.bytes, 0, attachment.bytes.size)
+            } else {
+                null
+            }
+        }
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = "Attachment preview",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(DeepBlack)
+            )
+        } else {
+            GlassSurface(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(18.dp)
+                ) {
+                    MediaFileIcon(modifier = Modifier.size(28.dp), color = NeonCyan)
+                    Text(
+                        text = attachment.mediaType,
+                        color = NeonCyan,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 10.dp)
+                    )
+                    Text(
+                        text = "${attachment.bytes.size / 1024} KB loaded in RAM",
+                        color = SteelMuted,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+            }
+        }
+
+        if (attachment.oneTimeView) {
+            Text(
+                text = "One-time view. Save disabled.",
+                color = SelfDestructAmber,
+                fontSize = 12.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.padding(top = 12.dp)
+            )
+        }
+
+        MiragePrimaryButton(
+            text = "Close",
+            onClick = onDismiss,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp)
+        )
+    }
+}
+
+private data class PickedAttachment(
+    val mediaType: String,
+    val name: String,
+    val mimeType: String,
+    val bytes: ByteArray
+)
+
+private fun Context.readPickedAttachment(uri: Uri, mediaType: String): PickedAttachment? {
+    val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (cursor.moveToFirst() && index >= 0) cursor.getString(index) else null
+    } ?: "attachment"
+    val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+    val bytes = contentResolver.openInputStream(uri)?.use { input ->
+        input.readBytes()
+    } ?: return null
+    if (bytes.size > 100 * 1024 * 1024) return null
+    return PickedAttachment(mediaType, name, mimeType, bytes)
+}
+
 @Preview
 @Composable
 private fun ChatContentPreview() {
@@ -643,9 +864,14 @@ private fun ChatContentPreview() {
             Message("2", "You", null, "Confirmed.", 0L, 10, readTimestampMs = System.currentTimeMillis())
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
+        attachmentPreview = null,
+        attachmentError = null,
         onBack = {},
         onSendMessage = { _, _ -> },
-        onSendMedia = { _, _, _, _ -> },
-        onMessageVisible = {}
+        onSendAttachment = { _, _, _, _, _, _, _ -> },
+        onMessageVisible = {},
+        onViewAttachment = {},
+        onSaveAttachment = { _, _ -> },
+        onDismissAttachmentPreview = {}
     )
 }
