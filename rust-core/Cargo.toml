@@ -1,0 +1,22 @@
+[package]
+name = "abyssal-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Secure memory wiping on drop
+zeroize = { version = "1.7", features = ["derive"] }
+
+# Cryptography
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+
+# UniFFI for Kotlin bindings generation
+uniffi = { version = "0.28", features = ["cli"] }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }

@@ -1,0 +1,30 @@
+# Local agent and editor state
+.agents/
+.codex/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Android local/build state
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+
+# Local Android SDK and downloaded toolchains
+android-sdk/
+gradle-temp/
+
+# Rust build outputs
+target/
+**/target/
+
+# Generated app artifacts
+build-outputs/
+*.apk
+*.aab
+
+# OS files
+.DS_Store
+Thumbs.db

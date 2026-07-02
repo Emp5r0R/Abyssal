@@ -1,0 +1,26 @@
+[Unit]
+Description=Mirage RAM-only chat relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mirage
+Group=mirage
+WorkingDirectory=/opt/mirage/mirage-server
+ExecStart=/opt/mirage/mirage-server/target/release/mirage-server
+Restart=always
+RestartSec=3
+Environment=MIRAGE_BIND_ADDR=0.0.0.0:8080
+Environment=MIRAGE_NODE_ID=oracle-ampere-1
+Environment=MIRAGE_INVITE_CODES=MIRA-4729-ZX00
+Environment=MIRAGE_ADMIN_CODES=ROOT-0000-WIPE
+Environment=RUST_LOG=mirage_server=info,tower_http=info
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mirage/mirage-server
+
+[Install]
+WantedBy=multi-user.target
