@@ -8,11 +8,13 @@ import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
+import com.abyssal.chat.domain.model.UserPresence
 import kotlinx.coroutines.flow.Flow
 
 interface IIdentityService {
-    suspend fun validateInviteCode(code: String, endpoint: NodeEndpoint): IdentityValidationResult
-    suspend fun generateRandomIdentity(): User
+    suspend fun createAccount(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
+    suspend fun login(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
+    fun setCurrentUser(user: User)
     fun getCurrentUser(): User?
     fun logout()
 }
@@ -50,6 +52,7 @@ interface IChatTransport {
     fun getServerStatus(): Flow<ServerStatus>
     fun getIncomingWipeCommands(): Flow<Unit>
     fun getIncomingPayloads(): Flow<IncomingTransportPayload>
+    fun getPresence(): Flow<List<UserPresence>>
     suspend fun joinChat(chatId: String)
     suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray)
     suspend fun broadcastGlobalWipe()

@@ -39,6 +39,9 @@ deploymentTargetDropDown.xml
 render.experimental.xml
 
 # Secrets and service configs
+.env
+.env.*
+!.env.example
 *.jks
 *.keystore
 google-services.json

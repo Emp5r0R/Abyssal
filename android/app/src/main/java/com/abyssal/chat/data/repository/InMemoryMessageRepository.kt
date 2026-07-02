@@ -23,34 +23,27 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
 
     init {
-        val cyberFoxId = "dm_cyberfox"
-        val neoRiderId = "dm_neorider"
-        val voltStaticId = "dm_voltstatic"
+        resetToEmptyDefaultRooms()
+        startMemorySweeper()
+    }
 
-        // Emojis removed, wordlists only. No default forums created.
+    private fun resetToEmptyDefaultRooms() {
         val initialSessions = listOf(
-            ChatSession(cyberFoxId, "SilentWolf482", isForum = false, lastMessage = null, unreadCount = 2, selfDestructTimerSec = 5),
-            ChatSession(neoRiderId, "NebulaTiger93", isForum = false, lastMessage = null, unreadCount = 1, selfDestructTimerSec = 10),
-            ChatSession(voltStaticId, "StaticCore108", isForum = false, lastMessage = null, unreadCount = 0, selfDestructTimerSec = 7)
-        )
-
-        val initialMessages = mapOf(
-            cyberFoxId to listOf(
-                Message(UUID.randomUUID().toString(), "SilentWolf482", "You", "Identity derived. E2EE handshake confirmed.", System.currentTimeMillis() - 10000, 5)
-            ),
-            neoRiderId to listOf(
-                Message(UUID.randomUUID().toString(), "NebulaTiger93", "You", "Ready for secure deployment.", System.currentTimeMillis() - 20000, 10)
-            ),
-            voltStaticId to listOf(
-                Message(UUID.randomUUID().toString(), "StaticCore108", "You", "Handshake active. Session keys locked.", System.currentTimeMillis() - 5000, 7)
+            ChatSession(
+                id = DEFAULT_ROOM_ID,
+                name = "Abyssal Lobby",
+                isForum = true,
+                lastMessage = null,
+                unreadCount = 0,
+                selfDestructTimerSec = 10,
+                overallExpirySec = 0
             )
         )
 
         _sessions.value = initialSessions
-        _messages.value = initialMessages
+        _messages.value = initialSessions.associate { it.id to emptyList() }
 
         updateLastMessages()
-        startMemorySweeper()
     }
 
     private fun updateLastMessages() {
@@ -122,6 +115,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun saveMessage(chatId: String, message: Message) {
+        ensureSessionExists(chatId, message.selfDestructDurationSec)
         val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
         currentChatMsgs.add(message)
         _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
@@ -136,10 +130,25 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         updateLastMessages()
     }
 
+    private fun ensureSessionExists(chatId: String, selfDestructSec: Int) {
+        if (_sessions.value.any { it.id == chatId }) return
+
+        val isRoom = chatId.startsWith("room_") || chatId.startsWith("forum_")
+        val session = ChatSession(
+            id = chatId,
+            name = chatId.removePrefix("room_").removePrefix("forum_").replace('_', ' ')
+                .replaceFirstChar { it.titlecase() },
+            isForum = isRoom,
+            lastMessage = null,
+            unreadCount = 1,
+            selfDestructTimerSec = selfDestructSec
+        )
+        _sessions.value = _sessions.value + session
+    }
+
     override suspend fun sendMessage(chatId: String, content: String, selfDestructSec: Int) {
-        val messageId = UUID.randomUUID().toString()
         val newMsg = Message(
-            id = messageId,
+            id = UUID.randomUUID().toString(),
             sender = "You",
             receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
             content = content,
@@ -148,30 +157,11 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         )
 
         saveMessage(chatId, newMsg)
-
-        // Simulating the WebSocket remote reply arriving
-        if (chatId.startsWith("dm_")) {
-            val contactName = _sessions.value.find { it.id == chatId }?.name ?: "RemoteNode"
-            scope.launch {
-                delay(1200)
-                val replyId = UUID.randomUUID().toString()
-                val reply = Message(
-                    id = replyId,
-                    sender = contactName,
-                    receiver = "You",
-                    content = "Copy that. Sanitizing buffer structures.",
-                    timestampMs = System.currentTimeMillis(),
-                    selfDestructDurationSec = selfDestructSec
-                )
-                saveMessage(chatId, reply)
-            }
-        }
     }
 
     override suspend fun sendMediaMessage(chatId: String, mediaType: String, fileName: String, sizeMb: Int, selfDestructSec: Int) {
-        val messageId = UUID.randomUUID().toString()
         val newMsg = Message(
-            id = messageId,
+            id = UUID.randomUUID().toString(),
             sender = "You",
             receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
             content = "Sent $mediaType ($sizeMb MB): $fileName",
@@ -183,23 +173,6 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         )
 
         saveMessage(chatId, newMsg)
-
-        if (chatId.startsWith("dm_")) {
-            val contactName = _sessions.value.find { it.id == chatId }?.name ?: "RemoteNode"
-            scope.launch {
-                delay(1500)
-                val replyId = UUID.randomUUID().toString()
-                val reply = Message(
-                    id = replyId,
-                    sender = contactName,
-                    receiver = "You",
-                    content = "Acknowledged. Payload decrypted in RAM.",
-                    timestampMs = System.currentTimeMillis(),
-                    selfDestructDurationSec = selfDestructSec
-                )
-                saveMessage(chatId, reply)
-            }
-        }
     }
 
     override suspend fun markAsRead(chatId: String, messageId: String) {
@@ -227,7 +200,10 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun clearAllData() {
-        _messages.value = emptyMap()
-        _sessions.value = emptyList()
+        resetToEmptyDefaultRooms()
+    }
+
+    private companion object {
+        const val DEFAULT_ROOM_ID = "room_lobby"
     }
 }

@@ -3,10 +3,12 @@ package com.abyssal.chat.data.network
 import android.util.Base64
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.ServerStatus
+import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.INodeConfigService
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -26,10 +28,12 @@ class RealChatTransport(
 ) : IChatTransport {
     private val _wipeCommands = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     private val _incomingPayloads = MutableSharedFlow<IncomingTransportPayload>(extraBufferCapacity = 32)
+    private val _presence = MutableStateFlow<List<UserPresence>>(emptyList())
     private val _serverStatus = MutableStateFlow(ServerStatus("DISCONNECTED", "No node", 0))
     private val connecting = AtomicBoolean(false)
 
     private var webSocket: WebSocket? = null
+    private val joinedChatIds = Collections.synchronizedSet(mutableSetOf<String>())
 
     override fun connect() {
         if (webSocket != null || connecting.getAndSet(true)) return
@@ -54,6 +58,8 @@ class RealChatTransport(
         connecting.set(false)
         webSocket?.close(1000, "client disconnect")
         webSocket = null
+        joinedChatIds.clear()
+        _presence.value = emptyList()
         _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
     }
 
@@ -63,13 +69,11 @@ class RealChatTransport(
 
     override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.asSharedFlow()
 
-    override suspend fun joinChat(chatId: String) {
-        val frame = JSONObject()
-            .put("type", "join")
-            .put("chat_id", chatId)
-            .toString()
+    override fun getPresence(): Flow<List<UserPresence>> = _presence.asStateFlow()
 
-        webSocket?.send(frame)
+    override suspend fun joinChat(chatId: String) {
+        joinedChatIds.add(chatId)
+        sendJoinFrame(chatId)
     }
 
     override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray) {
@@ -100,6 +104,9 @@ class RealChatTransport(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connecting.set(false)
                 _serverStatus.value = ServerStatus("CONNECTED", nodeId, 0)
+                joinedChatIds.toList().forEach { chatId ->
+                    sendJoinFrame(chatId)
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -111,6 +118,18 @@ class RealChatTransport(
                             val chatId = json.optString("chat_id").takeIf { it.isNotBlank() } ?: return
                             val payload = Base64.decode(json.optString("payload_b64"), Base64.NO_WRAP)
                             _incomingPayloads.tryEmit(IncomingTransportPayload(chatId, payload))
+                        }
+                        "presence" -> {
+                            val users = json.optJSONArray("users") ?: return
+                            _presence.value = (0 until users.length()).mapNotNull { index ->
+                                val user = users.optJSONObject(index) ?: return@mapNotNull null
+                                val username = user.optString("username").takeIf { it.isNotBlank() }
+                                    ?: return@mapNotNull null
+                                UserPresence(
+                                    username = username,
+                                    connected = user.optBoolean("connected", false)
+                                )
+                            }
                         }
                         else -> Unit
                     }
@@ -129,5 +148,14 @@ class RealChatTransport(
                 _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
             }
         }
+    }
+
+    private fun sendJoinFrame(chatId: String) {
+        val frame = JSONObject()
+            .put("type", "join")
+            .put("chat_id", chatId)
+            .toString()
+
+        webSocket?.send(frame)
     }
 }

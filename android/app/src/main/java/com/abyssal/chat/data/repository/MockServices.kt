@@ -5,6 +5,7 @@ import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
+import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.ICryptoService
 import com.abyssal.chat.domain.repository.IIdentityService
 import com.abyssal.chat.domain.repository.IChatTransport
@@ -17,50 +18,34 @@ import java.security.SecureRandom
 
 class MockIdentityService : IIdentityService {
     private var currentUser: User? = null
-
-    private val prefixes = listOf(
-        "Silent", "Nebula", "Quantum", "Vortex", "Solar", "Cosmic", "Lunar", 
-        "Alpha", "Shadow", "Ghost", "Starlight", "Obsidian", "Frozen", "Electric"
-    )
-
-    private val suffixes = listOf(
-        "Wolf", "Tiger", "Fox", "Eagle", "Falcon", "Leopard", "Spectre", 
-        "Titan", "Node", "Warp", "Core", "Entity", "Daemon", "Vector"
-    )
-
-    override suspend fun validateInviteCode(code: String, endpoint: NodeEndpoint): IdentityValidationResult {
+    override suspend fun createAccount(
+        code: String,
+        password: String,
+        endpoint: NodeEndpoint
+    ): IdentityValidationResult {
         delay(800)
-        val regex = Regex("^[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}$")
-        val accepted = regex.matches(code) || code == "BIOM-ETRI-CAUT"
+        val accepted = code.length >= 12 && password.length >= 8
         return IdentityValidationResult(
             accepted = accepted,
+            created = accepted,
             token = if (accepted) "mock-token" else null,
             nodeId = endpoint.displayHost,
+            username = if (accepted) "SilentVector482" else null,
             isAdmin = accepted,
-            error = if (accepted) null else "Invalid invite code."
+            error = if (accepted) null else "Invalid account credentials."
         )
     }
 
-    override suspend fun generateRandomIdentity(): User {
-        delay(500)
-        val random = SecureRandom()
-        val prefix = prefixes[random.nextInt(prefixes.size)]
-        val suffix = suffixes[random.nextInt(suffixes.size)]
-        val number = 100 + random.nextInt(900)
-        
-        val fakeKey = ByteArray(32)
-        random.nextBytes(fakeKey)
+    override suspend fun login(
+        code: String,
+        password: String,
+        endpoint: NodeEndpoint
+    ): IdentityValidationResult {
+        return createAccount(code, password, endpoint).copy(created = false)
+    }
 
-        // Make every 2nd user an admin for easier testing of custom forum features
-        val isAdmin = random.nextInt(2) == 0
-
-        val user = User(
-            username = "$prefix$suffix$number",
-            publicKey = fakeKey,
-            isAdmin = isAdmin
-        )
+    override fun setCurrentUser(user: User) {
         currentUser = user
-        return user
     }
 
     override fun getCurrentUser(): User? = currentUser
@@ -112,6 +97,7 @@ class MockChatTransport : IChatTransport {
     override fun getServerStatus(): Flow<ServerStatus> = _serverStatus.asSharedFlow()
     override fun getIncomingWipeCommands(): Flow<Unit> = _wipeCommands.asSharedFlow()
     override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.asSharedFlow()
+    override fun getPresence(): Flow<List<UserPresence>> = MutableSharedFlow<List<UserPresence>>(replay = 1).asSharedFlow()
 
     override suspend fun joinChat(chatId: String) {}
     override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray) {}

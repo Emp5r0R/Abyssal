@@ -60,6 +60,7 @@ import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
+import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.BorderCyan
@@ -78,17 +79,24 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val sessions by viewModel.sessions.collectAsState()
     val status by viewModel.serverStatus.collectAsState()
     val disguiseSet by viewModel.disguiseSettings.collectAsState()
+    val presence by viewModel.presence.collectAsState()
+    val showCamouflagePinPrompt = viewModel.showCamouflagePinPrompt.value
 
     DashboardContent(
         currentUser = currentUser,
         sessions = sessions,
         status = status,
+        presence = presence,
         disguiseSettings = disguiseSet,
         onOpenChat = { viewModel.navigateTo(Screen.Chat(it)) },
         onUpdateDisguise = viewModel::updateDisguiseSettings,
         onCreateForum = viewModel::createForum,
         onWipe = viewModel::executeAdminClearAll
     )
+
+    if (showCamouflagePinPrompt) {
+        CamouflagePinSetupDialog(onSave = viewModel::completeCamouflagePinSetup)
+    }
 }
 
 @Composable
@@ -96,6 +104,7 @@ private fun DashboardContent(
     currentUser: User?,
     sessions: List<ChatSession>,
     status: ServerStatus,
+    presence: List<UserPresence>,
     disguiseSettings: DisguiseSettings,
     onOpenChat: (String) -> Unit,
     onUpdateDisguise: (Boolean, String) -> Unit,
@@ -155,6 +164,13 @@ private fun DashboardContent(
                     text = { Text("Direct", fontWeight = FontWeight.Bold) }
                 )
             }
+
+            PresenceStrip(
+                users = presence,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            )
 
             if (filteredSessions.isEmpty()) {
                 EmptyState(
@@ -290,6 +306,55 @@ private fun DashboardHeader(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun PresenceStrip(
+    users: List<UserPresence>,
+    modifier: Modifier = Modifier
+) {
+    if (users.isEmpty()) {
+        return
+    }
+
+    FlowRow(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        users.sortedBy { it.username }.forEach { user ->
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.White.copy(alpha = 0.04f))
+                    .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(if (user.connected) NeonGreen else SteelMuted)
+                )
+                Text(
+                    text = user.username,
+                    color = PureWhite,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = if (user.connected) "online" else "offline",
+                    color = if (user.connected) NeonGreen else SteelMuted,
+                    fontSize = 11.sp,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun SettingsDialog(
     initialSettings: DisguiseSettings,
@@ -333,7 +398,7 @@ private fun SettingsDialog(
                     .padding(top = 16.dp)
             )
             Text(
-                text = "Enter this sequence and tap = on the calculator cover to unlock Mirage.",
+                text = "Enter this sequence and tap = on the calculator cover to unlock Abyssal.",
                 color = SteelMuted,
                 fontSize = 12.sp,
                 lineHeight = 17.sp,
@@ -346,6 +411,42 @@ private fun SettingsDialog(
             confirm = "Save",
             onCancel = onDismiss,
             onConfirm = { onSave(disguiseEnabled, pinCode.ifBlank { "2026" }) }
+        )
+    }
+}
+
+@Composable
+private fun CamouflagePinSetupDialog(
+    onSave: (String) -> Unit
+) {
+    var pinCode by remember { mutableStateOf("") }
+    val canSave = pinCode.length >= 4
+
+    MirageDialog(title = "Calculator PIN", onDismiss = {}) {
+        Text(
+            text = "Choose a calculator cover PIN for this device session. Remember it; Abyssal will not save it to disk.",
+            color = SteelMuted,
+            fontSize = 13.sp,
+            lineHeight = 18.sp
+        )
+        OutlinedTextField(
+            value = pinCode,
+            onValueChange = { if (it.length <= 32) pinCode = it },
+            label = { Text("Camouflage PIN") },
+            colors = mirageTextFieldColors(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp)
+        )
+        MiragePrimaryButton(
+            text = "Remember and continue",
+            onClick = { onSave(pinCode) },
+            enabled = canSave,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 18.dp)
         )
     }
 }
@@ -631,6 +732,10 @@ private fun DashboardContentPreview() {
             ChatSession("dm", "LunarNode231", false, null, 0, 10)
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
+        presence = listOf(
+            UserPresence("SilentVector482", true),
+            UserPresence("LunarNode231", false)
+        ),
         disguiseSettings = DisguiseSettings(),
         onOpenChat = {},
         onUpdateDisguise = { _, _ -> },
