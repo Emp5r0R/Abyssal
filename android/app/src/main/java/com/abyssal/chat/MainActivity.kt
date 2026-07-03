@@ -101,12 +101,12 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        viewModel.logoutForLifecycleExit()
+        viewModel.lockForLifecycleExit()
         super.onPause()
     }
 
     override fun onStop() {
-        viewModel.logoutForLifecycleExit()
+        viewModel.lockForLifecycleExit()
         super.onStop()
     }
 }

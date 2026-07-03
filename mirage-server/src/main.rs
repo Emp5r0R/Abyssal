@@ -563,6 +563,19 @@ async fn login_account(
         .await;
     }
 
+    if code_has_connected_client(&state, &code).await {
+        warn!(
+            "account_login_rejected {} reason=already_connected",
+            code_log_label(&code)
+        );
+        return account_error(
+            StatusCode::CONFLICT,
+            &state,
+            "Wrong information.".to_string(),
+        )
+        .await;
+    }
+
     info!(
         "account_login_accepted {} username={} admin={}",
         code_log_label(&code),
@@ -598,6 +611,19 @@ async fn enter_account(
             );
             return account_error(
                 StatusCode::UNAUTHORIZED,
+                &state,
+                "Wrong information.".to_string(),
+            )
+            .await;
+        }
+
+        if code_has_connected_client(&state, &code).await {
+            warn!(
+                "account_enter_rejected {} reason=already_connected",
+                code_log_label(&code)
+            );
+            return account_error(
+                StatusCode::CONFLICT,
                 &state,
                 "Wrong information.".to_string(),
             )
@@ -651,6 +677,15 @@ async fn enter_account(
     );
 
     issue_session(&state, code, username, grant.admin, true).await
+}
+
+async fn code_has_connected_client(state: &AppState, code: &str) -> bool {
+    state
+        .clients
+        .lock()
+        .await
+        .values()
+        .any(|client| client.code == code)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {

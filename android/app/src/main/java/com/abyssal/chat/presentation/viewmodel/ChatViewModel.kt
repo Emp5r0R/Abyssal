@@ -88,6 +88,8 @@ class ChatViewModel(
     private val _calculatorDisplay = MutableStateFlow("0")
     val calculatorDisplay: StateFlow<String> = _calculatorDisplay.asStateFlow()
 
+    private var externalSystemUiOpen = false
+
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
@@ -113,10 +115,8 @@ class ChatViewModel(
             chatTransport.getIncomingPayloads().collect { incoming ->
                 val decryptedContent = runCatching { payloadCipher.decrypt(incoming.payload) }
                     .getOrElse { "Encrypted payload received." }
-                messageRepository.saveMessage(
-                    incoming.chatId,
-                    parseIncomingMessage(incoming.chatId, decryptedContent)
-                )
+                val message = parseIncomingMessage(incoming.chatId, decryptedContent) ?: return@collect
+                messageRepository.saveMessage(incoming.chatId, message)
             }
         }
     }
@@ -175,8 +175,16 @@ class ChatViewModel(
     fun sendMessage(content: String, selfDestructSec: Int) {
         val chatId = _activeChatId.value ?: return
         viewModelScope.launch {
-            messageSender.sendMessage(chatId, content, selfDestructSec)
-            chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(content))
+            val message = Message(
+                id = UUID.randomUUID().toString(),
+                sender = "You",
+                receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
+                content = content,
+                timestampMs = System.currentTimeMillis(),
+                selfDestructDurationSec = selfDestructSec
+            )
+            messageRepository.saveMessage(chatId, message)
+            chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(textMetadata(message)))
         }
     }
 
@@ -346,10 +354,17 @@ class ChatViewModel(
         if (disguiseSettings.value.isDisguised) _isLocked.value = true
     }
 
-    fun logoutForLifecycleExit() {
-        viewModelScope.launch {
-            logoutLocal()
-            _isLocked.value = disguiseSettings.value.isDisguised
+    fun beginExternalSystemUi() {
+        externalSystemUiOpen = true
+    }
+
+    fun endExternalSystemUi() {
+        externalSystemUiOpen = false
+    }
+
+    fun lockForLifecycleExit() {
+        if (!externalSystemUiOpen && disguiseSettings.value.isDisguised) {
+            _isLocked.value = true
         }
     }
 
@@ -399,10 +414,13 @@ class ChatViewModel(
         _attachmentError.value = null
     }
 
-    private fun parseIncomingMessage(chatId: String, decryptedContent: String): Message {
+    private fun parseIncomingMessage(chatId: String, decryptedContent: String): Message? {
         val json = runCatching { JSONObject(decryptedContent) }.getOrNull()
+        if (json != null && json.optString("sender") == currentUser.value?.username) return null
+
         if (json?.optString("kind") == "attachment") {
             return attachmentMessage(
+                messageId = json.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
                 sender = "Remote node",
                 receiver = if (chatId.startsWith("dm_")) "You" else null,
                 attachmentId = json.optString("attachment_id"),
@@ -413,6 +431,19 @@ class ChatViewModel(
                 selfDestructSec = json.optInt("self_destruct_sec", 10),
                 oneTimeView = json.optBoolean("one_time", false),
                 deleteAfterDownload = json.optBoolean("delete_after_download", false)
+            )
+        }
+
+        if (json?.optString("kind") == "text") {
+            val content = json.optString("content").takeIf { it.isNotBlank() } ?: return null
+            val sender = json.optString("sender").takeIf { it.isNotBlank() } ?: "Remote node"
+            return Message(
+                id = json.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
+                sender = sender,
+                receiver = if (chatId.startsWith("dm_")) "You" else null,
+                content = content,
+                timestampMs = System.currentTimeMillis(),
+                selfDestructDurationSec = json.optInt("self_destruct_sec", 10).coerceAtLeast(1)
             )
         }
 
@@ -427,6 +458,7 @@ class ChatViewModel(
     }
 
     private fun attachmentMessage(
+        messageId: String = UUID.randomUUID().toString(),
         sender: String,
         receiver: String?,
         attachmentId: String,
@@ -440,7 +472,7 @@ class ChatViewModel(
     ): Message {
         val safeName = fileName.ifBlank { "attachment" }
         return Message(
-            id = UUID.randomUUID().toString(),
+            id = messageId,
             sender = sender,
             receiver = receiver,
             content = safeName,
@@ -462,6 +494,8 @@ class ChatViewModel(
     private fun attachmentMetadata(message: Message): String {
         return JSONObject()
             .put("kind", "attachment")
+            .put("id", message.id)
+            .put("sender", currentUser.value?.username.orEmpty())
             .put("attachment_id", message.attachmentId)
             .put("name", message.attachmentName)
             .put("media_type", message.mediaType)
@@ -470,6 +504,16 @@ class ChatViewModel(
             .put("self_destruct_sec", message.selfDestructDurationSec)
             .put("one_time", message.oneTimeView)
             .put("delete_after_download", message.deleteAfterDownload)
+            .toString()
+    }
+
+    private fun textMetadata(message: Message): String {
+        return JSONObject()
+            .put("kind", "text")
+            .put("id", message.id)
+            .put("sender", currentUser.value?.username.orEmpty())
+            .put("content", message.content)
+            .put("self_destruct_sec", message.selfDestructDurationSec)
             .toString()
     }
 
