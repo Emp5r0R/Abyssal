@@ -189,7 +189,7 @@ async fn main() {
         .route("/v1/attachment", post(upload_attachment))
         .route("/v1/attachment/:id", get(download_attachment))
         .route("/v1/invite/validate", post(login_account))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .route("/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

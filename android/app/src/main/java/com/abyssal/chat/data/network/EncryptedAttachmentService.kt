@@ -12,9 +12,11 @@ import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
+import okio.BufferedSink
 import org.json.JSONObject
 
 class EncryptedAttachmentService(
@@ -28,7 +30,8 @@ class EncryptedAttachmentService(
         encryptedBytes: ByteArray,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
-        ttlSec: Int
+        ttlSec: Int,
+        onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult = withContext(Dispatchers.IO) {
         val session = nodeConfigService.getActiveSession() ?: return@withContext AttachmentUploadResult(false)
         val query = listOf(
@@ -39,7 +42,11 @@ class EncryptedAttachmentService(
         ).joinToString("&") { (key, value) ->
             "${key}=${URLEncoder.encode(value, StandardCharsets.UTF_8.name())}"
         }
-        val body = encryptedBytes.toRequestBody("application/octet-stream".toMediaType())
+        val body = ProgressRequestBody(
+            bytes = encryptedBytes,
+            mediaType = "application/octet-stream".toMediaType(),
+            onProgress = onProgress
+        )
         val request = Request.Builder()
             .url("${session.endpoint.apiBaseUrl}/v1/attachment?$query")
             .header("Authorization", "Bearer ${session.token}")
@@ -90,6 +97,34 @@ class EncryptedAttachmentService(
             } != null
         } catch (e: Exception) {
             false
+        }
+    }
+
+    private class ProgressRequestBody(
+        private val bytes: ByteArray,
+        private val mediaType: MediaType,
+        private val onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
+    ) : RequestBody() {
+        override fun contentType(): MediaType = mediaType
+
+        override fun contentLength(): Long = bytes.size.toLong()
+
+        override fun writeTo(sink: BufferedSink) {
+            val total = bytes.size.toLong()
+            var sent = 0L
+            var offset = 0
+            onProgress(0L, total)
+            while (offset < bytes.size) {
+                val count = minOf(CHUNK_BYTES, bytes.size - offset)
+                sink.write(bytes, offset, count)
+                offset += count
+                sent += count
+                onProgress(sent, total)
+            }
+        }
+
+        private companion object {
+            const val CHUNK_BYTES = 64 * 1024
         }
     }
 }

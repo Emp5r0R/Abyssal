@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
+import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
@@ -78,6 +79,9 @@ class ChatViewModel(
 
     private val _attachmentError = mutableStateOf<String?>(null)
     val attachmentError: State<String?> = _attachmentError
+
+    private val _attachmentUploadProgress = MutableStateFlow(AttachmentUploadProgress())
+    val attachmentUploadProgress: StateFlow<AttachmentUploadProgress> = _attachmentUploadProgress.asStateFlow()
 
     private val _isLocked = MutableStateFlow(false)
     val isLocked: StateFlow<Boolean> = _isLocked.asStateFlow()
@@ -175,13 +179,14 @@ class ChatViewModel(
     fun sendMessage(content: String, selfDestructSec: Int) {
         val chatId = _activeChatId.value ?: return
         viewModelScope.launch {
+            val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec)
             val message = Message(
                 id = UUID.randomUUID().toString(),
                 sender = "You",
                 receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
                 content = content,
                 timestampMs = System.currentTimeMillis(),
-                selfDestructDurationSec = selfDestructSec
+                selfDestructDurationSec = effectiveTimerSec
             )
             messageRepository.saveMessage(chatId, message)
             chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(textMetadata(message)))
@@ -198,24 +203,41 @@ class ChatViewModel(
         deleteAfterDownload: Boolean
     ) {
         val chatId = _activeChatId.value ?: return
-        if (bytes.isEmpty() || bytes.size > MAX_ATTACHMENT_BYTES) {
+        val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec)
+        if (bytes.isEmpty() || bytes.size > attachmentLimitBytes(mediaType)) {
             _attachmentError.value = "Wrong information."
             return
         }
 
         viewModelScope.launch {
             _attachmentError.value = null
+            _attachmentUploadProgress.value = AttachmentUploadProgress(
+                active = true,
+                fileName = fileName.ifBlank { "attachment" },
+                mediaType = mediaType,
+                totalBytes = bytes.size.toLong()
+            )
             val encryptedBytes = payloadCipher.encryptBytes(bytes)
             val upload = attachmentService.uploadEncryptedAttachment(
                 chatId = chatId,
                 encryptedBytes = encryptedBytes,
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload,
-                ttlSec = selfDestructSec
+                ttlSec = effectiveTimerSec,
+                onProgress = { sent, total ->
+                    _attachmentUploadProgress.value = AttachmentUploadProgress(
+                        active = true,
+                        fileName = fileName.ifBlank { "attachment" },
+                        mediaType = mediaType,
+                        bytesSent = sent.coerceAtMost(total),
+                        totalBytes = total
+                    )
+                }
             )
             val attachmentId = upload.attachmentId
             if (!upload.accepted || attachmentId == null) {
                 _attachmentError.value = "Wrong information."
+                _attachmentUploadProgress.value = AttachmentUploadProgress()
                 return@launch
             }
 
@@ -227,12 +249,13 @@ class ChatViewModel(
                 fileName = fileName,
                 mimeType = mimeType,
                 sizeBytes = bytes.size.toLong(),
-                selfDestructSec = selfDestructSec,
+                selfDestructSec = effectiveTimerSec,
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload
             )
             messageSender.saveLocalAttachmentMessage(chatId, message)
             chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(attachmentMetadata(message)))
+            _attachmentUploadProgress.value = AttachmentUploadProgress()
         }
     }
 
@@ -412,6 +435,7 @@ class ChatViewModel(
         _showCamouflagePinPrompt.value = false
         _attachmentPreview.value = null
         _attachmentError.value = null
+        _attachmentUploadProgress.value = AttachmentUploadProgress()
     }
 
     private fun parseIncomingMessage(chatId: String, decryptedContent: String): Message? {
@@ -428,7 +452,7 @@ class ChatViewModel(
                 fileName = json.optString("name", "attachment"),
                 mimeType = json.optString("mime_type", "application/octet-stream"),
                 sizeBytes = json.optLong("size_bytes", 0L),
-                selfDestructSec = json.optInt("self_destruct_sec", 10),
+                selfDestructSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10)),
                 oneTimeView = json.optBoolean("one_time", false),
                 deleteAfterDownload = json.optBoolean("delete_after_download", false)
             )
@@ -443,7 +467,7 @@ class ChatViewModel(
                 receiver = if (chatId.startsWith("dm_")) "You" else null,
                 content = content,
                 timestampMs = System.currentTimeMillis(),
-                selfDestructDurationSec = json.optInt("self_destruct_sec", 10).coerceAtLeast(1)
+                selfDestructDurationSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10))
             )
         }
 
@@ -453,8 +477,25 @@ class ChatViewModel(
             receiver = if (chatId.startsWith("dm_")) "You" else null,
             content = decryptedContent,
             timestampMs = System.currentTimeMillis(),
-            selfDestructDurationSec = 10
+            selfDestructDurationSec = effectiveRetentionSec(chatId, 10)
         )
+    }
+
+    private fun effectiveRetentionSec(chatId: String, requestedSec: Int): Int {
+        val session = sessions.value.find { it.id == chatId }
+        return if (session?.isForum == true) {
+            session.selfDestructTimerSec.coerceAtLeast(1)
+        } else {
+            requestedSec.coerceAtLeast(1)
+        }
+    }
+
+    private fun attachmentLimitBytes(mediaType: String): Long {
+        return when (mediaType.uppercase()) {
+            "IMAGE" -> IMAGE_ATTACHMENT_BYTES
+            "VIDEO" -> VIDEO_ATTACHMENT_BYTES
+            else -> FILE_ATTACHMENT_BYTES
+        }
     }
 
     private fun attachmentMessage(
@@ -589,6 +630,8 @@ class ChatViewModel(
     }
 
     companion object {
-        const val MAX_ATTACHMENT_BYTES = 100L * 1024L * 1024L
+        const val IMAGE_ATTACHMENT_BYTES = 20L * 1024L * 1024L
+        const val VIDEO_ATTACHMENT_BYTES = 100L * 1024L * 1024L
+        const val FILE_ATTACHMENT_BYTES = 200L * 1024L * 1024L
     }
 }
