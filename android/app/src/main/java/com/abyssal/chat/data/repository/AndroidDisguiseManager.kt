@@ -40,15 +40,13 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         val abyssal = ComponentName(context, "${context.packageName}.LauncherAbyssal")
         val calculator = ComponentName(context, "${context.packageName}.LauncherCalculator")
         runCatching {
-            packageManager.setComponentEnabledSetting(
-                abyssal,
-                if (enabled) {
-                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                } else {
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                },
-                PackageManager.DONT_KILL_APP
-            )
+            if (!enabled) {
+                packageManager.setComponentEnabledSetting(
+                    abyssal,
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                    PackageManager.DONT_KILL_APP
+                )
+            }
             packageManager.setComponentEnabledSetting(
                 calculator,
                 if (enabled) {

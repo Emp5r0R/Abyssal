@@ -563,18 +563,7 @@ async fn login_account(
         .await;
     }
 
-    if code_has_connected_client(&state, &code).await {
-        warn!(
-            "account_login_rejected {} reason=already_connected",
-            code_log_label(&code)
-        );
-        return account_error(
-            StatusCode::CONFLICT,
-            &state,
-            "Wrong information.".to_string(),
-        )
-        .await;
-    }
+    replace_connected_clients_for_code(&state, &code).await;
 
     info!(
         "account_login_accepted {} username={} admin={}",
@@ -617,18 +606,7 @@ async fn enter_account(
             .await;
         }
 
-        if code_has_connected_client(&state, &code).await {
-            warn!(
-                "account_enter_rejected {} reason=already_connected",
-                code_log_label(&code)
-            );
-            return account_error(
-                StatusCode::CONFLICT,
-                &state,
-                "Wrong information.".to_string(),
-            )
-            .await;
-        }
+        replace_connected_clients_for_code(&state, &code).await;
 
         info!(
             "account_enter_login {} username={} admin={}",
@@ -679,13 +657,45 @@ async fn enter_account(
     issue_session(&state, code, username, grant.admin, true).await
 }
 
-async fn code_has_connected_client(state: &AppState, code: &str) -> bool {
+async fn replace_connected_clients_for_code(state: &AppState, code: &str) {
+    let old_clients = state
+        .clients
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(client_id, client)| {
+            if client.code == code {
+                Some((*client_id, client.tx.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if old_clients.is_empty() {
+        return;
+    }
+
+    for (_, tx) in &old_clients {
+        let _ = tx.send(Message::Close(None));
+    }
+
+    let old_ids = old_clients
+        .iter()
+        .map(|(client_id, _)| *client_id)
+        .collect::<HashSet<_>>();
     state
         .clients
         .lock()
         .await
-        .values()
-        .any(|client| client.code == code)
+        .retain(|client_id, _| !old_ids.contains(client_id));
+    for members in state.rooms.lock().await.values_mut() {
+        members.retain(|client_id| !old_ids.contains(client_id));
+    }
+    if let Some(account) = state.accounts.lock().await.get_mut(code) {
+        account.connected = false;
+    }
+    broadcast_presence(state).await;
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
