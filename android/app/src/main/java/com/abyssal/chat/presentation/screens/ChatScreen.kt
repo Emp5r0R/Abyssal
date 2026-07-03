@@ -110,7 +110,9 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         onMessageVisible = viewModel::markMessageAsRead,
         onViewAttachment = viewModel::viewAttachment,
         onSaveAttachment = viewModel::saveAttachment,
-        onDismissAttachmentPreview = viewModel::dismissAttachmentPreview
+        onDismissAttachmentPreview = viewModel::dismissAttachmentPreview,
+        onExternalSystemUiStart = viewModel::beginExternalSystemUi,
+        onExternalSystemUiEnd = viewModel::endExternalSystemUi
     )
 }
 
@@ -127,13 +129,16 @@ private fun ChatContent(
     onMessageVisible: (String) -> Unit,
     onViewAttachment: (Message) -> Unit,
     onSaveAttachment: (Message, Uri) -> Unit,
-    onDismissAttachmentPreview: () -> Unit
+    onDismissAttachmentPreview: () -> Unit,
+    onExternalSystemUiStart: () -> Unit,
+    onExternalSystemUiEnd: () -> Unit
 ) {
     var textInput by remember { mutableStateOf("") }
     var selectedTimerSec by remember(session) { mutableIntStateOf(session?.selfDestructTimerSec ?: 5) }
     var showAttachmentDialog by remember { mutableStateOf(false) }
     var saveTargetMessage by remember { mutableStateOf<Message?>(null) }
     val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+        onExternalSystemUiEnd()
         val message = saveTargetMessage
         if (uri != null && message != null) onSaveAttachment(message, uri)
         saveTargetMessage = null
@@ -174,6 +179,7 @@ private fun ChatContent(
                             onViewAttachment = { onViewAttachment(message) },
                             onSaveAttachment = {
                                 saveTargetMessage = message
+                                onExternalSystemUiStart()
                                 saveLauncher.launch(message.attachmentName ?: "attachment")
                             }
                         )
@@ -210,7 +216,9 @@ private fun ChatContent(
                 onSendAttachment = { type, name, mime, bytes, oneTime, deleteAfterDownload ->
                     onSendAttachment(type, name, mime, bytes, selectedTimerSec, oneTime, deleteAfterDownload)
                     showAttachmentDialog = false
-                }
+                },
+                onExternalSystemUiStart = onExternalSystemUiStart,
+                onExternalSystemUiEnd = onExternalSystemUiEnd
             )
         }
 
@@ -380,7 +388,9 @@ private fun AttachmentDialog(
     selectedTimerSec: Int,
     attachmentError: String?,
     onDismiss: () -> Unit,
-    onSendAttachment: (String, String, String, ByteArray, Boolean, Boolean) -> Unit
+    onSendAttachment: (String, String, String, ByteArray, Boolean, Boolean) -> Unit,
+    onExternalSystemUiStart: () -> Unit,
+    onExternalSystemUiEnd: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -409,12 +419,15 @@ private fun AttachmentDialog(
         }
     }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        onExternalSystemUiEnd()
         handlePicked(uri, "IMAGE", true)
     }
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        onExternalSystemUiEnd()
         handlePicked(uri, "VIDEO", true)
     }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        onExternalSystemUiEnd()
         handlePicked(uri, "FILE", false)
     }
 
@@ -460,19 +473,28 @@ private fun AttachmentDialog(
                 label = "Image",
                 detail = "Pick image from device",
                 enabled = imagesOk,
-                onClick = { imagePicker.launch("image/*") }
+                onClick = {
+                    onExternalSystemUiStart()
+                    imagePicker.launch("image/*")
+                }
             )
             AttachmentRow(
                 label = "Video",
                 detail = "Pick video from device",
                 enabled = videosOk,
-                onClick = { videoPicker.launch("video/*") }
+                onClick = {
+                    onExternalSystemUiStart()
+                    videoPicker.launch("video/*")
+                }
             )
             AttachmentRow(
                 label = "Document",
                 detail = "Pick file up to 100 MB",
                 enabled = filesOk,
-                onClick = { filePicker.launch("*/*") }
+                onClick = {
+                    onExternalSystemUiStart()
+                    filePicker.launch("*/*")
+                }
             )
         }
 
@@ -872,6 +894,8 @@ private fun ChatContentPreview() {
         onMessageVisible = {},
         onViewAttachment = {},
         onSaveAttachment = { _, _ -> },
-        onDismissAttachmentPreview = {}
+        onDismissAttachmentPreview = {},
+        onExternalSystemUiStart = {},
+        onExternalSystemUiEnd = {}
     )
 }

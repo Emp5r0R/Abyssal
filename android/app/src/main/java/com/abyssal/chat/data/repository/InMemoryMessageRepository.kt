@@ -23,27 +23,13 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
 
     init {
-        resetToEmptyDefaultRooms()
+        resetToEmpty()
         startMemorySweeper()
     }
 
-    private fun resetToEmptyDefaultRooms() {
-        val initialSessions = listOf(
-            ChatSession(
-                id = DEFAULT_ROOM_ID,
-                name = "Abyssal Lobby",
-                isForum = true,
-                lastMessage = null,
-                unreadCount = 0,
-                selfDestructTimerSec = 10,
-                overallExpirySec = 0
-            )
-        )
-
-        _sessions.value = initialSessions
-        _messages.value = initialSessions.associate { it.id to emptyList() }
-
-        updateLastMessages()
+    private fun resetToEmpty() {
+        _sessions.value = emptyList()
+        _messages.value = emptyMap()
     }
 
     private fun updateLastMessages() {
@@ -117,6 +103,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     override suspend fun saveMessage(chatId: String, message: Message) {
         ensureSessionExists(chatId, message.selfDestructDurationSec)
         val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
+        if (currentChatMsgs.any { it.id == message.id }) return
         currentChatMsgs.add(message)
         _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
         updateLastMessages()
@@ -188,10 +175,6 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun clearAllData() {
-        resetToEmptyDefaultRooms()
-    }
-
-    private companion object {
-        const val DEFAULT_ROOM_ID = "room_lobby"
+        resetToEmpty()
     }
 }
