@@ -35,7 +35,8 @@ data class Message(
     val attachmentSizeBytes: Long = 0L,
     val oneTimeView: Boolean = false,
     val saveAllowed: Boolean = true,
-    val deleteAfterDownload: Boolean = false
+    val deleteAfterDownload: Boolean = false,
+    val absoluteExpirySec: Int = 0
 ) {
     val isExpired: Boolean
         get() = readTimestampMs?.let {
@@ -61,7 +62,17 @@ data class ChatSession(
     val overallExpirySec: Int = 0, // Time-based self-destruct (regardless of read or not)
     val allowImages: Boolean = true,
     val allowVideos: Boolean = true,
-    val allowFiles: Boolean = true
+    val allowFiles: Boolean = true,
+    val enforceTextAbsoluteExpiry: Boolean = false,
+    val imageReadTimerSec: Int = 5,
+    val imageOverallExpirySec: Int = 0,
+    val enforceImageAbsoluteExpiry: Boolean = false,
+    val videoReadTimerSec: Int = 5,
+    val videoOverallExpirySec: Int = 0,
+    val enforceVideoAbsoluteExpiry: Boolean = false,
+    val fileReadTimerSec: Int = 5,
+    val fileOverallExpirySec: Int = 0,
+    val enforceFileAbsoluteExpiry: Boolean = false
 )
 
 data class ServerStatus(
@@ -110,6 +121,12 @@ data class IncomingTransportPayload(
         return result
     }
 }
+
+data class RoomChange(
+    val action: String,
+    val session: ChatSession? = null,
+    val chatId: String? = null
+)
 
 data class DisguiseSettings(
     val isDisguised: Boolean = false,

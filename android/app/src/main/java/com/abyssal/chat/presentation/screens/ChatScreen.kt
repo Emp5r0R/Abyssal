@@ -2,8 +2,17 @@ package com.abyssal.chat.presentation.screens
 
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
+import android.graphics.drawable.AnimatedImageDrawable
+import android.media.MediaDataSource
+import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
 import android.provider.OpenableColumns
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.ViewGroup
+import android.widget.ImageView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -42,6 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -70,6 +80,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.sp
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.ChatSession
@@ -90,6 +101,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
 
 @Composable
 fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
@@ -511,7 +523,7 @@ private fun AttachmentDialog(
     MirageDialog(title = "Add attachment", onDismiss = onDismiss) {
         Text(
             text = if (session?.isForum == true) {
-                "Encrypted upload. Room rule: ${session.selfDestructTimerSec}s after read."
+                "Room rules: image ${session.imageReadTimerSec}s, video ${session.videoReadTimerSec}s, file ${session.fileReadTimerSec}s after read."
             } else {
                 "Encrypted upload. ${selectedTimerSec}s retention after read."
             },
@@ -552,7 +564,7 @@ private fun AttachmentDialog(
         ) {
             AttachmentRow(
                 label = "Image",
-                detail = "Pick image up to 20 MB",
+                detail = roomMediaRuleDetail(session, "IMAGE", "Pick image or GIF up to 20 MB"),
                 enabled = imagesOk,
                 onClick = {
                     onExternalSystemUiStart()
@@ -561,7 +573,7 @@ private fun AttachmentDialog(
             )
             AttachmentRow(
                 label = "Video",
-                detail = "Pick video up to 100 MB",
+                detail = roomMediaRuleDetail(session, "VIDEO", "Pick video up to 100 MB"),
                 enabled = videosOk,
                 onClick = {
                     onExternalSystemUiStart()
@@ -570,7 +582,7 @@ private fun AttachmentDialog(
             )
             AttachmentRow(
                 label = "Document",
-                detail = "Pick file up to 200 MB",
+                detail = roomMediaRuleDetail(session, "FILE", "Pick file up to 200 MB"),
                 enabled = filesOk,
                 onClick = {
                     onExternalSystemUiStart()
@@ -877,44 +889,10 @@ private fun AttachmentPreviewDialog(
     onDismiss: () -> Unit
 ) {
     MirageDialog(title = attachment.name, onDismiss = onDismiss) {
-        val bitmap = remember(attachment.bytes, attachment.mimeType) {
-            if (attachment.mimeType.startsWith("image/")) {
-                BitmapFactory.decodeByteArray(attachment.bytes, 0, attachment.bytes.size)
-            } else {
-                null
-            }
-        }
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = "Attachment preview",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(DeepBlack)
-            )
-        } else {
-            GlassSurface(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(18.dp)
-                ) {
-                    MediaFileIcon(modifier = Modifier.size(28.dp), color = NeonCyan)
-                    Text(
-                        text = attachment.mediaType,
-                        color = NeonCyan,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(top = 10.dp)
-                    )
-                    Text(
-                        text = "${attachment.bytes.size / 1024} KB loaded in RAM",
-                        color = SteelMuted,
-                        fontSize = 12.sp,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
-                }
-            }
+        when {
+            attachment.mimeType.startsWith("video/") -> RamVideoPreview(attachment.bytes)
+            attachment.mimeType.startsWith("image/") -> RamImagePreview(attachment.bytes, attachment.mimeType)
+            else -> AttachmentLoadedPanel(attachment)
         }
 
         if (attachment.oneTimeView) {
@@ -937,12 +915,143 @@ private fun AttachmentPreviewDialog(
     }
 }
 
+@Composable
+private fun RamImagePreview(bytes: ByteArray, mimeType: String) {
+    val isAnimatedGif = mimeType.equals("image/gif", ignoreCase = true)
+    if (isAnimatedGif && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        AndroidView(
+            factory = { context ->
+                ImageView(context).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    setBackgroundColor(android.graphics.Color.BLACK)
+                    val drawable = runCatching {
+                        ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(bytes)))
+                    }.getOrNull()
+                    setImageDrawable(drawable)
+                    (drawable as? AnimatedImageDrawable)?.start()
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(320.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(DeepBlack)
+        )
+        return
+    }
+
+    val bitmap = remember(bytes) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = "Attachment preview",
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(DeepBlack)
+        )
+    } else {
+        AttachmentLoadedPanel(
+            DecryptedAttachment("", "image", "IMAGE", mimeType, bytes, oneTimeView = false)
+        )
+    }
+}
+
+@Composable
+private fun RamVideoPreview(bytes: ByteArray) {
+    val mediaPlayer = remember(bytes) {
+        MediaPlayer().apply {
+            setDataSource(ByteArrayMediaDataSource(bytes))
+            isLooping = true
+        }
+    }
+
+    DisposableEffect(mediaPlayer) {
+        onDispose {
+            runCatching {
+                if (mediaPlayer.isPlaying) mediaPlayer.stop()
+                mediaPlayer.release()
+            }
+        }
+    }
+
+    AndroidView(
+        factory = { context ->
+            SurfaceView(context).apply {
+                setBackgroundColor(android.graphics.Color.BLACK)
+                holder.addCallback(object : SurfaceHolder.Callback {
+                    override fun surfaceCreated(holder: SurfaceHolder) {
+                        runCatching {
+                            mediaPlayer.setDisplay(holder)
+                            mediaPlayer.setOnPreparedListener { it.start() }
+                            mediaPlayer.prepareAsync()
+                        }
+                    }
+
+                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+                    override fun surfaceDestroyed(holder: SurfaceHolder) {
+                        mediaPlayer.setDisplay(null)
+                    }
+                })
+            }
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(320.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(DeepBlack)
+    )
+}
+
+@Composable
+private fun AttachmentLoadedPanel(attachment: DecryptedAttachment) {
+    GlassSurface(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(18.dp)
+        ) {
+            MediaFileIcon(modifier = Modifier.size(28.dp), color = NeonCyan)
+            Text(
+                text = attachment.mediaType,
+                color = NeonCyan,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(top = 10.dp)
+            )
+            Text(
+                text = "${attachment.bytes.size / 1024} KB loaded in RAM",
+                color = SteelMuted,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+    }
+}
+
 private data class PickedAttachment(
     val mediaType: String,
     val name: String,
     val mimeType: String,
     val bytes: ByteArray
 )
+
+private class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
+    override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+        if (position < 0 || position >= bytes.size) return -1
+        val length = minOf(size, bytes.size - position.toInt())
+        bytes.copyInto(buffer, destinationOffset = offset, startIndex = position.toInt(), endIndex = position.toInt() + length)
+        return length
+    }
+
+    override fun getSize(): Long = bytes.size.toLong()
+
+    override fun close() = Unit
+}
 
 private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: Long): PickedAttachment? {
     var knownSize = -1L
@@ -971,6 +1080,17 @@ private fun attachmentLimitBytes(mediaType: String): Long {
         "VIDEO" -> 100L * 1024L * 1024L
         else -> 200L * 1024L * 1024L
     }
+}
+
+private fun roomMediaRuleDetail(session: ChatSession?, mediaType: String, fallback: String): String {
+    if (session?.isForum != true) return fallback
+    val (readSec, absoluteSec, enforced) = when (mediaType) {
+        "IMAGE" -> Triple(session.imageReadTimerSec, session.imageOverallExpirySec, session.enforceImageAbsoluteExpiry)
+        "VIDEO" -> Triple(session.videoReadTimerSec, session.videoOverallExpirySec, session.enforceVideoAbsoluteExpiry)
+        else -> Triple(session.fileReadTimerSec, session.fileOverallExpirySec, session.enforceFileAbsoluteExpiry)
+    }
+    val absolute = if (enforced && absoluteSec > 0) ", ${absoluteSec}s absolute" else ""
+    return "${readSec}s after read$absolute"
 }
 
 private fun formatBytes(bytes: Long): String {

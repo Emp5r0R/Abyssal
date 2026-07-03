@@ -1,7 +1,9 @@
 package com.abyssal.chat.data.network
 
 import android.util.Base64
+import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
@@ -15,6 +17,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -28,6 +31,7 @@ class RealChatTransport(
 ) : IChatTransport {
     private val _wipeCommands = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     private val _incomingPayloads = MutableSharedFlow<IncomingTransportPayload>(extraBufferCapacity = 32)
+    private val _roomChanges = MutableSharedFlow<RoomChange>(extraBufferCapacity = 32)
     private val _presence = MutableStateFlow<List<UserPresence>>(emptyList())
     private val _serverStatus = MutableStateFlow(ServerStatus("DISCONNECTED", "No node", 0))
     private val connecting = AtomicBoolean(false)
@@ -69,11 +73,35 @@ class RealChatTransport(
 
     override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.asSharedFlow()
 
+    override fun getRoomChanges(): Flow<RoomChange> = _roomChanges.asSharedFlow()
+
     override fun getPresence(): Flow<List<UserPresence>> = _presence.asStateFlow()
 
     override suspend fun joinChat(chatId: String) {
         joinedChatIds.add(chatId)
         sendJoinFrame(chatId)
+    }
+
+    override suspend fun createForum(session: ChatSession) {
+        val frame = JSONObject()
+            .put("type", "create_room")
+            .put("room", session.toRoomJson())
+            .toString()
+
+        if (webSocket?.send(frame) != true) {
+            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+        }
+    }
+
+    override suspend fun deleteForum(chatId: String) {
+        val frame = JSONObject()
+            .put("type", "delete_room")
+            .put("chat_id", chatId)
+            .toString()
+
+        if (webSocket?.send(frame) != true) {
+            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+        }
     }
 
     override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray) {
@@ -131,6 +159,26 @@ class RealChatTransport(
                                 )
                             }
                         }
+                        "rooms" -> {
+                            val rooms = json.optJSONArray("rooms") ?: JSONArray()
+                            (0 until rooms.length()).forEach { index ->
+                                rooms.optJSONObject(index)?.toChatSession()?.let { session ->
+                                    joinedChatIds.add(session.id)
+                                    _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                                }
+                            }
+                        }
+                        "room_created" -> {
+                            json.optJSONObject("room")?.toChatSession()?.let { session ->
+                                joinedChatIds.add(session.id)
+                                _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                            }
+                        }
+                        "room_deleted" -> {
+                            val chatId = json.optString("chat_id").takeIf { it.isNotBlank() } ?: return
+                            joinedChatIds.remove(chatId)
+                            _roomChanges.tryEmit(RoomChange("delete", chatId = chatId))
+                        }
                         else -> Unit
                     }
                 }
@@ -157,5 +205,52 @@ class RealChatTransport(
             .toString()
 
         webSocket?.send(frame)
+    }
+
+    private fun ChatSession.toRoomJson(): JSONObject {
+        return JSONObject()
+            .put("id", id)
+            .put("name", name)
+            .put("self_destruct_timer_sec", selfDestructTimerSec)
+            .put("overall_expiry_sec", overallExpirySec)
+            .put("allow_images", allowImages)
+            .put("allow_videos", allowVideos)
+            .put("allow_files", allowFiles)
+            .put("enforce_text_absolute_expiry", enforceTextAbsoluteExpiry)
+            .put("image_read_timer_sec", imageReadTimerSec)
+            .put("image_overall_expiry_sec", imageOverallExpirySec)
+            .put("enforce_image_absolute_expiry", enforceImageAbsoluteExpiry)
+            .put("video_read_timer_sec", videoReadTimerSec)
+            .put("video_overall_expiry_sec", videoOverallExpirySec)
+            .put("enforce_video_absolute_expiry", enforceVideoAbsoluteExpiry)
+            .put("file_read_timer_sec", fileReadTimerSec)
+            .put("file_overall_expiry_sec", fileOverallExpirySec)
+            .put("enforce_file_absolute_expiry", enforceFileAbsoluteExpiry)
+    }
+
+    private fun JSONObject.toChatSession(): ChatSession? {
+        val chatId = optString("id").takeIf { it.isNotBlank() } ?: return null
+        return ChatSession(
+            id = chatId,
+            name = optString("name", chatId.removePrefix("forum_")),
+            isForum = true,
+            lastMessage = null,
+            unreadCount = 0,
+            selfDestructTimerSec = optInt("self_destruct_timer_sec", 5).coerceAtLeast(1),
+            overallExpirySec = optInt("overall_expiry_sec", 0).coerceAtLeast(0),
+            allowImages = optBoolean("allow_images", true),
+            allowVideos = optBoolean("allow_videos", true),
+            allowFiles = optBoolean("allow_files", true),
+            enforceTextAbsoluteExpiry = optBoolean("enforce_text_absolute_expiry", false),
+            imageReadTimerSec = optInt("image_read_timer_sec", 5).coerceAtLeast(1),
+            imageOverallExpirySec = optInt("image_overall_expiry_sec", 0).coerceAtLeast(0),
+            enforceImageAbsoluteExpiry = optBoolean("enforce_image_absolute_expiry", false),
+            videoReadTimerSec = optInt("video_read_timer_sec", 5).coerceAtLeast(1),
+            videoOverallExpirySec = optInt("video_overall_expiry_sec", 0).coerceAtLeast(0),
+            enforceVideoAbsoluteExpiry = optBoolean("enforce_video_absolute_expiry", false),
+            fileReadTimerSec = optInt("file_read_timer_sec", 5).coerceAtLeast(1),
+            fileOverallExpirySec = optInt("file_overall_expiry_sec", 0).coerceAtLeast(0),
+            enforceFileAbsoluteExpiry = optBoolean("enforce_file_absolute_expiry", false)
+        )
     }
 }

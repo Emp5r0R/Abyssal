@@ -8,6 +8,7 @@ import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
@@ -40,6 +41,7 @@ interface IMessageRepository {
     suspend fun saveMessage(chatId: String, message: Message)
     suspend fun markAsRead(chatId: String, messageId: String)
     suspend fun createForumSession(session: ChatSession)
+    suspend fun deleteChatSession(chatId: String)
     suspend fun clearAllData()
 }
 
@@ -55,8 +57,11 @@ interface IChatTransport {
     fun getServerStatus(): Flow<ServerStatus>
     fun getIncomingWipeCommands(): Flow<Unit>
     fun getIncomingPayloads(): Flow<IncomingTransportPayload>
+    fun getRoomChanges(): Flow<RoomChange>
     fun getPresence(): Flow<List<UserPresence>>
     suspend fun joinChat(chatId: String)
+    suspend fun createForum(session: ChatSession)
+    suspend fun deleteForum(chatId: String)
     suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray)
     suspend fun broadcastGlobalWipe()
 }

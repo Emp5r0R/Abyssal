@@ -58,12 +58,10 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                 val now = System.currentTimeMillis()
                 var updated = false
                 
-                val cleanMessages = _messages.value.mapValues { (chatId, list) ->
-                    val session = _sessions.value.find { it.id == chatId }
-                    val overallLimit = session?.overallExpirySec ?: 0
-                    
+                val cleanMessages = _messages.value.mapValues { (_, list) ->
                     val filtered = list.filter { msg ->
                         // 1. Overall absolute self-destruct check (expires regardless of read or not)
+                        val overallLimit = msg.absoluteExpirySec
                         if (overallLimit > 0) {
                             val elapsed = now - msg.timestampMs
                             if (elapsed >= overallLimit * 1000L) {
@@ -111,10 +109,23 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     override suspend fun createForumSession(session: ChatSession) {
         val current = _sessions.value.toMutableList()
-        current.add(session)
+        val existingIndex = current.indexOfFirst { it.id == session.id }
+        if (existingIndex >= 0) {
+            current[existingIndex] = session.copy(
+                lastMessage = current[existingIndex].lastMessage,
+                unreadCount = current[existingIndex].unreadCount
+            )
+        } else {
+            current.add(session)
+        }
         _sessions.value = current
-        _messages.value = _messages.value.toMutableMap().apply { put(session.id, emptyList()) }
+        _messages.value = _messages.value.toMutableMap().apply { putIfAbsent(session.id, emptyList()) }
         updateLastMessages()
+    }
+
+    override suspend fun deleteChatSession(chatId: String) {
+        _sessions.value = _sessions.value.filterNot { it.id == chatId }
+        _messages.value = _messages.value.toMutableMap().apply { remove(chatId) }
     }
 
     private fun ensureSessionExists(chatId: String, selfDestructSec: Int) {
@@ -140,7 +151,8 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
             content = content,
             timestampMs = System.currentTimeMillis(),
-            selfDestructDurationSec = selfDestructSec
+            selfDestructDurationSec = selfDestructSec,
+            absoluteExpirySec = 0
         )
 
         saveMessage(chatId, newMsg)
