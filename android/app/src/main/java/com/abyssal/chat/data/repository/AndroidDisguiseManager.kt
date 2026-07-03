@@ -7,12 +7,8 @@ import com.abyssal.chat.domain.repository.IDisguiseManager
 
 class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
 
-    private var disguiseEnabled = false
+    private var disguiseEnabled = readCalculatorAliasEnabled()
     private var unlockPin = DEFAULT_PIN
-
-    init {
-        applyLauncherIcon(disguiseEnabled)
-    }
 
     override fun setDisguiseEnabled(enabled: Boolean) {
         disguiseEnabled = enabled
@@ -43,23 +39,31 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         val packageManager = context.packageManager
         val abyssal = ComponentName(context, "${context.packageName}.LauncherAbyssal")
         val calculator = ComponentName(context, "${context.packageName}.LauncherCalculator")
-        packageManager.setComponentEnabledSetting(
-            abyssal,
-            if (enabled) {
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-            } else {
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-            },
-            PackageManager.DONT_KILL_APP
-        )
-        packageManager.setComponentEnabledSetting(
-            calculator,
-            if (enabled) {
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-            } else {
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-            },
-            PackageManager.DONT_KILL_APP
-        )
+        runCatching {
+            packageManager.setComponentEnabledSetting(
+                abyssal,
+                if (enabled) {
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                } else {
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                },
+                PackageManager.DONT_KILL_APP
+            )
+            packageManager.setComponentEnabledSetting(
+                calculator,
+                if (enabled) {
+                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                } else {
+                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+                },
+                PackageManager.DONT_KILL_APP
+            )
+        }
+    }
+
+    private fun readCalculatorAliasEnabled(): Boolean {
+        val calculator = ComponentName(context, "${context.packageName}.LauncherCalculator")
+        return context.packageManager.getComponentEnabledSetting(calculator) ==
+            PackageManager.COMPONENT_ENABLED_STATE_ENABLED
     }
 }
