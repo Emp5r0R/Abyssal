@@ -126,6 +126,17 @@ data class AttachmentUploadResult(
     val attachmentId: String? = null
 )
 
+data class AttachmentUploadProgress(
+    val active: Boolean = false,
+    val fileName: String = "",
+    val mediaType: String = "FILE",
+    val bytesSent: Long = 0L,
+    val totalBytes: Long = 0L
+) {
+    val fraction: Float
+        get() = if (totalBytes <= 0L) 0f else (bytesSent.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+}
+
 data class DecryptedAttachment(
     val messageId: String,
     val name: String,

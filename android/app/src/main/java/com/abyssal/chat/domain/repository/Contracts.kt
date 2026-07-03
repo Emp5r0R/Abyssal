@@ -67,7 +67,8 @@ interface IEncryptedAttachmentService {
         encryptedBytes: ByteArray,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
-        ttlSec: Int
+        ttlSec: Int,
+        onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult
 
     suspend fun downloadEncryptedAttachment(attachmentId: String): ByteArray?

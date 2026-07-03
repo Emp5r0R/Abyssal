@@ -512,7 +512,7 @@ private fun CreateForumDialog(
             SectionLabel("ALLOWED PAYLOADS")
             PayloadCheckbox("Images and GIFs", imagesAllowed) { imagesAllowed = it }
             PayloadCheckbox("Video files", videosAllowed) { videosAllowed = it }
-            PayloadCheckbox("Documents up to 100 MB", filesAllowed) { filesAllowed = it }
+            PayloadCheckbox("Documents up to 200 MB", filesAllowed) { filesAllowed = it }
         }
 
         DialogButtons(

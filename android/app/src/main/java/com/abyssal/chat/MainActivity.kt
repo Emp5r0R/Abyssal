@@ -14,23 +14,16 @@ import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import com.abyssal.chat.data.network.CloudflareFallbackDns
-import com.abyssal.chat.data.network.EncryptedAttachmentService
-import com.abyssal.chat.data.network.InMemoryNodeConfigService
-import com.abyssal.chat.data.network.NetworkIdentityService
-import com.abyssal.chat.data.network.RealChatTransport
-import com.abyssal.chat.data.repository.InMemoryMessageRepository
-import com.abyssal.chat.data.repository.AndroidDisguiseManager
+import androidx.lifecycle.ViewModelProvider
 import com.abyssal.chat.presentation.screens.ChatScreen
 import com.abyssal.chat.presentation.screens.DashboardScreen
 import com.abyssal.chat.presentation.screens.EntranceScreen
 import com.abyssal.chat.presentation.screens.CalculatorScreen
+import com.abyssal.chat.presentation.viewmodel.AbyssalViewModelFactory
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.AbyssalTheme
 import com.abyssal.chat.theme.DeepBlack
-import java.util.concurrent.TimeUnit
-import okhttp3.OkHttpClient
 
 class MainActivity : ComponentActivity() {
     private lateinit var viewModel: ChatViewModel
@@ -44,29 +37,10 @@ class MainActivity : ComponentActivity() {
             WindowManager.LayoutParams.FLAG_SECURE
         )
 
-        // Singletons injected adhering to DIP
-        val httpClient = OkHttpClient.Builder()
-            .dns(CloudflareFallbackDns())
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS)
-            .writeTimeout(10, TimeUnit.SECONDS)
-            .build()
-        val nodeConfigService = InMemoryNodeConfigService()
-        val identityService = NetworkIdentityService(httpClient)
-        val messageRepository = InMemoryMessageRepository()
-        val chatTransport = RealChatTransport(nodeConfigService, httpClient)
-        val attachmentService = EncryptedAttachmentService(applicationContext, nodeConfigService, httpClient)
-        val disguiseManager = AndroidDisguiseManager(this)
-        
-        viewModel = ChatViewModel(
-            identityService = identityService,
-            nodeConfigService = nodeConfigService,
-            messageRepository = messageRepository,
-            messageSender = messageRepository,
-            chatTransport = chatTransport,
-            attachmentService = attachmentService,
-            disguiseManager = disguiseManager
-        )
+        viewModel = ViewModelProvider(
+            this,
+            AbyssalViewModelFactory(applicationContext)
+        )[ChatViewModel::class.java]
 
         setContent {
             AbyssalTheme {

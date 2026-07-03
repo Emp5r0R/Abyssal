@@ -40,6 +40,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -70,6 +71,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.Message
@@ -95,6 +97,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
     val sessions by viewModel.sessions.collectAsState()
     val status by viewModel.serverStatus.collectAsState()
     val attachmentPreview by viewModel.attachmentPreview.collectAsState()
+    val uploadProgress by viewModel.attachmentUploadProgress.collectAsState()
     val attachmentError = viewModel.attachmentError.value
     val currentSession = remember(sessions, sessionId) { sessions.find { it.id == sessionId } }
 
@@ -103,6 +106,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         messages = messages,
         status = status,
         attachmentPreview = attachmentPreview,
+        uploadProgress = uploadProgress,
         attachmentError = attachmentError,
         onBack = { viewModel.navigateTo(Screen.Dashboard) },
         onSendMessage = viewModel::sendMessage,
@@ -122,6 +126,7 @@ private fun ChatContent(
     messages: List<Message>,
     status: ServerStatus,
     attachmentPreview: DecryptedAttachment?,
+    uploadProgress: AttachmentUploadProgress,
     attachmentError: String?,
     onBack: () -> Unit,
     onSendMessage: (String, Int) -> Unit,
@@ -189,8 +194,11 @@ private fun ChatContent(
 
             RetentionPicker(
                 selectedTimerSec = selectedTimerSec,
+                lockedTimerSec = session?.selfDestructTimerSec?.takeIf { session.isForum },
                 onSelected = { selectedTimerSec = it }
             )
+
+            UploadProgressStrip(uploadProgress = uploadProgress)
 
             ChatInputBar(
                 value = textInput,
@@ -287,6 +295,7 @@ private fun ChatHeader(
 @Composable
 private fun RetentionPicker(
     selectedTimerSec: Int,
+    lockedTimerSec: Int?,
     onSelected: (Int) -> Unit
 ) {
     val timerOptions = listOf(5, 10, 30, 60)
@@ -302,7 +311,7 @@ private fun RetentionPicker(
         Row(verticalAlignment = Alignment.CenterVertically) {
             TimerIcon(modifier = Modifier.size(14.dp), color = SteelMuted)
             Text(
-                text = "Retention",
+                text = if (lockedTimerSec != null) "Room retention" else "Retention",
                 color = SteelMuted,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -310,14 +319,80 @@ private fun RetentionPicker(
             )
         }
         Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            timerOptions.forEach { option ->
+            if (lockedTimerSec != null) {
                 TimerChip(
-                    text = "${option}s",
-                    selected = selectedTimerSec == option,
-                    onClick = { onSelected(option) }
+                    text = "${lockedTimerSec}s locked",
+                    selected = true,
+                    onClick = {}
                 )
+            } else {
+                timerOptions.forEach { option ->
+                    TimerChip(
+                        text = "${option}s",
+                        selected = selectedTimerSec == option,
+                        onClick = { onSelected(option) }
+                    )
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun UploadProgressStrip(uploadProgress: AttachmentUploadProgress) {
+    if (!uploadProgress.active) return
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(DeepBlue.copy(alpha = 0.78f))
+            .border(BorderStroke(1.dp, NeonCyan.copy(alpha = 0.28f)), RoundedCornerShape(0.dp))
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Uploading ${uploadProgress.mediaType.lowercase()}",
+                    color = NeonCyan,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+                Text(
+                    text = uploadProgress.fileName,
+                    color = PureWhite,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Text(
+                text = "${(uploadProgress.fraction * 100f).toInt()}%",
+                color = NeonGreen,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+        LinearProgressIndicator(
+            progress = { uploadProgress.fraction },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 9.dp)
+                .height(4.dp),
+            color = NeonCyan,
+            trackColor = SteelMuted.copy(alpha = 0.2f)
+        )
+        Text(
+            text = "${formatBytes(uploadProgress.bytesSent)} / ${formatBytes(uploadProgress.totalBytes)}",
+            color = SteelMuted,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(top = 5.dp)
+        )
     }
 }
 
@@ -403,7 +478,9 @@ private fun AttachmentDialog(
     fun handlePicked(uri: Uri?, mediaType: String, allowOneTime: Boolean) {
         if (uri == null) return
         scope.launch {
-            val picked = withContext(Dispatchers.IO) { context.readPickedAttachment(uri, mediaType) }
+            val picked = withContext(Dispatchers.IO) {
+                context.readPickedAttachment(uri, mediaType, attachmentLimitBytes(mediaType))
+            }
             if (picked == null) {
                 localError = "Wrong information."
             } else {
@@ -433,7 +510,11 @@ private fun AttachmentDialog(
 
     MirageDialog(title = "Add attachment", onDismiss = onDismiss) {
         Text(
-            text = "Encrypted upload. ${selectedTimerSec}s retention after read.",
+            text = if (session?.isForum == true) {
+                "Encrypted upload. Room rule: ${session.selfDestructTimerSec}s after read."
+            } else {
+                "Encrypted upload. ${selectedTimerSec}s retention after read."
+            },
             color = SteelMuted,
             fontSize = 13.sp,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -471,7 +552,7 @@ private fun AttachmentDialog(
         ) {
             AttachmentRow(
                 label = "Image",
-                detail = "Pick image from device",
+                detail = "Pick image up to 20 MB",
                 enabled = imagesOk,
                 onClick = {
                     onExternalSystemUiStart()
@@ -480,7 +561,7 @@ private fun AttachmentDialog(
             )
             AttachmentRow(
                 label = "Video",
-                detail = "Pick video from device",
+                detail = "Pick video up to 100 MB",
                 enabled = videosOk,
                 onClick = {
                     onExternalSystemUiStart()
@@ -489,7 +570,7 @@ private fun AttachmentDialog(
             )
             AttachmentRow(
                 label = "Document",
-                detail = "Pick file up to 100 MB",
+                detail = "Pick file up to 200 MB",
                 enabled = filesOk,
                 onClick = {
                     onExternalSystemUiStart()
@@ -863,17 +944,42 @@ private data class PickedAttachment(
     val bytes: ByteArray
 )
 
-private fun Context.readPickedAttachment(uri: Uri, mediaType: String): PickedAttachment? {
+private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: Long): PickedAttachment? {
+    var knownSize = -1L
     val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        if (cursor.moveToFirst() && index >= 0) cursor.getString(index) else null
+        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+        if (cursor.moveToFirst()) {
+            if (sizeIndex >= 0) knownSize = cursor.getLong(sizeIndex)
+            if (nameIndex >= 0) cursor.getString(nameIndex) else null
+        } else {
+            null
+        }
     } ?: "attachment"
+    if (knownSize > maxBytes) return null
     val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
     val bytes = contentResolver.openInputStream(uri)?.use { input ->
         input.readBytes()
     } ?: return null
-    if (bytes.size > 100 * 1024 * 1024) return null
+    if (bytes.size > maxBytes) return null
     return PickedAttachment(mediaType, name, mimeType, bytes)
+}
+
+private fun attachmentLimitBytes(mediaType: String): Long {
+    return when (mediaType.uppercase()) {
+        "IMAGE" -> 20L * 1024L * 1024L
+        "VIDEO" -> 100L * 1024L * 1024L
+        else -> 200L * 1024L * 1024L
+    }
+}
+
+private fun formatBytes(bytes: Long): String {
+    val mb = bytes / (1024f * 1024f)
+    return if (mb >= 1f) {
+        "${String.format("%.1f", mb)} MB"
+    } else {
+        "${(bytes / 1024L).coerceAtLeast(0L)} KB"
+    }
 }
 
 @Preview
@@ -887,6 +993,7 @@ private fun ChatContentPreview() {
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
         attachmentPreview = null,
+        uploadProgress = AttachmentUploadProgress(),
         attachmentError = null,
         onBack = {},
         onSendMessage = { _, _ -> },
