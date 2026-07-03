@@ -40,6 +40,7 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
+    room_catalog: Arc<Mutex<HashMap<String, RoomRecord>>>,
     pending: Arc<Mutex<HashMap<String, Vec<OutboundFrame>>>>,
     attachments: Arc<Mutex<HashMap<Uuid, AttachmentRecord>>>,
 }
@@ -76,6 +77,27 @@ struct AttachmentRecord {
     one_time: bool,
     delete_after_download: bool,
     expires_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct RoomRecord {
+    id: String,
+    name: String,
+    self_destruct_timer_sec: u64,
+    overall_expiry_sec: u64,
+    allow_images: bool,
+    allow_videos: bool,
+    allow_files: bool,
+    enforce_text_absolute_expiry: bool,
+    image_read_timer_sec: u64,
+    image_overall_expiry_sec: u64,
+    enforce_image_absolute_expiry: bool,
+    video_read_timer_sec: u64,
+    video_overall_expiry_sec: u64,
+    enforce_video_absolute_expiry: bool,
+    file_read_timer_sec: u64,
+    file_overall_expiry_sec: u64,
+    enforce_file_absolute_expiry: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +158,10 @@ enum InboundFrame {
     },
     #[serde(rename = "global_wipe")]
     GlobalWipe,
+    #[serde(rename = "create_room")]
+    CreateRoom { room: RoomRecord },
+    #[serde(rename = "delete_room")]
+    DeleteRoom { chat_id: String },
 }
 
 #[derive(Clone, Serialize)]
@@ -155,6 +181,12 @@ enum OutboundFrame {
     Presence { users: Vec<PresenceUser> },
     #[serde(rename = "GLOBAL_WIPE")]
     GlobalWipe,
+    #[serde(rename = "rooms")]
+    Rooms { rooms: Vec<RoomRecord> },
+    #[serde(rename = "room_created")]
+    RoomCreated { room: RoomRecord },
+    #[serde(rename = "room_deleted")]
+    RoomDeleted { chat_id: String },
 }
 
 #[derive(Clone, Serialize)]
@@ -256,6 +288,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
+            room_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -878,6 +911,7 @@ async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
     }
     info!("{} connected", auth.username);
     broadcast_presence(&state).await;
+    send_room_catalog(&state, client_id).await;
 
     let writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
@@ -933,6 +967,8 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             broadcast_to_room(state, sender_id, &chat_id, outbound).await
         }
         InboundFrame::GlobalWipe => broadcast_wipe(state, sender_id).await,
+        InboundFrame::CreateRoom { room } => create_room(state, sender_id, room).await,
+        InboundFrame::DeleteRoom { chat_id } => delete_room(state, sender_id, &chat_id).await,
     }
 }
 
@@ -1012,6 +1048,9 @@ async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String>
     }
 
     state.pending.lock().await.clear();
+    state.attachments.lock().await.clear();
+    state.room_catalog.lock().await.clear();
+    state.rooms.lock().await.clear();
     let clients = state
         .clients
         .lock()
@@ -1022,6 +1061,87 @@ async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String>
     for client_id in clients {
         send_to_client(state, client_id, &OutboundFrame::GlobalWipe).await;
     }
+    Ok(())
+}
+
+async fn create_room(
+    state: &AppState,
+    sender_id: Uuid,
+    mut room: RoomRecord,
+) -> Result<(), String> {
+    require_admin(state, sender_id).await?;
+    normalize_room_record(&mut room)?;
+    state
+        .room_catalog
+        .lock()
+        .await
+        .insert(room.id.clone(), room.clone());
+    broadcast_to_all(state, &OutboundFrame::RoomCreated { room }).await;
+    Ok(())
+}
+
+async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result<(), String> {
+    require_admin(state, sender_id).await?;
+    let chat_id = chat_id.trim();
+    if chat_id.is_empty() {
+        return Err("room id is required".to_string());
+    }
+    state.room_catalog.lock().await.remove(chat_id);
+    state.pending.lock().await.remove(chat_id);
+    state.rooms.lock().await.remove(chat_id);
+    broadcast_to_all(
+        state,
+        &OutboundFrame::RoomDeleted {
+            chat_id: chat_id.to_string(),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn send_room_catalog(state: &AppState, client_id: Uuid) {
+    let rooms = state
+        .room_catalog
+        .lock()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    send_to_client(state, client_id, &OutboundFrame::Rooms { rooms }).await;
+}
+
+async fn require_admin(state: &AppState, client_id: Uuid) -> Result<(), String> {
+    let admin = state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| client.admin)
+        .unwrap_or(false);
+    if admin {
+        Ok(())
+    } else {
+        Err("admin account required".to_string())
+    }
+}
+
+fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
+    room.id = room.id.trim().to_string();
+    room.name = room.name.trim().chars().take(36).collect::<String>();
+    if room.id.is_empty() || !room.id.starts_with("forum_") {
+        return Err("room id rejected".to_string());
+    }
+    if room.name.is_empty() {
+        return Err("room name rejected".to_string());
+    }
+    room.self_destruct_timer_sec = room.self_destruct_timer_sec.max(1).min(86_400);
+    room.overall_expiry_sec = room.overall_expiry_sec.min(86_400);
+    room.image_read_timer_sec = room.image_read_timer_sec.max(1).min(86_400);
+    room.image_overall_expiry_sec = room.image_overall_expiry_sec.min(86_400);
+    room.video_read_timer_sec = room.video_read_timer_sec.max(1).min(86_400);
+    room.video_overall_expiry_sec = room.video_overall_expiry_sec.min(86_400);
+    room.file_read_timer_sec = room.file_read_timer_sec.max(1).min(86_400);
+    room.file_overall_expiry_sec = room.file_overall_expiry_sec.min(86_400);
     Ok(())
 }
 
@@ -1046,6 +1166,19 @@ async fn broadcast_presence(state: &AppState) {
         .collect::<Vec<_>>();
     for client_id in clients {
         send_to_client(state, client_id, &frame).await;
+    }
+}
+
+async fn broadcast_to_all(state: &AppState, frame: &OutboundFrame) {
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for client_id in clients {
+        send_to_client(state, client_id, frame).await;
     }
 }
 

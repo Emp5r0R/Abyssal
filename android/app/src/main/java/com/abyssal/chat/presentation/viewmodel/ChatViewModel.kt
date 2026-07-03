@@ -123,6 +123,24 @@ class ChatViewModel(
                 messageRepository.saveMessage(incoming.chatId, message)
             }
         }
+
+        viewModelScope.launch {
+            chatTransport.getRoomChanges().collect { change ->
+                when (change.action) {
+                    "upsert" -> change.session?.let { session ->
+                        messageRepository.createForumSession(session)
+                        chatTransport.joinChat(session.id)
+                    }
+                    "delete" -> change.chatId?.let { chatId ->
+                        messageRepository.deleteChatSession(chatId)
+                        if (_activeChatId.value == chatId) {
+                            _activeChatId.value = null
+                            _currentScreen.value = Screen.Dashboard
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fun navigateTo(screen: Screen) {
@@ -180,13 +198,15 @@ class ChatViewModel(
         val chatId = _activeChatId.value ?: return
         viewModelScope.launch {
             val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec)
+            val absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null)
             val message = Message(
                 id = UUID.randomUUID().toString(),
                 sender = "You",
                 receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
                 content = content,
                 timestampMs = System.currentTimeMillis(),
-                selfDestructDurationSec = effectiveTimerSec
+                selfDestructDurationSec = effectiveTimerSec,
+                absoluteExpirySec = absoluteExpirySec
             )
             messageRepository.saveMessage(chatId, message)
             chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(textMetadata(message)))
@@ -203,8 +223,9 @@ class ChatViewModel(
         deleteAfterDownload: Boolean
     ) {
         val chatId = _activeChatId.value ?: return
-        val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec)
-        if (bytes.isEmpty() || bytes.size > attachmentLimitBytes(mediaType)) {
+        val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec, mediaType)
+        val absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, mediaType)
+        if (bytes.isEmpty() || bytes.size > attachmentLimitBytes(mediaType) || !isMediaAllowed(chatId, mediaType)) {
             _attachmentError.value = "Wrong information."
             return
         }
@@ -223,7 +244,7 @@ class ChatViewModel(
                 encryptedBytes = encryptedBytes,
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload,
-                ttlSec = effectiveTimerSec,
+                ttlSec = absoluteExpirySec,
                 onProgress = { sent, total ->
                     _attachmentUploadProgress.value = AttachmentUploadProgress(
                         active = true,
@@ -250,6 +271,7 @@ class ChatViewModel(
                 mimeType = mimeType,
                 sizeBytes = bytes.size.toLong(),
                 selfDestructSec = effectiveTimerSec,
+                absoluteExpirySec = absoluteExpirySec,
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload
             )
@@ -332,9 +354,19 @@ class ChatViewModel(
         name: String,
         readExpirySec: Int,
         overallExpirySec: Int,
+        enforceTextAbsoluteExpiry: Boolean,
         allowImages: Boolean,
         allowVideos: Boolean,
-        allowFiles: Boolean
+        allowFiles: Boolean,
+        imageReadTimerSec: Int,
+        imageOverallExpirySec: Int,
+        enforceImageAbsoluteExpiry: Boolean,
+        videoReadTimerSec: Int,
+        videoOverallExpirySec: Int,
+        enforceVideoAbsoluteExpiry: Boolean,
+        fileReadTimerSec: Int,
+        fileOverallExpirySec: Int,
+        enforceFileAbsoluteExpiry: Boolean
     ) {
         viewModelScope.launch {
             val forumId = "forum_" + UUID.randomUUID().toString().take(8)
@@ -348,10 +380,32 @@ class ChatViewModel(
                 overallExpirySec = overallExpirySec,
                 allowImages = allowImages,
                 allowVideos = allowVideos,
-                allowFiles = allowFiles
+                allowFiles = allowFiles,
+                enforceTextAbsoluteExpiry = enforceTextAbsoluteExpiry,
+                imageReadTimerSec = imageReadTimerSec,
+                imageOverallExpirySec = imageOverallExpirySec,
+                enforceImageAbsoluteExpiry = enforceImageAbsoluteExpiry,
+                videoReadTimerSec = videoReadTimerSec,
+                videoOverallExpirySec = videoOverallExpirySec,
+                enforceVideoAbsoluteExpiry = enforceVideoAbsoluteExpiry,
+                fileReadTimerSec = fileReadTimerSec,
+                fileOverallExpirySec = fileOverallExpirySec,
+                enforceFileAbsoluteExpiry = enforceFileAbsoluteExpiry
             )
             messageRepository.createForumSession(session)
+            chatTransport.createForum(session)
             chatTransport.joinChat(forumId)
+        }
+    }
+
+    fun deleteForum(chatId: String) {
+        viewModelScope.launch {
+            chatTransport.deleteForum(chatId)
+            messageRepository.deleteChatSession(chatId)
+            if (_activeChatId.value == chatId) {
+                _activeChatId.value = null
+                _currentScreen.value = Screen.Dashboard
+            }
         }
     }
 
@@ -452,7 +506,8 @@ class ChatViewModel(
                 fileName = json.optString("name", "attachment"),
                 mimeType = json.optString("mime_type", "application/octet-stream"),
                 sizeBytes = json.optLong("size_bytes", 0L),
-                selfDestructSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10)),
+                selfDestructSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10), json.optString("media_type", "FILE")),
+                absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, json.optString("media_type", "FILE")),
                 oneTimeView = json.optBoolean("one_time", false),
                 deleteAfterDownload = json.optBoolean("delete_after_download", false)
             )
@@ -467,7 +522,8 @@ class ChatViewModel(
                 receiver = if (chatId.startsWith("dm_")) "You" else null,
                 content = content,
                 timestampMs = System.currentTimeMillis(),
-                selfDestructDurationSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10))
+                selfDestructDurationSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10)),
+                absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null)
             )
         }
 
@@ -477,16 +533,41 @@ class ChatViewModel(
             receiver = if (chatId.startsWith("dm_")) "You" else null,
             content = decryptedContent,
             timestampMs = System.currentTimeMillis(),
-            selfDestructDurationSec = effectiveRetentionSec(chatId, 10)
+            selfDestructDurationSec = effectiveRetentionSec(chatId, 10),
+            absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null)
         )
     }
 
-    private fun effectiveRetentionSec(chatId: String, requestedSec: Int): Int {
+    private fun effectiveRetentionSec(chatId: String, requestedSec: Int, mediaType: String? = null): Int {
         val session = sessions.value.find { it.id == chatId }
-        return if (session?.isForum == true) {
-            session.selfDestructTimerSec.coerceAtLeast(1)
-        } else {
-            requestedSec.coerceAtLeast(1)
+        if (session?.isForum != true) return requestedSec.coerceAtLeast(1)
+        return when (mediaType?.uppercase()) {
+            "IMAGE" -> session.imageReadTimerSec
+            "VIDEO" -> session.videoReadTimerSec
+            "FILE" -> session.fileReadTimerSec
+            else -> session.selfDestructTimerSec
+        }.coerceAtLeast(1)
+    }
+
+    private fun effectiveAbsoluteExpirySec(chatId: String, mediaType: String?): Int {
+        val session = sessions.value.find { it.id == chatId }
+        if (session?.isForum != true) return 0
+        return when (mediaType?.uppercase()) {
+            "IMAGE" -> if (session.enforceImageAbsoluteExpiry) session.imageOverallExpirySec else 0
+            "VIDEO" -> if (session.enforceVideoAbsoluteExpiry) session.videoOverallExpirySec else 0
+            "FILE" -> if (session.enforceFileAbsoluteExpiry) session.fileOverallExpirySec else 0
+            else -> if (session.enforceTextAbsoluteExpiry) session.overallExpirySec else 0
+        }.coerceAtLeast(0)
+    }
+
+    private fun isMediaAllowed(chatId: String, mediaType: String): Boolean {
+        val session = sessions.value.find { it.id == chatId }
+        if (session?.isForum != true) return true
+        return when (mediaType.uppercase()) {
+            "IMAGE" -> session.allowImages
+            "VIDEO" -> session.allowVideos
+            "FILE" -> session.allowFiles
+            else -> false
         }
     }
 
@@ -508,6 +589,7 @@ class ChatViewModel(
         mimeType: String,
         sizeBytes: Long,
         selfDestructSec: Int,
+        absoluteExpirySec: Int,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean
     ): Message {
@@ -528,7 +610,8 @@ class ChatViewModel(
             attachmentSizeBytes = sizeBytes,
             oneTimeView = oneTimeView,
             saveAllowed = !oneTimeView,
-            deleteAfterDownload = deleteAfterDownload
+            deleteAfterDownload = deleteAfterDownload,
+            absoluteExpirySec = absoluteExpirySec
         )
     }
 
@@ -543,6 +626,7 @@ class ChatViewModel(
             .put("mime_type", message.attachmentMimeType)
             .put("size_bytes", message.attachmentSizeBytes)
             .put("self_destruct_sec", message.selfDestructDurationSec)
+            .put("absolute_expiry_sec", message.absoluteExpirySec)
             .put("one_time", message.oneTimeView)
             .put("delete_after_download", message.deleteAfterDownload)
             .toString()
@@ -555,6 +639,7 @@ class ChatViewModel(
             .put("sender", currentUser.value?.username.orEmpty())
             .put("content", message.content)
             .put("self_destruct_sec", message.selfDestructDurationSec)
+            .put("absolute_expiry_sec", message.absoluteExpirySec)
             .toString()
     }
 

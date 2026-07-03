@@ -91,6 +91,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         onOpenChat = { viewModel.navigateTo(Screen.Chat(it)) },
         onUpdateDisguise = viewModel::updateDisguiseSettings,
         onCreateForum = viewModel::createForum,
+        onDeleteForum = viewModel::deleteForum,
         onWipe = viewModel::executeAdminClearAll
     )
 
@@ -108,7 +109,8 @@ private fun DashboardContent(
     disguiseSettings: DisguiseSettings,
     onOpenChat: (String) -> Unit,
     onUpdateDisguise: (Boolean, String) -> Unit,
-    onCreateForum: (String, Int, Int, Boolean, Boolean, Boolean) -> Unit,
+    onCreateForum: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean) -> Unit,
+    onDeleteForum: (String) -> Unit,
     onWipe: () -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -189,7 +191,12 @@ private fun DashboardContent(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(filteredSessions, key = { it.id }) { session ->
-                        ChatSessionItem(session = session, onClick = { onOpenChat(session.id) })
+                        ChatSessionItem(
+                            session = session,
+                            canDelete = currentUser?.isAdmin == true && session.isForum,
+                            onClick = { onOpenChat(session.id) },
+                            onDelete = { onDeleteForum(session.id) }
+                        )
                     }
                 }
             }
@@ -238,8 +245,25 @@ private fun DashboardContent(
         if (showCreateForumDialog) {
             CreateForumDialog(
                 onDismiss = { showCreateForumDialog = false },
-                onCreate = { name, readExpiry, overallExpiry, images, videos, files ->
-                    onCreateForum(name, readExpiry, overallExpiry, images, videos, files)
+                onCreate = { name, readExpiry, overallExpiry, textAbsolute, images, videos, files, imageRead, imageAbsolute, imageEnforce, videoRead, videoAbsolute, videoEnforce, fileRead, fileAbsolute, fileEnforce ->
+                    onCreateForum(
+                        name,
+                        readExpiry,
+                        overallExpiry,
+                        textAbsolute,
+                        images,
+                        videos,
+                        files,
+                        imageRead,
+                        imageAbsolute,
+                        imageEnforce,
+                        videoRead,
+                        videoAbsolute,
+                        videoEnforce,
+                        fileRead,
+                        fileAbsolute,
+                        fileEnforce
+                    )
                     showCreateForumDialog = false
                 }
             )
@@ -454,14 +478,24 @@ private fun CamouflagePinSetupDialog(
 @Composable
 private fun CreateForumDialog(
     onDismiss: () -> Unit,
-    onCreate: (String, Int, Int, Boolean, Boolean, Boolean) -> Unit
+    onCreate: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean) -> Unit
 ) {
     var forumName by remember { mutableStateOf("") }
     var readExpiryText by remember { mutableStateOf("5") }
     var overallExpiryText by remember { mutableStateOf("0") }
+    var textAbsoluteEnforced by remember { mutableStateOf(false) }
     var imagesAllowed by remember { mutableStateOf(true) }
     var videosAllowed by remember { mutableStateOf(true) }
     var filesAllowed by remember { mutableStateOf(true) }
+    var imageReadText by remember { mutableStateOf("5") }
+    var imageAbsoluteText by remember { mutableStateOf("0") }
+    var imageAbsoluteEnforced by remember { mutableStateOf(false) }
+    var videoReadText by remember { mutableStateOf("5") }
+    var videoAbsoluteText by remember { mutableStateOf("0") }
+    var videoAbsoluteEnforced by remember { mutableStateOf(false) }
+    var fileReadText by remember { mutableStateOf("5") }
+    var fileAbsoluteText by remember { mutableStateOf("0") }
+    var fileAbsoluteEnforced by remember { mutableStateOf(false) }
 
     MirageDialog(title = "Create room", onDismiss = onDismiss) {
         OutlinedTextField(
@@ -500,19 +534,50 @@ private fun CreateForumDialog(
         }
 
         Text(
-            text = "Absolute timer uses seconds after send. Use 0 to disable.",
+            text = "Absolute timers use seconds after send. Enforced timers cannot be overridden in the room.",
             color = SteelMuted,
             fontSize = 12.sp,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 8.dp)
         )
+        PayloadCheckbox("Enforce text absolute timer", textAbsoluteEnforced) { textAbsoluteEnforced = it }
 
         Column(modifier = Modifier.padding(top = 16.dp)) {
             SectionLabel("ALLOWED PAYLOADS")
-            PayloadCheckbox("Images and GIFs", imagesAllowed) { imagesAllowed = it }
-            PayloadCheckbox("Video files", videosAllowed) { videosAllowed = it }
-            PayloadCheckbox("Documents up to 200 MB", filesAllowed) { filesAllowed = it }
+            MediaRuleEditor(
+                label = "Images and GIFs",
+                allowed = imagesAllowed,
+                onAllowedChange = { imagesAllowed = it },
+                readText = imageReadText,
+                onReadTextChange = { imageReadText = it },
+                absoluteText = imageAbsoluteText,
+                onAbsoluteTextChange = { imageAbsoluteText = it },
+                absoluteEnforced = imageAbsoluteEnforced,
+                onAbsoluteEnforcedChange = { imageAbsoluteEnforced = it }
+            )
+            MediaRuleEditor(
+                label = "Video files",
+                allowed = videosAllowed,
+                onAllowedChange = { videosAllowed = it },
+                readText = videoReadText,
+                onReadTextChange = { videoReadText = it },
+                absoluteText = videoAbsoluteText,
+                onAbsoluteTextChange = { videoAbsoluteText = it },
+                absoluteEnforced = videoAbsoluteEnforced,
+                onAbsoluteEnforcedChange = { videoAbsoluteEnforced = it }
+            )
+            MediaRuleEditor(
+                label = "Documents up to 200 MB",
+                allowed = filesAllowed,
+                onAllowedChange = { filesAllowed = it },
+                readText = fileReadText,
+                onReadTextChange = { fileReadText = it },
+                absoluteText = fileAbsoluteText,
+                onAbsoluteTextChange = { fileAbsoluteText = it },
+                absoluteEnforced = fileAbsoluteEnforced,
+                onAbsoluteEnforcedChange = { fileAbsoluteEnforced = it }
+            )
         }
 
         DialogButtons(
@@ -525,12 +590,77 @@ private fun CreateForumDialog(
                     forumName.trim(),
                     readExpiryText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
                     overallExpiryText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                    textAbsoluteEnforced,
                     imagesAllowed,
                     videosAllowed,
-                    filesAllowed
+                    filesAllowed,
+                    imageReadText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    imageAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                    imageAbsoluteEnforced,
+                    videoReadText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    videoAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                    videoAbsoluteEnforced,
+                    fileReadText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    fileAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
+                    fileAbsoluteEnforced
                 )
             }
         )
+    }
+}
+
+@Composable
+private fun MediaRuleEditor(
+    label: String,
+    allowed: Boolean,
+    onAllowedChange: (Boolean) -> Unit,
+    readText: String,
+    onReadTextChange: (String) -> Unit,
+    absoluteText: String,
+    onAbsoluteTextChange: (String) -> Unit,
+    absoluteEnforced: Boolean,
+    onAbsoluteEnforcedChange: (Boolean) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.White.copy(alpha = 0.035f))
+            .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
+            .padding(10.dp)
+    ) {
+        PayloadCheckbox(label, allowed, onAllowedChange)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            OutlinedTextField(
+                value = readText,
+                onValueChange = { onReadTextChange(it.filter(Char::isDigit).take(4)) },
+                label = { Text("Read sec") },
+                colors = mirageTextFieldColors(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                enabled = allowed,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedTextField(
+                value = absoluteText,
+                onValueChange = { onAbsoluteTextChange(it.filter(Char::isDigit).take(4)) },
+                label = { Text("Abs sec") },
+                colors = mirageTextFieldColors(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true,
+                enabled = allowed,
+                modifier = Modifier.weight(1f)
+            )
+        }
+        PayloadCheckbox("Enforce absolute timer", absoluteEnforced && allowed) {
+            onAbsoluteEnforcedChange(it && allowed)
+        }
     }
 }
 
@@ -610,13 +740,16 @@ private fun DialogButtons(
 }
 
 @Composable
-private fun ChatSessionItem(session: ChatSession, onClick: () -> Unit) {
+private fun ChatSessionItem(
+    session: ChatSession,
+    canDelete: Boolean,
+    onClick: () -> Unit,
+    onDelete: () -> Unit
+) {
     val accent = if (session.isForum) NeonCyan else NeonGreen
 
     GlassSurface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
+        modifier = Modifier.fillMaxWidth(),
         borderColor = accent.copy(alpha = 0.26f)
     ) {
         Row(
@@ -627,7 +760,9 @@ private fun ChatSessionItem(session: ChatSession, onClick: () -> Unit) {
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(onClick = onClick),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
@@ -698,6 +833,19 @@ private fun ChatSessionItem(session: ChatSession, onClick: () -> Unit) {
                         )
                     }
                 }
+                if (canDelete) {
+                    Text(
+                        text = "Delete",
+                        color = SelfDestructAmber,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .padding(top = 8.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable(onClick = onDelete)
+                            .padding(horizontal = 6.dp, vertical = 4.dp)
+                    )
+                }
             }
         }
     }
@@ -739,7 +887,8 @@ private fun DashboardContentPreview() {
         disguiseSettings = DisguiseSettings(),
         onOpenChat = {},
         onUpdateDisguise = { _, _ -> },
-        onCreateForum = { _, _, _, _, _, _ -> },
+        onCreateForum = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
+        onDeleteForum = {},
         onWipe = {}
     )
 }
