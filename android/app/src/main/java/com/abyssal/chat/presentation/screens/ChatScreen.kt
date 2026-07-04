@@ -3,14 +3,15 @@ package com.abyssal.chat.presentation.screens
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
+import android.graphics.SurfaceTexture
 import android.graphics.drawable.AnimatedImageDrawable
 import android.media.MediaDataSource
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 import android.view.ViewGroup
 import android.widget.ImageView
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -102,6 +103,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
 fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
@@ -963,10 +965,21 @@ private fun RamImagePreview(bytes: ByteArray, mimeType: String) {
 
 @Composable
 private fun RamVideoPreview(bytes: ByteArray) {
+    var prepared by remember(bytes) { mutableStateOf(false) }
+    var playbackFailed by remember(bytes) { mutableStateOf(false) }
+    val prepareStarted = remember(bytes) { AtomicBoolean(false) }
     val mediaPlayer = remember(bytes) {
         MediaPlayer().apply {
             setDataSource(ByteArrayMediaDataSource(bytes))
             isLooping = true
+            setOnPreparedListener { player ->
+                prepared = true
+                runCatching { player.start() }.onFailure { playbackFailed = true }
+            }
+            setOnErrorListener { _, _, _ ->
+                playbackFailed = true
+                true
+            }
         }
     }
 
@@ -979,33 +992,77 @@ private fun RamVideoPreview(bytes: ByteArray) {
         }
     }
 
-    AndroidView(
-        factory = { context ->
-            SurfaceView(context).apply {
-                setBackgroundColor(android.graphics.Color.BLACK)
-                holder.addCallback(object : SurfaceHolder.Callback {
-                    override fun surfaceCreated(holder: SurfaceHolder) {
-                        runCatching {
-                            mediaPlayer.setDisplay(holder)
-                            mediaPlayer.setOnPreparedListener { it.start() }
-                            mediaPlayer.prepareAsync()
-                        }
-                    }
-
-                    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
-
-                    override fun surfaceDestroyed(holder: SurfaceHolder) {
-                        mediaPlayer.setDisplay(null)
-                    }
-                })
-            }
-        },
+    Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(320.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(DeepBlack)
-    )
+    ) {
+        AndroidView(
+            factory = { context ->
+                TextureView(context).apply {
+                    setBackgroundColor(android.graphics.Color.BLACK)
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        private var surface: Surface? = null
+
+                        override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                            surface = Surface(texture).also { renderSurface ->
+                                runCatching {
+                                    mediaPlayer.setSurface(renderSurface)
+                                    if (prepareStarted.compareAndSet(false, true)) {
+                                        mediaPlayer.prepareAsync()
+                                    } else if (prepared && !mediaPlayer.isPlaying) {
+                                        mediaPlayer.start()
+                                    }
+                                }.onFailure { playbackFailed = true }
+                            }
+                        }
+
+                        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
+
+                        override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                            runCatching {
+                                if (mediaPlayer.isPlaying) mediaPlayer.pause()
+                                mediaPlayer.setSurface(null)
+                            }
+                            surface?.release()
+                            surface = null
+                            return true
+                        }
+
+                        override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        if (!prepared && !playbackFailed) {
+            Text(
+                text = "Loading video",
+                color = SteelMuted,
+                fontSize = 12.sp,
+                modifier = Modifier.align(Alignment.Center)
+            )
+        }
+
+        if (playbackFailed) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.align(Alignment.Center)
+            ) {
+                MediaFileIcon(modifier = Modifier.size(28.dp), color = SelfDestructAmber)
+                Text(
+                    text = "Preview unavailable",
+                    color = SelfDestructAmber,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+        }
+    }
 }
 
 @Composable
