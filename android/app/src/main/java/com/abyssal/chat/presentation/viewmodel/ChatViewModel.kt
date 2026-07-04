@@ -105,7 +105,8 @@ class ChatViewModel(
     init {
         _disguiseSettings.value = DisguiseSettings(
             isDisguised = disguiseManager.isDisguiseEnabled(),
-            pin = disguiseManager.getPin()
+            pin = disguiseManager.getPin(),
+            duressPin = disguiseManager.getDuressPin()
         )
         _isLocked.value = disguiseManager.isDisguiseEnabled()
 
@@ -414,17 +415,19 @@ class ChatViewModel(
         sessions.value.forEach { session -> chatTransport.joinChat(session.id) }
     }
 
-    fun updateDisguiseSettings(enabled: Boolean, pin: String) {
+    fun updateDisguiseSettings(enabled: Boolean, pin: String, duressPin: String) {
         disguiseManager.setDisguiseEnabled(enabled)
         disguiseManager.savePin(pin)
-        _disguiseSettings.value = DisguiseSettings(enabled, pin)
+        disguiseManager.saveDuressPin(duressPin)
+        _disguiseSettings.value = DisguiseSettings(enabled, pin, duressPin)
     }
 
-    fun completeCamouflagePinSetup(pin: String) {
+    fun completeCamouflagePinSetup(pin: String, duressPin: String) {
         val safePin = pin.ifBlank { "2026" }
         disguiseManager.setDisguiseEnabled(true)
         disguiseManager.savePin(safePin)
-        _disguiseSettings.value = DisguiseSettings(isDisguised = true, pin = safePin)
+        disguiseManager.saveDuressPin(duressPin)
+        _disguiseSettings.value = DisguiseSettings(isDisguised = true, pin = safePin, duressPin = duressPin)
         _showCamouflagePinPrompt.value = false
     }
 
@@ -461,6 +464,12 @@ class ChatViewModel(
 
     private fun evaluateExpression(expr: String): String {
         val cleanExpr = expr.replace(" ", "")
+        if (disguiseManager.verifyDuressPin(cleanExpr)) {
+            viewModelScope.launch {
+                executeDuressWipe()
+            }
+            return "0"
+        }
         if (disguiseManager.verifyPin(cleanExpr)) {
             _isLocked.value = false
             return "0"
@@ -477,6 +486,13 @@ class ChatViewModel(
     private suspend fun executeLocalMemoryPurge() {
         logoutLocal()
         _isLocked.value = false
+    }
+
+    private suspend fun executeDuressWipe() {
+        runCatching { chatTransport.broadcastGlobalWipe() }
+        logoutLocal()
+        _isLocked.value = true
+        _calculatorDisplay.value = "0"
     }
 
     private suspend fun logoutLocal() {

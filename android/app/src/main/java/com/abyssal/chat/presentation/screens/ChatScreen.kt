@@ -205,7 +205,7 @@ private fun ChatContent(
                             onSaveAttachment = {
                                 saveTargetMessage = message
                                 onExternalSystemUiStart()
-                                saveLauncher.launch(message.attachmentName ?: "attachment")
+                                saveLauncher.launch(encryptedExportName(message.attachmentName ?: "attachment"))
                             }
                         )
                     }
@@ -1001,7 +1001,7 @@ private fun MediaMessageContent(
             )
             if (message.saveAllowed) {
                 MirageSecondaryButton(
-                    text = "Save",
+                    text = "Save encrypted",
                     onClick = onSaveAttachment,
                     modifier = Modifier.weight(1f)
                 )
@@ -1368,6 +1368,11 @@ private fun formatBytes(bytes: Long): String {
     } else {
         "${(bytes / 1024L).coerceAtLeast(0L)} KB"
     }
+}
+
+private fun encryptedExportName(name: String): String {
+    val safeName = name.ifBlank { "attachment" }
+    return if (safeName.endsWith(".abyssal", ignoreCase = true)) safeName else "$safeName.abyssal"
 }
 
 private const val BUNDLED_EMOJI_ASSET_DIR = "abyssal_emojis"

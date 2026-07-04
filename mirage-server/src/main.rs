@@ -44,6 +44,8 @@ const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
 struct AppState {
     node_id: String,
     attachment_ram_limit_bytes: usize,
+    inactivity_limit_ms: Option<u64>,
+    last_activity_ms: Arc<Mutex<u64>>,
     account_ops: Arc<Mutex<()>>,
     available_codes: Arc<Mutex<HashMap<String, CodeGrant>>>,
     accounts: Arc<Mutex<HashMap<String, Account>>>,
@@ -182,6 +184,11 @@ enum InboundFrame {
     CreateRoom { room: RoomRecord },
     #[serde(rename = "delete_room")]
     DeleteRoom { chat_id: String },
+    #[serde(rename = "dummy")]
+    Dummy {
+        padding_b64: Option<String>,
+        bytes: Option<usize>,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -227,6 +234,9 @@ async fn main() {
     let state = AppState::from_env();
     state.print_boot_codes().await;
     tokio::spawn(attachment_sweeper(state.clone()));
+    if state.inactivity_limit_ms.is_some() {
+        tokio::spawn(inactivity_watcher(state.clone()));
+    }
 
     let bind_addr: SocketAddr = env::var("ABYSSAL_BIND_ADDR")
         .or_else(|_| env::var("MIRAGE_BIND_ADDR"))
@@ -272,6 +282,10 @@ impl AppState {
         let mut generated_lengths = HashSet::new();
         let attachment_ram_limit_bytes =
             read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512).saturating_mul(1024 * 1024);
+        let inactivity_limit_ms = read_usize_env("ABYSSAL_INACTIVITY_LIMIT_HOURS", 0)
+            .checked_mul(60 * 60 * 1000)
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as u64);
 
         for code in parse_codes_from_env("ABYSSAL_INVITE_CODES")
             .into_iter()
@@ -307,6 +321,8 @@ impl AppState {
         Self {
             node_id,
             attachment_ram_limit_bytes,
+            inactivity_limit_ms,
+            last_activity_ms: Arc::new(Mutex::new(now_ms())),
             account_ops: Arc::new(Mutex::new(())),
             available_codes: Arc::new(Mutex::new(available_codes)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
@@ -331,6 +347,9 @@ impl AppState {
             "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
             self.attachment_ram_limit_bytes
         );
+        if let Some(limit_ms) = self.inactivity_limit_ms {
+            info!("ABYSSAL_DEAD_MAN_SWITCH inactivity_limit_ms={limit_ms}");
+        }
     }
 }
 
@@ -558,10 +577,35 @@ fn current_attachment_bytes(attachments: &HashMap<Uuid, AttachmentRecord>) -> us
         .sum()
 }
 
+async fn touch_activity(state: &AppState) {
+    *state.last_activity_ms.lock().await = now_ms();
+}
+
+async fn inactivity_watcher(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        let Some(limit_ms) = state.inactivity_limit_ms else {
+            return;
+        };
+        let last_activity = *state.last_activity_ms.lock().await;
+        let idle_ms = now_ms().saturating_sub(last_activity);
+        if idle_ms >= limit_ms {
+            warn!(
+                "dead_man_switch_triggered idle_ms={} limit_ms={}",
+                idle_ms, limit_ms
+            );
+            wipe_relay_state(&state, true).await;
+            touch_activity(&state).await;
+        }
+    }
+}
+
 async fn create_account(
     State(state): State<AppState>,
     Json(request): Json<AccountRequest>,
 ) -> impl IntoResponse {
+    touch_activity(&state).await;
     let _account_guard = state.account_ops.lock().await;
     let code = match normalize_code(&request.code) {
         Ok(code) => code,
@@ -632,6 +676,7 @@ async fn login_account(
     State(state): State<AppState>,
     Json(request): Json<AccountRequest>,
 ) -> impl IntoResponse {
+    touch_activity(&state).await;
     let code = match normalize_code(&request.code) {
         Ok(code) => code,
         Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
@@ -689,6 +734,7 @@ async fn enter_account(
     State(state): State<AppState>,
     Json(request): Json<AccountRequest>,
 ) -> impl IntoResponse {
+    touch_activity(&state).await;
     let _account_guard = state.account_ops.lock().await;
     let code = match normalize_code(&request.code) {
         Ok(code) => code,
@@ -841,6 +887,7 @@ async fn upload_attachment(
     if let Err(status) = auth_from_headers(&state, &headers).await {
         return status.into_response();
     }
+    touch_activity(&state).await;
     let chat_id = query.chat_id.trim();
     if chat_id.is_empty() || body.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -909,6 +956,7 @@ async fn download_attachment(
     if let Err(status) = auth_from_headers(&state, &headers).await {
         return status.into_response();
     }
+    touch_activity(&state).await;
 
     let mut attachments = state.attachments.lock().await;
     let Some(record) = attachments.get(&id) else {
@@ -1099,12 +1147,24 @@ async fn check_ws_frame_allowed(
 async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(), String> {
     let frame: InboundFrame = serde_json::from_str(text).map_err(|err| err.to_string())?;
     match frame {
-        InboundFrame::Join { chat_id } => join_room(state, sender_id, chat_id).await,
-        InboundFrame::Leave { chat_id } => leave_room(state, sender_id, &chat_id).await,
+        InboundFrame::Dummy { padding_b64, bytes } => {
+            let _discarded_hint =
+                padding_b64.as_deref().map(str::len).unwrap_or(0) + bytes.unwrap_or_default();
+            Ok(())
+        }
+        InboundFrame::Join { chat_id } => {
+            touch_activity(state).await;
+            join_room(state, sender_id, chat_id).await
+        }
+        InboundFrame::Leave { chat_id } => {
+            touch_activity(state).await;
+            leave_room(state, sender_id, &chat_id).await
+        }
         InboundFrame::Message {
             chat_id,
             payload_b64,
         } => {
+            touch_activity(state).await;
             let outbound = OutboundFrame::Message {
                 chat_id: chat_id.clone(),
                 payload_b64,
@@ -1115,15 +1175,25 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             chat_id,
             message_id,
         } => {
+            touch_activity(state).await;
             let outbound = OutboundFrame::ReadReceipt {
                 chat_id: chat_id.clone(),
                 message_id,
             };
             broadcast_to_room(state, sender_id, &chat_id, outbound).await
         }
-        InboundFrame::GlobalWipe => broadcast_wipe(state, sender_id).await,
-        InboundFrame::CreateRoom { room } => create_room(state, sender_id, room).await,
-        InboundFrame::DeleteRoom { chat_id } => delete_room(state, sender_id, &chat_id).await,
+        InboundFrame::GlobalWipe => {
+            touch_activity(state).await;
+            broadcast_wipe(state, sender_id).await
+        }
+        InboundFrame::CreateRoom { room } => {
+            touch_activity(state).await;
+            create_room(state, sender_id, room).await
+        }
+        InboundFrame::DeleteRoom { chat_id } => {
+            touch_activity(state).await;
+            delete_room(state, sender_id, &chat_id).await
+        }
     }
 }
 
@@ -1201,10 +1271,11 @@ async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String>
         return Err("global wipe requires an admin account".to_string());
     }
 
-    state.pending.lock().await.clear();
-    state.attachments.lock().await.clear();
-    state.room_catalog.lock().await.clear();
-    state.rooms.lock().await.clear();
+    wipe_relay_state(state, true).await;
+    Ok(())
+}
+
+async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     let clients = state
         .clients
         .lock()
@@ -1212,10 +1283,21 @@ async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String>
         .keys()
         .copied()
         .collect::<Vec<_>>();
-    for client_id in clients {
-        send_to_client(state, client_id, &OutboundFrame::GlobalWipe).await;
+    if notify_clients {
+        for client_id in &clients {
+            send_to_client(state, *client_id, &OutboundFrame::GlobalWipe).await;
+        }
     }
-    Ok(())
+
+    state.pending.lock().await.clear();
+    state.attachments.lock().await.clear();
+    state.room_catalog.lock().await.clear();
+    state.rooms.lock().await.clear();
+    state.sessions.lock().await.clear();
+    state.accounts.lock().await.clear();
+    state.available_codes.lock().await.clear();
+    state.frame_limits.lock().await.clear();
+    state.clients.lock().await.clear();
 }
 
 async fn create_room(

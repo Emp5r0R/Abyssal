@@ -108,7 +108,7 @@ private fun DashboardContent(
     presence: List<UserPresence>,
     disguiseSettings: DisguiseSettings,
     onOpenChat: (String) -> Unit,
-    onUpdateDisguise: (Boolean, String) -> Unit,
+    onUpdateDisguise: (Boolean, String, String) -> Unit,
     onCreateForum: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean) -> Unit,
     onDeleteForum: (String) -> Unit,
     onWipe: () -> Unit
@@ -235,8 +235,8 @@ private fun DashboardContent(
             SettingsDialog(
                 initialSettings = disguiseSettings,
                 onDismiss = { showSettingsDialog = false },
-                onSave = { enabled, pin ->
-                    onUpdateDisguise(enabled, pin)
+                onSave = { enabled, pin, duressPin ->
+                    onUpdateDisguise(enabled, pin, duressPin)
                     showSettingsDialog = false
                 }
             )
@@ -383,10 +383,11 @@ private fun PresenceStrip(
 private fun SettingsDialog(
     initialSettings: DisguiseSettings,
     onDismiss: () -> Unit,
-    onSave: (Boolean, String) -> Unit
+    onSave: (Boolean, String, String) -> Unit
 ) {
     var disguiseEnabled by remember(initialSettings) { mutableStateOf(initialSettings.isDisguised) }
     var pinCode by remember(initialSettings) { mutableStateOf(initialSettings.pin) }
+    var duressPin by remember(initialSettings) { mutableStateOf(initialSettings.duressPin) }
 
     MirageDialog(title = "Security", onDismiss = onDismiss) {
         Row(
@@ -428,22 +429,40 @@ private fun SettingsDialog(
                 lineHeight = 17.sp,
                 modifier = Modifier.padding(top = 8.dp)
             )
+            OutlinedTextField(
+                value = duressPin,
+                onValueChange = { if (it.length <= 12) duressPin = it },
+                label = { Text("Duress PIN") },
+                colors = mirageTextFieldColors(),
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 14.dp)
+            )
+            Text(
+                text = "Entering the duress sequence on the calculator cover wipes local memory and attempts a relay wipe for admin sessions.",
+                color = SelfDestructAmber,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(top = 8.dp)
+            )
         }
 
         DialogButtons(
             cancel = "Cancel",
             confirm = "Save",
             onCancel = onDismiss,
-            onConfirm = { onSave(disguiseEnabled, pinCode.ifBlank { "2026" }) }
+            onConfirm = { onSave(disguiseEnabled, pinCode.ifBlank { "2026" }, duressPin) }
         )
     }
 }
 
 @Composable
 private fun CamouflagePinSetupDialog(
-    onSave: (String) -> Unit
+    onSave: (String, String) -> Unit
 ) {
     var pinCode by remember { mutableStateOf("") }
+    var duressPin by remember { mutableStateOf("") }
     val canSave = pinCode.length >= 4
 
     MirageDialog(title = "Calculator PIN", onDismiss = {}) {
@@ -464,9 +483,27 @@ private fun CamouflagePinSetupDialog(
                 .fillMaxWidth()
                 .padding(top = 16.dp)
         )
+        OutlinedTextField(
+            value = duressPin,
+            onValueChange = { if (it.length <= 32) duressPin = it },
+            label = { Text("Duress PIN") },
+            colors = mirageTextFieldColors(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 12.dp)
+        )
+        Text(
+            text = "Optional. This sequence performs a silent memory wipe from the calculator cover.",
+            color = SelfDestructAmber,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+            modifier = Modifier.padding(top = 8.dp)
+        )
         MiragePrimaryButton(
             text = "Remember and continue",
-            onClick = { onSave(pinCode) },
+            onClick = { onSave(pinCode, duressPin) },
             enabled = canSave,
             modifier = Modifier
                 .fillMaxWidth()
@@ -886,7 +923,7 @@ private fun DashboardContentPreview() {
         ),
         disguiseSettings = DisguiseSettings(),
         onOpenChat = {},
-        onUpdateDisguise = { _, _ -> },
+        onUpdateDisguise = { _, _, _ -> },
         onCreateForum = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
         onDeleteForum = {},
         onWipe = {}

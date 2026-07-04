@@ -6,8 +6,9 @@ Abyssal is an Android-first ephemeral chat prototype with a RAM-only Rust relay.
 
 - Android keeps account sessions, node URLs, chat sessions, message buffers, camouflage state, passwords, and encryption material in process memory only.
 - Pausing/stopping the Android activity locks to the calculator cover when camouflage is enabled. Process death, explicit logout, wipe, or relay restart clears RAM-only session state and returns to account entry.
-- The relay stores generated codes, accounts, password hashes, sessions, rooms, clients, presence, and pending encrypted frames in RAM only. Restarting the relay clears all account and chat state.
-- Files, images, and videos may only be written to disk through an explicit user save/export flow. Those persisted artifacts must be encrypted before writing.
+- The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe when the current session has admin rights.
+- The relay stores generated codes, accounts, password hashes, sessions, rooms, clients, presence, and pending encrypted frames in RAM only. Restarting the relay, admin wipe, or dead-man wipe clears all relay account and chat state.
+- Files, images, and videos may only be written to disk through an explicit user save/export flow. Android saves attachments as `.abyssal` encrypted export blobs using Android Keystore AES-GCM, preferring StrongBox when the device supports it.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
 - Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
 
@@ -48,6 +49,8 @@ ABYSSAL_BIND_ADDR=0.0.0.0:4020 \
 ABYSSAL_NODE_ID=oracle-ampere-1 \
 ABYSSAL_CODE_COUNT=8 \
 ABYSSAL_ADMIN_CODE_COUNT=1 \
+ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
+ABYSSAL_INACTIVITY_LIMIT_HOURS=0 \
 cargo run --release
 ```
 
@@ -58,6 +61,15 @@ curl http://127.0.0.1:4020/health
 ```
 
 The server prints generated user/admin codes to stdout during boot. Each code has a random variable length of at least 12 characters including dashes, can create exactly one RAM-only account, and is never written to disk by the relay.
+
+Security-related relay knobs:
+
+- `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
+- `ABYSSAL_INACTIVITY_LIMIT_HOURS`: dead-man switch. `0` disables it. A positive value wipes relay RAM state and broadcasts `GLOBAL_WIPE` after that many idle hours.
+
+The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
+
+Current crypto note: Abyssal encrypts payloads before sending them to the relay, but this is not yet Signal Double Ratchet or OPAQUE. True per-recipient Double Ratchet, prekeys, sealed sender, and OPAQUE login remain future architecture work and should be implemented with audited libraries rather than custom crypto.
 
 ## Docker
 
