@@ -27,6 +27,7 @@ class EncryptedAttachmentService(
 
     override suspend fun uploadEncryptedAttachment(
         chatId: String,
+        mediaType: String,
         encryptedBytes: ByteArray,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
@@ -36,6 +37,7 @@ class EncryptedAttachmentService(
         val session = nodeConfigService.getActiveSession() ?: return@withContext AttachmentUploadResult(false)
         val query = listOf(
             "chat_id" to chatId,
+            "media_type" to mediaType.uppercase(),
             "one_time" to oneTimeView.toString(),
             "delete_after_download" to deleteAfterDownload.toString(),
             "ttl_sec" to ttlSec.coerceAtLeast(0).toString()
