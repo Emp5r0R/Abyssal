@@ -9,6 +9,7 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
 
     private var disguiseEnabled = readCalculatorAliasEnabled()
     private var unlockPin = DEFAULT_PIN
+    private var duressPin = ""
 
     override fun setDisguiseEnabled(enabled: Boolean) {
         disguiseEnabled = enabled
@@ -23,12 +24,24 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         unlockPin = pin.ifBlank { DEFAULT_PIN }
     }
 
+    override fun saveDuressPin(pin: String) {
+        duressPin = pin
+    }
+
     override fun verifyPin(pin: String): Boolean {
         return pin == unlockPin
     }
 
+    override fun verifyDuressPin(pin: String): Boolean {
+        return duressPin.isNotBlank() && pin == duressPin
+    }
+
     override fun getPin(): String {
         return unlockPin
+    }
+
+    override fun getDuressPin(): String {
+        return duressPin
     }
 
     private companion object {

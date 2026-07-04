@@ -85,6 +85,9 @@ interface IDisguiseManager {
     fun setDisguiseEnabled(enabled: Boolean)
     fun isDisguiseEnabled(): Boolean
     fun savePin(pin: String)
+    fun saveDuressPin(pin: String)
     fun verifyPin(pin: String): Boolean
+    fun verifyDuressPin(pin: String): Boolean
     fun getPin(): String
+    fun getDuressPin(): String
 }
