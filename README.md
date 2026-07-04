@@ -5,10 +5,15 @@ Abyssal is an Android-first ephemeral chat prototype with a RAM-only Rust relay.
 ## Storage Policy
 
 - Android keeps account sessions, node URLs, chat sessions, message buffers, camouflage state, passwords, and encryption material in process memory only.
-- Pausing/stopping the Android activity logs out and clears local chat state. If calculator camouflage is enabled, Abyssal shows the calculator cover first; passing it returns to the account login screen.
+- Pausing/stopping the Android activity locks to the calculator cover when camouflage is enabled. Process death, explicit logout, wipe, or relay restart clears RAM-only session state and returns to account entry.
 - The relay stores generated codes, accounts, password hashes, sessions, rooms, clients, presence, and pending encrypted frames in RAM only. Restarting the relay clears all account and chat state.
 - Files, images, and videos may only be written to disk through an explicit user save/export flow. Those persisted artifacts must be encrypted before writing.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
+- Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
+
+## Credits
+
+The bundled GIF reaction pack came from ECA, [`EraseableChatApp`](https://github.com/i-vt/EraseableChatApp), by [@i-vt](https://github.com/i-vt). We adapted those assets for Abyssal's encrypted in-chat GIF picker.
 
 ## Android
 

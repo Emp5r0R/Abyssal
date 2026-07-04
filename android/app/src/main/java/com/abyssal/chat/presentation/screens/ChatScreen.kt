@@ -42,6 +42,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,6 +74,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -156,6 +160,7 @@ private fun ChatContent(
     var textInput by remember { mutableStateOf("") }
     var selectedTimerSec by remember(session) { mutableIntStateOf(session?.selfDestructTimerSec ?: 5) }
     var showAttachmentDialog by remember { mutableStateOf(false) }
+    var showBundledGifDialog by remember { mutableStateOf(false) }
     var saveTargetMessage by remember { mutableStateOf<Message?>(null) }
     val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
         onExternalSystemUiEnd()
@@ -219,6 +224,7 @@ private fun ChatContent(
                 value = textInput,
                 onValueChange = { textInput = it },
                 onAttach = { showAttachmentDialog = true },
+                onGif = { showBundledGifDialog = true },
                 onSend = {
                     val trimmed = textInput.trim()
                     if (trimmed.isNotEmpty()) {
@@ -242,6 +248,25 @@ private fun ChatContent(
                 },
                 onExternalSystemUiStart = onExternalSystemUiStart,
                 onExternalSystemUiEnd = onExternalSystemUiEnd
+            )
+        }
+
+        if (showBundledGifDialog) {
+            BundledGifDialog(
+                session = session,
+                onDismiss = { showBundledGifDialog = false },
+                onSend = { asset ->
+                    onSendAttachment(
+                        "IMAGE",
+                        asset.fileName,
+                        asset.mimeType,
+                        asset.bytes,
+                        selectedTimerSec,
+                        false,
+                        false
+                    )
+                    showBundledGifDialog = false
+                }
             )
         }
 
@@ -416,6 +441,7 @@ private fun ChatInputBar(
     value: String,
     onValueChange: (String) -> Unit,
     onAttach: () -> Unit,
+    onGif: () -> Unit,
     onSend: () -> Unit,
     canSend: Boolean
 ) {
@@ -433,6 +459,21 @@ private fun ChatInputBar(
             onClick = onAttach
         ) {
             PaperclipIcon(modifier = Modifier.size(20.dp), color = SteelMuted)
+        }
+
+        MirageIconButton(
+            contentDescription = "Open bundled GIFs",
+            onClick = onGif,
+            modifier = Modifier.size(44.dp),
+            accent = NeonGreen.copy(alpha = 0.24f)
+        ) {
+            Text(
+                text = "GIF",
+                color = NeonGreen,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace
+            )
         }
 
         OutlinedTextField(
@@ -670,6 +711,136 @@ private fun AttachmentRow(
                     fontSize = 12.sp
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun BundledGifDialog(
+    session: ChatSession?,
+    onDismiss: () -> Unit,
+    onSend: (BundledEmojiPayload) -> Unit
+) {
+    val context = LocalContext.current
+    val assets = remember { context.listBundledEmojiAssets() }
+    val imagesOk = session?.allowImages != false
+
+    MirageDialog(title = "GIFs", onDismiss = onDismiss) {
+        if (!imagesOk) {
+            Text(
+                text = "Disabled by room policy.",
+                color = SelfDestructAmber,
+                fontSize = 13.sp,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(72.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(360.dp)
+            ) {
+                items(assets, key = { it.path }) { asset ->
+                    BundledEmojiTile(
+                        asset = asset,
+                        onClick = {
+                            context.readBundledEmoji(asset)?.let(onSend)
+                        }
+                    )
+                }
+            }
+        }
+
+        MirageSecondaryButton(
+            text = "Cancel",
+            onClick = onDismiss,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp)
+        )
+    }
+}
+
+@Composable
+private fun BundledEmojiTile(
+    asset: BundledEmojiAsset,
+    onClick: () -> Unit
+) {
+    GlassSurface(
+        modifier = Modifier
+            .height(84.dp)
+            .clickable(onClick = onClick),
+        borderColor = GlassBorder.copy(alpha = 0.42f),
+        backgroundColor = Color.White.copy(alpha = 0.05f)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(6.dp)
+        ) {
+            BundledEmojiPreview(
+                assetPath = asset.path,
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(6.dp))
+            )
+            Text(
+                text = asset.label,
+                color = SteelMuted,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 5.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun BundledEmojiPreview(
+    assetPath: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        AndroidView(
+            factory = { viewContext ->
+                ImageView(viewContext).apply {
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    val drawable = runCatching {
+                        ImageDecoder.decodeDrawable(
+                            ImageDecoder.createSource(viewContext.assets, assetPath)
+                        )
+                    }.getOrNull()
+                    setImageDrawable(drawable)
+                    (drawable as? AnimatedImageDrawable)?.start()
+                }
+            },
+            modifier = modifier.background(DeepBlack.copy(alpha = 0.35f))
+        )
+        return
+    }
+
+    val bytes = remember(assetPath) {
+        runCatching { context.assets.open(assetPath).use { it.readBytes() } }.getOrNull()
+    }
+    val bitmap = remember(bytes) { bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
+    if (bitmap != null) {
+        Image(
+            bitmap = bitmap.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = modifier.background(DeepBlack.copy(alpha = 0.35f))
+        )
+    } else {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = modifier.background(DeepBlack.copy(alpha = 0.35f))
+        ) {
+            MediaFileIcon(modifier = Modifier.size(20.dp), color = SteelMuted)
         }
     }
 }
@@ -1101,6 +1272,20 @@ private data class PickedAttachment(
     val bytes: ByteArray
 )
 
+private data class BundledEmojiAsset(
+    val fileName: String
+) {
+    val path: String = "$BUNDLED_EMOJI_ASSET_DIR/$fileName"
+    val label: String = fileName.substringBeforeLast('.')
+    val mimeType: String = if (fileName.endsWith(".gif", ignoreCase = true)) "image/gif" else "image/png"
+}
+
+private data class BundledEmojiPayload(
+    val fileName: String,
+    val mimeType: String,
+    val bytes: ByteArray
+)
+
 private class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
         if (position < 0 || position >= bytes.size) return -1
@@ -1112,6 +1297,28 @@ private class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaData
     override fun getSize(): Long = bytes.size.toLong()
 
     override fun close() = Unit
+}
+
+private fun Context.listBundledEmojiAssets(): List<BundledEmojiAsset> {
+    return assets.list(BUNDLED_EMOJI_ASSET_DIR)
+        ?.filter { name ->
+            name.endsWith(".gif", ignoreCase = true) || name.endsWith(".png", ignoreCase = true)
+        }
+        ?.sorted()
+        ?.map(::BundledEmojiAsset)
+        ?: emptyList()
+}
+
+private fun Context.readBundledEmoji(asset: BundledEmojiAsset): BundledEmojiPayload? {
+    return runCatching {
+        val bytes = assets.open(asset.path).use { it.readBytes() }
+        if (bytes.isEmpty() || bytes.size > attachmentLimitBytes("IMAGE")) return null
+        BundledEmojiPayload(
+            fileName = asset.fileName,
+            mimeType = asset.mimeType,
+            bytes = bytes
+        )
+    }.getOrNull()
 }
 
 private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: Long): PickedAttachment? {
@@ -1162,6 +1369,8 @@ private fun formatBytes(bytes: Long): String {
         "${(bytes / 1024L).coerceAtLeast(0L)} KB"
     }
 }
+
+private const val BUNDLED_EMOJI_ASSET_DIR = "abyssal_emojis"
 
 @Preview
 @Composable
