@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -449,11 +450,14 @@ private fun ChatInputBar(
                 unfocusedTextColor = PureWhite
             ),
             shape = RoundedCornerShape(24.dp),
-            singleLine = true,
+            singleLine = false,
+            minLines = 1,
+            maxLines = 4,
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
             keyboardActions = KeyboardActions(onSend = { if (canSend) onSend() }),
             modifier = Modifier
                 .weight(1f)
+                .heightIn(min = 48.dp, max = 136.dp)
                 .padding(horizontal = 10.dp)
         )
 

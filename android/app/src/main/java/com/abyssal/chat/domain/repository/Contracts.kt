@@ -69,6 +69,7 @@ interface IChatTransport {
 interface IEncryptedAttachmentService {
     suspend fun uploadEncryptedAttachment(
         chatId: String,
+        mediaType: String,
         encryptedBytes: ByteArray,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,

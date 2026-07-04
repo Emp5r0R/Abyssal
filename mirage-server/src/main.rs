@@ -31,14 +31,25 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
+const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
+const FILE_ATTACHMENT_LIMIT_BYTES: usize = 200 * 1024 * 1024;
+const ENCRYPTION_OVERHEAD_BYTES: usize = 64 * 1024;
+const WS_RATE_WINDOW_MS: u64 = 10_000;
+const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
+const WS_MAX_FRAME_BYTES: usize = 64 * 1024;
+const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
+
 #[derive(Clone)]
 struct AppState {
     node_id: String,
+    attachment_ram_limit_bytes: usize,
     account_ops: Arc<Mutex<()>>,
     available_codes: Arc<Mutex<HashMap<String, CodeGrant>>>,
     accounts: Arc<Mutex<HashMap<String, Account>>>,
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
+    frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     room_catalog: Arc<Mutex<HashMap<String, RoomRecord>>>,
     pending: Arc<Mutex<HashMap<String, Vec<OutboundFrame>>>>,
@@ -72,8 +83,16 @@ struct ClientHandle {
     tx: mpsc::UnboundedSender<Message>,
 }
 
+#[derive(Clone)]
+struct RateState {
+    window_start_ms: u64,
+    count: usize,
+}
+
 struct AttachmentRecord {
     encrypted_bytes: Vec<u8>,
+    chat_id: String,
+    media_type: String,
     one_time: bool,
     delete_after_download: bool,
     expires_at_ms: Option<u64>,
@@ -109,6 +128,7 @@ struct AccountRequest {
 #[derive(Deserialize)]
 struct AttachmentQuery {
     chat_id: String,
+    media_type: Option<String>,
     one_time: Option<bool>,
     delete_after_download: Option<bool>,
     ttl_sec: Option<u64>,
@@ -206,6 +226,7 @@ async fn main() {
 
     let state = AppState::from_env();
     state.print_boot_codes().await;
+    tokio::spawn(attachment_sweeper(state.clone()));
 
     let bind_addr: SocketAddr = env::var("ABYSSAL_BIND_ADDR")
         .or_else(|_| env::var("MIRAGE_BIND_ADDR"))
@@ -213,6 +234,7 @@ async fn main() {
         .parse()
         .expect("ABYSSAL_BIND_ADDR must be a valid socket address");
 
+    let attachment_body_limit = FILE_ATTACHMENT_LIMIT_BYTES + ENCRYPTION_OVERHEAD_BYTES;
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/account/create", post(create_account))
@@ -221,7 +243,7 @@ async fn main() {
         .route("/v1/attachment", post(upload_attachment))
         .route("/v1/attachment/:id", get(download_attachment))
         .route("/v1/invite/validate", post(login_account))
-        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(attachment_body_limit))
         .route("/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -248,6 +270,8 @@ impl AppState {
         let max_len = requested_max_len.max(min_len + user_count + admin_count);
         let mut available_codes = HashMap::new();
         let mut generated_lengths = HashSet::new();
+        let attachment_ram_limit_bytes =
+            read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512).saturating_mul(1024 * 1024);
 
         for code in parse_codes_from_env("ABYSSAL_INVITE_CODES")
             .into_iter()
@@ -282,11 +306,13 @@ impl AppState {
 
         Self {
             node_id,
+            attachment_ram_limit_bytes,
             account_ops: Arc::new(Mutex::new(())),
             available_codes: Arc::new(Mutex::new(available_codes)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            frame_limits: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -301,6 +327,10 @@ impl AppState {
             let role = if grant.admin { "admin" } else { "user" };
             info!("ABYSSAL_CODE role={role} code={code}");
         }
+        info!(
+            "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
+            self.attachment_ram_limit_bytes
+        );
     }
 }
 
@@ -478,6 +508,54 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         available_codes: state.available_codes.lock().await.len(),
         accounts: state.accounts.lock().await.len(),
     })
+}
+
+async fn attachment_sweeper(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+        prune_expired_attachments(&state).await;
+    }
+}
+
+async fn prune_expired_attachments(state: &AppState) {
+    let now = now_ms();
+    let mut attachments = state.attachments.lock().await;
+    let before = attachments.len();
+    attachments.retain(|_, record| !record.expires_at_ms.is_some_and(|expires| now >= expires));
+    let removed = before.saturating_sub(attachments.len());
+    if removed > 0 {
+        info!("expired_attachments_removed count={removed}");
+    }
+}
+
+fn normalize_media_type(media_type: Option<&str>) -> String {
+    match media_type
+        .unwrap_or("FILE")
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "IMAGE" => "IMAGE".to_string(),
+        "VIDEO" => "VIDEO".to_string(),
+        _ => "FILE".to_string(),
+    }
+}
+
+fn encrypted_attachment_limit_bytes(media_type: &str) -> usize {
+    let plain_limit = match media_type {
+        "IMAGE" => IMAGE_ATTACHMENT_LIMIT_BYTES,
+        "VIDEO" => VIDEO_ATTACHMENT_LIMIT_BYTES,
+        _ => FILE_ATTACHMENT_LIMIT_BYTES,
+    };
+    plain_limit + ENCRYPTION_OVERHEAD_BYTES
+}
+
+fn current_attachment_bytes(attachments: &HashMap<Uuid, AttachmentRecord>) -> usize {
+    attachments
+        .values()
+        .map(|record| record.encrypted_bytes.len())
+        .sum()
 }
 
 async fn create_account(
@@ -763,8 +841,21 @@ async fn upload_attachment(
     if let Err(status) = auth_from_headers(&state, &headers).await {
         return status.into_response();
     }
-    if query.chat_id.trim().is_empty() || body.is_empty() {
+    let chat_id = query.chat_id.trim();
+    if chat_id.is_empty() || body.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    let media_type = normalize_media_type(query.media_type.as_deref());
+    let max_bytes = encrypted_attachment_limit_bytes(&media_type);
+    if body.len() > max_bytes {
+        warn!(
+            "attachment_upload_rejected chat_id={} media_type={} reason=size bytes={} max={}",
+            chat_id,
+            media_type,
+            body.len(),
+            max_bytes
+        );
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
 
     let id = Uuid::new_v4();
@@ -773,15 +864,34 @@ async fn upload_attachment(
         .filter(|ttl| *ttl > 0)
         .map(|ttl| now_ms().saturating_add(ttl.saturating_mul(1000)));
     let one_time = query.one_time.unwrap_or(false);
-    state.attachments.lock().await.insert(
+    prune_expired_attachments(&state).await;
+    let mut attachments = state.attachments.lock().await;
+    let used_bytes = current_attachment_bytes(&attachments);
+    if used_bytes.saturating_add(body.len()) > state.attachment_ram_limit_bytes {
+        warn!(
+            "attachment_upload_rejected chat_id={} media_type={} reason=ram_limit used={} incoming={} limit={}",
+            chat_id,
+            media_type,
+            used_bytes,
+            body.len(),
+            state.attachment_ram_limit_bytes
+        );
+        return StatusCode::from_u16(507)
+            .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            .into_response();
+    }
+    attachments.insert(
         id,
         AttachmentRecord {
             encrypted_bytes: body.to_vec(),
+            chat_id: chat_id.to_string(),
+            media_type,
             one_time,
             delete_after_download: query.delete_after_download.unwrap_or(one_time),
             expires_at_ms: ttl_ms,
         },
     );
+    drop(attachments);
 
     Json(serde_json::json!({
         "accepted": true,
@@ -813,9 +923,18 @@ async fn download_attachment(
     }
 
     let bytes = record.encrypted_bytes.clone();
+    let chat_id = record.chat_id.clone();
+    let media_type = record.media_type.clone();
     if record.one_time || record.delete_after_download {
         attachments.remove(&id);
     }
+    info!(
+        "attachment_downloaded id={} chat_id={} media_type={} bytes={}",
+        id,
+        chat_id,
+        media_type,
+        bytes.len()
+    );
 
     let mut response = bytes.into_response();
     response.headers_mut().insert(
@@ -924,6 +1043,10 @@ async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
     while let Some(result) = stream.next().await {
         match result {
             Ok(Message::Text(text)) => {
+                if let Err(err) = check_ws_frame_allowed(&state, client_id, text.len()).await {
+                    warn!("dropping limited frame from {client_id}: {err}");
+                    continue;
+                }
                 if let Err(err) = handle_frame(&state, client_id, &text).await {
                     warn!("dropping invalid frame from {client_id}: {err}");
                 }
@@ -939,6 +1062,38 @@ async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
 
     cleanup_client(&state, client_id).await;
     writer.abort();
+}
+
+async fn check_ws_frame_allowed(
+    state: &AppState,
+    client_id: Uuid,
+    frame_bytes: usize,
+) -> Result<(), String> {
+    if frame_bytes > WS_MAX_FRAME_BYTES {
+        return Err(format!(
+            "frame too large: bytes={} max={}",
+            frame_bytes, WS_MAX_FRAME_BYTES
+        ));
+    }
+
+    let now = now_ms();
+    let mut limits = state.frame_limits.lock().await;
+    let state = limits.entry(client_id).or_insert(RateState {
+        window_start_ms: now,
+        count: 0,
+    });
+    if now.saturating_sub(state.window_start_ms) > WS_RATE_WINDOW_MS {
+        state.window_start_ms = now;
+        state.count = 0;
+    }
+    state.count = state.count.saturating_add(1);
+    if state.count > WS_MAX_FRAMES_PER_WINDOW {
+        return Err(format!(
+            "rate limit exceeded: count={} window_ms={}",
+            state.count, WS_RATE_WINDOW_MS
+        ));
+    }
+    Ok(())
 }
 
 async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(), String> {
@@ -1018,13 +1173,12 @@ async fn broadcast_to_room(
         .collect::<Vec<_>>();
 
     if recipients.is_empty() {
-        state
-            .pending
-            .lock()
-            .await
-            .entry(chat_id.to_string())
-            .or_default()
-            .push(frame);
+        let mut pending = state.pending.lock().await;
+        let queue = pending.entry(chat_id.to_string()).or_default();
+        if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
+            queue.remove(0);
+        }
+        queue.push(frame);
         return Ok(());
     }
 
@@ -1197,6 +1351,7 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
 }
 
 async fn cleanup_client(state: &AppState, client_id: Uuid) {
+    state.frame_limits.lock().await.remove(&client_id);
     let code = state
         .clients
         .lock()

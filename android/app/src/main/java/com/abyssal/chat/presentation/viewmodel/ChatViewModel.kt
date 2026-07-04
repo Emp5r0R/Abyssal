@@ -241,6 +241,7 @@ class ChatViewModel(
             val encryptedBytes = payloadCipher.encryptBytes(bytes)
             val upload = attachmentService.uploadEncryptedAttachment(
                 chatId = chatId,
+                mediaType = mediaType,
                 encryptedBytes = encryptedBytes,
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload,
