@@ -23,9 +23,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,19 +44,21 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -63,19 +67,22 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.foundation.Image
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -86,8 +93,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
@@ -108,6 +115,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
@@ -148,8 +156,8 @@ private fun ChatContent(
     uploadProgress: AttachmentUploadProgress,
     attachmentError: String?,
     onBack: () -> Unit,
-    onSendMessage: (String, Int) -> Unit,
-    onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean) -> Unit,
+    onSendMessage: (String, Int, String?) -> Unit,
+    onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean, String?) -> Unit,
     onMessageVisible: (String) -> Unit,
     onViewAttachment: (Message) -> Unit,
     onSaveAttachment: (Message, Uri) -> Unit,
@@ -162,6 +170,42 @@ private fun ChatContent(
     var showAttachmentDialog by remember { mutableStateOf(false) }
     var showBundledGifDialog by remember { mutableStateOf(false) }
     var saveTargetMessage by remember { mutableStateOf<Message?>(null) }
+    var replyingToMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
+    var highlightedMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
+    var hasPositionedMessageList by remember(session?.id) { mutableStateOf(false) }
+    val messageListState = remember(session?.id) { LazyListState() }
+    val inputFocusRequester = remember { FocusRequester() }
+    val scope = rememberCoroutineScope()
+    val hapticFeedback = LocalHapticFeedback.current
+    val messagesById = remember(messages) { messages.associateBy(Message::id) }
+    val replyingToMessage = replyingToMessageId?.let(messagesById::get)
+    val isConnected = status.state == "CONNECTED"
+
+    LaunchedEffect(replyingToMessageId, replyingToMessage) {
+        if (replyingToMessageId != null && replyingToMessage == null) {
+            replyingToMessageId = null
+        }
+    }
+
+    LaunchedEffect(replyingToMessageId) {
+        if (replyingToMessageId != null) inputFocusRequester.requestFocus()
+    }
+
+    LaunchedEffect(messages.lastOrNull()?.id) {
+        if (messages.isEmpty()) {
+            hasPositionedMessageList = false
+            return@LaunchedEffect
+        }
+
+        val lastVisibleIndex = messageListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+        val isNearBottom = lastVisibleIndex >= messages.lastIndex - 2
+        if (!hasPositionedMessageList) {
+            messageListState.scrollToItem(messages.lastIndex)
+            hasPositionedMessageList = true
+        } else if (isNearBottom) {
+            messageListState.animateScrollToItem(messages.lastIndex)
+        }
+    }
     val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
         onExternalSystemUiEnd()
         val message = saveTargetMessage
@@ -191,6 +235,7 @@ private fun ChatContent(
                 )
             } else {
                 LazyColumn(
+                    state = messageListState,
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
@@ -200,7 +245,25 @@ private fun ChatContent(
                     items(messages, key = { it.id }) { message ->
                         MessageBubbleItem(
                             message = message,
+                            replyTarget = message.replyToMessageId?.let(messagesById::get),
+                            highlighted = highlightedMessageId == message.id,
                             onBecomeVisible = { onMessageVisible(message.id) },
+                            onReply = {
+                                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                replyingToMessageId = message.id
+                            },
+                            onOpenReply = { messageId ->
+                                messages.indexOfFirst { it.id == messageId }
+                                    .takeIf { it >= 0 }
+                                    ?.let { index ->
+                                        scope.launch {
+                                            messageListState.animateScrollToItem(index)
+                                            highlightedMessageId = messageId
+                                            delay(900)
+                                            if (highlightedMessageId == messageId) highlightedMessageId = null
+                                        }
+                                    }
+                            },
                             onViewAttachment = { onViewAttachment(message) },
                             onSaveAttachment = {
                                 saveTargetMessage = message
@@ -220,6 +283,13 @@ private fun ChatContent(
 
             UploadProgressStrip(uploadProgress = uploadProgress)
 
+            if (replyingToMessage != null) {
+                ReplyComposerPreview(
+                    message = replyingToMessage,
+                    onCancel = { replyingToMessageId = null }
+                )
+            }
+
             ChatInputBar(
                 value = textInput,
                 onValueChange = { textInput = it },
@@ -228,11 +298,14 @@ private fun ChatContent(
                 onSend = {
                     val trimmed = textInput.trim()
                     if (trimmed.isNotEmpty()) {
-                        onSendMessage(trimmed, selectedTimerSec)
+                        onSendMessage(trimmed, selectedTimerSec, replyingToMessageId)
                         textInput = ""
+                        replyingToMessageId = null
                     }
                 },
-                canSend = textInput.isNotBlank()
+                canSend = textInput.isNotBlank() && isConnected,
+                isConnected = isConnected,
+                focusRequester = inputFocusRequester
             )
         }
 
@@ -243,7 +316,17 @@ private fun ChatContent(
                 attachmentError = attachmentError,
                 onDismiss = { showAttachmentDialog = false },
                 onSendAttachment = { type, name, mime, bytes, oneTime, deleteAfterDownload ->
-                    onSendAttachment(type, name, mime, bytes, selectedTimerSec, oneTime, deleteAfterDownload)
+                    onSendAttachment(
+                        type,
+                        name,
+                        mime,
+                        bytes,
+                        selectedTimerSec,
+                        oneTime,
+                        deleteAfterDownload,
+                        replyingToMessageId
+                    )
+                    replyingToMessageId = null
                     showAttachmentDialog = false
                 },
                 onExternalSystemUiStart = onExternalSystemUiStart,
@@ -263,8 +346,10 @@ private fun ChatContent(
                         asset.bytes,
                         selectedTimerSec,
                         false,
-                        false
+                        false,
+                        replyingToMessageId
                     )
+                    replyingToMessageId = null
                     showBundledGifDialog = false
                 }
             )
@@ -358,7 +443,14 @@ private fun RetentionPicker(
                 modifier = Modifier.padding(start = 7.dp)
             )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 12.dp)
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(7.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             if (lockedTimerSec != null) {
                 TimerChip(
                     text = "${lockedTimerSec}s locked",
@@ -437,13 +529,65 @@ private fun UploadProgressStrip(uploadProgress: AttachmentUploadProgress) {
 }
 
 @Composable
+private fun ReplyComposerPreview(
+    message: Message,
+    onCancel: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(DeepBlue.copy(alpha = 0.82f))
+            .border(BorderStroke(1.dp, NeonCyan.copy(alpha = 0.22f)))
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Spacer(
+            modifier = Modifier
+                .width(3.dp)
+                .height(34.dp)
+                .background(NeonCyan, RoundedCornerShape(2.dp))
+        )
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 10.dp)
+        ) {
+            Text(
+                text = "Replying to ${if (message.sender == "You") "your message" else message.sender}",
+                color = NeonCyan,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = replyPreviewText(message),
+                color = SteelMuted,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        MirageIconButton(
+            contentDescription = "Cancel reply",
+            onClick = onCancel,
+            modifier = Modifier.size(36.dp)
+        ) {
+            CloseIcon(modifier = Modifier.size(14.dp), color = SteelMuted)
+        }
+    }
+}
+
+@Composable
 private fun ChatInputBar(
     value: String,
     onValueChange: (String) -> Unit,
     onAttach: () -> Unit,
     onGif: () -> Unit,
     onSend: () -> Unit,
-    canSend: Boolean
+    canSend: Boolean,
+    isConnected: Boolean,
+    focusRequester: FocusRequester
 ) {
     Row(
         modifier = Modifier
@@ -456,7 +600,8 @@ private fun ChatInputBar(
     ) {
         MirageIconButton(
             contentDescription = "Add attachment",
-            onClick = onAttach
+            onClick = onAttach,
+            enabled = isConnected
         ) {
             PaperclipIcon(modifier = Modifier.size(20.dp), color = SteelMuted)
         }
@@ -465,7 +610,8 @@ private fun ChatInputBar(
             contentDescription = "Open bundled GIFs",
             onClick = onGif,
             modifier = Modifier.size(44.dp),
-            accent = NeonGreen.copy(alpha = 0.24f)
+            accent = NeonGreen.copy(alpha = 0.24f),
+            enabled = isConnected
         ) {
             Text(
                 text = "GIF",
@@ -480,7 +626,11 @@ private fun ChatInputBar(
             value = value,
             onValueChange = onValueChange,
             placeholder = {
-                Text("Message", color = SteelMuted.copy(alpha = 0.65f), fontSize = 14.sp)
+                Text(
+                    if (isConnected) "Message" else "Waiting for node",
+                    color = SteelMuted.copy(alpha = 0.65f),
+                    fontSize = 14.sp
+                )
             },
             textStyle = TextStyle(color = PureWhite, fontSize = 15.sp),
             colors = OutlinedTextFieldDefaults.colors(
@@ -498,6 +648,7 @@ private fun ChatInputBar(
             keyboardActions = KeyboardActions(onSend = { if (canSend) onSend() }),
             modifier = Modifier
                 .weight(1f)
+                .focusRequester(focusRequester)
                 .heightIn(min = 48.dp, max = 136.dp)
                 .padding(horizontal = 10.dp)
         )
@@ -848,7 +999,11 @@ private fun BundledEmojiPreview(
 @Composable
 private fun MessageBubbleItem(
     message: Message,
+    replyTarget: Message?,
+    highlighted: Boolean,
     onBecomeVisible: () -> Unit,
+    onReply: () -> Unit,
+    onOpenReply: (String) -> Unit,
     onViewAttachment: () -> Unit,
     onSaveAttachment: () -> Unit
 ) {
@@ -907,39 +1062,125 @@ private fun MessageBubbleItem(
             enter = fadeIn(tween(220)),
             exit = fadeOut(tween(220))
         ) {
-            GlassSurface(
-                modifier = Modifier
-                    .fillMaxWidth(0.86f)
-                    .alpha(alpha),
-                borderColor = accent.copy(alpha = 0.42f)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = if (isMine) Arrangement.End else Arrangement.Start,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column(modifier = Modifier.padding(13.dp)) {
-                    if (message.isMedia) {
-                        MediaMessageContent(
-                            message = message,
-                            onViewAttachment = onViewAttachment,
-                            onSaveAttachment = onSaveAttachment
-                        )
-                    } else {
-                        Text(
-                            text = message.content,
-                            color = PureWhite,
-                            fontSize = 15.sp,
-                            lineHeight = 21.sp
-                        )
-                    }
+                if (isMine) {
+                    MessageReplyAction(onReply = onReply)
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
 
-                    if (message.readTimestampMs != null) {
-                        CountdownRow(
-                            millisRemaining = millisRemaining,
-                            progressFraction = progressFraction,
-                            expiringSoon = expiringSoon
-                        )
+                GlassSurface(
+                    modifier = Modifier
+                        .fillMaxWidth(0.78f)
+                        .alpha(alpha),
+                    borderColor = accent.copy(alpha = if (highlighted) 0.95f else 0.42f)
+                ) {
+                    Column(modifier = Modifier.padding(13.dp)) {
+                        if (message.replyToMessageId != null) {
+                            MessageReplyReference(
+                                target = replyTarget,
+                                onOpen = { onOpenReply(message.replyToMessageId) }
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+
+                        if (message.isMedia) {
+                            MediaMessageContent(
+                                message = message,
+                                onViewAttachment = onViewAttachment,
+                                onSaveAttachment = onSaveAttachment
+                            )
+                        } else {
+                            Text(
+                                text = message.content,
+                                color = PureWhite,
+                                fontSize = 15.sp,
+                                lineHeight = 21.sp
+                            )
+                        }
+
+                        if (message.readTimestampMs != null) {
+                            CountdownRow(
+                                millisRemaining = millisRemaining,
+                                progressFraction = progressFraction,
+                                expiringSoon = expiringSoon
+                            )
+                        }
                     }
+                }
+
+                if (!isMine) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    MessageReplyAction(onReply = onReply)
                 }
             }
         }
     }
+}
+
+@Composable
+private fun MessageReplyAction(onReply: () -> Unit) {
+    MirageIconButton(
+        contentDescription = "Reply to message",
+        onClick = onReply,
+        modifier = Modifier.size(36.dp),
+        accent = NeonCyan.copy(alpha = 0.18f)
+    ) {
+        ReplyIcon(modifier = Modifier.size(16.dp), color = SteelMuted)
+    }
+}
+
+@Composable
+private fun MessageReplyReference(
+    target: Message?,
+    onOpen: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .background(DeepBlack.copy(alpha = 0.48f))
+            .clickable(enabled = target != null, role = Role.Button, onClick = onOpen)
+            .padding(horizontal = 9.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Spacer(
+            modifier = Modifier
+                .width(2.dp)
+                .height(31.dp)
+                .background(if (target != null) NeonCyan else SteelMuted, RoundedCornerShape(2.dp))
+        )
+        Column(modifier = Modifier.padding(start = 8.dp).weight(1f)) {
+            Text(
+                text = target?.let { if (it.sender == "You") "You" else it.sender }
+                    ?: "Original message unavailable",
+                color = if (target != null) NeonCyan else SteelMuted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (target != null) {
+                Text(
+                    text = replyPreviewText(target),
+                    color = SteelMuted,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+private fun replyPreviewText(message: Message): String {
+    if (!message.isMedia) return message.content
+    if (message.oneTimeView) return "One-time media"
+    val mediaType = message.mediaType?.uppercase(Locale.ROOT) ?: "FILE"
+    return "$mediaType - ${message.attachmentName ?: message.content}"
 }
 
 @Composable
@@ -1050,7 +1291,7 @@ private fun CountdownRow(
             }
         }
         Text(
-            text = "${String.format("%.1f", millisRemaining / 1000f)}s",
+            text = "${String.format(Locale.ROOT, "%.1f", millisRemaining / 1000f)}s",
             color = if (expiringSoon) SelfDestructAmber else NeonCyan,
             fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
@@ -1364,7 +1605,7 @@ private fun roomMediaRuleDetail(session: ChatSession?, mediaType: String, fallba
 private fun formatBytes(bytes: Long): String {
     val mb = bytes / (1024f * 1024f)
     return if (mb >= 1f) {
-        "${String.format("%.1f", mb)} MB"
+        "${String.format(Locale.ROOT, "%.1f", mb)} MB"
     } else {
         "${(bytes / 1024L).coerceAtLeast(0L)} KB"
     }
@@ -1384,15 +1625,24 @@ private fun ChatContentPreview() {
         session = ChatSession("room", "operations", true, null, 0, 5),
         messages = listOf(
             Message("1", "NebulaTiger93", null, "Keys rotated for the room.", 0L, 5),
-            Message("2", "You", null, "Confirmed.", 0L, 10, readTimestampMs = System.currentTimeMillis())
+            Message(
+                "2",
+                "You",
+                null,
+                "Confirmed.",
+                0L,
+                10,
+                readTimestampMs = System.currentTimeMillis(),
+                replyToMessageId = "1"
+            )
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
         attachmentPreview = null,
         uploadProgress = AttachmentUploadProgress(),
         attachmentError = null,
         onBack = {},
-        onSendMessage = { _, _ -> },
-        onSendAttachment = { _, _, _, _, _, _, _ -> },
+        onSendMessage = { _, _, _ -> },
+        onSendAttachment = { _, _, _, _, _, _, _, _ -> },
         onMessageVisible = {},
         onViewAttachment = {},
         onSaveAttachment = { _, _ -> },

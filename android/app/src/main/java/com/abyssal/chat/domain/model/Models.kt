@@ -36,13 +36,19 @@ data class Message(
     val oneTimeView: Boolean = false,
     val saveAllowed: Boolean = true,
     val deleteAfterDownload: Boolean = false,
-    val absoluteExpirySec: Int = 0
+    val absoluteExpirySec: Int = 0,
+    val replyToMessageId: String? = null
 ) {
     val isExpired: Boolean
-        get() = readTimestampMs?.let {
-            val elapsedMs = System.currentTimeMillis() - it
-            elapsedMs >= selfDestructDurationSec * 1000L
-        } ?: false
+        get() {
+            val now = System.currentTimeMillis()
+            val absoluteExpired = absoluteExpirySec > 0 &&
+                now - timestampMs >= absoluteExpirySec * 1000L
+            val readExpired = readTimestampMs?.let { readAt ->
+                now - readAt >= selfDestructDurationSec * 1000L
+            } ?: false
+            return absoluteExpired || readExpired
+        }
 
     val timeRemainingMs: Long
         get() = readTimestampMs?.let {

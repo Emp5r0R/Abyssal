@@ -11,6 +11,7 @@ import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
@@ -195,8 +196,9 @@ class ChatViewModel(
         }
     }
 
-    fun sendMessage(content: String, selfDestructSec: Int) {
+    fun sendMessage(content: String, selfDestructSec: Int, replyToMessageId: String? = null) {
         val chatId = _activeChatId.value ?: return
+        if (serverStatus.value.state != "CONNECTED") return
         viewModelScope.launch {
             val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec)
             val absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null)
@@ -207,10 +209,14 @@ class ChatViewModel(
                 content = content,
                 timestampMs = System.currentTimeMillis(),
                 selfDestructDurationSec = effectiveTimerSec,
-                absoluteExpirySec = absoluteExpirySec
+                absoluteExpirySec = absoluteExpirySec,
+                replyToMessageId = validReplyTarget(replyToMessageId)
             )
-            messageRepository.saveMessage(chatId, message)
-            chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(textMetadata(message)))
+            val accepted = chatTransport.sendEncryptedPayload(
+                chatId,
+                payloadCipher.encrypt(textMetadata(message))
+            )
+            if (accepted) messageRepository.saveMessage(chatId, message)
         }
     }
 
@@ -221,9 +227,14 @@ class ChatViewModel(
         bytes: ByteArray,
         selfDestructSec: Int,
         oneTimeView: Boolean,
-        deleteAfterDownload: Boolean
+        deleteAfterDownload: Boolean,
+        replyToMessageId: String? = null
     ) {
         val chatId = _activeChatId.value ?: return
+        if (serverStatus.value.state != "CONNECTED") {
+            _attachmentError.value = "Wrong information."
+            return
+        }
         val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec, mediaType)
         val absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, mediaType)
         if (bytes.isEmpty() || bytes.size > attachmentLimitBytes(mediaType) || !isMediaAllowed(chatId, mediaType)) {
@@ -275,10 +286,18 @@ class ChatViewModel(
                 selfDestructSec = effectiveTimerSec,
                 absoluteExpirySec = absoluteExpirySec,
                 oneTimeView = oneTimeView,
-                deleteAfterDownload = deleteAfterDownload
+                deleteAfterDownload = deleteAfterDownload,
+                replyToMessageId = validReplyTarget(replyToMessageId)
             )
-            messageSender.saveLocalAttachmentMessage(chatId, message)
-            chatTransport.sendEncryptedPayload(chatId, payloadCipher.encrypt(attachmentMetadata(message)))
+            val accepted = chatTransport.sendEncryptedPayload(
+                chatId,
+                payloadCipher.encrypt(attachmentMetadata(message))
+            )
+            if (accepted) {
+                messageSender.saveLocalAttachmentMessage(chatId, message)
+            } else {
+                _attachmentError.value = "Wrong information."
+            }
             _attachmentUploadProgress.value = AttachmentUploadProgress()
         }
     }
@@ -526,7 +545,8 @@ class ChatViewModel(
                 selfDestructSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10), json.optString("media_type", "FILE")),
                 absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, json.optString("media_type", "FILE")),
                 oneTimeView = json.optBoolean("one_time", false),
-                deleteAfterDownload = json.optBoolean("delete_after_download", false)
+                deleteAfterDownload = json.optBoolean("delete_after_download", false),
+                replyToMessageId = json.replyToMessageId()
             )
         }
 
@@ -540,7 +560,8 @@ class ChatViewModel(
                 content = content,
                 timestampMs = System.currentTimeMillis(),
                 selfDestructDurationSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10)),
-                absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null)
+                absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null),
+                replyToMessageId = json.replyToMessageId()
             )
         }
 
@@ -608,7 +629,8 @@ class ChatViewModel(
         selfDestructSec: Int,
         absoluteExpirySec: Int,
         oneTimeView: Boolean,
-        deleteAfterDownload: Boolean
+        deleteAfterDownload: Boolean,
+        replyToMessageId: String? = null
     ): Message {
         val safeName = fileName.ifBlank { "attachment" }
         return Message(
@@ -628,7 +650,8 @@ class ChatViewModel(
             oneTimeView = oneTimeView,
             saveAllowed = !oneTimeView,
             deleteAfterDownload = deleteAfterDownload,
-            absoluteExpirySec = absoluteExpirySec
+            absoluteExpirySec = absoluteExpirySec,
+            replyToMessageId = replyToMessageId
         )
     }
 
@@ -646,6 +669,7 @@ class ChatViewModel(
             .put("absolute_expiry_sec", message.absoluteExpirySec)
             .put("one_time", message.oneTimeView)
             .put("delete_after_download", message.deleteAfterDownload)
+            .apply { message.replyToMessageId?.let { put("reply_to_id", it) } }
             .toString()
     }
 
@@ -657,7 +681,16 @@ class ChatViewModel(
             .put("content", message.content)
             .put("self_destruct_sec", message.selfDestructDurationSec)
             .put("absolute_expiry_sec", message.absoluteExpirySec)
+            .apply { message.replyToMessageId?.let { put("reply_to_id", it) } }
             .toString()
+    }
+
+    private fun validReplyTarget(messageId: String?): String? {
+        return MessageReplyPolicy.findAvailableTargetId(messageId, activeMessages.value)
+    }
+
+    private fun JSONObject.replyToMessageId(): String? {
+        return MessageReplyPolicy.sanitizeMessageId(optString("reply_to_id"))
     }
 
     override fun onCleared() {

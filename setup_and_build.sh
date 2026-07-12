@@ -3,7 +3,7 @@
 set -e
 
 echo "=========================================================="
-echo "Initializing Mirage Chat local headless build environment"
+echo "Initializing Abyssal Chat local headless build environment"
 echo "=========================================================="
 
 WORKSPACE_DIR="/media/n_emperor/Aadhish/Projects/Abyssal"
@@ -73,9 +73,9 @@ chmod +x gradlew
 # 7. Copy compiled APK to the local workspace build-outputs/ directory
 echo "[+] Staging compiled debug APK..."
 mkdir -p "$OUTPUT_DIR"
-cp app/build/outputs/apk/debug/app-debug.apk "$OUTPUT_DIR/mirage-chat-debug.apk"
+cp app/build/outputs/apk/debug/app-debug.apk "$OUTPUT_DIR/abyssal-chat-debug.apk"
 
 echo "=========================================================="
 echo "BUILD SUCCESSFUL!"
-echo "APK Location: $OUTPUT_DIR/mirage-chat-debug.apk"
+echo "APK Location: $OUTPUT_DIR/abyssal-chat-debug.apk"
 echo "=========================================================="
