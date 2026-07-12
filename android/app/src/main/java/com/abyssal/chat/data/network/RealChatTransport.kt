@@ -104,7 +104,7 @@ class RealChatTransport(
         }
     }
 
-    override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray) {
+    override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray): Boolean {
         val encodedPayload = Base64.encodeToString(payload, Base64.NO_WRAP)
         val frame = JSONObject()
             .put("type", "message")
@@ -112,9 +112,11 @@ class RealChatTransport(
             .put("payload_b64", encodedPayload)
             .toString()
 
-        if (webSocket?.send(frame) != true) {
+        val accepted = webSocket?.send(frame) == true
+        if (!accepted) {
             _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
         }
+        return accepted
     }
 
     override suspend fun broadcastGlobalWipe() {

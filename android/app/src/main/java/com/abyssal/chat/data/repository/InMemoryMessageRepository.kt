@@ -144,7 +144,12 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         _sessions.value = _sessions.value + session
     }
 
-    override suspend fun sendMessage(chatId: String, content: String, selfDestructSec: Int) {
+    override suspend fun sendMessage(
+        chatId: String,
+        content: String,
+        selfDestructSec: Int,
+        replyToMessageId: String?
+    ) {
         val newMsg = Message(
             id = UUID.randomUUID().toString(),
             sender = "You",
@@ -152,7 +157,8 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             content = content,
             timestampMs = System.currentTimeMillis(),
             selfDestructDurationSec = selfDestructSec,
-            absoluteExpirySec = 0
+            absoluteExpirySec = 0,
+            replyToMessageId = replyToMessageId
         )
 
         saveMessage(chatId, newMsg)

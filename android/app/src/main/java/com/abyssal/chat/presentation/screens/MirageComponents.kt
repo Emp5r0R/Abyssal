@@ -28,6 +28,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -154,6 +155,7 @@ fun MirageIconButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     accent: Color = GlassBorder,
+    enabled: Boolean = true,
     content: @Composable () -> Unit
 ) {
     Box(
@@ -163,8 +165,9 @@ fun MirageIconButton(
             .clip(CircleShape)
             .background(GlassCardBg)
             .border(BorderStroke(1.dp, accent), CircleShape)
+            .alpha(if (enabled) 1f else 0.42f)
             .semantics { this.contentDescription = contentDescription }
-            .clickable(role = Role.Button, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
     ) {
         content()
     }

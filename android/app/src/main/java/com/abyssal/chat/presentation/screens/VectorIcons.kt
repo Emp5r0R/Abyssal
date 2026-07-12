@@ -191,6 +191,44 @@ fun SendIcon(modifier: Modifier = Modifier, color: Color = DeepBlack) {
 }
 
 @Composable
+fun ReplyIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val path = Path().apply {
+            moveTo(w * 0.42f, h * 0.18f)
+            lineTo(w * 0.10f, h * 0.48f)
+            lineTo(w * 0.42f, h * 0.78f)
+            moveTo(w * 0.12f, h * 0.48f)
+            cubicTo(w * 0.52f, h * 0.42f, w * 0.78f, h * 0.55f, w * 0.90f, h * 0.84f)
+        }
+        drawPath(
+            path = path,
+            color = color,
+            style = Stroke(width = 1.8.dp.toPx())
+        )
+    }
+}
+
+@Composable
+fun CloseIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
+    Canvas(modifier = modifier) {
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.18f, size.height * 0.18f),
+            end = Offset(size.width * 0.82f, size.height * 0.82f),
+            strokeWidth = 1.8.dp.toPx()
+        )
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.82f, size.height * 0.18f),
+            end = Offset(size.width * 0.18f, size.height * 0.82f),
+            strokeWidth = 1.8.dp.toPx()
+        )
+    }
+}
+
+@Composable
 fun SettingsIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
     Canvas(modifier = modifier) {
         val r = size.minDimension / 2

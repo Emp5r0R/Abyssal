@@ -31,7 +31,12 @@ interface INodeConfigService {
 }
 
 interface IMessageSender {
-    suspend fun sendMessage(chatId: String, content: String, selfDestructSec: Int)
+    suspend fun sendMessage(
+        chatId: String,
+        content: String,
+        selfDestructSec: Int,
+        replyToMessageId: String? = null
+    )
     suspend fun saveLocalAttachmentMessage(chatId: String, message: Message)
 }
 
@@ -62,7 +67,7 @@ interface IChatTransport {
     suspend fun joinChat(chatId: String)
     suspend fun createForum(session: ChatSession)
     suspend fun deleteForum(chatId: String)
-    suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray)
+    suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray): Boolean
     suspend fun broadcastGlobalWipe()
 }
 

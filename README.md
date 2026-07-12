@@ -28,7 +28,7 @@ cd android
 Install to a connected device:
 
 ```bash
-/media/n_emperor/Aadhish/Projects/Abyssal/android-sdk/platform-tools/adb install -r /media/n_emperor/Aadhish/Projects/Abyssal/android/app/build/outputs/apk/debug/app-debug.apk
+/media/n_emperor/Aadhish/Projects/Abyssal/android-sdk/platform-tools/adb install -r /media/n_emperor/Aadhish/Projects/Abyssal/build-outputs/abyssal-chat-debug.apk
 ```
 
 At the entrance screen enter:
@@ -38,6 +38,14 @@ At the entrance screen enter:
 - Password. Creating an account consumes the code; later logins use the same code and password while the relay process is still alive.
 
 For an Android emulator talking to a server on the development machine, use `http://10.0.2.2:4020`.
+
+### Chat behavior
+
+- Text and media messages can reply to any message still present in the current RAM buffer. Tap the reply icon beside a bubble, then send text, a file, an image, a video, or a bundled GIF.
+- Reply envelopes contain only the original message ID inside the encrypted payload. They do not copy the original plaintext, filename, or sender. If the original expires, the reply renders `Original message unavailable` instead of extending the original content's lifetime.
+- Tapping an available reply preview scrolls to and briefly highlights the original message. The composer automatically cancels a reply if its target expires before send.
+- The composer remains editable while reconnecting, but send and attachment actions stay disabled until the WebSocket is connected so a local bubble is not mistaken for a relayed message.
+- The chat initially opens at the latest active message and follows new messages only while the user remains near the bottom.
 
 ## Rust Server
 
