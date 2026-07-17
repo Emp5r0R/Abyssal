@@ -1,0 +1,17 @@
+{
+  "name": "abyssal-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "web:dev": "npm run dev --workspace @abyssal/web",
+    "web:build": "npm run build --workspace @abyssal/web",
+    "web:test": "npm run test --workspace @abyssal/web",
+    "web:lint": "npm run lint --workspace @abyssal/web",
+    "web:check": "npm run check --workspace @abyssal/web",
+    "rust:test": "cargo test --workspace",
+    "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "check": "npm run web:check && npm run rust:test && npm run rust:lint"
+  }
+}

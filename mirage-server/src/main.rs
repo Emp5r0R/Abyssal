@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,20 +15,26 @@ use argon2::{
 };
 use axum::{
     body::Bytes,
+    extract::Request,
     extract::{
         ws::{Message, WebSocket},
         DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
     },
-    http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -39,12 +46,15 @@ const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
 const WS_MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
+const ACCOUNT_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
 
 #[derive(Clone)]
 struct AppState {
     node_id: String,
     attachment_ram_limit_bytes: usize,
     max_rooms_per_user: usize,
+    web_origins: Vec<String>,
     session_inactivity_ms: u64,
     inactivity_limit_ms: Option<u64>,
     last_activity_ms: Arc<Mutex<u64>>,
@@ -164,11 +174,6 @@ struct HealthResponse {
 }
 
 #[derive(Deserialize)]
-struct WsQuery {
-    token: String,
-}
-
-#[derive(Deserialize)]
 #[serde(tag = "type")]
 enum InboundFrame {
     #[serde(rename = "activity")]
@@ -207,6 +212,7 @@ enum OutboundFrame {
     Message {
         chat_id: String,
         payload_b64: String,
+        sender_username: String,
     },
     #[serde(rename = "read_receipt")]
     ReadReceipt {
@@ -255,19 +261,52 @@ async fn main() {
         .expect("ABYSSAL_BIND_ADDR must be a valid socket address");
 
     let attachment_body_limit = FILE_ATTACHMENT_LIMIT_BYTES + ENCRYPTION_OVERHEAD_BYTES;
-    let app = Router::new()
-        .route("/health", get(health))
+    let account_routes = Router::new()
         .route("/v1/account/create", post(create_account))
         .route("/v1/account/login", post(login_account))
         .route("/v1/account/enter", post(enter_account))
         .route("/v1/account/logout", post(logout_account))
+        .route("/v1/invite/validate", post(login_account))
+        .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
+    let attachment_routes = Router::new()
         .route("/v1/attachment", post(upload_attachment))
         .route("/v1/attachment/:id", get(download_attachment))
-        .route("/v1/invite/validate", post(login_account))
-        .layer(DefaultBodyLimit::max(attachment_body_limit))
+        .layer(DefaultBodyLimit::max(attachment_body_limit));
+
+    let web_origins = state.web_origins.clone();
+    let mut app = Router::new()
+        .route("/health", get(health))
+        .merge(account_routes)
+        .merge(attachment_routes)
         .route("/v1/ws", get(ws_handler))
+        .route("/v1/*path", any(api_not_found))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    if let Some(web_root) = resolve_web_root() {
+        info!("serving Abyssal web client from {}", web_root.display());
+        let index = web_root.join("index.html");
+        app = app.fallback_service(
+            ServeDir::new(web_root)
+                .append_index_html_on_directories(true)
+                .not_found_service(ServeFile::new(index)),
+        );
+    }
+
+    let allowed_origins = web_origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    if !allowed_origins.is_empty() {
+        app = app.layer(
+            CorsLayer::new()
+                .allow_origin(allowed_origins)
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .max_age(std::time::Duration::from_secs(600)),
+        );
+    }
+    app = app.layer(middleware::from_fn(security_headers));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
@@ -292,6 +331,7 @@ impl AppState {
         let attachment_ram_limit_bytes =
             read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512).saturating_mul(1024 * 1024);
         let max_rooms_per_user = read_usize_env("ABYSSAL_MAX_ROOMS_PER_USER", 5).clamp(1, 100);
+        let web_origins = parse_origins_from_env("ABYSSAL_WEB_ORIGINS");
         let session_inactivity_minutes =
             read_usize_env("ABYSSAL_SESSION_INACTIVITY_MINUTES", 15).clamp(1, 24 * 60);
         let session_inactivity_ms = session_inactivity_minutes.saturating_mul(60 * 1000) as u64;
@@ -319,6 +359,7 @@ impl AppState {
             node_id,
             attachment_ram_limit_bytes,
             max_rooms_per_user,
+            web_origins,
             session_inactivity_ms,
             inactivity_limit_ms,
             last_activity_ms: Arc::new(Mutex::new(now_ms())),
@@ -353,6 +394,9 @@ impl AppState {
             "ABYSSAL_SESSION_INACTIVITY inactivity_limit_ms={}",
             self.session_inactivity_ms
         );
+        if !self.web_origins.is_empty() {
+            info!("ABYSSAL_WEB_ORIGINS count={}", self.web_origins.len());
+        }
         if let Some(limit_ms) = self.inactivity_limit_ms {
             info!("ABYSSAL_DEAD_MAN_SWITCH inactivity_limit_ms={limit_ms}");
         }
@@ -371,6 +415,113 @@ fn read_usize_env(key: &str, fallback: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(fallback)
+}
+
+fn parse_origins_from_env(key: &str) -> Vec<String> {
+    env::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|value| normalize_web_origin(value).ok())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn normalize_web_origin(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let uri = trimmed
+        .parse::<Uri>()
+        .map_err(|_| "web origin rejected".to_string())?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| "web origin rejected".to_string())?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| "web origin rejected".to_string())?;
+    if !matches!(scheme, "http" | "https") || uri.path() != "/" || uri.query().is_some() {
+        return Err("web origin rejected".to_string());
+    }
+    Ok(format!("{scheme}://{authority}"))
+}
+
+fn resolve_web_root() -> Option<PathBuf> {
+    if let Ok(configured) = env::var("ABYSSAL_WEB_ROOT") {
+        let path = PathBuf::from(configured);
+        if path.join("index.html").is_file() {
+            return Some(path);
+        }
+        warn!("ABYSSAL_WEB_ROOT has no index.html; web client disabled");
+        return None;
+    }
+
+    ["apps/web/dist", "../apps/web/dist", "/opt/abyssal/web"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.join("index.html").is_file())
+}
+
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+async fn security_headers(request: Request, next: Next) -> Response {
+    let clear_site_data = request.uri().path() == "/v1/account/logout";
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, max-age=0, must-revalidate"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http: ws:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'",
+        ),
+    );
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), interest-cohort=()",
+        ),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("cross-origin"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-permitted-cross-domain-policies"),
+        HeaderValue::from_static("none"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex, noarchive, nosnippet"),
+    );
+    if clear_site_data {
+        headers.insert(
+            header::HeaderName::from_static("clear-site-data"),
+            HeaderValue::from_static("\"cache\", \"cookies\", \"storage\""),
+        );
+    }
+    response
 }
 
 fn parse_codes_from_env(key: &str) -> Vec<String> {
@@ -1118,17 +1269,59 @@ async fn issue_session(
 
 async fn ws_handler(
     State(state): State<AppState>,
-    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let auth = active_session(&state, &query.token, true).await;
+    if !websocket_origin_allowed(&headers, &state.web_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(token) = websocket_protocol_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let auth = active_session(&state, &token, true).await;
 
     match auth {
         Some(session) => ws
-            .on_upgrade(move |socket| socket_loop(state, query.token, session, socket))
+            .protocols([WEB_SOCKET_PROTOCOL])
+            .on_upgrade(move |socket| socket_loop(state, token, session, socket))
             .into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+fn websocket_protocol_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::SEC_WEBSOCKET_PROTOCOL)?
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .find_map(|protocol| protocol.strip_prefix("bearer."))
+        .filter(|token| !token.is_empty() && token.len() <= 128)
+        .map(ToOwned::to_owned)
+}
+
+fn websocket_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    let Ok(uri) = origin.parse::<Uri>() else {
+        return false;
+    };
+    let Some(origin_authority) = uri.authority().map(|value| value.as_str()) else {
+        return false;
+    };
+    let same_host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(origin_authority));
+    same_host
+        || allowed_origins
+            .iter()
+            .any(|allowed| allowed == origin.trim_end_matches('/'))
 }
 
 async fn socket_loop(state: AppState, session_token: String, auth: AuthSession, socket: WebSocket) {
@@ -1255,9 +1448,17 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             payload_b64,
         } => {
             touch_activity(state).await;
+            let sender_username = state
+                .clients
+                .lock()
+                .await
+                .get(&sender_id)
+                .map(|client| client.username.clone())
+                .ok_or_else(|| "authenticated client required".to_string())?;
             let outbound = OutboundFrame::Message {
                 chat_id: chat_id.clone(),
                 payload_b64,
+                sender_username,
             };
             broadcast_to_room(state, sender_id, &chat_id, outbound).await
         }
@@ -1644,6 +1845,51 @@ mod tests {
         assert_eq!(owned_room_count(&catalog, "code-a"), 2);
         assert!(!has_room_capacity(&catalog, "code-a", 2));
         assert!(has_room_capacity(&catalog, "code-b", 2));
+    }
+
+    #[test]
+    fn websocket_token_uses_bearer_subprotocol() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("abyssal-v1, bearer.12345678-abcd"),
+        );
+
+        assert_eq!(
+            websocket_protocol_token(&headers).as_deref(),
+            Some("12345678-abcd")
+        );
+    }
+
+    #[test]
+    fn websocket_origin_requires_same_host_or_allow_list() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("abyssal.example"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://abyssal.example"),
+        );
+        assert!(websocket_origin_allowed(&headers, &[]));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://web.example"),
+        );
+        assert!(!websocket_origin_allowed(&headers, &[]));
+        assert!(websocket_origin_allowed(
+            &headers,
+            &["https://web.example".to_string()]
+        ));
+    }
+
+    #[test]
+    fn web_origin_normalization_rejects_paths_and_non_http_schemes() {
+        assert_eq!(
+            normalize_web_origin("https://web.example/").as_deref(),
+            Ok("https://web.example")
+        );
+        assert!(normalize_web_origin("https://web.example/path").is_err());
+        assert!(normalize_web_origin("file://web.example").is_err());
     }
 
     fn test_room(id: &str) -> RoomRecord {

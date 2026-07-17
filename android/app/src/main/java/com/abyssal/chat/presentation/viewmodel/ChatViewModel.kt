@@ -135,7 +135,11 @@ class ChatViewModel(
             chatTransport.getIncomingPayloads().collect { incoming ->
                 val decryptedContent = runCatching { payloadCipher.decrypt(incoming.payload) }
                     .getOrElse { "Encrypted payload received." }
-                val message = parseIncomingMessage(incoming.chatId, decryptedContent) ?: return@collect
+                val message = parseIncomingMessage(
+                    incoming.chatId,
+                    decryptedContent,
+                    incoming.senderUsername
+                ) ?: return@collect
                 messageRepository.saveMessage(incoming.chatId, message)
             }
         }
@@ -638,14 +642,22 @@ class ChatViewModel(
 
     private fun elapsedRealtimeMs(): Long = System.nanoTime() / 1_000_000L
 
-    private fun parseIncomingMessage(chatId: String, decryptedContent: String): Message? {
+    private fun parseIncomingMessage(
+        chatId: String,
+        decryptedContent: String,
+        authoritativeSender: String?
+    ): Message? {
         val json = runCatching { JSONObject(decryptedContent) }.getOrNull()
-        if (json != null && json.optString("sender") == currentUser.value?.username) return null
+        val sender = authoritativeSender
+            ?.takeIf { it.isNotBlank() }
+            ?: json?.optString("sender")?.takeIf { it.isNotBlank() }
+            ?: "Remote node"
+        if (sender == currentUser.value?.username) return null
 
         if (json?.optString("kind") == "attachment") {
             return attachmentMessage(
                 messageId = json.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
-                sender = "Remote node",
+                sender = sender,
                 receiver = if (chatId.startsWith("dm_")) "You" else null,
                 attachmentId = json.optString("attachment_id"),
                 mediaType = json.optString("media_type", "FILE"),
@@ -662,7 +674,6 @@ class ChatViewModel(
 
         if (json?.optString("kind") == "text") {
             val content = json.optString("content").takeIf { it.isNotBlank() } ?: return null
-            val sender = json.optString("sender").takeIf { it.isNotBlank() } ?: "Remote node"
             return Message(
                 id = json.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
                 sender = sender,
@@ -677,7 +688,7 @@ class ChatViewModel(
 
         return Message(
             id = UUID.randomUUID().toString(),
-            sender = "Remote node",
+                sender = sender,
             receiver = if (chatId.startsWith("dm_")) "You" else null,
             content = decryptedContent,
             timestampMs = System.currentTimeMillis(),
