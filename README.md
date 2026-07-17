@@ -2,6 +2,14 @@
 
 Abyssal is an ephemeral chat monorepo containing a native Android client, a browser client, a Rust relay, and a native crypto crate. Neither client hardcodes a node URL: account entry takes a node URL, access code, and password every time a process starts.
 
+## UI Preview
+
+The web client and Android client share the same Abyssal visual language: dark relay surfaces, restrained cyan/green status signals, RAM-only account entry, encrypted rooms, mentions, replies, GIF reactions, and media controls.
+
+![Abyssal web account entry](docs/assets/readme/web-entry.png)
+
+Android uses `FLAG_SECURE`, so production device screenshots are intentionally blocked instead of being used as README media.
+
 ## Monorepo Layout
 
 ```text
