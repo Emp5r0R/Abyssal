@@ -1149,6 +1149,7 @@ button:disabled {
   display: flex;
   margin-bottom: 6px;
   align-items: center;
+  flex-wrap: wrap;
   gap: 9px;
   color: var(--muted);
   font-size: 9px;
@@ -1157,6 +1158,36 @@ button:disabled {
 .message-meta span {
   color: var(--muted-strong);
   font-weight: 700;
+}
+
+.message-author {
+  padding: 0;
+  border: 0;
+  color: var(--muted-strong);
+  font: inherit;
+  font-weight: 700;
+  background: transparent;
+  cursor: pointer;
+}
+
+.message-author:hover,
+.message-author:focus-visible {
+  color: var(--cyan);
+  outline: 0;
+}
+
+.attention-badge {
+  display: inline-flex;
+  min-height: 20px;
+  padding: 0 6px;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgba(245, 184, 70, 0.28);
+  border-radius: 4px;
+  color: var(--amber) !important;
+  font-size: 7px;
+  letter-spacing: 0;
+  background: rgba(245, 184, 70, 0.08);
 }
 
 .is-mine .message-meta {
@@ -1186,12 +1217,44 @@ button:disabled {
   background: #0b171d;
 }
 
+.message-row.is-attention .message-bubble {
+  border-color: rgba(245, 184, 70, 0.58);
+  box-shadow: inset 3px 0 0 var(--amber), 0 0 0 1px rgba(245, 184, 70, 0.08);
+  background: #17140d;
+}
+
+.message-row.is-targeted .message-bubble {
+  animation: target-message 1.2s ease-out;
+}
+
+@keyframes target-message {
+  0%, 100% {
+    box-shadow: none;
+  }
+  35% {
+    border-color: rgba(0, 217, 232, 0.8);
+    box-shadow: 0 0 0 3px rgba(0, 217, 232, 0.14);
+  }
+}
+
 .message-bubble p {
   margin: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
   font-size: 13px;
   line-height: 1.5;
+}
+
+.mention-token {
+  color: var(--cyan);
+  font-weight: 720;
+}
+
+.mention-token.is-self {
+  padding: 1px 3px;
+  border-radius: 3px;
+  color: #101000;
+  background: var(--amber);
 }
 
 .reply-action {
@@ -1297,6 +1360,60 @@ button:disabled {
   height: 30px;
 }
 
+.inline-reaction {
+  width: min(240px, 62vw);
+}
+
+.inline-reaction-preview {
+  display: grid;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  padding: 8px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #080c11;
+  cursor: pointer;
+}
+
+.inline-reaction-preview:hover,
+.inline-reaction-preview:focus-visible {
+  border-color: var(--cyan);
+  outline: 0;
+}
+
+.inline-reaction-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  object-fit: contain;
+}
+
+.inline-reaction-footer {
+  display: flex;
+  min-height: 28px;
+  padding: 3px 0 0 4px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.inline-reaction-footer code {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 8px;
+}
+
+.inline-reaction-footer .icon-button {
+  width: 26px;
+  height: 26px;
+}
+
 .composer-wrap {
   position: relative;
   padding: 10px clamp(14px, 3vw, 30px) max(12px, env(safe-area-inset-bottom));
@@ -1367,6 +1484,76 @@ button:disabled {
   color: var(--cyan);
 }
 
+.composer-suggestions {
+  position: absolute;
+  z-index: 21;
+  right: clamp(14px, 3vw, 30px);
+  bottom: calc(100% + 8px);
+  display: grid;
+  width: min(390px, calc(100vw - 28px));
+  max-height: 260px;
+  padding: 5px;
+  gap: 2px;
+  overflow-y: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: #090e14;
+  box-shadow: var(--shadow);
+}
+
+.composer-suggestions button {
+  display: grid;
+  min-height: 40px;
+  padding: 7px 9px;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--muted);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.composer-suggestions button:hover,
+.composer-suggestions button:focus-visible {
+  border-color: rgba(0, 217, 232, 0.28);
+  color: var(--text);
+  background: var(--cyan-soft);
+  outline: 0;
+}
+
+.composer-suggestions strong,
+.composer-suggestions code {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+.composer-suggestions span {
+  color: var(--muted);
+  font-size: 7px;
+  font-weight: 750;
+}
+
+.composer-suggestions span.is-online {
+  color: var(--green);
+}
+
+.reaction-suggestions button {
+  grid-template-columns: 30px minmax(0, 1fr);
+}
+
+.reaction-suggestions img {
+  display: block;
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+}
+
 .upload-progress > span {
   max-width: 180px;
   overflow: hidden;
@@ -1407,7 +1594,7 @@ button:disabled {
   right: clamp(14px, 3vw, 30px);
   bottom: calc(100% + 8px);
   display: flex;
-  width: min(400px, calc(100vw - 28px));
+  width: min(440px, calc(100vw - 28px));
   max-height: 380px;
   flex-direction: column;
   border: 1px solid var(--line-strong);
@@ -1445,16 +1632,21 @@ button:disabled {
   min-height: 0;
   padding: 9px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: 96px;
   gap: 6px;
   overflow-y: auto;
 }
 
 .gif-grid button {
   display: grid;
+  width: 100%;
+  height: 96px;
   min-width: 0;
-  aspect-ratio: 1;
-  padding: 4px;
-  place-items: center;
+  min-height: 0;
+  padding: 5px;
+  grid-template-rows: minmax(0, 1fr) 17px;
+  align-items: stretch;
+  gap: 3px;
   overflow: hidden;
   border: 1px solid transparent;
   border-radius: 5px;
@@ -1462,14 +1654,40 @@ button:disabled {
   cursor: pointer;
 }
 
-.gif-grid button:hover {
+.gif-grid button:hover,
+.gif-grid button:focus-visible {
   border-color: var(--cyan);
+  outline: 0;
+}
+
+.gif-thumb {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
 }
 
 .gif-grid img {
+  display: block;
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   object-fit: contain;
+}
+
+.gif-grid code {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 7px;
+  line-height: 17px;
 }
 
 .file-drop {
@@ -1914,6 +2132,12 @@ button:disabled {
     bottom: calc(100% + 6px);
     width: calc(100vw - 16px);
     max-height: 330px;
+  }
+
+  .composer-suggestions {
+    right: 8px;
+    bottom: calc(100% + 6px);
+    width: calc(100vw - 16px);
   }
 
   .dialog-backdrop {

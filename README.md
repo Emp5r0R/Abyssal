@@ -39,13 +39,10 @@ Build a debug APK:
 ```bash
 cd android
 ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Install to a connected device:
-
-```bash
-/media/n_emperor/Aadhish/Projects/Abyssal/android-sdk/platform-tools/adb install -r /media/n_emperor/Aadhish/Projects/Abyssal/build-outputs/abyssal-chat-debug.apk
-```
+The install command expects `adb` on `PATH`. Otherwise invoke `platform-tools/adb` from your Android SDK.
 
 At the entrance screen enter:
 
@@ -61,6 +58,8 @@ For an Android emulator talking to a server on the development machine, use `htt
 - Text and media messages can reply to any message still present in the current RAM buffer. Tap the reply icon beside a bubble, then send text, a file, an image, a video, or a bundled GIF.
 - Reply envelopes contain only the original message ID inside the encrypted payload. They do not copy the original plaintext, filename, or sender. If the original expires, the reply renders `Original message unavailable` instead of extending the original content's lifetime.
 - Tapping an available reply preview scrolls to and briefly highlights the original message. The composer automatically cancels a reply if its target expires before send.
+- Every bundled reaction has a `:filename:` shortcut, such as `:fire:`. Picker and shortcut sends use the same encrypted attachment path and render in equal-size inline frames on Android and web.
+- Type `@` to complete a connected username, or tap a sender name to mention them. Mentions and replies to one of the current process's own message IDs receive recipient-only attention styling.
 - The composer remains editable while reconnecting, but send and attachment actions stay disabled until the WebSocket is connected so a local bubble is not mistaken for a relayed message.
 - The chat initially opens at the latest active message and follows new messages only while the user remains near the bottom.
 
@@ -79,12 +78,14 @@ For local cross-origin development, start the relay from the repository root wit
 ABYSSAL_WEB_ORIGINS=http://localhost:4173 cargo run --package mirage-server
 ```
 
-Open `http://localhost:4173`, then enter `http://127.0.0.1:4020` as the node URL. Production Docker builds the web client and serves it from the relay root, so `https://YOUR_NODE/` and the API use one origin. Leave `ABYSSAL_WEB_ORIGINS` empty for that deployment.
+Open `http://localhost:4173`, then enter `http://127.0.0.1:4020` as the node URL. Production Docker builds the web client and serves it from the relay root, so a URL such as `https://chat.example.com/` and the API use one origin. Leave `ABYSSAL_WEB_ORIGINS` empty for that deployment.
 
 Web client behavior:
 
 - Account entry automatically creates an account for an unused code or logs into its existing RAM account.
 - Rooms, owner quotas, room media policy, live presence, encrypted messages, replies, read expiry, absolute expiry, GIFs, upload progress, images, videos, and explicit encrypted `.abyssal` exports use the existing relay protocol.
+- Every bundled reaction has a `:filename:` shortcut, such as `:fire:`. Picker reactions carry a validated shortcut inside encrypted attachment metadata and render in equal-size inline frames without exposing the selection to the relay.
+- Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
 - The calculator cover PIN and optional duress PIN exist only in the current tab. Reload, tab close, logout, wipe, session expiry, or process termination loses them.
 - WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Old Android APKs using `?token=` must be replaced with Abyssal `1.4.0` or newer.
 
@@ -101,7 +102,7 @@ Run locally:
 ```bash
 cd mirage-server
 ABYSSAL_BIND_ADDR=0.0.0.0:4020 \
-ABYSSAL_NODE_ID=oracle-ampere-1 \
+ABYSSAL_NODE_ID=abyssal-node-1 \
 ABYSSAL_CODE_COUNT=8 \
 ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
 ABYSSAL_MAX_ROOMS_PER_USER=5 \
@@ -152,14 +153,13 @@ docker compose -f deploy/docker-compose.yml down
 
 Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env`, systemd environment entries, or your server secret manager. Read the generated codes from process logs.
 
-## Oracle Docker Deploy
+## Remote Docker Deploy
 
-The helper scripts default to your Oracle host:
+The remote helpers read SSH settings from environment variables or the ignored `deploy/deploy.env` file. Create a local configuration from the tracked template:
 
 ```bash
-ubuntu@161.118.195.126
-/home/Emp5r0R/Documents/ssh_key.key
-/home/ubuntu/abyssal
+cp deploy/deploy.env.example deploy/deploy.env
+$EDITOR deploy/deploy.env
 ```
 
 Sync the repo and rebuild/restart Docker on the server:
@@ -168,7 +168,7 @@ Sync the repo and rebuild/restart Docker on the server:
 ./deploy/deploy-server.sh
 ```
 
-Run that command from your local machine, not from inside the server shell. It uses SSH and rsync to reach the Oracle host.
+Run that command from your local machine, not from inside the server shell. It uses SSH and rsync to reach the configured remote host.
 
 If you are already SSH'd into the server at `/home/ubuntu/abyssal`, use the server-local scripts instead:
 
@@ -206,36 +206,43 @@ Stop the server:
 Equivalent raw `rsync` command:
 
 ```bash
+SSH_HOST=ubuntu@chat.example.com
+SSH_KEY="$HOME/.ssh/abyssal"
+REMOTE_DIR=/home/ubuntu/abyssal
+
 rsync -az --delete \
-  -e "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i /home/Emp5r0R/Documents/ssh_key.key" \
+  -e "ssh -o StrictHostKeyChecking=accept-new -i $SSH_KEY" \
   --exclude '.git/' --exclude '.gradle/' --exclude '.idea/' \
+  --exclude 'README.local.md' --exclude 'deploy/deploy.env' \
   --exclude 'node_modules/' --exclude 'target/' \
   --include '.env.example' --exclude '.env' --exclude '.env.*' \
   --exclude 'android/.gradle/' --exclude 'android/app/build/' --exclude 'android/build/' \
   --exclude 'build-outputs/' --exclude 'mirage-server/target/' --exclude 'rust-core/target/' \
   --exclude 'apps/web/dist/' --exclude 'apps/web/coverage/' \
-  ./ ubuntu@161.118.195.126:/home/ubuntu/abyssal/
+  ./ "$SSH_HOST:$REMOTE_DIR/"
 ```
 
 Override the target without editing scripts:
 
 ```bash
-ABYSSAL_SSH_HOST=ubuntu@YOUR_IP \
-ABYSSAL_SSH_KEY=/path/to/key \
+ABYSSAL_SSH_HOST=ubuntu@chat.example.com \
+ABYSSAL_SSH_KEY="$HOME/.ssh/abyssal" \
 ABYSSAL_REMOTE_DIR=/home/ubuntu/abyssal \
 ./deploy/deploy-server.sh
 ```
 
-## Oracle Ampere Deployment
+Command-line environment values override `deploy/deploy.env`. Set `ABYSSAL_DEPLOY_ENV` to use a different local configuration file.
 
-On Ubuntu ARM64:
+## ARM64 Server Deployment
+
+On Ubuntu ARM64, including Oracle Ampere instances:
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential pkg-config libssl-dev curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
-cd /opt/mirage
+cd /opt/abyssal
 npm ci
 npm run web:build
 cargo build --release --package mirage-server

@@ -1,4 +1,5 @@
 import {
+  AtSign,
   ArrowDownToLine,
   ArrowLeft,
   Clock3,
@@ -16,7 +17,9 @@ import {
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { remainingSeconds } from "../domain/messagePolicy";
 import { formatBytes } from "../domain/format";
-import type { ChatMessage, RoomRecord, UploadProgress } from "../domain/types";
+import { splitMentionText } from "../domain/messageAttention";
+import { exactReactionShortcut, reactionByShortcode, searchReactions, type ReactionAsset } from "../domain/reactions";
+import type { ChatMessage, PresenceUser, RoomRecord, UploadProgress } from "../domain/types";
 import { GifPicker } from "./GifPicker";
 import { IconButton } from "./Ui";
 
@@ -25,6 +28,7 @@ interface ChatViewProps {
   username: string;
   connected: boolean;
   messages: ChatMessage[];
+  users: PresenceUser[];
   upload: UploadProgress & { active: boolean; name: string };
   onBack: () => void;
   onSend: (content: string, replyToId?: string) => Promise<boolean>;
@@ -33,7 +37,7 @@ interface ChatViewProps {
   onOpenAttachment: () => void;
   onViewAttachment: (message: ChatMessage) => void;
   onExportAttachment: (message: ChatMessage) => void;
-  onSendGif: (path: string, replyToId?: string) => Promise<void>;
+  onSendGif: (reaction: ReactionAsset, replyToId?: string) => Promise<boolean>;
 }
 
 export function ChatView({
@@ -41,6 +45,7 @@ export function ChatView({
   username,
   connected,
   messages,
+  users,
   upload,
   onBack,
   onSend,
@@ -54,7 +59,9 @@ export function ChatView({
   const [draft, setDraft] = useState("");
   const [showGifs, setShowGifs] = useState(false);
   const [now, setNow] = useState(0);
+  const [flashTargetId, setFlashTargetId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wasNearBottom = useRef(true);
 
   useEffect(() => {
@@ -74,6 +81,14 @@ export function ChatView({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!draft.trim()) return;
+    const reaction = exactReactionShortcut(draft);
+    if (reaction) {
+      if (await onSendGif(reaction, replyTarget?.id)) {
+        setDraft("");
+        onReply(null);
+      }
+      return;
+    }
     if (await onSend(draft, replyTarget?.id)) {
       setDraft("");
       onReply(null);
@@ -81,10 +96,38 @@ export function ChatView({
   };
 
   const byId = useMemo(() => new Map(messages.map((message) => [message.id, message])), [messages]);
-  const sendGif = async (path: string) => {
+  const mentionQuery = trailingComposerQuery(draft, "@");
+  const reactionQuery = trailingComposerQuery(draft, ":");
+  const mentionSuggestions = useMemo(() => {
+    if (mentionQuery === null) return [];
+    const unique = new Map<string, PresenceUser>();
+    users.forEach((user) => {
+      if (user.username !== username) unique.set(user.username.toLowerCase(), user);
+    });
+    return [...unique.values()]
+      .filter((user) => user.username.toLowerCase().includes(mentionQuery.toLowerCase()))
+      .sort((left, right) => Number(right.connected) - Number(left.connected) || left.username.localeCompare(right.username))
+      .slice(0, 7);
+  }, [mentionQuery, username, users]);
+  const reactionSuggestions = useMemo(
+    () => reactionQuery === null ? [] : searchReactions(reactionQuery, 7),
+    [reactionQuery],
+  );
+
+  const focusComposer = () => window.requestAnimationFrame(() => textareaRef.current?.focus());
+  const insertComposerToken = (token: string) => {
+    setDraft((current) => replaceTrailingComposerToken(current, token));
+    focusComposer();
+  };
+  const sendGif = async (reaction: ReactionAsset) => {
+    if (!await onSendGif(reaction, replyTarget?.id)) return;
     setShowGifs(false);
-    await onSendGif(path, replyTarget?.id);
     onReply(null);
+  };
+  const focusMessage = (messageId: string) => {
+    document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    setFlashTargetId(messageId);
+    window.setTimeout(() => setFlashTargetId((current) => current === messageId ? null : current), 1_300);
   };
 
   return (
@@ -117,11 +160,29 @@ export function ChatView({
           </div>
         ) : messages.map((message) => {
           const original = message.replyToId ? byId.get(message.replyToId) : undefined;
+          const attention = !message.mine && (message.mentionsCurrentUser || message.repliesToCurrentUser);
+          const attentionLabel = message.mentionsCurrentUser && message.repliesToCurrentUser
+            ? "MENTIONED + REPLIED"
+            : message.repliesToCurrentUser ? "REPLIED TO YOU" : "MENTIONED YOU";
           return (
-            <article className={`message-row ${message.mine ? "is-mine" : ""}`} key={message.id} id={`message-${message.id}`}>
+            <article
+              className={`message-row ${message.mine ? "is-mine" : ""} ${attention ? "is-attention" : ""} ${flashTargetId === message.id ? "is-targeted" : ""}`}
+              key={message.id}
+              id={`message-${message.id}`}
+            >
               <div className="message-meta">
-                <span>{message.mine ? username : message.sender}</span>
+                {message.mine ? <span>{username}</span> : (
+                  <button type="button" className="message-author" onClick={() => insertComposerToken(`@${message.sender}`)}>
+                    {message.sender}
+                  </button>
+                )}
                 <time>{formatTime(message.createdAtMs)}</time>
+                {attention ? (
+                  <span className="attention-badge">
+                    {message.mentionsCurrentUser ? <AtSign size={11} /> : <MessageSquareReply size={11} />}
+                    {attentionLabel}
+                  </span>
+                ) : null}
               </div>
               <div className="message-line">
                 <div className="message-bubble">
@@ -129,14 +190,14 @@ export function ChatView({
                     <button
                       className="reply-preview"
                       type="button"
-                      onClick={() => document.getElementById(`message-${message.replyToId}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}
+                      onClick={() => message.replyToId && focusMessage(message.replyToId)}
                     >
                       <MessageSquareReply size={14} />
                       <span>{original ? `${original.sender}: ${original.content}` : "Original message unavailable"}</span>
                     </button>
                   ) : null}
                   {message.kind === "text" ? (
-                    <p>{message.content}</p>
+                    <MessageText content={message.content} currentUsername={username} />
                   ) : (
                     <AttachmentMessage
                       message={message}
@@ -171,18 +232,52 @@ export function ChatView({
             <IconButton label="Cancel reply" onClick={() => onReply(null)}><X size={17} /></IconButton>
           </div>
         ) : null}
-        {showGifs ? <GifPicker onClose={() => setShowGifs(false)} onSelect={(path) => void sendGif(path)} /> : null}
+        {showGifs ? <GifPicker onClose={() => setShowGifs(false)} onSelect={(reaction) => void sendGif(reaction)} /> : null}
+        {mentionSuggestions.length > 0 ? (
+          <div className="composer-suggestions" role="listbox" aria-label="Mention users">
+            {mentionSuggestions.map((user) => (
+              <button key={user.username} type="button" role="option" onClick={() => insertComposerToken(`@${user.username}`)}>
+                <AtSign size={14} />
+                <strong>{user.username}</strong>
+                <span className={user.connected ? "is-online" : ""}>{user.connected ? "ONLINE" : "OFFLINE"}</span>
+              </button>
+            ))}
+          </div>
+        ) : reactionSuggestions.length > 0 ? (
+          <div className="composer-suggestions reaction-suggestions" role="listbox" aria-label="Reaction shortcuts">
+            {reactionSuggestions.map((reaction) => (
+              <button key={reaction.shortcode} type="button" role="option" onClick={() => insertComposerToken(reaction.shortcode)}>
+                <img src={reaction.path} alt="" />
+                <code>{reaction.shortcode}</code>
+              </button>
+            ))}
+          </div>
+        ) : null}
         <form className="composer" onSubmit={submit}>
           <IconButton label="Attach file" disabled={!connected} onClick={onOpenAttachment}><Paperclip size={20} /></IconButton>
           <IconButton label="Send GIF" disabled={!connected || !room.allow_images} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>
           <textarea
+            ref={textareaRef}
             aria-label="Message"
             placeholder={connected ? "Message" : "Reconnecting"}
             rows={1}
             maxLength={8000}
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              setShowGifs(false);
+            }}
             onKeyDown={(event) => {
+              if (event.key === "Tab" && mentionSuggestions[0]) {
+                event.preventDefault();
+                insertComposerToken(`@${mentionSuggestions[0].username}`);
+                return;
+              }
+              if (event.key === "Tab" && reactionSuggestions[0]) {
+                event.preventDefault();
+                insertComposerToken(reactionSuggestions[0].shortcode);
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
@@ -199,6 +294,20 @@ export function ChatView({
 function AttachmentMessage({ message, onView, onExport }: { message: ChatMessage; onView: () => void; onExport: () => void }) {
   const attachment = message.attachment;
   if (!attachment) return null;
+  const reaction = reactionByShortcode(attachment.reactionShortcode);
+  if (reaction && !attachment.oneTime) {
+    return (
+      <div className="inline-reaction">
+        <button type="button" className="inline-reaction-preview" onClick={onView} aria-label={`Open ${reaction.shortcode}`}>
+          <img src={reaction.path} alt={reaction.label} />
+        </button>
+        <div className="inline-reaction-footer">
+          <code>{reaction.shortcode}</code>
+          <IconButton label="Save encrypted reaction" onClick={onExport}><ArrowDownToLine size={16} /></IconButton>
+        </div>
+      </div>
+    );
+  }
   const Icon = attachment.mediaType === "IMAGE" ? Image : attachment.mediaType === "VIDEO" ? Play : FileArchive;
   return (
     <div className="attachment-message">
@@ -211,6 +320,34 @@ function AttachmentMessage({ message, onView, onExport }: { message: ChatMessage
       {!attachment.oneTime ? <IconButton label="Save encrypted attachment" onClick={onExport}><ArrowDownToLine size={17} /></IconButton> : null}
     </div>
   );
+}
+
+function MessageText({ content, currentUsername }: { content: string; currentUsername: string }) {
+  return (
+    <p>
+      {splitMentionText(content).map((part, index) => part.username ? (
+        <span
+          className={`mention-token ${part.username.toLowerCase() === currentUsername.toLowerCase() ? "is-self" : ""}`}
+          key={`${part.text}-${index}`}
+        >
+          {part.text}
+        </span>
+      ) : part.text)}
+    </p>
+  );
+}
+
+function trailingComposerQuery(value: string, marker: "@" | ":"): string | null {
+  const pattern = marker === "@" ? /(?:^|\s)@([A-Za-z0-9_]*)$/ : /(?:^|\s):([A-Za-z0-9_]*)$/;
+  return value.match(pattern)?.[1] ?? null;
+}
+
+function replaceTrailingComposerToken(value: string, token: string): string {
+  const match = value.match(/(^|\s)[@:][A-Za-z0-9_]*$/);
+  if (match?.index !== undefined) {
+    return `${value.slice(0, match.index)}${match[1]}${token} `;
+  }
+  return `${value}${value && !/\s$/.test(value) ? " " : ""}${token} `;
 }
 
 function formatTime(timestamp: number): string {

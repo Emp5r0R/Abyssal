@@ -29,6 +29,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -87,6 +88,8 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -99,7 +102,9 @@ import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.ServerStatus
+import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.DeepBlack
@@ -125,6 +130,8 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
     val status by viewModel.serverStatus.collectAsState()
     val attachmentPreview by viewModel.attachmentPreview.collectAsState()
     val uploadProgress by viewModel.attachmentUploadProgress.collectAsState()
+    val currentUser by viewModel.currentUser.collectAsState()
+    val presence by viewModel.presence.collectAsState()
     val attachmentError = viewModel.attachmentError.value
     val currentSession = remember(sessions, sessionId) { sessions.find { it.id == sessionId } }
 
@@ -135,6 +142,8 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         attachmentPreview = attachmentPreview,
         uploadProgress = uploadProgress,
         attachmentError = attachmentError,
+        currentUsername = currentUser?.username,
+        presence = presence,
         onBack = { viewModel.navigateTo(Screen.Dashboard) },
         onSendMessage = viewModel::sendMessage,
         onSendAttachment = viewModel::sendAttachment,
@@ -156,9 +165,11 @@ private fun ChatContent(
     attachmentPreview: DecryptedAttachment?,
     uploadProgress: AttachmentUploadProgress,
     attachmentError: String?,
+    currentUsername: String?,
+    presence: List<UserPresence>,
     onBack: () -> Unit,
     onSendMessage: (String, Int, String?) -> Unit,
-    onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean, String?) -> Unit,
+    onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean, String?, String?) -> Unit,
     onMessageVisible: (String) -> Unit,
     onViewAttachment: (Message) -> Unit,
     onSaveAttachment: (Message, Uri) -> Unit,
@@ -178,10 +189,42 @@ private fun ChatContent(
     val messageListState = remember(session?.id) { LazyListState() }
     val inputFocusRequester = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
     val hapticFeedback = LocalHapticFeedback.current
     val messagesById = remember(messages) { messages.associateBy(Message::id) }
     val replyingToMessage = replyingToMessageId?.let(messagesById::get)
     val isConnected = status.state == "CONNECTED"
+    val bundledAssets = remember { context.listBundledEmojiAssets() }
+    val bundledByShortcode = remember(bundledAssets) {
+        bundledAssets.associateBy { it.shortcode.lowercase(Locale.ROOT) }
+    }
+    val composerToken = trailingComposerToken(textInput)
+    val reactionSuggestions = remember(composerToken, bundledAssets) {
+        composerToken
+            ?.takeIf { it.startsWith(":") }
+            ?.lowercase(Locale.ROOT)
+            ?.let { query -> bundledAssets.filter { it.shortcode.startsWith(query) }.take(6) }
+            ?: emptyList()
+    }
+    val mentionSuggestions = remember(composerToken, presence, currentUsername) {
+        val query = composerToken?.takeIf { it.startsWith("@") }?.drop(1).orEmpty()
+        if (composerToken?.startsWith("@") != true) {
+            emptyList()
+        } else {
+            presence
+                .asSequence()
+                .filterNot { it.username.equals(currentUsername, ignoreCase = true) }
+                .filter { it.username.contains(query, ignoreCase = true) }
+                .distinctBy { it.username.lowercase(Locale.ROOT) }
+                .sortedWith(
+                    compareByDescending<UserPresence> { it.connected }
+                        .thenBy { it.username.lowercase(Locale.ROOT) }
+                )
+                .take(6)
+                .map { it.username }
+                .toList()
+        }
+    }
 
     LaunchedEffect(replyingToMessageId, replyingToMessage) {
         if (replyingToMessageId != null && replyingToMessage == null) {
@@ -254,6 +297,11 @@ private fun ChatContent(
                                 hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
                                 replyingToMessageId = message.id
                             },
+                            currentUsername = currentUsername,
+                            onMentionSender = { sender ->
+                                textInput = appendMention(textInput, sender)
+                                inputFocusRequester.requestFocus()
+                            },
                             onOpenReply = { messageId ->
                                 messages.indexOfFirst { it.id == messageId }
                                     .takeIf { it >= 0 }
@@ -292,6 +340,19 @@ private fun ChatContent(
                 )
             }
 
+            ComposerSuggestions(
+                reactionSuggestions = reactionSuggestions,
+                mentionSuggestions = mentionSuggestions,
+                onReactionSelected = { asset ->
+                    textInput = replaceTrailingComposerToken(textInput, asset.shortcode)
+                    inputFocusRequester.requestFocus()
+                },
+                onMentionSelected = { username ->
+                    textInput = replaceTrailingComposerToken(textInput, "@$username")
+                    inputFocusRequester.requestFocus()
+                }
+            )
+
             ChatInputBar(
                 value = textInput,
                 onValueChange = {
@@ -303,9 +364,32 @@ private fun ChatContent(
                 onSend = {
                     val trimmed = textInput.trim()
                     if (trimmed.isNotEmpty()) {
-                        onSendMessage(trimmed, selectedTimerSec, replyingToMessageId)
-                        textInput = ""
-                        replyingToMessageId = null
+                        val reaction = bundledByShortcode[trimmed.lowercase(Locale.ROOT)]
+                        if (reaction == null) {
+                            onSendMessage(trimmed, selectedTimerSec, replyingToMessageId)
+                            textInput = ""
+                            replyingToMessageId = null
+                        } else {
+                            val replyTargetId = replyingToMessageId
+                            scope.launch {
+                                val payload = withContext(Dispatchers.IO) {
+                                    context.readBundledEmoji(reaction)
+                                } ?: return@launch
+                                onSendAttachment(
+                                    "IMAGE",
+                                    payload.fileName,
+                                    payload.mimeType,
+                                    payload.bytes,
+                                    selectedTimerSec,
+                                    false,
+                                    false,
+                                    replyTargetId,
+                                    payload.shortcode
+                                )
+                                textInput = ""
+                                replyingToMessageId = null
+                            }
+                        }
                     }
                 },
                 canSend = textInput.isNotBlank() && isConnected,
@@ -329,7 +413,8 @@ private fun ChatContent(
                         selectedTimerSec,
                         oneTime,
                         deleteAfterDownload,
-                        replyingToMessageId
+                        replyingToMessageId,
+                        null
                     )
                     replyingToMessageId = null
                     showAttachmentDialog = false
@@ -352,7 +437,8 @@ private fun ChatContent(
                         selectedTimerSec,
                         false,
                         false,
-                        replyingToMessageId
+                        replyingToMessageId,
+                        asset.shortcode
                     )
                     replyingToMessageId = null
                     showBundledGifDialog = false
@@ -673,6 +759,71 @@ private fun ChatInputBar(
 }
 
 @Composable
+private fun ComposerSuggestions(
+    reactionSuggestions: List<BundledEmojiAsset>,
+    mentionSuggestions: List<String>,
+    onReactionSelected: (BundledEmojiAsset) -> Unit,
+    onMentionSelected: (String) -> Unit
+) {
+    if (reactionSuggestions.isEmpty() && mentionSuggestions.isEmpty()) return
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(DeepBlue.copy(alpha = 0.82f))
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        reactionSuggestions.forEach { asset ->
+            GlassSurface(
+                modifier = Modifier
+                    .height(44.dp)
+                    .clickable { onReactionSelected(asset) },
+                borderColor = NeonGreen.copy(alpha = 0.28f),
+                backgroundColor = DeepBlack.copy(alpha = 0.52f)
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    BundledEmojiPreview(
+                        assetPath = asset.path,
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(RoundedCornerShape(5.dp))
+                    )
+                    Text(
+                        text = asset.shortcode,
+                        color = NeonGreen,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.padding(start = 7.dp)
+                    )
+                }
+            }
+        }
+        mentionSuggestions.forEach { username ->
+            GlassSurface(
+                modifier = Modifier
+                    .height(44.dp)
+                    .clickable { onMentionSelected(username) },
+                borderColor = SelfDestructAmber.copy(alpha = 0.3f),
+                backgroundColor = DeepBlack.copy(alpha = 0.52f)
+            ) {
+                Text(
+                    text = "@$username",
+                    color = SelfDestructAmber,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 13.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun AttachmentDialog(
     session: ChatSession?,
     selectedTimerSec: Int,
@@ -878,7 +1029,15 @@ private fun BundledGifDialog(
     onSend: (BundledEmojiPayload) -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val assets = remember { context.listBundledEmojiAssets() }
+    var query by remember { mutableStateOf("") }
+    val filteredAssets = remember(assets, query) {
+        val normalized = query.trim().lowercase(Locale.ROOT)
+        if (normalized.isEmpty()) assets else assets.filter {
+            it.label.contains(normalized) || it.shortcode.contains(normalized)
+        }
+    }
     val imagesOk = session?.allowImages != false
 
     MirageDialog(title = "GIFs", onDismiss = onDismiss) {
@@ -890,19 +1049,40 @@ private fun BundledGifDialog(
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
         } else {
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                placeholder = { Text("Search", color = SteelMuted) },
+                singleLine = true,
+                textStyle = TextStyle(color = PureWhite, fontSize = 14.sp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = NeonCyan,
+                    unfocusedBorderColor = GlassBorder,
+                    cursorColor = NeonCyan,
+                    focusedTextColor = PureWhite,
+                    unfocusedTextColor = PureWhite
+                ),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+            )
             LazyVerticalGrid(
-                columns = GridCells.Adaptive(72.dp),
+                columns = GridCells.Fixed(3),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(360.dp)
             ) {
-                items(assets, key = { it.path }) { asset ->
+                items(filteredAssets, key = { it.path }) { asset ->
                     BundledEmojiTile(
                         asset = asset,
                         onClick = {
-                            context.readBundledEmoji(asset)?.let(onSend)
+                            scope.launch {
+                                withContext(Dispatchers.IO) { context.readBundledEmoji(asset) }
+                                    ?.let(onSend)
+                            }
                         }
                     )
                 }
@@ -926,7 +1106,7 @@ private fun BundledEmojiTile(
 ) {
     GlassSurface(
         modifier = Modifier
-            .height(84.dp)
+            .height(106.dp)
             .clickable(onClick = onClick),
         borderColor = GlassBorder.copy(alpha = 0.42f),
         backgroundColor = Color.White.copy(alpha = 0.05f)
@@ -939,13 +1119,14 @@ private fun BundledEmojiTile(
             BundledEmojiPreview(
                 assetPath = asset.path,
                 modifier = Modifier
-                    .size(48.dp)
+                    .size(58.dp)
                     .clip(RoundedCornerShape(6.dp))
             )
             Text(
-                text = asset.label,
-                color = SteelMuted,
+                text = asset.shortcode,
+                color = NeonGreen,
                 fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 5.dp)
@@ -1006,13 +1187,16 @@ private fun MessageBubbleItem(
     message: Message,
     replyTarget: Message?,
     highlighted: Boolean,
+    currentUsername: String?,
     onBecomeVisible: () -> Unit,
     onReply: () -> Unit,
+    onMentionSender: (String) -> Unit,
     onOpenReply: (String) -> Unit,
     onViewAttachment: () -> Unit,
     onSaveAttachment: () -> Unit
 ) {
     val isMine = message.sender == "You"
+    val requiresAttention = !isMine && (message.mentionsCurrentUser || message.repliesToCurrentUser)
 
     LaunchedEffect(message.id) {
         onBecomeVisible()
@@ -1044,6 +1228,7 @@ private fun MessageBubbleItem(
     )
     val accent = when {
         expiringSoon -> SelfDestructAmber
+        requiresAttention -> SelfDestructAmber
         isMine -> NeonCyan
         else -> NeonGreen
     }
@@ -1058,7 +1243,9 @@ private fun MessageBubbleItem(
                 color = SteelMuted,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
+                modifier = Modifier
+                    .padding(start = 8.dp, bottom = 4.dp)
+                    .clickable(role = Role.Button) { onMentionSender(message.sender) }
             )
         }
 
@@ -1081,9 +1268,24 @@ private fun MessageBubbleItem(
                     modifier = Modifier
                         .fillMaxWidth(0.78f)
                         .alpha(alpha),
-                    borderColor = accent.copy(alpha = if (highlighted) 0.95f else 0.42f)
+                    borderColor = accent.copy(alpha = if (highlighted || requiresAttention) 0.95f else 0.42f),
+                    backgroundColor = if (requiresAttention) {
+                        SelfDestructAmber.copy(alpha = 0.1f)
+                    } else {
+                        com.abyssal.chat.theme.GlassCardBg
+                    }
                 ) {
                     Column(modifier = Modifier.padding(13.dp)) {
+                        if (requiresAttention) {
+                            Text(
+                                text = attentionLabel(message),
+                                color = SelfDestructAmber,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                            )
+                        }
                         if (message.replyToMessageId != null) {
                             MessageReplyReference(
                                 target = replyTarget,
@@ -1099,11 +1301,9 @@ private fun MessageBubbleItem(
                                 onSaveAttachment = onSaveAttachment
                             )
                         } else {
-                            Text(
-                                text = message.content,
-                                color = PureWhite,
-                                fontSize = 15.sp,
-                                lineHeight = 21.sp
+                            MessageText(
+                                content = message.content,
+                                currentUsername = currentUsername
                             )
                         }
 
@@ -1124,6 +1324,40 @@ private fun MessageBubbleItem(
             }
         }
     }
+}
+
+private fun attentionLabel(message: Message): String {
+    return when {
+        message.mentionsCurrentUser && message.repliesToCurrentUser -> "MENTIONED + REPLIED TO YOU"
+        message.mentionsCurrentUser -> "MENTIONED YOU"
+        else -> "REPLIED TO YOU"
+    }
+}
+
+@Composable
+private fun MessageText(content: String, currentUsername: String?) {
+    val styledContent = remember(content, currentUsername) {
+        buildAnnotatedString {
+            append(content)
+            MessageAttentionPolicy.mentionRanges(content, currentUsername).forEach { range ->
+                addStyle(
+                    style = SpanStyle(
+                        color = SelfDestructAmber,
+                        background = SelfDestructAmber.copy(alpha = 0.13f),
+                        fontWeight = FontWeight.Bold
+                    ),
+                    start = range.first,
+                    end = range.last + 1
+                )
+            }
+        }
+    }
+    Text(
+        text = styledContent,
+        color = PureWhite,
+        fontSize = 15.sp,
+        lineHeight = 21.sp
+    )
 }
 
 @Composable
@@ -1194,6 +1428,58 @@ private fun MediaMessageContent(
     onViewAttachment: () -> Unit,
     onSaveAttachment: () -> Unit
 ) {
+    val context = LocalContext.current
+    val reactionAsset = remember(message.reactionShortcode, message.attachmentName) {
+        val shortcode = message.reactionShortcode ?: return@remember null
+        context.listBundledEmojiAssets().firstOrNull { asset ->
+            asset.shortcode == shortcode && asset.fileName == message.attachmentName
+        }
+    }
+    if (reactionAsset != null) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(DeepBlack.copy(alpha = 0.42f))
+                .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
+                .padding(8.dp)
+        ) {
+            BundledEmojiPreview(
+                assetPath = reactionAsset.path,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(4f / 3f)
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(role = Role.Button, onClick = onViewAttachment)
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 7.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = reactionAsset.shortcode,
+                    color = NeonGreen,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
+                if (message.saveAllowed) {
+                    Text(
+                        text = "SAVE ENCRYPTED",
+                        color = SteelMuted,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable(role = Role.Button, onClick = onSaveAttachment)
+                    )
+                }
+            }
+        }
+        return
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1524,12 +1810,14 @@ private data class BundledEmojiAsset(
     val path: String = "$BUNDLED_EMOJI_ASSET_DIR/$fileName"
     val label: String = fileName.substringBeforeLast('.')
     val mimeType: String = if (fileName.endsWith(".gif", ignoreCase = true)) "image/gif" else "image/png"
+    val shortcode: String = MessageAttentionPolicy.shortcodeForFileName(fileName).orEmpty()
 }
 
 private data class BundledEmojiPayload(
     val fileName: String,
     val mimeType: String,
-    val bytes: ByteArray
+    val bytes: ByteArray,
+    val shortcode: String
 )
 
 private class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
@@ -1562,7 +1850,8 @@ private fun Context.readBundledEmoji(asset: BundledEmojiAsset): BundledEmojiPayl
         BundledEmojiPayload(
             fileName = asset.fileName,
             mimeType = asset.mimeType,
-            bytes = bytes
+            bytes = bytes,
+            shortcode = asset.shortcode
         )
     }.getOrNull()
 }
@@ -1621,6 +1910,22 @@ private fun encryptedExportName(name: String): String {
     return if (safeName.endsWith(".abyssal", ignoreCase = true)) safeName else "$safeName.abyssal"
 }
 
+private fun trailingComposerToken(value: String): String? {
+    val start = value.indexOfLast { it.isWhitespace() } + 1
+    val token = value.substring(start)
+    return token.takeIf { it.startsWith(":") || it.startsWith("@") }
+}
+
+private fun replaceTrailingComposerToken(value: String, replacement: String): String {
+    val start = value.indexOfLast { it.isWhitespace() } + 1
+    return value.substring(0, start) + replacement + " "
+}
+
+private fun appendMention(value: String, username: String): String {
+    val prefix = value.trimEnd()
+    return if (prefix.isEmpty()) "@$username " else "$prefix @$username "
+}
+
 private const val BUNDLED_EMOJI_ASSET_DIR = "abyssal_emojis"
 
 @Preview
@@ -1645,9 +1950,11 @@ private fun ChatContentPreview() {
         attachmentPreview = null,
         uploadProgress = AttachmentUploadProgress(),
         attachmentError = null,
+        currentUsername = "NebulaTiger93",
+        presence = listOf(UserPresence("SilentFox482", true)),
         onBack = {},
         onSendMessage = { _, _, _ -> },
-        onSendAttachment = { _, _, _, _, _, _, _, _ -> },
+        onSendAttachment = { _, _, _, _, _, _, _, _, _ -> },
         onMessageVisible = {},
         onViewAttachment = {},
         onSaveAttachment = { _, _ -> },
