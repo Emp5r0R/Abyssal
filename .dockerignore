@@ -4,6 +4,8 @@
 .idea
 .agents
 .codex
+README.local.md
+deploy/deploy.env
 node_modules
 **/node_modules
 target
@@ -19,4 +21,3 @@ apps/web/coverage
 .env
 .env.*
 !.env.example
-

@@ -7,6 +7,8 @@ import {
   mediaAllowed,
   readRetention,
 } from "../domain/messagePolicy";
+import { mentionsUsername, replyTargetsCurrentUser } from "../domain/messageAttention";
+import { reactionByShortcode } from "../domain/reactions";
 import type {
   AccountSession,
   AttachmentOptions,
@@ -43,6 +45,7 @@ interface AttachmentInput {
   file: File;
   options: AttachmentOptions;
   replyToId?: string;
+  reactionShortcode?: string;
 }
 
 interface UploadState extends UploadProgress {
@@ -71,6 +74,7 @@ export function useAbyssalSession() {
   const sessionRef = useRef<AccountSession | null>(null);
   const roomsRef = useRef<RoomRecord[]>([]);
   const activeRoomRef = useRef<string | null>(null);
+  const ownMessageIdsRef = useRef(new Set<string>());
 
   useEffect(() => {
     sessionRef.current = session;
@@ -104,6 +108,7 @@ export function useAbyssalSession() {
     setActiveRoomId(null);
     setRemainingSessionSec(0);
     setUpload(EMPTY_UPLOAD);
+    ownMessageIdsRef.current.clear();
     retainWhenHiddenRef.current = false;
     lastActivityRef.current = 0;
     lastActivitySignalRef.current = 0;
@@ -187,8 +192,10 @@ export function useAbyssalSession() {
         room,
         currentSession.username,
         frame.sender_username,
+        ownMessageIdsRef.current,
       );
       if (!message || isExpired(message, Date.now())) return;
+      if (message.mine) ownMessageIdsRef.current.add(message.id);
       if (activeRoomRef.current === frame.chat_id) {
         message.readAtMs = Date.now();
         socketRef.current?.send({ type: "read_receipt", chat_id: frame.chat_id, message_id: message.id });
@@ -299,15 +306,19 @@ export function useAbyssalSession() {
     const encrypted = await cipherRef.current.encryptText(JSON.stringify(messagePayload(message)));
     const accepted = socketRef.current?.send({ type: "message", chat_id: chatId, payload_b64: bytesToBase64(encrypted) }) ?? false;
     wipeBytes(encrypted);
-    if (accepted) setMessages((current) => appendUnique(current, message));
+    if (accepted) {
+      ownMessageIdsRef.current.add(message.id);
+      setMessages((current) => appendUnique(current, message));
+    }
     return accepted;
   }, [activeRoomId, connection, messages]);
 
-  const sendAttachment = useCallback(async ({ file, options, replyToId }: AttachmentInput): Promise<boolean> => {
+  const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
     const room = roomsRef.current.find((candidate) => candidate.id === chatId);
     const mediaType = classifyMedia(file);
+    const reaction = reactionByShortcode(reactionShortcode);
     if (
       !currentSession ||
       !chatId ||
@@ -315,7 +326,12 @@ export function useAbyssalSession() {
       connection !== "connected" ||
       file.size <= 0 ||
       file.size > MEDIA_LIMIT_BYTES[mediaType] ||
-      !mediaAllowed(room, mediaType)
+      !mediaAllowed(room, mediaType) ||
+      (reactionShortcode !== undefined && (
+        !reaction ||
+        reaction.filename !== file.name ||
+        reaction.mimeType !== file.type
+      ))
     ) {
       setNotice("Action unavailable.");
       return false;
@@ -359,12 +375,16 @@ export function useAbyssalSession() {
           sizeBytes: file.size,
           oneTime: options.oneTime,
           deleteAfterDownload: options.deleteAfterDownload || options.oneTime,
+          reactionShortcode: reaction?.shortcode,
         },
       };
       const metadata = await cipherRef.current.encryptText(JSON.stringify(messagePayload(message)));
       const accepted = socketRef.current?.send({ type: "message", chat_id: chatId, payload_b64: bytesToBase64(metadata) }) ?? false;
       wipeBytes(metadata);
-      if (accepted) setMessages((current) => appendUnique(current, message));
+      if (accepted) {
+        ownMessageIdsRef.current.add(message.id);
+        setMessages((current) => appendUnique(current, message));
+      }
       return accepted;
     } catch {
       setNotice("Action unavailable.");
@@ -483,6 +503,7 @@ function parsePayload(
   room: RoomRecord | undefined,
   currentUsername: string,
   authoritativeSender?: string,
+  ownMessageIds: ReadonlySet<string> = new Set(),
 ): ChatMessage | null {
   const kind = payload.kind;
   const id = cleanString(payload.id, 128);
@@ -507,6 +528,8 @@ function parsePayload(
       absoluteExpirySec: absoluteRetention(room),
       replyToId,
       mine: sender === currentUsername,
+      mentionsCurrentUser: sender !== currentUsername && mentionsUsername(content, currentUsername),
+      repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
     };
   }
 
@@ -514,6 +537,11 @@ function parsePayload(
   const mediaType = normalizeMediaType(payload.media_type);
   if (!attachmentId || !mediaType || !mediaAllowed(room, mediaType)) return null;
   const name = cleanString(payload.name, 160) || "attachment";
+  const mimeType = cleanString(payload.mime_type, 120) || "application/octet-stream";
+  const reaction = reactionByShortcode(cleanString(payload.reaction_shortcode, 80));
+  const reactionShortcode = reaction?.filename === name && reaction.mimeType === mimeType
+    ? reaction.shortcode
+    : undefined;
   return {
     id,
     chatId,
@@ -526,14 +554,16 @@ function parsePayload(
     absoluteExpirySec: absoluteRetention(room, mediaType),
     replyToId,
     mine: sender === currentUsername,
+    repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
     attachment: {
       id: attachmentId,
       name,
       mediaType,
-      mimeType: cleanString(payload.mime_type, 120) || "application/octet-stream",
+      mimeType,
       sizeBytes: safeNumber(payload.size_bytes, 0, MEDIA_LIMIT_BYTES[mediaType]),
       oneTime: payload.one_time === true,
       deleteAfterDownload: payload.delete_after_download === true || payload.one_time === true,
+      reactionShortcode,
     },
   };
 }
@@ -559,6 +589,7 @@ function messagePayload(message: ChatMessage): Record<string, unknown> {
     size_bytes: attachment?.sizeBytes,
     one_time: attachment?.oneTime,
     delete_after_download: attachment?.deleteAfterDownload,
+    reaction_shortcode: attachment?.reactionShortcode,
   };
 }
 

@@ -11,6 +11,7 @@ import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.ServerStatus
@@ -108,6 +109,7 @@ class ChatViewModel(
     private var sessionInactivityTimeoutSec = DEFAULT_SESSION_INACTIVITY_SEC
     private var externalSystemUiOpen = false
     private var lastRemoteActivitySignalMs = 0L
+    private val ownMessageIds = mutableSetOf<String>()
 
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -255,7 +257,10 @@ class ChatViewModel(
                 chatId,
                 payloadCipher.encrypt(textMetadata(message))
             )
-            if (accepted) messageRepository.saveMessage(chatId, message)
+            if (accepted) {
+                ownMessageIds += message.id
+                messageRepository.saveMessage(chatId, message)
+            }
         }
     }
 
@@ -267,7 +272,8 @@ class ChatViewModel(
         selfDestructSec: Int,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
-        replyToMessageId: String? = null
+        replyToMessageId: String? = null,
+        reactionShortcode: String? = null
     ) {
         val chatId = _activeChatId.value ?: return
         if (serverStatus.value.state != "CONNECTED") {
@@ -279,6 +285,13 @@ class ChatViewModel(
         if (bytes.isEmpty() || bytes.size > attachmentLimitBytes(mediaType) || !isMediaAllowed(chatId, mediaType)) {
             _attachmentError.value = "Wrong information."
             return
+        }
+        val safeReactionShortcode = reactionShortcode?.let {
+            MessageAttentionPolicy.validatedReactionShortcode(it, fileName, mimeType)
+                ?: run {
+                    _attachmentError.value = "Wrong information."
+                    return
+                }
         }
 
         viewModelScope.launch {
@@ -326,13 +339,15 @@ class ChatViewModel(
                 absoluteExpirySec = absoluteExpirySec,
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload,
-                replyToMessageId = validReplyTarget(replyToMessageId)
+                replyToMessageId = validReplyTarget(replyToMessageId),
+                reactionShortcode = safeReactionShortcode
             )
             val accepted = chatTransport.sendEncryptedPayload(
                 chatId,
                 payloadCipher.encrypt(attachmentMetadata(message))
             )
             if (accepted) {
+                ownMessageIds += message.id
                 messageSender.saveLocalAttachmentMessage(chatId, message)
             } else {
                 _attachmentError.value = "Wrong information."
@@ -611,6 +626,7 @@ class ChatViewModel(
         _attachmentPreview.value = null
         _attachmentError.value = null
         _attachmentUploadProgress.value = AttachmentUploadProgress()
+        ownMessageIds.clear()
         if (revokeRemote && remoteSession != null) {
             identityService.revokeSession(remoteSession)
         }
@@ -653,22 +669,37 @@ class ChatViewModel(
             ?: json?.optString("sender")?.takeIf { it.isNotBlank() }
             ?: "Remote node"
         if (sender == currentUser.value?.username) return null
+        val replyToMessageId = json?.replyToMessageId()
+        val repliesToCurrentUser = MessageAttentionPolicy.replyTargetsCurrentUser(
+            senderUsername = sender,
+            currentUsername = currentUser.value?.username,
+            replyToMessageId = replyToMessageId,
+            ownMessageIds = ownMessageIds
+        )
 
         if (json?.optString("kind") == "attachment") {
+            val fileName = json.optString("name", "attachment")
+            val mimeType = json.optString("mime_type", "application/octet-stream")
             return attachmentMessage(
                 messageId = json.optString("id").takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString(),
                 sender = sender,
                 receiver = if (chatId.startsWith("dm_")) "You" else null,
                 attachmentId = json.optString("attachment_id"),
                 mediaType = json.optString("media_type", "FILE"),
-                fileName = json.optString("name", "attachment"),
-                mimeType = json.optString("mime_type", "application/octet-stream"),
+                fileName = fileName,
+                mimeType = mimeType,
                 sizeBytes = json.optLong("size_bytes", 0L),
                 selfDestructSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10), json.optString("media_type", "FILE")),
                 absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, json.optString("media_type", "FILE")),
                 oneTimeView = json.optBoolean("one_time", false),
                 deleteAfterDownload = json.optBoolean("delete_after_download", false),
-                replyToMessageId = json.replyToMessageId()
+                replyToMessageId = replyToMessageId,
+                reactionShortcode = MessageAttentionPolicy.validatedReactionShortcode(
+                    json.optString("reaction_shortcode").takeIf { it.isNotBlank() },
+                    fileName,
+                    mimeType
+                ),
+                repliesToCurrentUser = repliesToCurrentUser
             )
         }
 
@@ -682,7 +713,12 @@ class ChatViewModel(
                 timestampMs = System.currentTimeMillis(),
                 selfDestructDurationSec = effectiveRetentionSec(chatId, json.optInt("self_destruct_sec", 10)),
                 absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null),
-                replyToMessageId = json.replyToMessageId()
+                replyToMessageId = replyToMessageId,
+                mentionsCurrentUser = MessageAttentionPolicy.mentionsUsername(
+                    content,
+                    currentUser.value?.username
+                ),
+                repliesToCurrentUser = repliesToCurrentUser
             )
         }
 
@@ -693,7 +729,11 @@ class ChatViewModel(
             content = decryptedContent,
             timestampMs = System.currentTimeMillis(),
             selfDestructDurationSec = effectiveRetentionSec(chatId, 10),
-            absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null)
+            absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, null),
+            mentionsCurrentUser = MessageAttentionPolicy.mentionsUsername(
+                decryptedContent,
+                currentUser.value?.username
+            )
         )
     }
 
@@ -751,7 +791,9 @@ class ChatViewModel(
         absoluteExpirySec: Int,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
-        replyToMessageId: String? = null
+        replyToMessageId: String? = null,
+        reactionShortcode: String? = null,
+        repliesToCurrentUser: Boolean = false
     ): Message {
         val safeName = fileName.ifBlank { "attachment" }
         return Message(
@@ -772,7 +814,9 @@ class ChatViewModel(
             saveAllowed = !oneTimeView,
             deleteAfterDownload = deleteAfterDownload,
             absoluteExpirySec = absoluteExpirySec,
-            replyToMessageId = replyToMessageId
+            replyToMessageId = replyToMessageId,
+            reactionShortcode = reactionShortcode,
+            repliesToCurrentUser = repliesToCurrentUser
         )
     }
 
@@ -790,6 +834,7 @@ class ChatViewModel(
             .put("absolute_expiry_sec", message.absoluteExpirySec)
             .put("one_time", message.oneTimeView)
             .put("delete_after_download", message.deleteAfterDownload)
+            .apply { message.reactionShortcode?.let { put("reaction_shortcode", it) } }
             .apply { message.replyToMessageId?.let { put("reply_to_id", it) } }
             .toString()
     }
@@ -815,6 +860,7 @@ class ChatViewModel(
     }
 
     override fun onCleared() {
+        ownMessageIds.clear()
         payloadCipher.clear()
         chatTransport.disconnect()
         super.onCleared()

@@ -67,6 +67,8 @@ export interface ChatMessage {
   absoluteExpirySec: number;
   replyToId?: string;
   mine: boolean;
+  mentionsCurrentUser?: boolean;
+  repliesToCurrentUser?: boolean;
   attachment?: {
     id: string;
     name: string;
@@ -75,6 +77,7 @@ export interface ChatMessage {
     sizeBytes: number;
     oneTime: boolean;
     deleteAfterDownload: boolean;
+    reactionShortcode?: string;
   };
 }
 

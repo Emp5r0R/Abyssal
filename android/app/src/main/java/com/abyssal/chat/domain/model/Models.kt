@@ -36,7 +36,10 @@ data class Message(
     val saveAllowed: Boolean = true,
     val deleteAfterDownload: Boolean = false,
     val absoluteExpirySec: Int = 0,
-    val replyToMessageId: String? = null
+    val replyToMessageId: String? = null,
+    val reactionShortcode: String? = null,
+    val mentionsCurrentUser: Boolean = false,
+    val repliesToCurrentUser: Boolean = false
 ) {
     val isExpired: Boolean
         get() {

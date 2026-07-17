@@ -2,6 +2,8 @@
 .agents/
 .codex/
 .vscode/
+/README.local.md
+/deploy/deploy.env
 *.swp
 *.swo
 

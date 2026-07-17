@@ -6,6 +6,7 @@ import { CreateRoomDialog } from "./components/CreateRoomDialog";
 import { Entrance } from "./components/Entrance";
 import { MediaViewer } from "./components/MediaViewer";
 import { CalculatorCover, PinSetup } from "./components/Privacy";
+import type { ReactionAsset } from "./domain/reactions";
 import type { ChatMessage } from "./domain/types";
 import { useAbyssalSession } from "./hooks/useAbyssalSession";
 
@@ -107,19 +108,20 @@ function SecureWorkspace({
   const session = abyssal.session;
   if (!session) return null;
 
-  const sendGif = async (path: string, replyToId?: string) => {
+  const sendGif = async (reaction: ReactionAsset, replyToId?: string): Promise<boolean> => {
     try {
-      const response = await fetch(path, { cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer" });
-      if (!response.ok) return;
+      const response = await fetch(reaction.path, { cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer" });
+      if (!response.ok) return false;
       const blob = await response.blob();
-      const name = path.split("/").at(-1) || "reaction.gif";
-      await abyssal.sendAttachment({
-        file: new File([blob], name, { type: "image/gif" }),
+      return await abyssal.sendAttachment({
+        file: new File([blob], reaction.filename, { type: reaction.mimeType }),
         options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
         replyToId,
+        reactionShortcode: reaction.shortcode,
       });
     } catch {
       // Same vague failure surface as other attachment operations.
+      return false;
     }
   };
 
@@ -154,6 +156,7 @@ function SecureWorkspace({
           username={session.username}
           connected={abyssal.connection === "connected"}
           messages={abyssal.messages[abyssal.activeRoom.id] ?? []}
+          users={abyssal.presence}
           upload={abyssal.upload}
           onBack={() => openRoom(null)}
           onSend={abyssal.sendText}

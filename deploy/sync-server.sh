@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ABYSSAL_SSH_HOST="${ABYSSAL_SSH_HOST:-ubuntu@161.118.195.126}"
-ABYSSAL_SSH_KEY="${ABYSSAL_SSH_KEY:-/home/Emp5r0R/Documents/ssh_key.key}"
-ABYSSAL_REMOTE_DIR="${ABYSSAL_REMOTE_DIR:-/home/ubuntu/abyssal}"
+source "$SCRIPT_DIR/remote-env.sh"
 
 rsync -az --delete --partial --human-readable --info=progress2,stats2 \
-  -e "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i $ABYSSAL_SSH_KEY" \
+  -e "ssh -o StrictHostKeyChecking=accept-new -i $ABYSSAL_SSH_KEY" \
   --rsync-path="mkdir -p '$ABYSSAL_REMOTE_DIR' && rsync" \
   --exclude '.git/' \
   --exclude '.gradle/' \
   --exclude '.idea/' \
+  --exclude 'README.local.md' \
+  --exclude 'deploy/deploy.env' \
   --exclude 'node_modules/' \
   --exclude 'target/' \
   --include '.env.example' \
