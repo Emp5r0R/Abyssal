@@ -13,6 +13,8 @@ rsync -az --delete --partial --human-readable --info=progress2,stats2 \
   --exclude '.git/' \
   --exclude '.gradle/' \
   --exclude '.idea/' \
+  --exclude 'node_modules/' \
+  --exclude 'target/' \
   --include '.env.example' \
   --exclude '.env' \
   --exclude '.env.*' \
@@ -20,6 +22,8 @@ rsync -az --delete --partial --human-readable --info=progress2,stats2 \
   --exclude 'android/app/build/' \
   --exclude 'android/build/' \
   --exclude 'build-outputs/' \
+  --exclude 'apps/web/dist/' \
+  --exclude 'apps/web/coverage/' \
   --exclude 'mirage-server/target/' \
   --exclude 'rust-core/target/' \
   "$ROOT_DIR/" \

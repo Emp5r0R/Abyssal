@@ -121,17 +121,21 @@ data class SessionSecurityState(
 
 data class IncomingTransportPayload(
     val chatId: String,
-    val payload: ByteArray
+    val payload: ByteArray,
+    val senderUsername: String? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is IncomingTransportPayload) return false
-        return chatId == other.chatId && payload.contentEquals(other.payload)
+        return chatId == other.chatId &&
+            senderUsername == other.senderUsername &&
+            payload.contentEquals(other.payload)
     }
 
     override fun hashCode(): Int {
         var result = chatId.hashCode()
         result = 31 * result + payload.contentHashCode()
+        result = 31 * result + (senderUsername?.hashCode() ?: 0)
         return result
     }
 }

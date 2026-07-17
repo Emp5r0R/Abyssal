@@ -190,7 +190,7 @@ impl InMemoryStore {
     /// Add a message to the in-memory store
     pub fn add_message(&self, chat_id: String, msg: Message) {
         let mut map = self.messages.lock().unwrap();
-        map.entry(chat_id).or_insert_with(Vec::new).push(msg);
+        map.entry(chat_id).or_default().push(msg);
     }
 
     /// Retrieve active messages for a chat

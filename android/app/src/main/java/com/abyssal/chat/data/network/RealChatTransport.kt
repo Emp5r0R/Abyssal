@@ -8,8 +8,6 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.INodeConfigService
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.Flow
@@ -50,9 +48,9 @@ class RealChatTransport(
         }
 
         _serverStatus.value = ServerStatus("CONNECTING", session.nodeId, 0)
-        val token = URLEncoder.encode(session.token, StandardCharsets.UTF_8.name())
         val request = Request.Builder()
-            .url("${session.endpoint.wsBaseUrl}/v1/ws?token=$token")
+            .url("${session.endpoint.wsBaseUrl}/v1/ws")
+            .header("Sec-WebSocket-Protocol", "abyssal-v1, bearer.${session.token}")
             .build()
 
         webSocket = client.newWebSocket(request, listener(session.nodeId))
@@ -155,7 +153,8 @@ class RealChatTransport(
                         "message" -> {
                             val chatId = json.optString("chat_id").takeIf { it.isNotBlank() } ?: return
                             val payload = Base64.decode(json.optString("payload_b64"), Base64.NO_WRAP)
-                            _incomingPayloads.tryEmit(IncomingTransportPayload(chatId, payload))
+                            val senderUsername = json.optString("sender_username").takeIf { it.isNotBlank() }
+                            _incomingPayloads.tryEmit(IncomingTransportPayload(chatId, payload, senderUsername))
                         }
                         "presence" -> {
                             val users = json.optJSONArray("users") ?: return

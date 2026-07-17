@@ -1,7 +1,8 @@
 services:
   mirage-server:
     build:
-      context: ../mirage-server
+      context: ..
+      dockerfile: mirage-server/Dockerfile
     image: mirage-server:latest
     restart: unless-stopped
     env_file:

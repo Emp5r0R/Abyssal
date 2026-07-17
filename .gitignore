@@ -26,6 +26,13 @@ gradle-temp/
 target/
 **/target/
 
+# Web workspace outputs
+node_modules/
+**/node_modules/
+apps/web/dist/
+apps/web/coverage/
+*.tsbuildinfo
+
 # Generated app artifacts
 build-outputs/
 *.apk

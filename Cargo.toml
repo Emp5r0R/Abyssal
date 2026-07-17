@@ -1,0 +1,4 @@
+[workspace]
+members = ["mirage-server", "rust-core"]
+resolver = "2"
+
