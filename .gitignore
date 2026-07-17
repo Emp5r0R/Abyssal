@@ -9,6 +9,7 @@
 
 # Gradle and Android build state
 .gradle/
+.gradle-local/
 build/
 android/.gradle/
 android/local.properties
