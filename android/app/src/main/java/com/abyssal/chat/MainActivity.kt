@@ -1,6 +1,7 @@
 package com.abyssal.chat
 
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -19,7 +20,6 @@ import com.abyssal.chat.presentation.screens.ChatScreen
 import com.abyssal.chat.presentation.screens.DashboardScreen
 import com.abyssal.chat.presentation.screens.EntranceScreen
 import com.abyssal.chat.presentation.screens.CalculatorScreen
-import com.abyssal.chat.presentation.viewmodel.AbyssalViewModelFactory
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.AbyssalTheme
@@ -37,9 +37,10 @@ class MainActivity : ComponentActivity() {
             WindowManager.LayoutParams.FLAG_SECURE
         )
 
+        val abyssalApplication = application as AbyssalApplication
         viewModel = ViewModelProvider(
-            this,
-            AbyssalViewModelFactory(applicationContext)
+            abyssalApplication,
+            abyssalApplication.viewModelFactory
         )[ChatViewModel::class.java]
 
         setContent {
@@ -75,12 +76,24 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        viewModel.lockForLifecycleExit()
+        if (!isChangingConfigurations) viewModel.lockForLifecycleExit()
         super.onPause()
     }
 
     override fun onStop() {
-        viewModel.lockForLifecycleExit()
+        if (!isChangingConfigurations) viewModel.lockForLifecycleExit()
         super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.onHostResumed()
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            viewModel.recordUserActivity()
+        }
+        return super.dispatchTouchEvent(event)
     }
 }

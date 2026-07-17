@@ -229,6 +229,107 @@ fun CloseIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
 }
 
 @Composable
+fun EyeIcon(
+    modifier: Modifier = Modifier,
+    color: Color = SteelMuted,
+    crossedOut: Boolean = false
+) {
+    Canvas(modifier = modifier) {
+        val eye = Path().apply {
+            moveTo(size.width * 0.08f, size.height * 0.5f)
+            cubicTo(
+                size.width * 0.28f,
+                size.height * 0.16f,
+                size.width * 0.72f,
+                size.height * 0.16f,
+                size.width * 0.92f,
+                size.height * 0.5f
+            )
+            cubicTo(
+                size.width * 0.72f,
+                size.height * 0.84f,
+                size.width * 0.28f,
+                size.height * 0.84f,
+                size.width * 0.08f,
+                size.height * 0.5f
+            )
+            close()
+        }
+        drawPath(eye, color = color, style = Stroke(width = 1.7.dp.toPx()))
+        drawCircle(
+            color = color,
+            radius = size.minDimension * 0.14f,
+            center = Offset(size.width / 2f, size.height / 2f),
+            style = Stroke(width = 1.7.dp.toPx())
+        )
+        if (crossedOut) {
+            drawLine(
+                color = color,
+                start = Offset(size.width * 0.12f, size.height * 0.12f),
+                end = Offset(size.width * 0.88f, size.height * 0.88f),
+                strokeWidth = 1.9.dp.toPx()
+            )
+        }
+    }
+}
+
+@Composable
+fun PlusIcon(modifier: Modifier = Modifier, color: Color = DeepBlack) {
+    Canvas(modifier = modifier) {
+        drawLine(
+            color = color,
+            start = Offset(size.width / 2f, size.height * 0.18f),
+            end = Offset(size.width / 2f, size.height * 0.82f),
+            strokeWidth = 2.dp.toPx()
+        )
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.18f, size.height / 2f),
+            end = Offset(size.width * 0.82f, size.height / 2f),
+            strokeWidth = 2.dp.toPx()
+        )
+    }
+}
+
+@Composable
+fun DeleteIcon(modifier: Modifier = Modifier, color: Color = SelfDestructAmber) {
+    Canvas(modifier = modifier) {
+        val stroke = 1.7.dp.toPx()
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(size.width * 0.24f, size.height * 0.30f),
+            size = Size(size.width * 0.52f, size.height * 0.58f),
+            cornerRadius = CornerRadius(2.dp.toPx()),
+            style = Stroke(width = stroke)
+        )
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.16f, size.height * 0.24f),
+            end = Offset(size.width * 0.84f, size.height * 0.24f),
+            strokeWidth = stroke
+        )
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.38f, size.height * 0.12f),
+            end = Offset(size.width * 0.62f, size.height * 0.12f),
+            strokeWidth = stroke
+        )
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.42f, size.height * 0.40f),
+            end = Offset(size.width * 0.42f, size.height * 0.76f),
+            strokeWidth = stroke
+        )
+        drawLine(
+            color = color,
+            start = Offset(size.width * 0.58f, size.height * 0.40f),
+            end = Offset(size.width * 0.58f, size.height * 0.76f),
+            strokeWidth = stroke
+        )
+    }
+}
+
+@Composable
 fun SettingsIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
     Canvas(modifier = modifier) {
         val r = size.minDimension / 2

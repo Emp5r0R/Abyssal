@@ -14,9 +14,10 @@ RestartSec=3
 Environment=ABYSSAL_BIND_ADDR=0.0.0.0:4020
 Environment=ABYSSAL_NODE_ID=oracle-ampere-1
 Environment=ABYSSAL_CODE_COUNT=8
-Environment=ABYSSAL_ADMIN_CODE_COUNT=1
 Environment=ABYSSAL_CODE_MIN_LEN=12
 Environment=ABYSSAL_CODE_MAX_LEN=20
+Environment=ABYSSAL_MAX_ROOMS_PER_USER=5
+Environment=ABYSSAL_SESSION_INACTIVITY_MINUTES=15
 Environment=RUST_LOG=mirage_server=info,tower_http=info
 NoNewPrivileges=true
 PrivateTmp=true

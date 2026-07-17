@@ -2,8 +2,7 @@ package com.abyssal.chat.domain.model
 
 data class User(
     val username: String,
-    val publicKey: ByteArray,
-    val isAdmin: Boolean = false
+    val publicKey: ByteArray
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -78,7 +77,8 @@ data class ChatSession(
     val enforceVideoAbsoluteExpiry: Boolean = false,
     val fileReadTimerSec: Int = 5,
     val fileOverallExpirySec: Int = 0,
-    val enforceFileAbsoluteExpiry: Boolean = false
+    val enforceFileAbsoluteExpiry: Boolean = false,
+    val ownerUsername: String? = null
 )
 
 data class ServerStatus(
@@ -98,7 +98,7 @@ data class NodeSession(
     val endpoint: NodeEndpoint,
     val token: String,
     val nodeId: String,
-    val isAdmin: Boolean
+    val maxRoomsPerUser: Int
 )
 
 data class IdentityValidationResult(
@@ -107,8 +107,16 @@ data class IdentityValidationResult(
     val token: String? = null,
     val nodeId: String? = null,
     val username: String? = null,
-    val isAdmin: Boolean = false,
+    val maxRoomsPerUser: Int = 5,
+    val sessionInactivitySec: Int = 15 * 60,
     val error: String? = null
+)
+
+data class SessionSecurityState(
+    val active: Boolean = false,
+    val retainedInBackground: Boolean = false,
+    val inactivityTimeoutSec: Int = 15 * 60,
+    val remainingSec: Int = 0
 )
 
 data class IncomingTransportPayload(

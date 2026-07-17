@@ -4,10 +4,12 @@ Abyssal is an Android-first ephemeral chat prototype with a RAM-only Rust relay.
 
 ## Storage Policy
 
-- Android keeps account sessions, node URLs, chat sessions, message buffers, camouflage state, passwords, and encryption material in process memory only.
-- Pausing/stopping the Android activity locks to the calculator cover when camouflage is enabled. Process death, explicit logout, wipe, or relay restart clears RAM-only session state and returns to account entry.
-- The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe when the current session has admin rights.
-- The relay stores generated codes, accounts, password hashes, sessions, rooms, clients, presence, and pending encrypted frames in RAM only. Restarting the relay, admin wipe, or dead-man wipe clears all relay account and chat state.
+- Android keeps account sessions, node URLs, chat sessions, message buffers, camouflage secrets, passwords, and encryption material out of app-owned persistent storage. Authenticated state lives only in the application process.
+- `Remember this session` keeps that RAM-only session alive across activity pause, stop, and activity recreation while the Android process remains alive. With calculator camouflage enabled, leaving the app shows the calculator cover without logging out. When unchecked, leaving the foreground ends the session.
+- Every authenticated session has a strict node-provided inactivity deadline. User interaction refreshes it; background time and time spent behind the calculator cover do not. Expiry clears local RAM state, disconnects transport, and requires account entry again. Process death, explicit logout, wipe, or relay restart also clears session state.
+- Explicit logout and client-side expiry also make a best-effort relay call to revoke the bearer token immediately. The relay independently rejects expired tokens and closes idle WebSockets, so client enforcement is not the only boundary.
+- The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe.
+- The relay stores generated codes, accounts, password hashes, sessions, rooms, clients, presence, and pending encrypted frames in RAM only. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
 - Files, images, and videos may only be written to disk through an explicit user save/export flow. Android saves attachments as `.abyssal` encrypted export blobs using Android Keystore AES-GCM, preferring StrongBox when the device supports it.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
 - Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
@@ -36,6 +38,7 @@ At the entrance screen enter:
 - Node URL, for example `https://chat.example.com` or `http://SERVER_IP:4020`.
 - Code printed by the relay process at startup.
 - Password. Creating an account consumes the code; later logins use the same code and password while the relay process is still alive.
+- `Remember this session` is optional and never stores the code, password, URL, or token on disk. It only changes lifecycle behavior for the current process.
 
 For an Android emulator talking to a server on the development machine, use `http://10.0.2.2:4020`.
 
@@ -56,8 +59,9 @@ cd mirage-server
 ABYSSAL_BIND_ADDR=0.0.0.0:4020 \
 ABYSSAL_NODE_ID=oracle-ampere-1 \
 ABYSSAL_CODE_COUNT=8 \
-ABYSSAL_ADMIN_CODE_COUNT=1 \
 ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
+ABYSSAL_MAX_ROOMS_PER_USER=5 \
+ABYSSAL_SESSION_INACTIVITY_MINUTES=15 \
 ABYSSAL_INACTIVITY_LIMIT_HOURS=0 \
 cargo run --release
 ```
@@ -68,11 +72,15 @@ Health check:
 curl http://127.0.0.1:4020/health
 ```
 
-The server prints generated user/admin codes to stdout during boot. Each code has a random variable length of at least 12 characters including dashes, can create exactly one RAM-only account, and is never written to disk by the relay.
+The server prints generated access codes to stdout during boot. Each code has a random variable length of at least 12 characters including dashes, can create exactly one RAM-only account, and is never written to disk by the relay. There are no administrator roles or privileged codes.
+
+Every authenticated user can create rooms and trigger a relay RAM wipe. Rooms are owned by their creator: only that account can update or delete them. `ABYSSAL_MAX_ROOMS_PER_USER` limits each account's active rooms, and deleting an owned room releases one slot.
 
 Security-related relay knobs:
 
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
+- `ABYSSAL_MAX_ROOMS_PER_USER`: active room quota for each account. Default: `5`; accepted range: `1` to `100`.
+- `ABYSSAL_SESSION_INACTIVITY_MINUTES`: strict bearer-token and WebSocket inactivity limit. Default: `15`; accepted range: `1` to `1440`. The Android client displays the node policy and enforces the same deadline locally.
 - `ABYSSAL_INACTIVITY_LIMIT_HOURS`: dead-man switch. `0` disables it. A positive value wipes relay RAM state and broadcasts `GLOBAL_WIPE` after that many idle hours.
 
 The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
