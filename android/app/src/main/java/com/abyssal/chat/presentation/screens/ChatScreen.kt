@@ -143,7 +143,8 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         onSaveAttachment = viewModel::saveAttachment,
         onDismissAttachmentPreview = viewModel::dismissAttachmentPreview,
         onExternalSystemUiStart = viewModel::beginExternalSystemUi,
-        onExternalSystemUiEnd = viewModel::endExternalSystemUi
+        onExternalSystemUiEnd = viewModel::endExternalSystemUi,
+        onUserActivity = viewModel::recordUserActivity
     )
 }
 
@@ -163,7 +164,8 @@ private fun ChatContent(
     onSaveAttachment: (Message, Uri) -> Unit,
     onDismissAttachmentPreview: () -> Unit,
     onExternalSystemUiStart: () -> Unit,
-    onExternalSystemUiEnd: () -> Unit
+    onExternalSystemUiEnd: () -> Unit,
+    onUserActivity: () -> Unit
 ) {
     var textInput by remember { mutableStateOf("") }
     var selectedTimerSec by remember(session) { mutableIntStateOf(session?.selfDestructTimerSec ?: 5) }
@@ -292,7 +294,10 @@ private fun ChatContent(
 
             ChatInputBar(
                 value = textInput,
-                onValueChange = { textInput = it },
+                onValueChange = {
+                    textInput = it
+                    onUserActivity()
+                },
                 onAttach = { showAttachmentDialog = true },
                 onGif = { showBundledGifDialog = true },
                 onSend = {
@@ -1648,6 +1653,7 @@ private fun ChatContentPreview() {
         onSaveAttachment = { _, _ -> },
         onDismissAttachmentPreview = {},
         onExternalSystemUiStart = {},
-        onExternalSystemUiEnd = {}
+        onExternalSystemUiEnd = {},
+        onUserActivity = {}
     )
 }

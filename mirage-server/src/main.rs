@@ -44,30 +44,26 @@ const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
 struct AppState {
     node_id: String,
     attachment_ram_limit_bytes: usize,
+    max_rooms_per_user: usize,
+    session_inactivity_ms: u64,
     inactivity_limit_ms: Option<u64>,
     last_activity_ms: Arc<Mutex<u64>>,
     account_ops: Arc<Mutex<()>>,
-    available_codes: Arc<Mutex<HashMap<String, CodeGrant>>>,
+    available_codes: Arc<Mutex<HashSet<String>>>,
     accounts: Arc<Mutex<HashMap<String, Account>>>,
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
-    room_catalog: Arc<Mutex<HashMap<String, RoomRecord>>>,
+    room_catalog: Arc<Mutex<HashMap<String, RoomEntry>>>,
     pending: Arc<Mutex<HashMap<String, Vec<OutboundFrame>>>>,
     attachments: Arc<Mutex<HashMap<Uuid, AttachmentRecord>>>,
-}
-
-#[derive(Clone)]
-struct CodeGrant {
-    admin: bool,
 }
 
 #[derive(Clone)]
 struct Account {
     username: String,
     password_hash: String,
-    admin: bool,
     connected: bool,
 }
 
@@ -75,14 +71,20 @@ struct Account {
 struct AuthSession {
     code: String,
     username: String,
-    admin: bool,
+    last_activity_ms: u64,
 }
 
 #[derive(Clone)]
 struct ClientHandle {
     code: String,
-    admin: bool,
+    username: String,
     tx: mpsc::UnboundedSender<Message>,
+}
+
+#[derive(Clone)]
+struct RoomEntry {
+    room: RoomRecord,
+    owner_code: String,
 }
 
 #[derive(Clone)]
@@ -104,6 +106,8 @@ struct AttachmentRecord {
 struct RoomRecord {
     id: String,
     name: String,
+    #[serde(default)]
+    owner_username: String,
     self_destruct_timer_sec: u64,
     overall_expiry_sec: u64,
     allow_images: bool,
@@ -143,7 +147,8 @@ struct AccountResponse {
     token: Option<String>,
     node_id: String,
     username: Option<String>,
-    admin: bool,
+    max_rooms_per_user: usize,
+    session_inactivity_sec: u64,
     error: Option<String>,
 }
 
@@ -154,6 +159,8 @@ struct HealthResponse {
     storage: &'static str,
     available_codes: usize,
     accounts: usize,
+    max_rooms_per_user: usize,
+    session_inactivity_sec: u64,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +171,8 @@ struct WsQuery {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum InboundFrame {
+    #[serde(rename = "activity")]
+    Activity,
     #[serde(rename = "join")]
     Join { chat_id: String },
     #[serde(rename = "leave")]
@@ -234,6 +243,7 @@ async fn main() {
     let state = AppState::from_env();
     state.print_boot_codes().await;
     tokio::spawn(attachment_sweeper(state.clone()));
+    tokio::spawn(session_sweeper(state.clone()));
     if state.inactivity_limit_ms.is_some() {
         tokio::spawn(inactivity_watcher(state.clone()));
     }
@@ -250,6 +260,7 @@ async fn main() {
         .route("/v1/account/create", post(create_account))
         .route("/v1/account/login", post(login_account))
         .route("/v1/account/enter", post(enter_account))
+        .route("/v1/account/logout", post(logout_account))
         .route("/v1/attachment", post(upload_attachment))
         .route("/v1/attachment/:id", get(download_attachment))
         .route("/v1/invite/validate", post(login_account))
@@ -273,15 +284,17 @@ impl AppState {
             .unwrap_or_else(|_| format!("abyssal-{}", Uuid::new_v4().simple()));
 
         let user_count = read_usize_env("ABYSSAL_CODE_COUNT", 5);
-        let admin_count = read_usize_env("ABYSSAL_ADMIN_CODE_COUNT", 1);
         let min_len = read_usize_env("ABYSSAL_CODE_MIN_LEN", 12).max(12);
-        let requested_max_len =
-            read_usize_env("ABYSSAL_CODE_MAX_LEN", min_len + user_count + admin_count);
-        let max_len = requested_max_len.max(min_len + user_count + admin_count);
-        let mut available_codes = HashMap::new();
+        let requested_max_len = read_usize_env("ABYSSAL_CODE_MAX_LEN", min_len + user_count);
+        let max_len = requested_max_len.max(min_len + user_count);
+        let mut available_codes = HashSet::new();
         let mut generated_lengths = HashSet::new();
         let attachment_ram_limit_bytes =
             read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512).saturating_mul(1024 * 1024);
+        let max_rooms_per_user = read_usize_env("ABYSSAL_MAX_ROOMS_PER_USER", 5).clamp(1, 100);
+        let session_inactivity_minutes =
+            read_usize_env("ABYSSAL_SESSION_INACTIVITY_MINUTES", 15).clamp(1, 24 * 60);
+        let session_inactivity_ms = session_inactivity_minutes.saturating_mul(60 * 1000) as u64;
         let inactivity_limit_ms = read_usize_env("ABYSSAL_INACTIVITY_LIMIT_HOURS", 0)
             .checked_mul(60 * 60 * 1000)
             .filter(|limit| *limit > 0)
@@ -291,29 +304,13 @@ impl AppState {
             .into_iter()
             .chain(parse_codes_from_env("MIRAGE_INVITE_CODES"))
         {
-            available_codes.insert(code, CodeGrant { admin: false });
-        }
-
-        for code in parse_codes_from_env("ABYSSAL_ADMIN_CODES")
-            .into_iter()
-            .chain(parse_codes_from_env("MIRAGE_ADMIN_CODES"))
-        {
-            available_codes.insert(code, CodeGrant { admin: true });
+            available_codes.insert(code);
         }
 
         generate_codes(
             &mut available_codes,
             &mut generated_lengths,
             user_count,
-            false,
-            min_len,
-            max_len,
-        );
-        generate_codes(
-            &mut available_codes,
-            &mut generated_lengths,
-            admin_count,
-            true,
             min_len,
             max_len,
         );
@@ -321,6 +318,8 @@ impl AppState {
         Self {
             node_id,
             attachment_ram_limit_bytes,
+            max_rooms_per_user,
+            session_inactivity_ms,
             inactivity_limit_ms,
             last_activity_ms: Arc::new(Mutex::new(now_ms())),
             account_ops: Arc::new(Mutex::new(())),
@@ -339,13 +338,20 @@ impl AppState {
     async fn print_boot_codes(&self) {
         let codes = self.available_codes.lock().await;
         info!("ABYSSAL RAM-ONLY ACCESS CODES - copy these now; they are not written to disk");
-        for (code, grant) in codes.iter() {
-            let role = if grant.admin { "admin" } else { "user" };
-            info!("ABYSSAL_CODE role={role} code={code}");
+        for code in codes.iter() {
+            info!("ABYSSAL_CODE code={code}");
         }
         info!(
             "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
             self.attachment_ram_limit_bytes
+        );
+        info!(
+            "ABYSSAL_ROOM_LIMIT max_rooms_per_user={}",
+            self.max_rooms_per_user
+        );
+        info!(
+            "ABYSSAL_SESSION_INACTIVITY inactivity_limit_ms={}",
+            self.session_inactivity_ms
         );
         if let Some(limit_ms) = self.inactivity_limit_ms {
             info!("ABYSSAL_DEAD_MAN_SWITCH inactivity_limit_ms={limit_ms}");
@@ -376,10 +382,9 @@ fn parse_codes_from_env(key: &str) -> Vec<String> {
 }
 
 fn generate_codes(
-    codes: &mut HashMap<String, CodeGrant>,
+    codes: &mut HashSet<String>,
     generated_lengths: &mut HashSet<usize>,
     count: usize,
-    admin: bool,
     min_len: usize,
     max_len: usize,
 ) {
@@ -388,8 +393,7 @@ fn generate_codes(
         loop {
             let len = next_unique_length(&mut rng, generated_lengths, min_len, max_len);
             let code = generate_code(&mut rng, len);
-            if !codes.contains_key(&code) {
-                codes.insert(code, CodeGrant { admin });
+            if codes.insert(code) {
                 break;
             }
         }
@@ -519,6 +523,28 @@ fn random_username() -> String {
     format!("{prefix}{suffix}{number}")
 }
 
+fn random_unique_username(accounts: &HashMap<String, Account>) -> String {
+    for _ in 0..128 {
+        let candidate = random_username();
+        if accounts
+            .values()
+            .all(|account| account.username != candidate)
+        {
+            return candidate;
+        }
+    }
+
+    loop {
+        let candidate = format!("Abyssal{}", Uuid::new_v4().simple());
+        if accounts
+            .values()
+            .all(|account| account.username != candidate)
+        {
+            return candidate;
+        }
+    }
+}
+
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
@@ -526,6 +552,8 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         storage: "ram-only",
         available_codes: state.available_codes.lock().await.len(),
         accounts: state.accounts.lock().await.len(),
+        max_rooms_per_user: state.max_rooms_per_user,
+        session_inactivity_sec: state.session_inactivity_ms / 1000,
     })
 }
 
@@ -541,11 +569,50 @@ async fn prune_expired_attachments(state: &AppState) {
     let now = now_ms();
     let mut attachments = state.attachments.lock().await;
     let before = attachments.len();
-    attachments.retain(|_, record| !record.expires_at_ms.is_some_and(|expires| now >= expires));
+    attachments.retain(|_, record| record.expires_at_ms.is_none_or(|expires| now < expires));
     let removed = before.saturating_sub(attachments.len());
     if removed > 0 {
         info!("expired_attachments_removed count={removed}");
     }
+}
+
+async fn session_sweeper(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let now = now_ms();
+        let mut sessions = state.sessions.lock().await;
+        let before = sessions.len();
+        sessions
+            .retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
+        let removed = before.saturating_sub(sessions.len());
+        if removed > 0 {
+            info!("expired_sessions_removed count={removed}");
+        }
+    }
+}
+
+fn session_is_expired(session: &AuthSession, now: u64, inactivity_limit_ms: u64) -> bool {
+    now.saturating_sub(session.last_activity_ms) >= inactivity_limit_ms
+}
+
+async fn active_session(state: &AppState, token: &str, touch: bool) -> Option<AuthSession> {
+    let now = now_ms();
+    let mut sessions = state.sessions.lock().await;
+    let expired = sessions
+        .get(token)
+        .is_some_and(|session| session_is_expired(session, now, state.session_inactivity_ms));
+    if expired {
+        sessions.remove(token);
+        return None;
+    }
+
+    let session = sessions.get_mut(token)?;
+    if touch {
+        session.last_activity_ms = now;
+    }
+    Some(session.clone())
 }
 
 fn normalize_media_type(media_type: Option<&str>) -> String {
@@ -620,56 +687,53 @@ async fn create_account(
         return account_error(StatusCode::BAD_REQUEST, &state, error).await;
     }
 
-    let grant = match state.available_codes.lock().await.remove(&code) {
-        Some(grant) => grant,
-        None => {
-            if state.accounts.lock().await.contains_key(&code) {
-                warn!(
-                    "account_create_rejected {} reason=already_created",
-                    code_log_label(&code)
-                );
-                return account_error(
-                    StatusCode::CONFLICT,
-                    &state,
-                    "Code already has an account. Use login.".to_string(),
-                )
-                .await;
-            }
+    if !state.available_codes.lock().await.remove(&code) {
+        if state.accounts.lock().await.contains_key(&code) {
             warn!(
-                "account_create_rejected {} reason=unknown_code",
+                "account_create_rejected {} reason=already_created",
                 code_log_label(&code)
             );
             return account_error(
-                StatusCode::UNAUTHORIZED,
+                StatusCode::CONFLICT,
                 &state,
-                "Code rejected.".to_string(),
+                "Code already has an account. Use login.".to_string(),
             )
             .await;
         }
-    };
+        warn!(
+            "account_create_rejected {} reason=unknown_code",
+            code_log_label(&code)
+        );
+        return account_error(
+            StatusCode::UNAUTHORIZED,
+            &state,
+            "Code rejected.".to_string(),
+        )
+        .await;
+    }
 
     let password_hash = match hash_password(&request.password) {
         Ok(hash) => hash,
         Err(error) => return account_error(StatusCode::INTERNAL_SERVER_ERROR, &state, error).await,
     };
-    let username = random_username();
-    state.accounts.lock().await.insert(
+    let mut accounts = state.accounts.lock().await;
+    let username = random_unique_username(&accounts);
+    accounts.insert(
         code.clone(),
         Account {
             username: username.clone(),
             password_hash,
-            admin: grant.admin,
             connected: false,
         },
     );
+    drop(accounts);
     info!(
-        "account_create_accepted {} username={} admin={}",
+        "account_create_accepted {} username={}",
         code_log_label(&code),
-        username,
-        grant.admin
+        username
     );
 
-    issue_session(&state, code, username, grant.admin, true).await
+    issue_session(&state, code, username, true).await
 }
 
 async fn login_account(
@@ -722,12 +786,11 @@ async fn login_account(
     replace_connected_clients_for_code(&state, &code).await;
 
     info!(
-        "account_login_accepted {} username={} admin={}",
+        "account_login_accepted {} username={}",
         code_log_label(&code),
-        account.username,
-        account.admin
+        account.username
     );
-    issue_session(&state, code, account.username, account.admin, false).await
+    issue_session(&state, code, account.username, false).await
 }
 
 async fn enter_account(
@@ -766,52 +829,48 @@ async fn enter_account(
         replace_connected_clients_for_code(&state, &code).await;
 
         info!(
-            "account_enter_login {} username={} admin={}",
+            "account_enter_login {} username={}",
             code_log_label(&code),
-            account.username,
-            account.admin
+            account.username
         );
-        return issue_session(&state, code, account.username, account.admin, false).await;
+        return issue_session(&state, code, account.username, false).await;
     }
 
-    let grant = match state.available_codes.lock().await.remove(&code) {
-        Some(grant) => grant,
-        None => {
-            warn!(
-                "account_enter_rejected {} reason=unknown_code",
-                code_log_label(&code)
-            );
-            return account_error(
-                StatusCode::UNAUTHORIZED,
-                &state,
-                "Wrong information.".to_string(),
-            )
-            .await;
-        }
-    };
+    if !state.available_codes.lock().await.remove(&code) {
+        warn!(
+            "account_enter_rejected {} reason=unknown_code",
+            code_log_label(&code)
+        );
+        return account_error(
+            StatusCode::UNAUTHORIZED,
+            &state,
+            "Wrong information.".to_string(),
+        )
+        .await;
+    }
 
     let password_hash = match hash_password(&request.password) {
         Ok(hash) => hash,
         Err(error) => return account_error(StatusCode::INTERNAL_SERVER_ERROR, &state, error).await,
     };
-    let username = random_username();
-    state.accounts.lock().await.insert(
+    let mut accounts = state.accounts.lock().await;
+    let username = random_unique_username(&accounts);
+    accounts.insert(
         code.clone(),
         Account {
             username: username.clone(),
             password_hash,
-            admin: grant.admin,
             connected: false,
         },
     );
+    drop(accounts);
     info!(
-        "account_enter_created {} username={} admin={}",
+        "account_enter_created {} username={}",
         code_log_label(&code),
-        username,
-        grant.admin
+        username
     );
 
-    issue_session(&state, code, username, grant.admin, true).await
+    issue_session(&state, code, username, true).await
 }
 
 async fn replace_connected_clients_for_code(state: &AppState, code: &str) {
@@ -869,13 +928,23 @@ async fn auth_from_headers(
     headers: &HeaderMap,
 ) -> Result<AuthSession, StatusCode> {
     let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    state
-        .sessions
-        .lock()
+    active_session(state, &token, true)
         .await
-        .get(&token)
-        .cloned()
         .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let session = state.sessions.lock().await.remove(&token);
+    let Some(session) = session else {
+        return StatusCode::UNAUTHORIZED;
+    };
+
+    replace_connected_clients_for_code(&state, &session.code).await;
+    touch_activity(&state).await;
+    StatusCode::NO_CONTENT
 }
 
 async fn upload_attachment(
@@ -1005,7 +1074,8 @@ async fn account_error(
             token: None,
             node_id: state.node_id.clone(),
             username: None,
-            admin: false,
+            max_rooms_per_user: state.max_rooms_per_user,
+            session_inactivity_sec: state.session_inactivity_ms / 1000,
             error: Some(error),
         }),
     )
@@ -1015,18 +1085,21 @@ async fn issue_session(
     state: &AppState,
     code: String,
     username: String,
-    admin: bool,
     created: bool,
 ) -> (StatusCode, Json<AccountResponse>) {
     let token = Uuid::new_v4().to_string();
-    state.sessions.lock().await.insert(
+    let now = now_ms();
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, session| session.code != code);
+    sessions.insert(
         token.clone(),
         AuthSession {
             code,
             username: username.clone(),
-            admin,
+            last_activity_ms: now,
         },
     );
+    drop(sessions);
 
     (
         StatusCode::OK,
@@ -1036,7 +1109,8 @@ async fn issue_session(
             token: Some(token),
             node_id: state.node_id.clone(),
             username: Some(username),
-            admin,
+            max_rooms_per_user: state.max_rooms_per_user,
+            session_inactivity_sec: state.session_inactivity_ms / 1000,
             error: None,
         }),
     )
@@ -1047,20 +1121,17 @@ async fn ws_handler(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let auth = {
-        let sessions = state.sessions.lock().await;
-        sessions.get(&query.token).cloned()
-    };
+    let auth = active_session(&state, &query.token, true).await;
 
     match auth {
         Some(session) => ws
-            .on_upgrade(move |socket| socket_loop(state, session, socket))
+            .on_upgrade(move |socket| socket_loop(state, query.token, session, socket))
             .into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
-async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
+async fn socket_loop(state: AppState, session_token: String, auth: AuthSession, socket: WebSocket) {
     let client_id = Uuid::new_v4();
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -1069,7 +1140,7 @@ async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
         client_id,
         ClientHandle {
             code: auth.code.clone(),
-            admin: auth.admin,
+            username: auth.username.clone(),
             tx,
         },
     );
@@ -1088,22 +1159,37 @@ async fn socket_loop(state: AppState, auth: AuthSession, socket: WebSocket) {
         }
     });
 
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(Message::Text(text)) => {
-                if let Err(err) = check_ws_frame_allowed(&state, client_id, text.len()).await {
-                    warn!("dropping limited frame from {client_id}: {err}");
-                    continue;
-                }
-                if let Err(err) = handle_frame(&state, client_id, &text).await {
-                    warn!("dropping invalid frame from {client_id}: {err}");
+    let mut session_watchdog = tokio::time::interval(std::time::Duration::from_secs(1));
+    session_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = session_watchdog.tick() => {
+                if active_session(&state, &session_token, false).await.is_none() {
+                    break;
                 }
             }
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(err) => {
-                warn!("websocket error from {client_id}: {err}");
-                break;
+            result = stream.next() => {
+                match result {
+                    Some(Ok(Message::Text(text))) => {
+                        if active_session(&state, &session_token, true).await.is_none() {
+                            break;
+                        }
+                        if let Err(err) = check_ws_frame_allowed(&state, client_id, text.len()).await {
+                            warn!("dropping limited frame from {client_id}: {err}");
+                            continue;
+                        }
+                        if let Err(err) = handle_frame(&state, client_id, &text).await {
+                            warn!("dropping invalid frame from {client_id}: {err}");
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => {
+                        warn!("websocket error from {client_id}: {err}");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1147,6 +1233,10 @@ async fn check_ws_frame_allowed(
 async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(), String> {
     let frame: InboundFrame = serde_json::from_str(text).map_err(|err| err.to_string())?;
     match frame {
+        InboundFrame::Activity => {
+            touch_activity(state).await;
+            Ok(())
+        }
         InboundFrame::Dummy { padding_b64, bytes } => {
             let _discarded_hint =
                 padding_b64.as_deref().map(str::len).unwrap_or(0) + bytes.unwrap_or_default();
@@ -1259,16 +1349,8 @@ async fn broadcast_to_room(
 }
 
 async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String> {
-    let sender_admin = state
-        .clients
-        .lock()
-        .await
-        .get(&sender_id)
-        .map(|client| client.admin)
-        .unwrap_or(false);
-
-    if !sender_admin {
-        return Err("global wipe requires an admin account".to_string());
+    if !state.clients.lock().await.contains_key(&sender_id) {
+        return Err("authenticated client required".to_string());
     }
 
     wipe_relay_state(state, true).await;
@@ -1305,24 +1387,44 @@ async fn create_room(
     sender_id: Uuid,
     mut room: RoomRecord,
 ) -> Result<(), String> {
-    require_admin(state, sender_id).await?;
+    let (owner_code, owner_username) = client_identity(state, sender_id).await?;
+    room.owner_username = owner_username;
     normalize_room_record(&mut room)?;
-    state
-        .room_catalog
-        .lock()
-        .await
-        .insert(room.id.clone(), room.clone());
+    let mut catalog = state.room_catalog.lock().await;
+    if let Some(existing) = catalog.get(&room.id) {
+        if existing.owner_code != owner_code {
+            return Err("room id rejected".to_string());
+        }
+    } else if !has_room_capacity(&catalog, &owner_code, state.max_rooms_per_user) {
+        return Err("room limit reached".to_string());
+    }
+    catalog.insert(
+        room.id.clone(),
+        RoomEntry {
+            room: room.clone(),
+            owner_code,
+        },
+    );
+    drop(catalog);
     broadcast_to_all(state, &OutboundFrame::RoomCreated { room }).await;
     Ok(())
 }
 
 async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result<(), String> {
-    require_admin(state, sender_id).await?;
+    let (owner_code, _) = client_identity(state, sender_id).await?;
     let chat_id = chat_id.trim();
     if chat_id.is_empty() {
         return Err("room id is required".to_string());
     }
-    state.room_catalog.lock().await.remove(chat_id);
+    let mut catalog = state.room_catalog.lock().await;
+    let Some(entry) = catalog.get(chat_id) else {
+        return Err("room unavailable".to_string());
+    };
+    if entry.owner_code != owner_code {
+        return Err("room owner required".to_string());
+    }
+    catalog.remove(chat_id);
+    drop(catalog);
     state.pending.lock().await.remove(chat_id);
     state.rooms.lock().await.remove(chat_id);
     broadcast_to_all(
@@ -1341,24 +1443,34 @@ async fn send_room_catalog(state: &AppState, client_id: Uuid) {
         .lock()
         .await
         .values()
-        .cloned()
+        .map(|entry| entry.room.clone())
         .collect::<Vec<_>>();
     send_to_client(state, client_id, &OutboundFrame::Rooms { rooms }).await;
 }
 
-async fn require_admin(state: &AppState, client_id: Uuid) -> Result<(), String> {
-    let admin = state
+async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(String, String), String> {
+    state
         .clients
         .lock()
         .await
         .get(&client_id)
-        .map(|client| client.admin)
-        .unwrap_or(false);
-    if admin {
-        Ok(())
-    } else {
-        Err("admin account required".to_string())
-    }
+        .map(|client| (client.code.clone(), client.username.clone()))
+        .ok_or_else(|| "authenticated client required".to_string())
+}
+
+fn owned_room_count(catalog: &HashMap<String, RoomEntry>, owner_code: &str) -> usize {
+    catalog
+        .values()
+        .filter(|entry| entry.owner_code == owner_code)
+        .count()
+}
+
+fn has_room_capacity(
+    catalog: &HashMap<String, RoomEntry>,
+    owner_code: &str,
+    max_rooms_per_user: usize,
+) -> bool {
+    owned_room_count(catalog, owner_code) < max_rooms_per_user
 }
 
 fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
@@ -1370,13 +1482,13 @@ fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
     if room.name.is_empty() {
         return Err("room name rejected".to_string());
     }
-    room.self_destruct_timer_sec = room.self_destruct_timer_sec.max(1).min(86_400);
+    room.self_destruct_timer_sec = room.self_destruct_timer_sec.clamp(1, 86_400);
     room.overall_expiry_sec = room.overall_expiry_sec.min(86_400);
-    room.image_read_timer_sec = room.image_read_timer_sec.max(1).min(86_400);
+    room.image_read_timer_sec = room.image_read_timer_sec.clamp(1, 86_400);
     room.image_overall_expiry_sec = room.image_overall_expiry_sec.min(86_400);
-    room.video_read_timer_sec = room.video_read_timer_sec.max(1).min(86_400);
+    room.video_read_timer_sec = room.video_read_timer_sec.clamp(1, 86_400);
     room.video_overall_expiry_sec = room.video_overall_expiry_sec.min(86_400);
-    room.file_read_timer_sec = room.file_read_timer_sec.max(1).min(86_400);
+    room.file_read_timer_sec = room.file_read_timer_sec.clamp(1, 86_400);
     room.file_overall_expiry_sec = room.file_overall_expiry_sec.min(86_400);
     Ok(())
 }
@@ -1475,12 +1587,11 @@ mod tests {
 
     #[test]
     fn generated_code_lengths_are_unique() {
-        let mut codes = HashMap::new();
+        let mut codes = HashSet::new();
         let mut lengths = HashSet::new();
-        generate_codes(&mut codes, &mut lengths, 8, false, 12, 20);
-        generate_codes(&mut codes, &mut lengths, 3, true, 12, 20);
+        generate_codes(&mut codes, &mut lengths, 11, 12, 24);
 
-        let unique_lengths = codes.keys().map(|code| code.len()).collect::<HashSet<_>>();
+        let unique_lengths = codes.iter().map(|code| code.len()).collect::<HashSet<_>>();
         assert_eq!(codes.len(), unique_lengths.len());
     }
 
@@ -1499,5 +1610,62 @@ mod tests {
         let hash = hash_password("strong-password").expect("hash");
         assert!(verify_password("strong-password", &hash));
         assert!(!verify_password("wrong-password", &hash));
+    }
+
+    #[test]
+    fn session_expiration_uses_strict_boundary() {
+        let session = AuthSession {
+            code: "ABCD-1234-WXYZ".to_string(),
+            username: "SilentNode123".to_string(),
+            last_activity_ms: 1_000,
+        };
+
+        assert!(!session_is_expired(&session, 5_999, 5_000));
+        assert!(session_is_expired(&session, 6_000, 5_000));
+    }
+
+    #[test]
+    fn room_quota_is_counted_per_owner() {
+        let mut catalog = HashMap::new();
+        for (id, owner_code) in [
+            ("room-a", "code-a"),
+            ("room-b", "code-a"),
+            ("room-c", "code-b"),
+        ] {
+            catalog.insert(
+                id.to_string(),
+                RoomEntry {
+                    room: test_room(id),
+                    owner_code: owner_code.to_string(),
+                },
+            );
+        }
+
+        assert_eq!(owned_room_count(&catalog, "code-a"), 2);
+        assert!(!has_room_capacity(&catalog, "code-a", 2));
+        assert!(has_room_capacity(&catalog, "code-b", 2));
+    }
+
+    fn test_room(id: &str) -> RoomRecord {
+        RoomRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            owner_username: "SilentNode123".to_string(),
+            self_destruct_timer_sec: 5,
+            overall_expiry_sec: 0,
+            allow_images: true,
+            allow_videos: true,
+            allow_files: true,
+            enforce_text_absolute_expiry: false,
+            image_read_timer_sec: 5,
+            image_overall_expiry_sec: 0,
+            enforce_image_absolute_expiry: false,
+            video_read_timer_sec: 5,
+            video_overall_expiry_sec: 0,
+            enforce_video_absolute_expiry: false,
+            file_read_timer_sec: 5,
+            file_overall_expiry_sec: 0,
+            enforce_file_absolute_expiry: false,
+        }
     }
 }

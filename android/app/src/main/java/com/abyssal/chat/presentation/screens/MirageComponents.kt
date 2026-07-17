@@ -41,6 +41,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.abyssal.chat.theme.BorderCyan
@@ -156,12 +157,13 @@ fun MirageIconButton(
     modifier: Modifier = Modifier,
     accent: Color = GlassBorder,
     enabled: Boolean = true,
+    size: Dp = 48.dp,
     content: @Composable () -> Unit
 ) {
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
-            .size(48.dp)
+            .size(size)
             .clip(CircleShape)
             .background(GlassCardBg)
             .border(BorderStroke(1.dp, accent), CircleShape)
@@ -279,7 +281,9 @@ fun MirageDialog(
 fun EmptyState(
     title: String,
     detail: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null
 ) {
     Column(
         modifier = modifier.padding(32.dp),
@@ -301,6 +305,15 @@ fun EmptyState(
             lineHeight = 18.sp,
             modifier = Modifier.padding(top = 8.dp)
         )
+        if (actionLabel != null && onAction != null) {
+            MiragePrimaryButton(
+                text = actionLabel,
+                onClick = onAction,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 22.dp)
+            )
+        }
     }
 }
 

@@ -119,6 +119,14 @@ class RealChatTransport(
         return accepted
     }
 
+    override suspend fun signalUserActivity(): Boolean {
+        val accepted = webSocket?.send(JSONObject().put("type", "activity").toString()) == true
+        if (!accepted) {
+            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+        }
+        return accepted
+    }
+
     override suspend fun broadcastGlobalWipe() {
         val frame = JSONObject()
             .put("type", "global_wipe")
@@ -252,7 +260,8 @@ class RealChatTransport(
             enforceVideoAbsoluteExpiry = optBoolean("enforce_video_absolute_expiry", false),
             fileReadTimerSec = optInt("file_read_timer_sec", 5).coerceAtLeast(1),
             fileOverallExpirySec = optInt("file_overall_expiry_sec", 0).coerceAtLeast(0),
-            enforceFileAbsoluteExpiry = optBoolean("enforce_file_absolute_expiry", false)
+            enforceFileAbsoluteExpiry = optBoolean("enforce_file_absolute_expiry", false),
+            ownerUsername = optString("owner_username").takeIf { it.isNotBlank() }
         )
     }
 }

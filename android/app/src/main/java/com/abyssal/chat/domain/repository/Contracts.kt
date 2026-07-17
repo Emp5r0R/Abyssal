@@ -20,6 +20,7 @@ interface IIdentityService {
     suspend fun login(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
     fun setCurrentUser(user: User)
     fun getCurrentUser(): User?
+    suspend fun revokeSession(session: NodeSession): Boolean
     fun logout()
 }
 
@@ -68,6 +69,7 @@ interface IChatTransport {
     suspend fun createForum(session: ChatSession)
     suspend fun deleteForum(chatId: String)
     suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray): Boolean
+    suspend fun signalUserActivity(): Boolean
     suspend fun broadcastGlobalWipe()
 }
 

@@ -7,8 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,13 +19,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Switch
@@ -59,6 +59,7 @@ import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.ServerStatus
+import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
@@ -80,6 +81,8 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val status by viewModel.serverStatus.collectAsState()
     val disguiseSet by viewModel.disguiseSettings.collectAsState()
     val presence by viewModel.presence.collectAsState()
+    val sessionSecurity by viewModel.sessionSecurity.collectAsState()
+    val roomCreationLimit by viewModel.roomCreationLimit.collectAsState()
     val showCamouflagePinPrompt = viewModel.showCamouflagePinPrompt.value
 
     DashboardContent(
@@ -87,12 +90,16 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         sessions = sessions,
         status = status,
         presence = presence,
+        sessionSecurity = sessionSecurity,
+        roomCreationLimit = roomCreationLimit,
         disguiseSettings = disguiseSet,
         onOpenChat = { viewModel.navigateTo(Screen.Chat(it)) },
         onUpdateDisguise = viewModel::updateDisguiseSettings,
         onCreateForum = viewModel::createForum,
         onDeleteForum = viewModel::deleteForum,
-        onWipe = viewModel::executeAdminClearAll
+        onWipe = viewModel::executeClearAll,
+        onLock = viewModel::lockApp,
+        onEndSession = viewModel::endSession
     )
 
     if (showCamouflagePinPrompt) {
@@ -106,12 +113,16 @@ private fun DashboardContent(
     sessions: List<ChatSession>,
     status: ServerStatus,
     presence: List<UserPresence>,
+    sessionSecurity: SessionSecurityState,
+    roomCreationLimit: Int,
     disguiseSettings: DisguiseSettings,
     onOpenChat: (String) -> Unit,
     onUpdateDisguise: (Boolean, String, String) -> Unit,
     onCreateForum: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean) -> Unit,
     onDeleteForum: (String) -> Unit,
-    onWipe: () -> Unit
+    onWipe: () -> Unit,
+    onLock: () -> Unit,
+    onEndSession: () -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -121,6 +132,10 @@ private fun DashboardContent(
     val filteredSessions = remember(sessions, selectedTab) {
         sessions.filter { it.isForum == (selectedTab == 0) }
     }
+    val ownedRoomCount = remember(sessions, currentUser?.username) {
+        sessions.count { it.isForum && it.ownerUsername == currentUser?.username }
+    }
+    val canCreateRoom = ownedRoomCount < roomCreationLimit
 
     MirageBackground {
         Column(
@@ -132,6 +147,7 @@ private fun DashboardContent(
             DashboardHeader(
                 currentUser = currentUser,
                 status = status,
+                sessionSecurity = sessionSecurity,
                 onSettings = { showSettingsDialog = true }
             )
 
@@ -158,13 +174,42 @@ private fun DashboardContent(
                 Tab(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    text = { Text("Rooms", fontWeight = FontWeight.Bold) }
+                    text = {
+                        Text(
+                            "Rooms ${sessions.count { it.isForum }}",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 )
                 Tab(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    text = { Text("Direct", fontWeight = FontWeight.Bold) }
+                    text = {
+                        Text(
+                            "Direct ${sessions.count { !it.isForum }}",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 )
+            }
+
+            if (selectedTab == 0) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 9.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SectionLabel("YOUR ROOMS", color = NeonGreen)
+                    Text(
+                        text = "$ownedRoomCount / $roomCreationLimit",
+                        color = if (canCreateRoom) NeonGreen else SelfDestructAmber,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
             }
 
             PresenceStrip(
@@ -177,10 +222,20 @@ private fun DashboardContent(
             if (filteredSessions.isEmpty()) {
                 EmptyState(
                     title = if (selectedTab == 0) "No active rooms" else "No direct messages",
-                    detail = "New encrypted conversations appear here while they are available in memory.",
+                    detail = if (selectedTab == 0) {
+                        "Rooms created on this node appear here."
+                    } else {
+                        "Direct conversations appear here while active."
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .weight(1f)
+                        .weight(1f),
+                    actionLabel = if (selectedTab == 0 && canCreateRoom) "Create room" else null,
+                    onAction = if (selectedTab == 0 && canCreateRoom) {
+                        { showCreateForumDialog = true }
+                    } else {
+                        null
+                    }
                 )
             } else {
                 LazyColumn(
@@ -188,12 +243,13 @@ private fun DashboardContent(
                         .fillMaxWidth()
                         .weight(1f)
                         .padding(horizontal = 16.dp, vertical = 12.dp),
+                    contentPadding = PaddingValues(bottom = 104.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(filteredSessions, key = { it.id }) { session ->
                         ChatSessionItem(
                             session = session,
-                            canDelete = currentUser?.isAdmin == true && session.isForum,
+                            canDelete = session.isForum && session.ownerUsername == currentUser?.username,
                             onClick = { onOpenChat(session.id) },
                             onDelete = { onDeleteForum(session.id) }
                         )
@@ -202,42 +258,50 @@ private fun DashboardContent(
             }
         }
 
-        if (currentUser?.isAdmin == true) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .navigationBarsPadding()
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                if (selectedTab == 0) {
-                    FloatingActionButton(
-                        onClick = { showCreateForumDialog = true },
-                        containerColor = NeonCyan,
-                        contentColor = DeepBlack,
-                        shape = CircleShape
-                    ) {
-                        Text("+", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-                FloatingActionButton(
-                    onClick = { showWipeDialog = true },
-                    containerColor = SelfDestructAmber,
-                    contentColor = PureWhite,
-                    shape = CircleShape
-                ) {
-                    HazardIcon(modifier = Modifier.size(24.dp), color = PureWhite)
-                }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalAlignment = Alignment.End
+        ) {
+            if (selectedTab == 0 && filteredSessions.isNotEmpty() && canCreateRoom) {
+                ExtendedFloatingActionButton(
+                    onClick = { showCreateForumDialog = true },
+                    containerColor = NeonCyan,
+                    contentColor = DeepBlack,
+                    shape = RoundedCornerShape(8.dp),
+                    icon = { PlusIcon(modifier = Modifier.size(20.dp), color = DeepBlack) },
+                    text = { Text("New room $ownedRoomCount/$roomCreationLimit", fontWeight = FontWeight.Bold) }
+                )
             }
+            ExtendedFloatingActionButton(
+                onClick = { showWipeDialog = true },
+                containerColor = SelfDestructAmber,
+                contentColor = PureWhite,
+                shape = RoundedCornerShape(8.dp),
+                icon = { HazardIcon(modifier = Modifier.size(20.dp), color = PureWhite) },
+                text = { Text("Wipe node", fontWeight = FontWeight.Bold) }
+            )
         }
 
         if (showSettingsDialog) {
             SettingsDialog(
                 initialSettings = disguiseSettings,
+                sessionSecurity = sessionSecurity,
                 onDismiss = { showSettingsDialog = false },
                 onSave = { enabled, pin, duressPin ->
                     onUpdateDisguise(enabled, pin, duressPin)
                     showSettingsDialog = false
+                },
+                onLock = {
+                    showSettingsDialog = false
+                    onLock()
+                },
+                onEndSession = {
+                    showSettingsDialog = false
+                    onEndSession()
                 }
             )
         }
@@ -281,45 +345,43 @@ private fun DashboardContent(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DashboardHeader(
     currentUser: User?,
     status: ServerStatus,
+    sessionSecurity: SessionSecurityState,
     onSettings: () -> Unit
 ) {
-    FlowRow(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 18.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        maxItemsInEachRow = 2
+            .padding(horizontal = 18.dp, vertical = 16.dp)
     ) {
-        Column(modifier = Modifier.weight(1f, fill = false)) {
-            SectionLabel("IDENTITY", color = NeonGreen)
-            Text(
-                text = currentUser?.username ?: "Anonymous",
-                color = PureWhite,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Text(
-                text = if (currentUser?.isAdmin == true) "Admin controls enabled" else "Ephemeral session",
-                color = SteelMuted,
-                fontSize = 12.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-
         Row(
+            modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            StatusPill("${status.state} ${status.latencyMs}ms")
+            MirageLogo(modifier = Modifier.size(38.dp))
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(start = 12.dp)
+            ) {
+                Text(
+                    text = "Abyssal",
+                    color = PureWhite,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = currentUser?.username ?: "Anonymous",
+                    color = NeonGreen,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
             MirageIconButton(
                 contentDescription = "Open security settings",
                 onClick = onSettings
@@ -327,10 +389,32 @@ private fun DashboardHeader(
                 SettingsIcon(modifier = Modifier.size(18.dp), color = SteelMuted)
             }
         }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            StatusPill(
+                label = if (status.state == "CONNECTED") {
+                    "CONNECTED ${status.latencyMs}ms"
+                } else {
+                    status.state
+                },
+                color = if (status.state == "CONNECTED") NeonGreen else SelfDestructAmber,
+                modifier = Modifier.weight(1f)
+            )
+            StatusPill(
+                label = sessionStatusLabel(sessionSecurity),
+                color = NeonCyan,
+                modifier = Modifier.weight(1f)
+            )
+        }
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun PresenceStrip(
     users: List<UserPresence>,
@@ -340,12 +424,12 @@ private fun PresenceStrip(
         return
     }
 
-    FlowRow(
+    LazyRow(
         modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        contentPadding = PaddingValues(end = 8.dp)
     ) {
-        users.sortedBy { it.username }.forEach { user ->
+        items(users.sortedBy { it.username }, key = { it.username }) { user ->
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
@@ -382,14 +466,56 @@ private fun PresenceStrip(
 @Composable
 private fun SettingsDialog(
     initialSettings: DisguiseSettings,
+    sessionSecurity: SessionSecurityState,
     onDismiss: () -> Unit,
-    onSave: (Boolean, String, String) -> Unit
+    onSave: (Boolean, String, String) -> Unit,
+    onLock: () -> Unit,
+    onEndSession: () -> Unit
 ) {
     var disguiseEnabled by remember(initialSettings) { mutableStateOf(initialSettings.isDisguised) }
     var pinCode by remember(initialSettings) { mutableStateOf(initialSettings.pin) }
     var duressPin by remember(initialSettings) { mutableStateOf(initialSettings.duressPin) }
 
     MirageDialog(title = "Security", onDismiss = onDismiss) {
+        SectionLabel(
+            text = "ACTIVE SESSION",
+            modifier = Modifier.fillMaxWidth(),
+            color = NeonGreen
+        )
+        Text(
+            text = if (sessionSecurity.retainedInBackground) {
+                "Remembered in RAM · ${formatDuration(sessionSecurity.remainingSec)} idle time left"
+            } else {
+                "Foreground only · ${formatDuration(sessionSecurity.remainingSec)} idle time left"
+            },
+            color = PureWhite,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp)
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 14.dp, bottom = 22.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            if (initialSettings.isDisguised) {
+                MirageSecondaryButton(
+                    text = "Lock now",
+                    onClick = onLock,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            MiragePrimaryButton(
+                text = "End session",
+                onClick = onEndSession,
+                danger = true,
+                modifier = Modifier.weight(1f)
+            )
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -440,7 +566,7 @@ private fun SettingsDialog(
                     .padding(top = 14.dp)
             )
             Text(
-                text = "Entering the duress sequence on the calculator cover wipes local memory and attempts a relay wipe for admin sessions.",
+                text = "Entering the duress sequence on the calculator cover wipes local memory and attempts a relay wipe.",
                 color = SelfDestructAmber,
                 fontSize = 12.sp,
                 lineHeight = 17.sp,
@@ -707,13 +833,13 @@ private fun ConfirmWipeDialog(
     onConfirm: () -> Unit
 ) {
     MirageDialog(
-        title = "Wipe local sessions",
+        title = "Wipe relay memory",
         onDismiss = onDismiss,
         accent = SelfDestructAmber,
         icon = { HazardIcon(modifier = Modifier.size(34.dp), color = SelfDestructAmber) }
     ) {
         Text(
-            text = "This sends the wipe command and clears local session data on clients that honor it. This cannot force deletion on modified clients.",
+            text = "This clears relay accounts, codes, rooms, queued messages, and attachments, then asks connected clients to clear local memory. This cannot force deletion on modified clients.",
             color = MutedWhite,
             fontSize = 14.sp,
             lineHeight = 20.sp,
@@ -871,17 +997,15 @@ private fun ChatSessionItem(
                     }
                 }
                 if (canDelete) {
-                    Text(
-                        text = "Delete",
-                        color = SelfDestructAmber,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier
-                            .padding(top = 8.dp)
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable(onClick = onDelete)
-                            .padding(horizontal = 6.dp, vertical = 4.dp)
-                    )
+                    MirageIconButton(
+                        contentDescription = "Delete ${session.name}",
+                        onClick = onDelete,
+                        accent = SelfDestructAmber.copy(alpha = 0.45f),
+                        size = 34.dp,
+                        modifier = Modifier.padding(top = 8.dp)
+                    ) {
+                        DeleteIcon(modifier = Modifier.size(16.dp))
+                    }
                 }
             }
         }
@@ -899,6 +1023,18 @@ private fun mirageTextFieldColors() = OutlinedTextFieldDefaults.colors(
     unfocusedLabelColor = SteelMuted
 )
 
+private fun sessionStatusLabel(state: SessionSecurityState): String {
+    val mode = if (state.retainedInBackground) "RAM" else "FOREGROUND"
+    return "$mode ${formatDuration(state.remainingSec)}"
+}
+
+private fun formatDuration(totalSeconds: Int): String {
+    val safeSeconds = totalSeconds.coerceAtLeast(0)
+    val minutes = safeSeconds / 60
+    val seconds = safeSeconds % 60
+    return "%d:%02d".format(minutes, seconds)
+}
+
 @Preview
 @Composable
 private fun DashboardContentPreview() {
@@ -911,9 +1047,9 @@ private fun DashboardContentPreview() {
         selfDestructDurationSec = 5
     )
     DashboardContent(
-        currentUser = User("SilentVector482", ByteArray(32), isAdmin = true),
+        currentUser = User("SilentVector482", ByteArray(32)),
         sessions = listOf(
-            ChatSession("room", "operations", true, sampleMessage, 3, 5),
+            ChatSession("room", "operations", true, sampleMessage, 3, 5, ownerUsername = "SilentVector482"),
             ChatSession("dm", "LunarNode231", false, null, 0, 10)
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
@@ -921,11 +1057,20 @@ private fun DashboardContentPreview() {
             UserPresence("SilentVector482", true),
             UserPresence("LunarNode231", false)
         ),
+        sessionSecurity = SessionSecurityState(
+            active = true,
+            retainedInBackground = true,
+            inactivityTimeoutSec = 900,
+            remainingSec = 842
+        ),
+        roomCreationLimit = 5,
         disguiseSettings = DisguiseSettings(),
         onOpenChat = {},
         onUpdateDisguise = { _, _, _ -> },
         onCreateForum = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
         onDeleteForum = {},
-        onWipe = {}
+        onWipe = {},
+        onLock = {},
+        onEndSession = {}
     )
 }

@@ -14,6 +14,8 @@ import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.ServerStatus
+import com.abyssal.chat.domain.model.SessionInactivityPolicy
+import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
@@ -26,6 +28,7 @@ import com.abyssal.chat.domain.repository.INodeConfigService
 import java.security.SecureRandom
 import java.util.UUID
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -33,6 +36,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -93,7 +97,17 @@ class ChatViewModel(
     private val _calculatorDisplay = MutableStateFlow("0")
     val calculatorDisplay: StateFlow<String> = _calculatorDisplay.asStateFlow()
 
+    private val sessionInactivityPolicy = SessionInactivityPolicy()
+    private val _sessionSecurity = MutableStateFlow(SessionSecurityState())
+    val sessionSecurity: StateFlow<SessionSecurityState> = _sessionSecurity.asStateFlow()
+
+    private val _roomCreationLimit = MutableStateFlow(DEFAULT_MAX_ROOMS_PER_USER)
+    val roomCreationLimit: StateFlow<Int> = _roomCreationLimit.asStateFlow()
+
+    private var retainSessionInBackground = false
+    private var sessionInactivityTimeoutSec = DEFAULT_SESSION_INACTIVITY_SEC
     private var externalSystemUiOpen = false
+    private var lastRemoteActivitySignalMs = 0L
 
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -143,6 +157,13 @@ class ChatViewModel(
                 }
             }
         }
+
+        viewModelScope.launch {
+            while (isActive) {
+                delay(SESSION_WATCHDOG_INTERVAL_MS)
+                if (!expireSessionIfNeeded()) updateSessionSecurityState()
+            }
+        }
     }
 
     fun navigateTo(screen: Screen) {
@@ -155,7 +176,16 @@ class ChatViewModel(
         }
     }
 
-    fun submitAccount(code: String, nodeUrl: String, password: String) {
+    fun clearAccountError() {
+        _inviteCodeError.value = null
+    }
+
+    fun submitAccount(
+        code: String,
+        nodeUrl: String,
+        password: String,
+        rememberSession: Boolean
+    ) {
         viewModelScope.launch {
             _isVerifyingCode.value = true
             _inviteCodeError.value = null
@@ -171,15 +201,20 @@ class ChatViewModel(
                 val nodeId = validation.nodeId ?: endpoint.displayHost
                 val identity = User(
                     username = validation.username ?: "AbyssalUser",
-                    publicKey = ByteArray(32).also { SecureRandom().nextBytes(it) },
-                    isAdmin = validation.isAdmin
+                    publicKey = ByteArray(32).also { SecureRandom().nextBytes(it) }
                 )
                 identityService.setCurrentUser(identity)
                 payloadCipher.deriveSessionKey(nodeId)
                 nodeConfigService.setActiveSession(
-                    NodeSession(endpoint, validation.token, nodeId, validation.isAdmin)
+                    NodeSession(endpoint, validation.token, nodeId, validation.maxRoomsPerUser)
                 )
                 _currentUser.value = identity
+                _roomCreationLimit.value = validation.maxRoomsPerUser
+                retainSessionInBackground = rememberSession
+                sessionInactivityTimeoutSec = validation.sessionInactivitySec
+                sessionInactivityPolicy.start(sessionInactivityTimeoutSec * 1000L)
+                updateSessionSecurityState()
+                _isLocked.value = false
                 if (validation.created) {
                     disguiseManager.setDisguiseEnabled(true)
                     _disguiseSettings.value = DisguiseSettings(isDisguised = true, pin = "")
@@ -364,7 +399,7 @@ class ChatViewModel(
         }
     }
 
-    fun executeAdminClearAll() {
+    fun executeClearAll() {
         viewModelScope.launch {
             chatTransport.broadcastGlobalWipe()
             executeLocalMemoryPurge()
@@ -411,22 +446,16 @@ class ChatViewModel(
                 enforceVideoAbsoluteExpiry = enforceVideoAbsoluteExpiry,
                 fileReadTimerSec = fileReadTimerSec,
                 fileOverallExpirySec = fileOverallExpirySec,
-                enforceFileAbsoluteExpiry = enforceFileAbsoluteExpiry
+                enforceFileAbsoluteExpiry = enforceFileAbsoluteExpiry,
+                ownerUsername = currentUser.value?.username
             )
-            messageRepository.createForumSession(session)
             chatTransport.createForum(session)
-            chatTransport.joinChat(forumId)
         }
     }
 
     fun deleteForum(chatId: String) {
         viewModelScope.launch {
             chatTransport.deleteForum(chatId)
-            messageRepository.deleteChatSession(chatId)
-            if (_activeChatId.value == chatId) {
-                _activeChatId.value = null
-                _currentScreen.value = Screen.Dashboard
-            }
         }
     }
 
@@ -456,16 +485,57 @@ class ChatViewModel(
 
     fun beginExternalSystemUi() {
         externalSystemUiOpen = true
+        recordUserActivity()
     }
 
     fun endExternalSystemUi() {
         externalSystemUiOpen = false
+        recordUserActivity()
     }
 
     fun lockForLifecycleExit() {
-        if (!externalSystemUiOpen && disguiseSettings.value.isDisguised) {
-            _isLocked.value = true
+        if (externalSystemUiOpen || !sessionInactivityPolicy.isActive()) return
+        if (disguiseSettings.value.isDisguised) _isLocked.value = true
+        if (!retainSessionInBackground) endSession(lockBehindDisguise = true)
+    }
+
+    fun onHostResumed() {
+        if (expireSessionIfNeeded()) return
+        if (sessionInactivityPolicy.isActive()) chatTransport.connect()
+    }
+
+    fun recordUserActivity() {
+        if (_isLocked.value || !sessionInactivityPolicy.isActive()) return
+        if (!sessionInactivityPolicy.touch()) {
+            expireSessionIfNeeded()
+            return
         }
+        updateSessionSecurityState()
+
+        val now = elapsedRealtimeMs()
+        if (
+            serverStatus.value.state == "CONNECTED" &&
+            now - lastRemoteActivitySignalMs >= REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS
+        ) {
+            lastRemoteActivitySignalMs = now
+            viewModelScope.launch { chatTransport.signalUserActivity() }
+        }
+    }
+
+    fun endSession() {
+        endSession(lockBehindDisguise = false)
+    }
+
+    private fun endSession(lockBehindDisguise: Boolean) {
+        if (!sessionInactivityPolicy.isActive()) return
+        sessionInactivityPolicy.clear()
+        updateSessionSecurityState()
+        if (lockBehindDisguise && disguiseSettings.value.isDisguised) {
+            _isLocked.value = true
+        } else {
+            _isLocked.value = false
+        }
+        viewModelScope.launch { logoutLocal(revokeRemote = true) }
     }
 
     fun onCalculatorInput(input: String) {
@@ -490,7 +560,12 @@ class ChatViewModel(
             return "0"
         }
         if (disguiseManager.verifyPin(cleanExpr)) {
+            if (expireSessionIfNeeded()) return "0"
             _isLocked.value = false
+            if (sessionInactivityPolicy.isActive()) {
+                sessionInactivityPolicy.touch()
+                updateSessionSecurityState()
+            }
             return "0"
         }
         return runCatching {
@@ -514,7 +589,13 @@ class ChatViewModel(
         _calculatorDisplay.value = "0"
     }
 
-    private suspend fun logoutLocal() {
+    private suspend fun logoutLocal(revokeRemote: Boolean = false) {
+        val remoteSession = nodeConfigService.getActiveSession()
+        sessionInactivityPolicy.clear()
+        retainSessionInBackground = false
+        lastRemoteActivitySignalMs = 0L
+        _roomCreationLimit.value = DEFAULT_MAX_ROOMS_PER_USER
+        updateSessionSecurityState()
         messageRepository.clearAllData()
         identityService.logout()
         nodeConfigService.clear()
@@ -526,7 +607,36 @@ class ChatViewModel(
         _attachmentPreview.value = null
         _attachmentError.value = null
         _attachmentUploadProgress.value = AttachmentUploadProgress()
+        if (revokeRemote && remoteSession != null) {
+            identityService.revokeSession(remoteSession)
+        }
     }
+
+    private fun expireSessionIfNeeded(): Boolean {
+        if (!sessionInactivityPolicy.isExpired()) return false
+        sessionInactivityPolicy.clear()
+        updateSessionSecurityState()
+        if (disguiseSettings.value.isDisguised) _isLocked.value = true
+        viewModelScope.launch { logoutLocal(revokeRemote = true) }
+        return true
+    }
+
+    private fun updateSessionSecurityState() {
+        val active = sessionInactivityPolicy.isActive()
+        val remainingSec = if (active) {
+            ((sessionInactivityPolicy.remainingMs() + 999L) / 1000L).toInt()
+        } else {
+            0
+        }
+        _sessionSecurity.value = SessionSecurityState(
+            active = active,
+            retainedInBackground = active && retainSessionInBackground,
+            inactivityTimeoutSec = sessionInactivityTimeoutSec,
+            remainingSec = remainingSec
+        )
+    }
+
+    private fun elapsedRealtimeMs(): Long = System.nanoTime() / 1_000_000L
 
     private fun parseIncomingMessage(chatId: String, decryptedContent: String): Message? {
         val json = runCatching { JSONObject(decryptedContent) }.getOrNull()
@@ -768,5 +878,9 @@ class ChatViewModel(
         const val IMAGE_ATTACHMENT_BYTES = 20L * 1024L * 1024L
         const val VIDEO_ATTACHMENT_BYTES = 100L * 1024L * 1024L
         const val FILE_ATTACHMENT_BYTES = 200L * 1024L * 1024L
+        private const val DEFAULT_SESSION_INACTIVITY_SEC = 15 * 60
+        private const val SESSION_WATCHDOG_INTERVAL_MS = 1_000L
+        private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
+        private const val DEFAULT_MAX_ROOMS_PER_USER = 5
     }
 }
