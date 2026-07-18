@@ -58,6 +58,7 @@ export function ChatView({
 }: ChatViewProps) {
   const [draft, setDraft] = useState("");
   const [showGifs, setShowGifs] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [now, setNow] = useState(0);
   const [flashTargetId, setFlashTargetId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -80,18 +81,23 @@ export function ChatView({
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!draft.trim()) return;
+    if (!draft.trim() || submitting || upload.active) return;
+    setSubmitting(true);
     const reaction = exactReactionShortcut(draft);
-    if (reaction) {
-      if (await onSendGif(reaction, replyTarget?.id)) {
+    try {
+      if (reaction) {
+        if (await onSendGif(reaction, replyTarget?.id)) {
+          setDraft("");
+          onReply(null);
+        }
+        return;
+      }
+      if (await onSend(draft, replyTarget?.id)) {
         setDraft("");
         onReply(null);
       }
-      return;
-    }
-    if (await onSend(draft, replyTarget?.id)) {
-      setDraft("");
-      onReply(null);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -120,9 +126,15 @@ export function ChatView({
     focusComposer();
   };
   const sendGif = async (reaction: ReactionAsset) => {
-    if (!await onSendGif(reaction, replyTarget?.id)) return;
-    setShowGifs(false);
-    onReply(null);
+    if (submitting || upload.active) return;
+    setSubmitting(true);
+    try {
+      if (!await onSendGif(reaction, replyTarget?.id)) return;
+      setShowGifs(false);
+      onReply(null);
+    } finally {
+      setSubmitting(false);
+    }
   };
   const focusMessage = (messageId: string) => {
     document.getElementById(`message-${messageId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -254,8 +266,8 @@ export function ChatView({
           </div>
         ) : null}
         <form className="composer" onSubmit={submit}>
-          <IconButton label="Attach file" disabled={!connected} onClick={onOpenAttachment}><Paperclip size={20} /></IconButton>
-          <IconButton label="Send GIF" disabled={!connected || !room.allow_images} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>
+          <IconButton label="Attach file" disabled={!connected || submitting || upload.active} onClick={onOpenAttachment}><Paperclip size={20} /></IconButton>
+          <IconButton label="Send GIF" disabled={!connected || !room.allow_images || submitting || upload.active} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>
           <textarea
             ref={textareaRef}
             aria-label="Message"
@@ -284,7 +296,7 @@ export function ChatView({
               }
             }}
           />
-          <IconButton className="send-button" label="Send message" disabled={!connected || !draft.trim()} type="submit"><Send size={19} /></IconButton>
+          <IconButton className="send-button" label="Send message" disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
         </form>
       </footer>
     </section>
