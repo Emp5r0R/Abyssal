@@ -1,7 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" role="img" aria-labelledby="title">
   <title id="title">Abyssal</title>
-  <path d="M54 16 88 48 54 92 20 48Z" fill="none" stroke="#00f0ff" stroke-width="4"/>
-  <path d="m54 36 21 16-21 22-21-22Z" fill="none" stroke="#00ff66" stroke-width="3.5"/>
-  <circle cx="54" cy="51" r="4" fill="#00ff66"/>
+  <style>
+    @keyframes spin-cw {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    @keyframes spin-ccw {
+      from { transform: rotate(360deg); }
+      to { transform: rotate(0deg); }
+    }
+    @keyframes pulse-core {
+      0%, 100% { transform: scale(0.9); opacity: 0.8; }
+      50% { transform: scale(1.1); opacity: 1; }
+    }
+    .outer-diamond {
+      transform-origin: 54px 54px;
+      animation: spin-cw 15s linear infinite;
+    }
+    .inner-chevron {
+      transform-origin: 54px 54px;
+      animation: spin-ccw 10s linear infinite;
+    }
+    .glow-core {
+      transform-origin: 54px 51px;
+      animation: pulse-core 2s ease-in-out infinite;
+    }
+  </style>
+  <path class="outer-diamond" d="M54 16 88 48 54 92 20 48Z" fill="none" stroke="#00f0ff" stroke-width="4"/>
+  <path class="inner-chevron" d="m54 36 21 16-21 22-21-22Z" fill="none" stroke="#00ff66" stroke-width="3.5"/>
+  <circle class="glow-core" cx="54" cy="51" r="4" fill="#00ff66"/>
 </svg>
 

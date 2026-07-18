@@ -378,12 +378,51 @@ button:disabled {
   position: absolute;
   border: 1px solid rgba(0, 217, 232, 0.16);
   transform: rotate(45deg);
+  animation: wormhole-vortex 8s cubic-bezier(0.25, 0.46, 0.45, 0.94) infinite;
+  transform-origin: center;
+  will-change: transform, opacity;
 }
 
-.entrance-signal span:nth-child(1) { width: 24%; height: 24%; border-color: var(--green); }
-.entrance-signal span:nth-child(2) { width: 45%; height: 45%; }
-.entrance-signal span:nth-child(3) { width: 67%; height: 67%; border-color: rgba(0, 217, 232, 0.3); }
-.entrance-signal span:nth-child(4) { width: 88%; height: 88%; border-color: rgba(255, 74, 107, 0.16); }
+.entrance-signal span:nth-child(1) {
+  width: 24%;
+  height: 24%;
+  border-color: var(--green);
+  animation-delay: 0s;
+}
+.entrance-signal span:nth-child(2) {
+  width: 45%;
+  height: 45%;
+  animation-delay: -2s;
+}
+.entrance-signal span:nth-child(3) {
+  width: 67%;
+  height: 67%;
+  border-color: rgba(0, 217, 232, 0.3);
+  animation-delay: -4s;
+}
+.entrance-signal span:nth-child(4) {
+  width: 88%;
+  height: 88%;
+  border-color: rgba(255, 74, 107, 0.16);
+  animation-delay: -6s;
+}
+
+@keyframes wormhole-vortex {
+  0% {
+    transform: rotate(45deg) scale(0.5);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    transform: rotate(135deg) scale(1.5);
+    opacity: 0;
+  }
+}
 
 .entrance-node-line {
   display: flex;
