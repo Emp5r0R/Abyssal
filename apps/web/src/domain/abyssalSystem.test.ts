@@ -3,6 +3,7 @@ import { normalizeNodeUrl } from "../security/nodeUrl";
 import { classifyMedia, mediaAllowed, MEDIA_LIMIT_BYTES, clampRoom } from "./messagePolicy";
 import { mentionsUsername, splitMentionText } from "./messageAttention";
 import { reactionByShortcode, exactReactionShortcut } from "./reactions";
+import { InMemoryPayloadCipher } from "../security/crypto";
 
 describe("Abyssal System Security & Feature Suite", () => {
   describe("1. Login & Connection Normalization", () => {
@@ -137,6 +138,44 @@ describe("Abyssal System Security & Feature Suite", () => {
 
     it("rejects invalid shortcode shortcuts", () => {
       expect(exactReactionShortcut("not_a_shortcut")).toBeUndefined();
+    });
+  });
+
+  describe("6. E2E Cryptography Verification (DMs, Rooms, & Attachments)", () => {
+    it("ensures message payload encrypts and decrypts correctly across private rooms and DMs using node key material", async () => {
+      const senderCipher = new InMemoryPayloadCipher();
+      const receiverCipher = new InMemoryPayloadCipher();
+      
+      await senderCipher.initialize("NODE-ALPHA-1");
+      await receiverCipher.initialize("NODE-ALPHA-1");
+
+      const plainText = "Super secret message content";
+      
+      const encrypted = await senderCipher.encryptText(plainText);
+      expect(encrypted).not.toEqual(new TextEncoder().encode(plainText));
+
+      const decrypted = await receiverCipher.decryptText(encrypted);
+      expect(decrypted).toBe(plainText);
+
+      const evilCipher = new InMemoryPayloadCipher();
+      await evilCipher.initialize("NODE-BETA-2");
+      await expect(evilCipher.decryptText(encrypted)).rejects.toThrow();
+    });
+
+    it("verifies attachment client-side pre-encryption and in-memory decryption boundaries", async () => {
+      const cipher = new InMemoryPayloadCipher();
+      await cipher.initialize("NODE-XYZ-9");
+
+      const attachmentBytes = new Uint8Array([12, 34, 56, 78]);
+
+      const encrypted = await cipher.encryptBytes(attachmentBytes);
+      expect(encrypted).not.toEqual(attachmentBytes);
+
+      const downloadedBytes = encrypted.slice();
+      expect(downloadedBytes).toEqual(encrypted);
+
+      const decrypted = await cipher.decryptBytes(downloadedBytes);
+      expect(decrypted).toEqual(attachmentBytes);
     });
   });
 });
