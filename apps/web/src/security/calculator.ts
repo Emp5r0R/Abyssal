@@ -28,12 +28,22 @@ class CalculatorParser {
   }
 
   private term(): number {
-    let value = this.factor();
+    let value = this.power();
     while (this.peek("*") || this.peek("/")) {
       const operator = this.input[this.index++];
-      const next = this.factor();
+      const next = this.power();
       if (operator === "/" && next === 0) throw new Error("Division by zero");
       value = operator === "*" ? value * next : value / next;
+    }
+    return value;
+  }
+
+  private power(): number {
+    let value = this.factor();
+    while (this.peek("^")) {
+      this.index += 1;
+      const next = this.factor();
+      value = Math.pow(value, next);
     }
     return value;
   }
@@ -43,6 +53,27 @@ class CalculatorParser {
       this.index += 1;
       return -this.factor();
     }
+
+    const funcMatch = this.input.slice(this.index).match(/^(sin|cos|tan|log|ln|sqrt)\(/);
+    if (funcMatch) {
+      const func = funcMatch[1];
+      this.index += func.length + 1; // Skip function name and '('
+      const value = this.expression();
+      if (!this.peek(")")) throw new Error("Missing parenthesis");
+      this.index += 1; // Skip ')'
+      switch (func) {
+        case "sin": return Math.sin(value);
+        case "cos": return Math.cos(value);
+        case "tan": return Math.tan(value);
+        case "log": return Math.log10(value);
+        case "ln": return Math.log(value);
+        case "sqrt":
+          if (value < 0) throw new Error("Negative square root");
+          return Math.sqrt(value);
+        default: throw new Error("Unknown function");
+      }
+    }
+
     if (this.peek("(")) {
       this.index += 1;
       const value = this.expression();
@@ -50,6 +81,24 @@ class CalculatorParser {
       this.index += 1;
       return value;
     }
+
+    // Constants
+    if (this.peek("π")) {
+      this.index += 1;
+      return Math.PI;
+    }
+    if (this.input.slice(this.index).startsWith("pi")) {
+      this.index += 2;
+      return Math.PI;
+    }
+    if (this.peek("e")) {
+      const prevChar = this.input[this.index - 1];
+      if (!prevChar || !/[\d.]/.test(prevChar)) {
+        this.index += 1;
+        return Math.E;
+      }
+    }
+
     return this.number();
   }
 
@@ -66,4 +115,3 @@ class CalculatorParser {
     return this.input[this.index] === value;
   }
 }
-

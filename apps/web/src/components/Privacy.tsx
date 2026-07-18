@@ -37,7 +37,14 @@ export function PinSetup({
   );
 }
 
-const KEYS = ["C", "(", ")", "/", "7", "8", "9", "*", "4", "5", "6", "-", "1", "2", "3", "+", "0", ".", "DEL", "="];
+const KEYS = [
+  "sin", "cos", "tan", "(", ")",
+  "ln", "log", "^", "√", "C",
+  "π", "7", "8", "9", "/",
+  "e", "4", "5", "6", "*",
+  "x²", "1", "2", "3", "-",
+  "DEL", "0", ".", "=", "+"
+];
 
 export function CalculatorCover({
   pin,
@@ -95,7 +102,17 @@ export function CalculatorCover({
       return;
     }
     if (input.length >= 40) return;
-    const next = input + key;
+
+    let append = key;
+    if (key === "sin") append = "sin(";
+    else if (key === "cos") append = "cos(";
+    else if (key === "tan") append = "tan(";
+    else if (key === "ln") append = "ln(";
+    else if (key === "log") append = "log(";
+    else if (key === "√") append = "sqrt(";
+    else if (key === "x²") append = "^2";
+
+    const next = input + append;
     setInput(next);
     setDisplay(next);
   };
@@ -103,14 +120,31 @@ export function CalculatorCover({
   return (
     <main className="calculator-page">
       <section className="calculator" aria-label="Calculator">
-        <header><span>Calculator</span></header>
+        <header>
+          <div className="calc-branding">
+            <img src="/abyssal-mark.svg" alt="" width={16} height={16} />
+            <strong>ABYSSAL</strong>
+            <span>LABS</span>
+          </div>
+          <span className="calc-model">MODEL 108S</span>
+        </header>
         <output aria-live="polite">{display}</output>
         <div className="calculator-grid">
           {KEYS.map((key) => (
             <button
               type="button"
               key={key}
-              className={key === "=" ? "equals" : isOperator(key) ? "operator" : ""}
+              className={
+                key === "="
+                  ? "equals"
+                  : isArithmetic(key)
+                  ? "arithmetic"
+                  : isScientific(key)
+                  ? "scientific"
+                  : isControl(key)
+                  ? "control"
+                  : "number"
+              }
               aria-label={calculatorLabel(key)}
               onClick={() => press(key)}
             >
@@ -127,12 +161,20 @@ function digits(value: string): string {
   return value.replace(/\D/g, "").slice(0, 12);
 }
 
-function isOperator(key: string): boolean {
-  return ["/", "*", "-", "+", "C", "DEL"].includes(key);
+function isArithmetic(key: string): boolean {
+  return ["/", "*", "-", "+"].includes(key);
+}
+
+function isScientific(key: string): boolean {
+  return ["sin", "cos", "tan", "ln", "log", "√", "x²", "^", "π", "e"].includes(key);
+}
+
+function isControl(key: string): boolean {
+  return ["C", "DEL", "(", ")"].includes(key);
 }
 
 function calculatorIcon(key: string) {
-  const props = { size: 21, strokeWidth: 2 };
+  const props = { size: 18, strokeWidth: 2 };
   if (key === "/") return <Divide {...props} />;
   if (key === "*") return <X {...props} />;
   if (key === "-") return <Minus {...props} />;
