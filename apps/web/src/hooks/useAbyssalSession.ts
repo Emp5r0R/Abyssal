@@ -22,6 +22,7 @@ import type {
   UploadProgress,
 } from "../domain/types";
 import { base64ToBytes, bytesToBase64, InMemoryPayloadCipher, wipeBytes } from "../security/crypto";
+import { decryptedAttachmentBlob } from "../security/attachmentExport";
 import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   downloadEncryptedAttachment,
@@ -427,12 +428,14 @@ export function useAbyssalSession() {
     const currentSession = sessionRef.current;
     if (!currentSession || !message.attachment || message.attachment.oneTime) return;
     let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     try {
       encrypted = await downloadEncryptedAttachment(currentSession, message.attachment.id);
-      const url = URL.createObjectURL(new Blob([encrypted.slice().buffer], { type: "application/octet-stream" }));
+      plain = await cipherRef.current.decryptBytes(encrypted);
+      const url = URL.createObjectURL(decryptedAttachmentBlob(plain, message.attachment.mimeType));
       const link = document.createElement("a");
       link.href = url;
-      link.download = `${message.id}.abyssal`;
+      link.download = message.attachment.name;
       link.rel = "noopener";
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 0);
@@ -440,6 +443,7 @@ export function useAbyssalSession() {
       setNotice("Action unavailable.");
     } finally {
       wipeBytes(encrypted);
+      wipeBytes(plain);
     }
   }, []);
 

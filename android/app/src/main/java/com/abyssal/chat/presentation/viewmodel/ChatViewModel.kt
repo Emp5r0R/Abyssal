@@ -751,12 +751,14 @@ class ChatViewModel(
     private fun effectiveAbsoluteExpirySec(chatId: String, mediaType: String?): Int {
         val session = sessions.value.find { it.id == chatId }
         if (session?.isForum != true) return 0
-        return when (mediaType?.uppercase()) {
+        val roomAbsolute = if (session.enforceTextAbsoluteExpiry) session.overallExpirySec else 0
+        val mediaAbsolute = when (mediaType?.uppercase()) {
             "IMAGE" -> if (session.enforceImageAbsoluteExpiry) session.imageOverallExpirySec else 0
             "VIDEO" -> if (session.enforceVideoAbsoluteExpiry) session.videoOverallExpirySec else 0
             "FILE" -> if (session.enforceFileAbsoluteExpiry) session.fileOverallExpirySec else 0
-            else -> if (session.enforceTextAbsoluteExpiry) session.overallExpirySec else 0
-        }.coerceAtLeast(0)
+            else -> roomAbsolute
+        }
+        return listOf(roomAbsolute, mediaAbsolute).filter { it > 0 }.minOrNull() ?: 0
     }
 
     private fun isMediaAllowed(chatId: String, mediaType: String): Boolean {
