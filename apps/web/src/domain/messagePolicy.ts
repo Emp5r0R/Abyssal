@@ -29,16 +29,25 @@ export function readRetention(room: RoomRecord | undefined, mediaType?: MediaTyp
 
 export function absoluteRetention(room: RoomRecord | undefined, mediaType?: MediaType): number {
   if (!room) return 0;
+  // A room-wide absolute lifetime is the safe default for every payload.  Media
+  // rules can opt into a shorter, media-specific lifetime, but must never make
+  // an attachment outlive the room's enabled absolute policy.
+  const roomAbsolute = room.enforce_text_absolute_expiry ? room.overall_expiry_sec : 0;
   if (mediaType === "IMAGE") {
-    return room.enforce_image_absolute_expiry ? room.image_overall_expiry_sec : 0;
+    return shortestRetention(roomAbsolute, room.enforce_image_absolute_expiry ? room.image_overall_expiry_sec : 0);
   }
   if (mediaType === "VIDEO") {
-    return room.enforce_video_absolute_expiry ? room.video_overall_expiry_sec : 0;
+    return shortestRetention(roomAbsolute, room.enforce_video_absolute_expiry ? room.video_overall_expiry_sec : 0);
   }
   if (mediaType === "FILE") {
-    return room.enforce_file_absolute_expiry ? room.file_overall_expiry_sec : 0;
+    return shortestRetention(roomAbsolute, room.enforce_file_absolute_expiry ? room.file_overall_expiry_sec : 0);
   }
-  return room.enforce_text_absolute_expiry ? room.overall_expiry_sec : 0;
+  return roomAbsolute;
+}
+
+function shortestRetention(...retentions: number[]): number {
+  const enabled = retentions.filter((retention) => retention > 0);
+  return enabled.length ? Math.min(...enabled) : 0;
 }
 
 export function isExpired(message: ChatMessage, nowMs: number): boolean {
@@ -72,4 +81,3 @@ export function clampRoom(room: RoomRecord): RoomRecord {
     file_overall_expiry_sec: clamp(room.file_overall_expiry_sec, 0, 86_400),
   };
 }
-
