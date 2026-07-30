@@ -52,6 +52,13 @@ export interface RoomRecord {
   file_read_timer_sec: number;
   file_overall_expiry_sec: number;
   enforce_file_absolute_expiry: boolean;
+  conversation_type?: "room" | "direct";
+  peer_username?: string;
+}
+
+export interface DirectRecord {
+  id: string;
+  peer_username: string;
 }
 
 export interface ChatMessage {
@@ -97,7 +104,9 @@ export type IncomingFrame =
   | { type: "GLOBAL_WIPE" | "global_wipe" }
   | { type: "rooms"; rooms: RoomRecord[] }
   | { type: "room_created"; room: RoomRecord }
-  | { type: "room_deleted"; chat_id: string };
+  | { type: "room_deleted"; chat_id: string }
+  | { type: "directs"; directs: DirectRecord[] }
+  | { type: "direct_opened"; direct: DirectRecord };
 
 export interface AttachmentOptions {
   oneTime: boolean;

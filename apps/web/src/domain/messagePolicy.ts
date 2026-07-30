@@ -67,7 +67,10 @@ export function remainingSeconds(message: ChatMessage, nowMs: number): number | 
 }
 
 export function clampRoom(room: RoomRecord): RoomRecord {
-  const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.floor(value)));
+  const clamp = (value: number, min: number, max: number) => {
+    const finite = Number.isFinite(value) ? value : min;
+    return Math.min(max, Math.max(min, Math.floor(finite)));
+  };
   return {
     ...room,
     name: room.name.trim().slice(0, 36),

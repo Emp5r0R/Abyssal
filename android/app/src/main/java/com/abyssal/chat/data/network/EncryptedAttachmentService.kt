@@ -2,6 +2,10 @@ package com.abyssal.chat.data.network
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.security.keystore.StrongBoxUnavailableException
 import com.abyssal.chat.domain.model.AttachmentUploadResult
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
@@ -9,6 +13,9 @@ import com.abyssal.chat.domain.repository.INodeConfigService
 import java.io.IOException
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.KeyStore
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -88,17 +95,53 @@ class EncryptedAttachmentService(
         }
     }
 
-    override suspend fun saveDecryptedAttachment(
+    override suspend fun saveEncryptedAttachmentExport(
         attachment: DecryptedAttachment,
         outputUri: Uri
     ): Boolean = withContext(Dispatchers.IO) {
+        var exportBytes = ByteArray(0)
         try {
+            exportBytes = AttachmentExportCipher.encrypt(getOrCreateExportKey(), attachment.bytes)
             appContext.contentResolver.openOutputStream(outputUri, "w")?.use { output ->
-                output.write(attachment.bytes)
+                output.write(exportBytes)
                 output.flush()
             } != null
         } catch (e: Exception) {
             false
+        } finally {
+            exportBytes.fill(0)
+        }
+    }
+
+    private fun getOrCreateExportKey(): SecretKey {
+        val keyStore = KeyStore.getInstance(KEYSTORE_PROVIDER).apply { load(null) }
+        (keyStore.getKey(EXPORT_KEY_ALIAS, null) as? SecretKey)?.let { return it }
+
+        fun generate(strongBox: Boolean): SecretKey {
+            val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE_PROVIDER)
+            val builder = KeyGenParameterSpec.Builder(
+                EXPORT_KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .setRandomizedEncryptionRequired(true)
+            if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                builder.setIsStrongBoxBacked(true)
+            }
+            generator.init(builder.build())
+            return generator.generateKey()
+        }
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                generate(strongBox = true)
+            } catch (_: StrongBoxUnavailableException) {
+                generate(strongBox = false)
+            }
+        } else {
+            generate(strongBox = false)
         }
     }
 
@@ -130,5 +173,8 @@ class EncryptedAttachmentService(
         }
     }
 
-
+    private companion object {
+        const val KEYSTORE_PROVIDER = "AndroidKeyStore"
+        const val EXPORT_KEY_ALIAS = "abyssal_attachment_export_v1"
+    }
 }

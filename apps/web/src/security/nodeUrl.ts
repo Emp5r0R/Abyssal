@@ -3,6 +3,7 @@ import type { NodeEndpoint } from "../domain/types";
 const SUPPORTED = new Set(["http:", "https:", "ws:", "wss:"]);
 
 export function normalizeNodeUrl(input: string, pageProtocol = window.location.protocol): NodeEndpoint {
+  void pageProtocol;
   const trimmed = input.trim();
   if (!trimmed) throw new Error("Node URL required");
 
@@ -13,17 +14,16 @@ export function normalizeNodeUrl(input: string, pageProtocol = window.location.p
 
   const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
   const apiProtocol = url.protocol === "ws:" ? "http:" : url.protocol === "wss:" ? "https:" : url.protocol;
-  if (pageProtocol === "https:" && apiProtocol !== "https:" && !loopback) {
-    throw new Error("Secure page requires HTTPS node");
+  if (apiProtocol !== "https:" && !loopback) {
+    throw new Error("Remote nodes require HTTPS");
   }
+  if (url.pathname !== "/" && url.pathname !== "") throw new Error("Node URL must not include a path");
 
   const wsProtocol = apiProtocol === "https:" ? "wss:" : "ws:";
-  const path = url.pathname.replace(/\/+$/, "");
   const authority = url.host.toLowerCase();
   return {
-    apiBaseUrl: `${apiProtocol}//${authority}${path}`,
-    wsBaseUrl: `${wsProtocol}//${authority}${path}`,
+    apiBaseUrl: `${apiProtocol}//${authority}`,
+    wsBaseUrl: `${wsProtocol}//${authority}`,
     displayHost: authority,
   };
 }
-

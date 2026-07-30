@@ -4,6 +4,8 @@
 .vscode/
 /README.local.md
 /deploy/deploy.env
+/deploy/release.env
+/.secrets/
 *.swp
 *.swo
 
@@ -40,6 +42,8 @@ apps/web/coverage/
 build-outputs/
 *.apk
 *.aab
+summary.txt
+*_summary.txt
 
 # IntelliJ / Android Studio
 *.iml

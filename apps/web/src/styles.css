@@ -724,8 +724,82 @@ button:disabled {
 .room-nav {
   min-height: 0;
   padding: 0 9px 12px;
-  flex: 1;
+  flex: 1 1 50%;
   overflow-y: auto;
+}
+
+.sidebar-section-title.direct-title {
+  height: 38px;
+  grid-template-columns: 1fr auto;
+  border-top: 1px solid var(--line);
+}
+
+.direct-nav {
+  min-height: 0;
+  padding: 0 9px 10px;
+  flex: 1 1 50%;
+  overflow-y: auto;
+}
+
+.direct-nav > button {
+  display: grid;
+  width: 100%;
+  height: 40px;
+  padding: 0 10px;
+  grid-template-columns: 17px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted-strong);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.direct-nav > button:hover,
+.direct-nav > button.is-active {
+  border-color: rgba(0, 229, 134, 0.18);
+  color: var(--text);
+  background: var(--green-soft);
+}
+
+.direct-nav > button span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.direct-nav > button strong {
+  display: grid;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  place-items: center;
+  border-radius: 10px;
+  color: #00150d;
+  font-size: 10px;
+  background: var(--green);
+}
+
+.direct-nav > button small {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.direct-status {
+  display: block;
+  width: 7px;
+  height: 7px;
+  justify-self: center;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.direct-status.is-online {
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(0, 229, 134, 0.45);
 }
 
 .room-nav > button {
@@ -871,17 +945,32 @@ button:disabled {
   overflow-y: auto;
 }
 
-.presence-list > div {
+.presence-list > button {
   display: grid;
+  width: 100%;
   min-height: 50px;
   padding: 7px;
-  grid-template-columns: 32px minmax(0, 1fr) 7px;
+  grid-template-columns: 32px minmax(0, 1fr) 16px;
   align-items: center;
   gap: 9px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
   opacity: 0.5;
 }
 
-.presence-list > div.is-online {
+.presence-list > button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.presence-list > button:disabled {
+  cursor: default;
+}
+
+.presence-list > button.is-online {
   opacity: 1;
 }
 
@@ -897,7 +986,7 @@ button:disabled {
   background: var(--panel-soft);
 }
 
-.presence-list > div > div {
+.presence-list > button > div {
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -925,6 +1014,10 @@ button:disabled {
 
 .presence-list .is-online i {
   background: var(--green);
+}
+
+.presence-list > button > svg {
+  color: var(--cyan);
 }
 
 .presence-rail > footer {
@@ -995,6 +1088,81 @@ button:disabled {
 .dashboard-metrics .text-connected { color: var(--green); font-size: 12px; }
 .dashboard-metrics .text-connecting { color: var(--amber); font-size: 12px; }
 .dashboard-metrics .text-disconnected { color: var(--rose); font-size: 12px; }
+
+.dashboard-section-heading {
+  display: flex;
+  min-height: 48px;
+  padding: 0 clamp(24px, 4vw, 54px);
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.dashboard-section-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dashboard-section-heading strong {
+  color: var(--green);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.direct-dashboard {
+  display: grid;
+  padding: 14px clamp(24px, 4vw, 54px) 6px;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.direct-dashboard > button {
+  display: grid;
+  min-height: 58px;
+  padding: 8px 10px;
+  grid-template-columns: 32px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  text-align: left;
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+
+.direct-dashboard > button:hover {
+  border-color: rgba(0, 229, 134, 0.28);
+  background: var(--green-soft);
+}
+
+.direct-dashboard > button > span:nth-child(2) {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.direct-dashboard strong,
+.direct-dashboard small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.direct-dashboard small,
+.direct-empty {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.direct-empty {
+  padding: 8px 0 16px;
+}
 
 .room-table {
   padding: 18px clamp(24px, 4vw, 54px) 40px;
@@ -1115,6 +1283,12 @@ button:disabled {
   color: var(--cyan);
   font-weight: 800;
   background: var(--cyan-soft);
+}
+
+.room-avatar.is-direct {
+  border-color: rgba(0, 229, 134, 0.24);
+  color: var(--green);
+  background: var(--green-soft);
 }
 
 .chat-title {

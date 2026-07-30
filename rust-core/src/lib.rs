@@ -2,7 +2,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
-use rand::{seq::SliceRandom, Rng};
+use rand::{rngs::OsRng, seq::SliceRandom, Rng, RngCore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use x25519_dalek::{PublicKey as X2PublicKey, StaticSecret};
@@ -19,7 +19,7 @@ pub struct SecureKey {
     key_bytes: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone)]
 pub struct EncryptedPayload {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
@@ -41,11 +41,14 @@ impl CryptoEngine {
         key: Arc<SecureKey>,
         plaintext: String,
     ) -> Result<EncryptedPayload, String> {
+        if key.key_bytes.len() != 32 {
+            return Err("Invalid key size".to_string());
+        }
         let key_ref = Key::from_slice(&key.key_bytes);
         let cipher = ChaCha20Poly1305::new(key_ref);
 
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill(&mut nonce_bytes);
+        OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
@@ -64,6 +67,12 @@ impl CryptoEngine {
         key: Arc<SecureKey>,
         payload: EncryptedPayload,
     ) -> Result<String, String> {
+        if key.key_bytes.len() != 32 {
+            return Err("Invalid key size".to_string());
+        }
+        if payload.nonce.len() != 12 {
+            return Err("Invalid nonce size".to_string());
+        }
         let key_ref = Key::from_slice(&key.key_bytes);
         let cipher = ChaCha20Poly1305::new(key_ref);
         let nonce = Nonce::from_slice(&payload.nonce);
@@ -95,6 +104,9 @@ impl CryptoEngine {
         let public = X2PublicKey::from(pub_bytes);
 
         let shared_secret = secret.diffie_hellman(&public);
+        if !shared_secret.was_contributory() {
+            return Err("Invalid public key".to_string());
+        }
         let key_bytes = shared_secret.as_bytes().to_vec();
 
         Ok(Arc::new(SecureKey { key_bytes }))
@@ -105,8 +117,11 @@ impl CryptoEngine {
 #[uniffi::export]
 impl SecureKey {
     #[uniffi::constructor]
-    pub fn from_bytes(bytes: Vec<u8>) -> Arc<Self> {
-        Arc::new(SecureKey { key_bytes: bytes })
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, String> {
+        if bytes.len() != 32 {
+            return Err("Invalid key size".to_string());
+        }
+        Ok(Arc::new(SecureKey { key_bytes: bytes }))
     }
 }
 
@@ -136,7 +151,7 @@ impl IdentityManager {
 
     /// Generate random username from wordlists with combination of words and numbers
     pub fn generate_username(&self) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = OsRng;
         let adj = ADJECTIVES.choose(&mut rng).unwrap_or(&"Cyber");
         let noun = NOUNS.choose(&mut rng).unwrap_or(&"Node");
         let num: u32 = rng.gen_range(100..999);
@@ -145,14 +160,16 @@ impl IdentityManager {
 
     /// Validate the registration invitation code
     pub fn validate_invite_code(&self, code: String) -> bool {
-        // Invite codes must be in the format: XXXX-XXXX-XXXX
-        let parts: Vec<&str> = code.split('-').collect();
-        if parts.len() != 3 {
-            return false;
-        }
-        parts
-            .iter()
-            .all(|part| part.len() == 4 && part.chars().all(|c| c.is_alphanumeric()))
+        let code = code.trim();
+        code.len() >= 12
+            && !code.starts_with('-')
+            && !code.ends_with('-')
+            && code
+                .chars()
+                .any(|character| character.is_ascii_alphanumeric())
+            && code
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
     }
 }
 
@@ -170,6 +187,16 @@ pub struct Message {
     pub timestamp_ms: i64,
     pub self_destruct_duration_sec: u32,
     pub read_timestamp_ms: Option<i64>,
+}
+
+impl Message {
+    fn zeroize_fields(&mut self) {
+        self.id.zeroize();
+        self.sender.zeroize();
+        self.receiver.zeroize();
+        self.ciphertext.zeroize();
+        self.nonce.zeroize();
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -215,10 +242,14 @@ impl InMemoryStore {
     pub fn purge_expired_messages(&self, current_time_ms: i64) {
         let mut map = self.messages.lock().unwrap();
         for (_, msgs) in map.iter_mut() {
-            msgs.retain(|msg| {
+            msgs.retain_mut(|msg| {
                 if let Some(read_time) = msg.read_timestamp_ms {
                     let elapsed_sec = (current_time_ms - read_time) / 1000;
-                    elapsed_sec < msg.self_destruct_duration_sec as i64
+                    let keep = elapsed_sec < msg.self_destruct_duration_sec as i64;
+                    if !keep {
+                        msg.zeroize_fields();
+                    }
+                    keep
                 } else {
                     true
                 }
@@ -226,19 +257,130 @@ impl InMemoryStore {
         }
     }
 
-    /// Admin Command: Erase ALL data from memory across all users
+    /// Erase all local in-memory data.
     pub fn admin_clear_all_data(&self) {
         let mut map = self.messages.lock().unwrap();
         for (_, msgs) in map.iter_mut() {
             for msg in msgs.iter_mut() {
-                // Manually zero out message contents in memory before clearing the list
-                msg.ciphertext.zeroize();
-                msg.nonce.zeroize();
-                msg.sender.zeroize();
-                msg.receiver.zeroize();
-                msg.id.zeroize();
+                msg.zeroize_fields();
             }
         }
         map.clear();
+    }
+}
+
+impl Drop for InMemoryStore {
+    fn drop(&mut self) {
+        if let Ok(messages) = self.messages.get_mut() {
+            for entries in messages.values_mut() {
+                for message in entries {
+                    message.zeroize_fields();
+                }
+            }
+            messages.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chacha20_poly1305_round_trip_and_tamper_rejection() {
+        let engine = CryptoEngine::new();
+        let key = SecureKey::from_bytes(vec![7; 32]).expect("valid key");
+        let payload = engine
+            .encrypt(key.clone(), "classified".to_string())
+            .expect("encrypt");
+        assert_ne!(payload.ciphertext, b"classified");
+        assert_eq!(
+            engine.decrypt(key.clone(), payload.clone()).as_deref(),
+            Ok("classified")
+        );
+
+        let mut tampered = payload;
+        tampered.ciphertext[0] ^= 1;
+        assert!(engine.decrypt(key, tampered).is_err());
+    }
+
+    #[test]
+    fn malformed_crypto_inputs_return_errors_instead_of_panicking() {
+        assert!(SecureKey::from_bytes(vec![1; 31]).is_err());
+        let engine = CryptoEngine::new();
+        let key = SecureKey::from_bytes(vec![1; 32]).expect("valid key");
+        assert!(engine
+            .decrypt(
+                key,
+                EncryptedPayload {
+                    ciphertext: vec![1, 2, 3],
+                    nonce: vec![0; 11],
+                },
+            )
+            .is_err());
+        assert!(engine
+            .derive_shared_secret(vec![0; 31], vec![0; 32])
+            .is_err());
+        assert!(engine
+            .derive_shared_secret(vec![1; 32], vec![0; 32])
+            .is_err());
+    }
+
+    #[test]
+    fn x25519_shared_secret_matches_for_both_participants() {
+        let engine = CryptoEngine::new();
+        let alice_secret = StaticSecret::from([3_u8; 32]);
+        let bob_secret = StaticSecret::from([9_u8; 32]);
+        let alice_public = X2PublicKey::from(&alice_secret);
+        let bob_public = X2PublicKey::from(&bob_secret);
+
+        let alice = engine
+            .derive_shared_secret(
+                alice_secret.to_bytes().to_vec(),
+                bob_public.as_bytes().to_vec(),
+            )
+            .expect("alice shared secret");
+        let bob = engine
+            .derive_shared_secret(
+                bob_secret.to_bytes().to_vec(),
+                alice_public.as_bytes().to_vec(),
+            )
+            .expect("bob shared secret");
+        assert_eq!(alice.key_bytes, bob.key_bytes);
+    }
+
+    #[test]
+    fn invite_codes_accept_server_variable_length_format() {
+        let manager = IdentityManager::new();
+        assert!(manager.validate_invite_code("ABCD-23456789".to_string()));
+        assert!(manager.validate_invite_code("ABCD-EFGH-23456789".to_string()));
+        assert!(!manager.validate_invite_code("SHORT-1".to_string()));
+        assert!(!manager.validate_invite_code("ABCD_23456789".to_string()));
+    }
+
+    #[test]
+    fn in_memory_store_marks_reads_purges_and_clears() {
+        let store = InMemoryStore::new();
+        store.add_message(
+            "room".to_string(),
+            Message {
+                id: "one".to_string(),
+                sender: "Alice".to_string(),
+                receiver: String::new(),
+                ciphertext: vec![1, 2, 3],
+                nonce: vec![4; 12],
+                timestamp_ms: 0,
+                self_destruct_duration_sec: 5,
+                read_timestamp_ms: None,
+            },
+        );
+        store.mark_as_read("room".to_string(), "one".to_string(), 1_000);
+        assert_eq!(store.get_messages("room".to_string()).len(), 1);
+        store.purge_expired_messages(5_999);
+        assert_eq!(store.get_messages("room".to_string()).len(), 1);
+        store.purge_expired_messages(6_000);
+        assert!(store.get_messages("room".to_string()).is_empty());
+        store.admin_clear_all_data();
+        assert!(store.get_messages("room".to_string()).is_empty());
     }
 }

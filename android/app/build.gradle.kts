@@ -3,6 +3,17 @@ plugins {
     alias(libs.plugins.jetbrains.kotlin.android)
 }
 
+val releaseStorePath = providers.environmentVariable("ABYSSAL_KEYSTORE_PATH").orNull
+val releaseStorePassword = providers.environmentVariable("ABYSSAL_KEYSTORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("ABYSSAL_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("ABYSSAL_KEY_PASSWORD").orNull
+val hasReleaseSigning = listOf(
+    releaseStorePath,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.abyssal.chat"
     compileSdk = 34
@@ -11,12 +22,27 @@ android {
         applicationId = "com.abyssal.chat"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.5.0"
+        versionCode = 9
+        versionName = "1.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(requireNotNull(releaseStorePath))
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
+            }
         }
     }
 
@@ -28,6 +54,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

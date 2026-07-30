@@ -59,4 +59,48 @@ describe("evaluateExpression", () => {
     expect(() => evaluateExpression("cos(pi")).toThrow();
     expect(() => evaluateExpression("unknown(5)")).toThrow();
   });
+
+  it("evaluates nested functions", () => {
+    expect(evaluateExpression("sin(cos(0))")).toBe("0.84147098");
+    expect(evaluateExpression("ln(sqrt(e))")).toBe("0.5");
+    expect(evaluateExpression("sqrt(sin(pi/2)^2)")).toBe("1");
+  });
+
+  it("evaluates negative numbers", () => {
+    expect(evaluateExpression("-5")).toBe("-5");
+    expect(evaluateExpression("(-3)*(-7)")).toBe("21");
+    expect(evaluateExpression("-2^2")).toBe("4");
+  });
+
+  it("evaluates tan(0)", () => {
+    expect(evaluateExpression("tan(0)")).toBe("0");
+  });
+
+  it("returns 0 for empty expression", () => {
+    expect(evaluateExpression("")).toBe("0");
+  });
+
+  it("evaluates log and ln edge cases", () => {
+    expect(evaluateExpression("log(10)")).toBe("1");
+    expect(evaluateExpression("log(0.1)")).toBe("-1");
+    expect(Number(evaluateExpression("ln(e^3)"))).toBeCloseTo(3, 8);
+  });
+
+  it("evaluates floating point arithmetic", () => {
+    expect(evaluateExpression("0.1+0.2")).toBe("0.3");
+    expect(evaluateExpression("1.5*2")).toBe("3");
+  });
+
+  it("rejects trailing characters", () => {
+    expect(() => evaluateExpression("5abc")).toThrow();
+  });
+
+  it("evaluates deeply nested parentheses", () => {
+    expect(evaluateExpression("((((2+3))))")).toBe("5");
+  });
+
+  it("evaluates mixed functions and operators", () => {
+    expect(evaluateExpression("sqrt(4)+log(100)")).toBe("4");
+    expect(evaluateExpression("2*sin(pi/6)")).toBe("1");
+  });
 });

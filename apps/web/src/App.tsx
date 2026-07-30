@@ -137,6 +137,7 @@ function SecureWorkspace({
       nodeId={session.nodeId}
       connection={abyssal.connection}
       rooms={abyssal.rooms}
+      directs={abyssal.directs}
       messages={abyssal.messages}
       presence={abyssal.presence}
       activeRoomId={abyssal.activeRoomId}
@@ -144,6 +145,7 @@ function SecureWorkspace({
       remainingSessionSec={abyssal.remainingSessionSec}
       sessionTimeoutSec={session.sessionInactivitySec}
       onOpenRoom={openRoom}
+      onOpenDirect={(username) => { setReplyTarget(null); setShowAttachment(false); abyssal.openDirect(username); }}
       onCreateRoom={() => setShowCreateRoom(true)}
       onDeleteRoom={abyssal.deleteRoom}
       onLock={() => setLocked(true)}

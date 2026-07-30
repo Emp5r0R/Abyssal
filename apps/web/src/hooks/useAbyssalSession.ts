@@ -15,6 +15,7 @@ import type {
   ChatMessage,
   ConnectionState,
   DecryptedMedia,
+  DirectRecord,
   IncomingFrame,
   MediaType,
   PresenceUser,
@@ -22,7 +23,7 @@ import type {
   UploadProgress,
 } from "../domain/types";
 import { base64ToBytes, bytesToBase64, InMemoryPayloadCipher, wipeBytes } from "../security/crypto";
-import { decryptedAttachmentBlob } from "../security/attachmentExport";
+import { encryptedAttachmentBlob, encryptedExportName } from "../security/attachmentExport";
 import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   downloadEncryptedAttachment,
@@ -60,6 +61,7 @@ export function useAbyssalSession() {
   const [session, setSession] = useState<AccountSession | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
   const [rooms, setRooms] = useState<RoomRecord[]>([]);
+  const [directs, setDirects] = useState<DirectRecord[]>([]);
   const [presence, setPresence] = useState<PresenceUser[]>([]);
   const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({});
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
@@ -74,7 +76,9 @@ export function useAbyssalSession() {
   const retainWhenHiddenRef = useRef(false);
   const sessionRef = useRef<AccountSession | null>(null);
   const roomsRef = useRef<RoomRecord[]>([]);
+  const directsRef = useRef<DirectRecord[]>([]);
   const activeRoomRef = useRef<string | null>(null);
+  const requestedDirectRef = useRef<string | null>(null);
   const ownMessageIdsRef = useRef(new Set<string>());
 
   useEffect(() => {
@@ -84,6 +88,10 @@ export function useAbyssalSession() {
   useEffect(() => {
     roomsRef.current = rooms;
   }, [rooms]);
+
+  useEffect(() => {
+    directsRef.current = directs;
+  }, [directs]);
 
   useEffect(() => {
     activeRoomRef.current = activeRoomId;
@@ -104,12 +112,17 @@ export function useAbyssalSession() {
     setSession(null);
     setConnection("disconnected");
     setRooms([]);
+    setDirects([]);
     setPresence([]);
     setMessages({});
     setActiveRoomId(null);
     setRemainingSessionSec(0);
     setUpload(EMPTY_UPLOAD);
     ownMessageIdsRef.current.clear();
+    roomsRef.current = [];
+    directsRef.current = [];
+    activeRoomRef.current = null;
+    requestedDirectRef.current = null;
     retainWhenHiddenRef.current = false;
     lastActivityRef.current = 0;
     lastActivitySignalRef.current = 0;
@@ -179,14 +192,36 @@ export function useAbyssalSession() {
       setActiveRoomId((current) => (current === frame.chat_id ? null : current));
       return;
     }
+    if (frame.type === "directs") {
+      const next = frame.directs.filter(validDirect);
+      directsRef.current = next;
+      setDirects(next);
+      next.forEach((direct) => socketRef.current?.join(direct.id));
+      return;
+    }
+    if (frame.type === "direct_opened" && validDirect(frame.direct)) {
+      const direct = frame.direct;
+      directsRef.current = [
+        ...directsRef.current.filter((current) => current.id !== direct.id),
+        direct,
+      ];
+      setDirects(directsRef.current);
+      if (requestedDirectRef.current?.toLowerCase() === direct.peer_username.toLowerCase()) {
+        requestedDirectRef.current = null;
+        activeRoomRef.current = direct.id;
+        setActiveRoomId(direct.id);
+      }
+      socketRef.current?.join(direct.id);
+      return;
+    }
     if (frame.type !== "message" || typeof frame.payload_b64 !== "string") return;
 
     try {
-      const decrypted = await cipherRef.current.decryptText(base64ToBytes(frame.payload_b64));
+      const decrypted = await cipherRef.current.decryptText(frame.chat_id, base64ToBytes(frame.payload_b64));
       const payload = JSON.parse(decrypted) as Record<string, unknown>;
       const currentSession = sessionRef.current;
       if (!currentSession) return;
-      const room = roomsRef.current.find((candidate) => candidate.id === frame.chat_id);
+      const room = conversationForId(roomsRef.current, directsRef.current, frame.chat_id);
       const message = parsePayload(
         frame.chat_id,
         payload,
@@ -226,7 +261,8 @@ export function useAbyssalSession() {
   useEffect(() => {
     if (connection !== "connected") return;
     rooms.forEach((room) => socketRef.current?.join(room.id));
-  }, [connection, rooms]);
+    directs.forEach((direct) => socketRef.current?.join(direct.id));
+  }, [connection, directs, rooms]);
 
   useEffect(() => {
     if (!session) return;
@@ -284,10 +320,23 @@ export function useAbyssalSession() {
     }
   }, [markRoomRead]);
 
+  const openDirect = useCallback((peerUsername: string): boolean => {
+    const existing = directsRef.current.find(
+      (direct) => direct.peer_username.toLowerCase() === peerUsername.trim().toLowerCase(),
+    );
+    if (existing) {
+      openRoom(existing.id);
+      return true;
+    }
+    if (connection !== "connected") return false;
+    requestedDirectRef.current = peerUsername.trim();
+    return socketRef.current?.openDirect(peerUsername.trim()) ?? false;
+  }, [connection, openRoom]);
+
   const sendText = useCallback(async (content: string, replyToId?: string): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
-    const room = roomsRef.current.find((candidate) => candidate.id === chatId);
+    const room = conversationForId(roomsRef.current, directsRef.current, chatId);
     const clean = content.trim();
     if (!currentSession || !chatId || !room || !clean || connection !== "connected") return false;
     const now = Date.now();
@@ -304,7 +353,7 @@ export function useAbyssalSession() {
       replyToId: validReplyId(messages[chatId], replyToId),
       mine: true,
     };
-    const encrypted = await cipherRef.current.encryptText(JSON.stringify(messagePayload(message)));
+    const encrypted = await cipherRef.current.encryptText(chatId, JSON.stringify(messagePayload(message)));
     const accepted = socketRef.current?.send({ type: "message", chat_id: chatId, payload_b64: bytesToBase64(encrypted) }) ?? false;
     wipeBytes(encrypted);
     if (accepted) {
@@ -317,7 +366,7 @@ export function useAbyssalSession() {
   const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
-    const room = roomsRef.current.find((candidate) => candidate.id === chatId);
+    const room = conversationForId(roomsRef.current, directsRef.current, chatId);
     const mediaType = classifyMedia(file);
     const reaction = reactionByShortcode(reactionShortcode);
     if (
@@ -344,7 +393,7 @@ export function useAbyssalSession() {
       setUpload({ active: true, name: file.name || "attachment", loaded: 0, total: file.size });
       const fileBuffer = await file.arrayBuffer();
       plain = new Uint8Array(fileBuffer);
-      encrypted = await cipherRef.current.encryptBytes(fileBuffer);
+      encrypted = await cipherRef.current.encryptBytes(chatId, fileBuffer);
       wipeBytes(plain);
       const ttlSec = absoluteRetention(room, mediaType);
       const attachmentId = await uploadEncryptedAttachment(
@@ -379,7 +428,7 @@ export function useAbyssalSession() {
           reactionShortcode: reaction?.shortcode,
         },
       };
-      const metadata = await cipherRef.current.encryptText(JSON.stringify(messagePayload(message)));
+      const metadata = await cipherRef.current.encryptText(chatId, JSON.stringify(messagePayload(message)));
       const accepted = socketRef.current?.send({ type: "message", chat_id: chatId, payload_b64: bytesToBase64(metadata) }) ?? false;
       wipeBytes(metadata);
       if (accepted) {
@@ -405,7 +454,7 @@ export function useAbyssalSession() {
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     try {
       encrypted = await downloadEncryptedAttachment(currentSession, message.attachment.id);
-      plain = await cipherRef.current.decryptBytes(encrypted);
+      plain = await cipherRef.current.decryptBytes(message.chatId, encrypted);
       const blob = new Blob([plain.slice().buffer], { type: message.attachment.mimeType });
       setMedia({
         messageId: message.id,
@@ -428,14 +477,12 @@ export function useAbyssalSession() {
     const currentSession = sessionRef.current;
     if (!currentSession || !message.attachment || message.attachment.oneTime) return;
     let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-    let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     try {
       encrypted = await downloadEncryptedAttachment(currentSession, message.attachment.id);
-      plain = await cipherRef.current.decryptBytes(encrypted);
-      const url = URL.createObjectURL(decryptedAttachmentBlob(plain, message.attachment.mimeType));
+      const url = URL.createObjectURL(encryptedAttachmentBlob(encrypted));
       const link = document.createElement("a");
       link.href = url;
-      link.download = message.attachment.name;
+      link.download = encryptedExportName(message.attachment.name);
       link.rel = "noopener";
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 0);
@@ -443,7 +490,6 @@ export function useAbyssalSession() {
       setNotice("Action unavailable.");
     } finally {
       wipeBytes(encrypted);
-      wipeBytes(plain);
     }
   }, []);
 
@@ -460,14 +506,15 @@ export function useAbyssalSession() {
   const wipeRelay = useCallback((): boolean => socketRef.current?.wipe() ?? false, []);
 
   const activeRoom = useMemo(
-    () => rooms.find((room) => room.id === activeRoomId),
-    [activeRoomId, rooms],
+    () => conversationForId(rooms, directs, activeRoomId),
+    [activeRoomId, directs, rooms],
   );
 
   return {
     session,
     connection,
     rooms,
+    directs,
     presence,
     messages,
     activeRoom,
@@ -482,6 +529,7 @@ export function useAbyssalSession() {
     clearMemory,
     touchActivity,
     openRoom,
+    openDirect,
     markRoomRead,
     sendText,
     sendAttachment,
@@ -499,6 +547,46 @@ function validRoom(value: unknown): value is RoomRecord {
   if (!value || typeof value !== "object") return false;
   const room = value as Partial<RoomRecord>;
   return typeof room.id === "string" && room.id.startsWith("forum_") && typeof room.name === "string";
+}
+
+function validDirect(value: unknown): value is DirectRecord {
+  if (!value || typeof value !== "object") return false;
+  const direct = value as Partial<DirectRecord>;
+  return typeof direct.id === "string" && /^dm_[A-Za-z0-9_-]{1,125}$/.test(direct.id) &&
+    typeof direct.peer_username === "string" && direct.peer_username.length > 0 && direct.peer_username.length <= 80;
+}
+
+function conversationForId(
+  rooms: RoomRecord[],
+  directs: DirectRecord[],
+  chatId: string | null,
+): RoomRecord | undefined {
+  if (!chatId) return undefined;
+  const room = rooms.find((candidate) => candidate.id === chatId);
+  if (room) return { ...room, conversation_type: "room" };
+  const direct = directs.find((candidate) => candidate.id === chatId);
+  if (!direct) return undefined;
+  return {
+    id: direct.id,
+    name: direct.peer_username,
+    peer_username: direct.peer_username,
+    conversation_type: "direct",
+    self_destruct_timer_sec: 5,
+    overall_expiry_sec: 0,
+    allow_images: true,
+    allow_videos: true,
+    allow_files: true,
+    enforce_text_absolute_expiry: false,
+    image_read_timer_sec: 5,
+    image_overall_expiry_sec: 0,
+    enforce_image_absolute_expiry: false,
+    video_read_timer_sec: 5,
+    video_overall_expiry_sec: 0,
+    enforce_video_absolute_expiry: false,
+    file_read_timer_sec: 5,
+    file_overall_expiry_sec: 0,
+    enforce_file_absolute_expiry: false,
+  };
 }
 
 function parsePayload(

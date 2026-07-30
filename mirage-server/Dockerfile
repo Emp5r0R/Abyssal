@@ -19,7 +19,7 @@ FROM debian:bookworm-slim AS runtime
 
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin mirage \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-builder /repo/target/release/mirage-server /usr/local/bin/mirage-server
@@ -30,5 +30,8 @@ EXPOSE 4020
 
 ENV ABYSSAL_BIND_ADDR=0.0.0.0:4020
 ENV ABYSSAL_WEB_ROOT=/opt/abyssal/web
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["curl", "--fail", "--silent", "http://127.0.0.1:4020/health"]
 
 ENTRYPOINT ["/usr/local/bin/mirage-server"]

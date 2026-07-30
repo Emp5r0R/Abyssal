@@ -4,6 +4,7 @@ import {
   Hash,
   LockKeyhole,
   Menu,
+  MessageCircle,
   Plus,
   Radio,
   ShieldAlert,
@@ -13,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { ChatMessage, ConnectionState, PresenceUser, RoomRecord } from "../domain/types";
+import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
 import { Brand, Dialog, IconButton } from "./Ui";
 
 interface AppShellProps {
@@ -21,6 +22,7 @@ interface AppShellProps {
   nodeId: string;
   connection: ConnectionState;
   rooms: RoomRecord[];
+  directs: DirectRecord[];
   messages: Record<string, ChatMessage[]>;
   presence: PresenceUser[];
   activeRoomId: string | null;
@@ -28,6 +30,7 @@ interface AppShellProps {
   remainingSessionSec: number;
   sessionTimeoutSec: number;
   onOpenRoom: (chatId: string | null) => void;
+  onOpenDirect: (username: string) => void;
   onCreateRoom: () => void;
   onDeleteRoom: (chatId: string) => void;
   onLock: () => void;
@@ -41,6 +44,7 @@ export function AppShell({
   nodeId,
   connection,
   rooms,
+  directs,
   messages,
   presence,
   activeRoomId,
@@ -48,6 +52,7 @@ export function AppShell({
   remainingSessionSec,
   sessionTimeoutSec,
   onOpenRoom,
+  onOpenDirect,
   onCreateRoom,
   onDeleteRoom,
   onLock,
@@ -103,6 +108,47 @@ export function AppShell({
           })}
         </nav>
 
+        <div className="sidebar-section-title direct-title">
+          <span>DIRECT</span>
+          <span>{directs.length}</span>
+        </div>
+
+        <nav className="direct-nav" aria-label="Direct messages">
+          {directs.map((direct) => {
+            const unread = (messages[direct.id] ?? []).filter((message) => !message.mine && message.readAtMs === undefined).length;
+            const online = presence.find((user) => user.username === direct.peer_username)?.connected === true;
+            return (
+              <button
+                type="button"
+                key={direct.id}
+                className={activeRoomId === direct.id ? "is-active" : ""}
+                onClick={() => { onOpenRoom(direct.id); setMobileMenu(false); }}
+              >
+                <span className={`direct-status ${online ? "is-online" : ""}`} />
+                <span>{direct.peer_username}</span>
+                {unread > 0 ? <strong>{Math.min(unread, 99)}</strong> : null}
+              </button>
+            );
+          })}
+          {presence
+            .filter((user) => user.username !== username && !directs.some((direct) => direct.peer_username === user.username))
+            .map((user) => (
+              <button
+                type="button"
+                key={user.username}
+                className="start-direct"
+                onClick={() => { onOpenDirect(user.username); setMobileMenu(false); }}
+              >
+                <MessageCircle size={15} />
+                <span>{user.username}</span>
+                <small>{user.connected ? "ONLINE" : "OFFLINE"}</small>
+              </button>
+            ))}
+          {presence.filter((user) => user.username !== username).length === 0 ? (
+            <div className="sidebar-empty">No peers</div>
+          ) : null}
+        </nav>
+
         <div className="sidebar-session">
           <div><Activity size={15} /><span>SESSION</span><strong>{formatDuration(remainingSessionSec)}</strong></div>
           <progress className="session-meter" max={sessionTimeoutSec} value={remainingSessionSec} aria-label="Session time remaining" />
@@ -120,6 +166,7 @@ export function AppShell({
           <Dashboard
             username={username}
             rooms={rooms}
+            directs={directs}
             messages={messages}
             maxRooms={maxRooms}
             connection={connection}
@@ -134,11 +181,18 @@ export function AppShell({
         <header><UsersRound size={17} /><span>CONNECTED</span><strong>{activeUsers.length}</strong></header>
         <div className="presence-list">
           {presence.map((user) => (
-            <div key={user.username} className={user.connected ? "is-online" : ""}>
+            <button
+              type="button"
+              key={user.username}
+              className={user.connected ? "is-online" : ""}
+              disabled={user.username === username}
+              onClick={() => onOpenDirect(user.username)}
+              title={user.username === username ? "Current account" : `Message ${user.username}`}
+            >
               <span className="presence-avatar">{initials(user.username)}</span>
               <div><strong>{user.username}</strong><span>{user.connected ? "ONLINE" : "OFFLINE"}</span></div>
-              <i />
-            </div>
+              {user.username === username ? <i /> : <MessageCircle size={14} />}
+            </button>
           ))}
         </div>
         <footer><Radio size={14} /><span>LIVE PRESENCE</span></footer>
@@ -165,6 +219,7 @@ export function AppShell({
 function Dashboard({
   username,
   rooms,
+  directs,
   messages,
   maxRooms,
   connection,
@@ -174,6 +229,7 @@ function Dashboard({
 }: {
   username: string;
   rooms: RoomRecord[];
+  directs: DirectRecord[];
   messages: Record<string, ChatMessage[]>;
   maxRooms: number;
   connection: ConnectionState;
@@ -194,6 +250,26 @@ function Dashboard({
         <div><span>AVAILABLE</span><strong>{rooms.length}</strong></div>
         <div><span>OWNED</span><strong>{owned}/{maxRooms}</strong></div>
         <div><span>RELAY</span><strong className={`text-${connection}`}>{connection.toUpperCase()}</strong></div>
+      </div>
+
+      <div className="dashboard-section-heading">
+        <div><MessageCircle size={16} /><span>DIRECT MESSAGES</span></div>
+        <strong>{directs.length}</strong>
+      </div>
+
+      <div className="direct-dashboard" role="list" aria-label="Direct messages">
+        {directs.length === 0 ? (
+          <div className="direct-empty">Select a peer from the Direct list to begin.</div>
+        ) : directs.map((direct) => {
+          const latest = messages[direct.id]?.at(-1);
+          return (
+            <button type="button" key={direct.id} onClick={() => onOpenRoom(direct.id)} role="listitem">
+              <span className="presence-avatar">{initials(direct.peer_username)}</span>
+              <span><strong>{direct.peer_username}</strong><small>{latest ? latest.content : "No active messages"}</small></span>
+              <MessageCircle size={16} />
+            </button>
+          );
+        })}
       </div>
 
       <div className="room-table" role="list">
