@@ -6,28 +6,24 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 source "$SCRIPT_DIR/remote-env.sh"
 
+SYNC_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$SYNC_DIR"
+}
+trap cleanup EXIT INT TERM
+
+git -C "$ROOT_DIR" archive --format=tar HEAD | tar -xf - -C "$SYNC_DIR"
+
 rsync -az --delete --partial --human-readable --info=progress2,stats2 \
   -e "ssh -o StrictHostKeyChecking=accept-new -i $ABYSSAL_SSH_KEY" \
   --rsync-path="mkdir -p '$ABYSSAL_REMOTE_DIR' && rsync" \
   --exclude '.git/' \
-  --exclude '.gradle/' \
-  --exclude '.idea/' \
+  --exclude '.secrets/' \
   --exclude 'README.local.md' \
   --exclude 'deploy/deploy.env' \
-  --exclude 'node_modules/' \
-  --exclude 'target/' \
-  --include '.env.example' \
-  --exclude '.env' \
-  --exclude '.env.*' \
-  --exclude 'android/.gradle/' \
-  --exclude 'android/app/build/' \
-  --exclude 'android/build/' \
-  --exclude 'build-outputs/' \
-  --exclude 'apps/web/dist/' \
-  --exclude 'apps/web/coverage/' \
-  --exclude 'mirage-server/target/' \
-  --exclude 'rust-core/target/' \
-  "$ROOT_DIR/" \
+  --exclude 'deploy/release.env' \
+  --exclude 'mirage-server/.env' \
+  "$SYNC_DIR/" \
   "$ABYSSAL_SSH_HOST:$ABYSSAL_REMOTE_DIR/"
 
-echo "Synced Abyssal to $ABYSSAL_SSH_HOST:$ABYSSAL_REMOTE_DIR"
+echo "Synced committed Abyssal snapshot to $ABYSSAL_SSH_HOST:$ABYSSAL_REMOTE_DIR"

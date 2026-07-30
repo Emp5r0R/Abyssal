@@ -247,17 +247,17 @@ Equivalent raw `rsync` command:
 SSH_HOST=ubuntu@chat.example.com
 SSH_KEY="$HOME/.ssh/abyssal"
 REMOTE_DIR=/home/ubuntu/abyssal
+SYNC_DIR="$(mktemp -d)"
+trap 'rm -rf "$SYNC_DIR"' EXIT
+
+git archive --format=tar HEAD | tar -xf - -C "$SYNC_DIR"
 
 rsync -az --delete \
   -e "ssh -o StrictHostKeyChecking=accept-new -i $SSH_KEY" \
-  --exclude '.git/' --exclude '.gradle/' --exclude '.idea/' \
-  --exclude 'README.local.md' --exclude 'deploy/deploy.env' \
-  --exclude 'node_modules/' --exclude 'target/' \
-  --include '.env.example' --exclude '.env' --exclude '.env.*' \
-  --exclude 'android/.gradle/' --exclude 'android/app/build/' --exclude 'android/build/' \
-  --exclude 'build-outputs/' --exclude 'mirage-server/target/' --exclude 'rust-core/target/' \
-  --exclude 'apps/web/dist/' --exclude 'apps/web/coverage/' \
-  ./ "$SSH_HOST:$REMOTE_DIR/"
+  --exclude '.git/' --exclude '.secrets/' --exclude 'README.local.md' \
+  --exclude 'deploy/deploy.env' --exclude 'deploy/release.env' \
+  --exclude 'mirage-server/.env' \
+  "$SYNC_DIR/" "$SSH_HOST:$REMOTE_DIR/"
 ```
 
 Override the target without editing scripts:

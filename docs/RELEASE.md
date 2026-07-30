@@ -42,3 +42,5 @@ curl --fail https://chat.example.com/health
 ```
 
 Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appear only in restricted logs. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments.
+
+The sync helper transfers a clean archive of committed `HEAD` only. It explicitly protects the remote relay `.env` and excludes local signing credentials even if future ignore rules change.
