@@ -94,6 +94,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         roomCreationLimit = roomCreationLimit,
         disguiseSettings = disguiseSet,
         onOpenChat = { viewModel.navigateTo(Screen.Chat(it)) },
+        onOpenDirect = viewModel::openDirect,
         onUpdateDisguise = viewModel::updateDisguiseSettings,
         onCreateForum = viewModel::createForum,
         onDeleteForum = viewModel::deleteForum,
@@ -117,6 +118,7 @@ private fun DashboardContent(
     roomCreationLimit: Int,
     disguiseSettings: DisguiseSettings,
     onOpenChat: (String) -> Unit,
+    onOpenDirect: (String) -> Unit,
     onUpdateDisguise: (Boolean, String, String) -> Unit,
     onCreateForum: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean) -> Unit,
     onDeleteForum: (String) -> Unit,
@@ -214,6 +216,8 @@ private fun DashboardContent(
 
             PresenceStrip(
                 users = presence,
+                currentUsername = currentUser?.username,
+                onOpenDirect = onOpenDirect,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 10.dp)
@@ -418,6 +422,8 @@ private fun DashboardHeader(
 @Composable
 private fun PresenceStrip(
     users: List<UserPresence>,
+    currentUsername: String?,
+    onOpenDirect: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     if (users.isEmpty()) {
@@ -430,11 +436,15 @@ private fun PresenceStrip(
         contentPadding = PaddingValues(end = 8.dp)
     ) {
         items(users.sortedBy { it.username }, key = { it.username }) { user ->
+            val isCurrentUser = user.username.equals(currentUsername, ignoreCase = true)
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color.White.copy(alpha = 0.04f))
                     .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
+                    .then(
+                        if (isCurrentUser) Modifier else Modifier.clickable { onOpenDirect(user.username) }
+                    )
                     .padding(horizontal = 10.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(7.dp)
@@ -453,7 +463,7 @@ private fun PresenceStrip(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = if (user.connected) "online" else "offline",
+                    text = if (isCurrentUser) "you" else if (user.connected) "message" else "offline",
                     color = if (user.connected) NeonGreen else SteelMuted,
                     fontSize = 11.sp,
                     maxLines = 1
@@ -1066,6 +1076,7 @@ private fun DashboardContentPreview() {
         roomCreationLimit = 5,
         disguiseSettings = DisguiseSettings(),
         onOpenChat = {},
+        onOpenDirect = {},
         onUpdateDisguise = { _, _, _ -> },
         onCreateForum = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
         onDeleteForum = {},

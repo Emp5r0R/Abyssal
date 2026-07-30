@@ -37,6 +37,7 @@ use tower_http::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
@@ -46,7 +47,13 @@ const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
 const WS_MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
+const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const ACCOUNT_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const MAX_CHAT_ID_BYTES: usize = 128;
+const MAX_USERNAME_BYTES: usize = 80;
+const MAX_CODE_BYTES: usize = 128;
+const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
+const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
 const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
 
 #[derive(Clone)]
@@ -64,9 +71,11 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
+    login_limits: Arc<Mutex<HashMap<String, RateState>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     room_catalog: Arc<Mutex<HashMap<String, RoomEntry>>>,
-    pending: Arc<Mutex<HashMap<String, Vec<OutboundFrame>>>>,
+    direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
+    pending: Arc<Mutex<HashMap<PendingKey, Vec<OutboundFrame>>>>,
     attachments: Arc<Mutex<HashMap<Uuid, AttachmentRecord>>>,
 }
 
@@ -88,7 +97,7 @@ struct AuthSession {
 struct ClientHandle {
     code: String,
     username: String,
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
 }
 
 #[derive(Clone)]
@@ -98,9 +107,29 @@ struct RoomEntry {
 }
 
 #[derive(Clone)]
+struct DirectEntry {
+    id: String,
+    user_a: String,
+    user_b: String,
+}
+
+#[derive(Clone)]
 struct RateState {
     window_start_ms: u64,
     count: usize,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct PendingKey {
+    chat_id: String,
+    recipient_username: String,
+}
+
+impl Drop for PendingKey {
+    fn drop(&mut self) {
+        self.chat_id.zeroize();
+        self.recipient_username.zeroize();
+    }
 }
 
 struct AttachmentRecord {
@@ -110,6 +139,55 @@ struct AttachmentRecord {
     one_time: bool,
     delete_after_download: bool,
     expires_at_ms: Option<u64>,
+}
+
+impl Drop for AttachmentRecord {
+    fn drop(&mut self) {
+        self.encrypted_bytes.zeroize();
+        self.chat_id.zeroize();
+        self.media_type.zeroize();
+    }
+}
+
+impl Drop for Account {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.password_hash.zeroize();
+    }
+}
+
+impl Drop for AuthSession {
+    fn drop(&mut self) {
+        self.code.zeroize();
+        self.username.zeroize();
+    }
+}
+
+impl Drop for DirectEntry {
+    fn drop(&mut self) {
+        self.id.zeroize();
+        self.user_a.zeroize();
+        self.user_b.zeroize();
+    }
+}
+
+impl Drop for RoomEntry {
+    fn drop(&mut self) {
+        self.owner_code.zeroize();
+    }
+}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        self.code.zeroize();
+        self.username.zeroize();
+    }
+}
+
+#[derive(Clone)]
+enum ConversationAccess {
+    Room(RoomRecord),
+    Direct,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -139,6 +217,13 @@ struct RoomRecord {
 struct AccountRequest {
     code: String,
     password: String,
+}
+
+impl Drop for AccountRequest {
+    fn drop(&mut self) {
+        self.code.zeroize();
+        self.password.zeroize();
+    }
 }
 
 #[derive(Deserialize)]
@@ -198,6 +283,8 @@ enum InboundFrame {
     CreateRoom { room: RoomRecord },
     #[serde(rename = "delete_room")]
     DeleteRoom { chat_id: String },
+    #[serde(rename = "open_direct")]
+    OpenDirect { peer_username: String },
     #[serde(rename = "dummy")]
     Dummy {
         padding_b64: Option<String>,
@@ -229,12 +316,46 @@ enum OutboundFrame {
     RoomCreated { room: RoomRecord },
     #[serde(rename = "room_deleted")]
     RoomDeleted { chat_id: String },
+    #[serde(rename = "directs")]
+    Directs { directs: Vec<DirectRecord> },
+    #[serde(rename = "direct_opened")]
+    DirectOpened { direct: DirectRecord },
+}
+
+impl OutboundFrame {
+    fn zeroize_sensitive(&mut self) {
+        match self {
+            Self::Message {
+                chat_id,
+                payload_b64,
+                sender_username,
+            } => {
+                chat_id.zeroize();
+                payload_b64.zeroize();
+                sender_username.zeroize();
+            }
+            Self::ReadReceipt {
+                chat_id,
+                message_id,
+            } => {
+                chat_id.zeroize();
+                message_id.zeroize();
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
 struct PresenceUser {
     username: String,
     connected: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct DirectRecord {
+    id: String,
+    peer_username: String,
 }
 
 #[tokio::main]
@@ -369,8 +490,10 @@ impl AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
+            login_limits: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
+            direct_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -604,6 +727,7 @@ fn normalize_code(code: &str) -> Result<String, String> {
 
 fn valid_code_shape(code: &str) -> bool {
     code.len() >= 12
+        && code.len() <= MAX_CODE_BYTES
         && !code.starts_with('-')
         && !code.ends_with('-')
         && code.chars().any(|ch| ch.is_ascii_alphanumeric())
@@ -623,9 +747,7 @@ fn validate_password(password: &str) -> Result<(), String> {
 }
 
 fn code_log_label(code: &str) -> String {
-    let suffix_rev: String = code.chars().rev().take(4).collect();
-    let suffix: String = suffix_rev.chars().rev().collect();
-    format!("len={} suffix={suffix}", code.len())
+    format!("len={}", code.len())
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
@@ -644,6 +766,34 @@ fn verify_password(password: &str, encoded_hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok()
+}
+
+fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: usize) -> bool {
+    if now.saturating_sub(state.window_start_ms) >= window_ms {
+        state.window_start_ms = now;
+        state.count = 0;
+    }
+    state.count = state.count.saturating_add(1);
+    state.count <= limit
+}
+
+async fn login_attempt_allowed(state: &AppState, code: &str) -> bool {
+    let now = now_ms();
+    let mut limits = state.login_limits.lock().await;
+    let rate = limits.entry(code.to_string()).or_insert(RateState {
+        window_start_ms: now,
+        count: 0,
+    });
+    record_rate_attempt(
+        rate,
+        now,
+        LOGIN_RATE_WINDOW_MS,
+        LOGIN_MAX_ATTEMPTS_PER_WINDOW,
+    )
+}
+
+async fn clear_login_limit(state: &AppState, code: &str) {
+    state.login_limits.lock().await.remove(code);
 }
 
 fn random_username() -> String {
@@ -766,6 +916,13 @@ async fn active_session(state: &AppState, token: &str, touch: bool) -> Option<Au
     Some(session.clone())
 }
 
+async fn code_has_active_session(state: &AppState, code: &str) -> bool {
+    let now = now_ms();
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
+    sessions.values().any(|session| session.code == code)
+}
+
 fn normalize_media_type(media_type: Option<&str>) -> String {
     match media_type
         .unwrap_or("FILE")
@@ -786,6 +943,83 @@ fn encrypted_attachment_limit_bytes(media_type: &str) -> usize {
         _ => FILE_ATTACHMENT_LIMIT_BYTES,
     };
     plain_limit + ENCRYPTION_OVERHEAD_BYTES
+}
+
+fn valid_chat_id(chat_id: &str) -> bool {
+    !chat_id.is_empty()
+        && chat_id.len() <= MAX_CHAT_ID_BYTES
+        && chat_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+async fn conversation_access(
+    state: &AppState,
+    username: &str,
+    chat_id: &str,
+) -> Option<ConversationAccess> {
+    if !valid_chat_id(chat_id) {
+        return None;
+    }
+    if let Some(room) = state
+        .room_catalog
+        .lock()
+        .await
+        .get(chat_id)
+        .map(|entry| entry.room.clone())
+    {
+        return Some(ConversationAccess::Room(room));
+    }
+    state
+        .direct_catalog
+        .lock()
+        .await
+        .get(chat_id)
+        .filter(|direct| direct.user_a == username || direct.user_b == username)
+        .map(|_| ConversationAccess::Direct)
+}
+
+fn room_allows_media(room: &RoomRecord, media_type: &str) -> bool {
+    match media_type {
+        "IMAGE" => room.allow_images,
+        "VIDEO" => room.allow_videos,
+        _ => room.allow_files,
+    }
+}
+
+fn enforced_attachment_ttl_sec(room: &RoomRecord, media_type: &str) -> u64 {
+    let room_ttl = room
+        .enforce_text_absolute_expiry
+        .then_some(room.overall_expiry_sec)
+        .filter(|ttl| *ttl > 0);
+    let media_ttl = match media_type {
+        "IMAGE" if room.enforce_image_absolute_expiry => room.image_overall_expiry_sec,
+        "VIDEO" if room.enforce_video_absolute_expiry => room.video_overall_expiry_sec,
+        "FILE" if room.enforce_file_absolute_expiry => room.file_overall_expiry_sec,
+        _ => 0,
+    };
+    room_ttl
+        .into_iter()
+        .chain((media_ttl > 0).then_some(media_ttl))
+        .min()
+        .unwrap_or(0)
+}
+
+fn effective_attachment_ttl_sec(
+    requested: Option<u64>,
+    access: &ConversationAccess,
+    media_type: &str,
+) -> u64 {
+    let requested = requested.unwrap_or_default().min(86_400);
+    let ConversationAccess::Room(room) = access else {
+        return requested;
+    };
+    let enforced = enforced_attachment_ttl_sec(room, media_type);
+    match (requested, enforced) {
+        (0, enforced) => enforced,
+        (requested, 0) => requested,
+        (requested, enforced) => requested.min(enforced),
+    }
 }
 
 fn current_attachment_bytes(attachments: &HashMap<Uuid, AttachmentRecord>) -> usize {
@@ -878,11 +1112,7 @@ async fn create_account(
         },
     );
     drop(accounts);
-    info!(
-        "account_create_accepted {} username={}",
-        code_log_label(&code),
-        username
-    );
+    info!("account_create_accepted {}", code_log_label(&code));
 
     issue_session(&state, code, username, true).await
 }
@@ -892,6 +1122,7 @@ async fn login_account(
     Json(request): Json<AccountRequest>,
 ) -> impl IntoResponse {
     touch_activity(&state).await;
+    let _account_guard = state.account_ops.lock().await;
     let code = match normalize_code(&request.code) {
         Ok(code) => code,
         Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
@@ -921,6 +1152,19 @@ async fn login_account(
         }
     };
 
+    if !login_attempt_allowed(&state, &code).await {
+        warn!(
+            "account_login_rejected {} reason=rate_limit",
+            code_log_label(&code)
+        );
+        return account_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &state,
+            "Wrong information.".to_string(),
+        )
+        .await;
+    }
+
     if !verify_password(&request.password, &account.password_hash) {
         warn!(
             "account_login_rejected {} reason=bad_password",
@@ -934,14 +1178,23 @@ async fn login_account(
         .await;
     }
 
-    replace_connected_clients_for_code(&state, &code).await;
+    clear_login_limit(&state, &code).await;
 
-    info!(
-        "account_login_accepted {} username={}",
-        code_log_label(&code),
-        account.username
-    );
-    issue_session(&state, code, account.username, false).await
+    if code_has_active_session(&state, &code).await {
+        warn!(
+            "account_login_rejected {} reason=active_session",
+            code_log_label(&code)
+        );
+        return account_error(
+            StatusCode::CONFLICT,
+            &state,
+            "Wrong information.".to_string(),
+        )
+        .await;
+    }
+
+    info!("account_login_accepted {}", code_log_label(&code));
+    issue_session(&state, code, account.username.clone(), false).await
 }
 
 async fn enter_account(
@@ -964,6 +1217,18 @@ async fn enter_account(
     }
 
     if let Some(account) = state.accounts.lock().await.get(&code).cloned() {
+        if !login_attempt_allowed(&state, &code).await {
+            warn!(
+                "account_enter_rejected {} reason=rate_limit",
+                code_log_label(&code)
+            );
+            return account_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &state,
+                "Wrong information.".to_string(),
+            )
+            .await;
+        }
         if !verify_password(&request.password, &account.password_hash) {
             warn!(
                 "account_enter_rejected {} reason=bad_password",
@@ -977,14 +1242,23 @@ async fn enter_account(
             .await;
         }
 
-        replace_connected_clients_for_code(&state, &code).await;
+        clear_login_limit(&state, &code).await;
 
-        info!(
-            "account_enter_login {} username={}",
-            code_log_label(&code),
-            account.username
-        );
-        return issue_session(&state, code, account.username, false).await;
+        if code_has_active_session(&state, &code).await {
+            warn!(
+                "account_enter_rejected {} reason=active_session",
+                code_log_label(&code)
+            );
+            return account_error(
+                StatusCode::CONFLICT,
+                &state,
+                "Wrong information.".to_string(),
+            )
+            .await;
+        }
+
+        info!("account_enter_login {}", code_log_label(&code));
+        return issue_session(&state, code, account.username.clone(), false).await;
     }
 
     if !state.available_codes.lock().await.remove(&code) {
@@ -1015,11 +1289,7 @@ async fn enter_account(
         },
     );
     drop(accounts);
-    info!(
-        "account_enter_created {} username={}",
-        code_log_label(&code),
-        username
-    );
+    info!("account_enter_created {}", code_log_label(&code));
 
     issue_session(&state, code, username, true).await
 }
@@ -1044,7 +1314,7 @@ async fn replace_connected_clients_for_code(state: &AppState, code: &str) {
     }
 
     for (_, tx) in &old_clients {
-        let _ = tx.send(Message::Close(None));
+        let _ = tx.try_send(Message::Close(None));
     }
 
     let old_ids = old_clients
@@ -1104,15 +1374,22 @@ async fn upload_attachment(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Err(status) = auth_from_headers(&state, &headers).await {
-        return status.into_response();
-    }
+    let auth = match auth_from_headers(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(status) => return status.into_response(),
+    };
     touch_activity(&state).await;
     let chat_id = query.chat_id.trim();
-    if chat_id.is_empty() || body.is_empty() {
+    if !valid_chat_id(chat_id) || body.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let media_type = normalize_media_type(query.media_type.as_deref());
+    let Some(access) = conversation_access(&state, &auth.username, chat_id).await else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if matches!(&access, ConversationAccess::Room(room) if !room_allows_media(room, &media_type)) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let max_bytes = encrypted_attachment_limit_bytes(&media_type);
     if body.len() > max_bytes {
         warn!(
@@ -1126,10 +1403,8 @@ async fn upload_attachment(
     }
 
     let id = Uuid::new_v4();
-    let ttl_ms = query
-        .ttl_sec
-        .filter(|ttl| *ttl > 0)
-        .map(|ttl| now_ms().saturating_add(ttl.saturating_mul(1000)));
+    let ttl_ms = effective_attachment_ttl_sec(query.ttl_sec, &access, &media_type);
+    let ttl_ms = (ttl_ms > 0).then(|| now_ms().saturating_add(ttl_ms.saturating_mul(1000)));
     let one_time = query.one_time.unwrap_or(false);
     prune_expired_attachments(&state).await;
     let mut attachments = state.attachments.lock().await;
@@ -1173,10 +1448,25 @@ async fn download_attachment(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(status) = auth_from_headers(&state, &headers).await {
-        return status.into_response();
-    }
+    let auth = match auth_from_headers(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(status) => return status.into_response(),
+    };
     touch_activity(&state).await;
+
+    let chat_id = {
+        let attachments = state.attachments.lock().await;
+        let Some(record) = attachments.get(&id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        record.chat_id.clone()
+    };
+    if conversation_access(&state, &auth.username, &chat_id)
+        .await
+        .is_none()
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     let mut attachments = state.attachments.lock().await;
     let Some(record) = attachments.get(&id) else {
@@ -1191,15 +1481,13 @@ async fn download_attachment(
     }
 
     let bytes = record.encrypted_bytes.clone();
-    let chat_id = record.chat_id.clone();
     let media_type = record.media_type.clone();
     if record.one_time || record.delete_after_download {
         attachments.remove(&id);
     }
     info!(
-        "attachment_downloaded id={} chat_id={} media_type={} bytes={}",
+        "attachment_downloaded id={} media_type={} bytes={}",
         id,
-        chat_id,
         media_type,
         bytes.len()
     );
@@ -1215,7 +1503,7 @@ async fn download_attachment(
 async fn account_error(
     status: StatusCode,
     state: &AppState,
-    error: String,
+    _error: String,
 ) -> (StatusCode, Json<AccountResponse>) {
     (
         status,
@@ -1227,7 +1515,7 @@ async fn account_error(
             username: None,
             max_rooms_per_user: state.max_rooms_per_user,
             session_inactivity_sec: state.session_inactivity_ms / 1000,
-            error: Some(error),
+            error: Some("Wrong information.".to_string()),
         }),
     )
 }
@@ -1327,7 +1615,7 @@ fn websocket_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> 
 async fn socket_loop(state: AppState, session_token: String, auth: AuthSession, socket: WebSocket) {
     let client_id = Uuid::new_v4();
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::channel::<Message>(CLIENT_OUTBOUND_QUEUE_CAPACITY);
 
     state.clients.lock().await.insert(
         client_id,
@@ -1340,9 +1628,10 @@ async fn socket_loop(state: AppState, session_token: String, auth: AuthSession, 
     if let Some(account) = state.accounts.lock().await.get_mut(&auth.code) {
         account.connected = true;
     }
-    info!("{} connected", auth.username);
+    info!("client_connected id={client_id}");
     broadcast_presence(&state).await;
     send_room_catalog(&state, client_id).await;
+    send_direct_catalog(&state, client_id, &auth.username).await;
 
     let writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
@@ -1409,12 +1698,7 @@ async fn check_ws_frame_allowed(
         window_start_ms: now,
         count: 0,
     });
-    if now.saturating_sub(state.window_start_ms) > WS_RATE_WINDOW_MS {
-        state.window_start_ms = now;
-        state.count = 0;
-    }
-    state.count = state.count.saturating_add(1);
-    if state.count > WS_MAX_FRAMES_PER_WINDOW {
+    if !record_rate_attempt(state, now, WS_RATE_WINDOW_MS, WS_MAX_FRAMES_PER_WINDOW) {
         return Err(format!(
             "rate limit exceeded: count={} window_ms={}",
             state.count, WS_RATE_WINDOW_MS
@@ -1485,10 +1769,21 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             touch_activity(state).await;
             delete_room(state, sender_id, &chat_id).await
         }
+        InboundFrame::OpenDirect { peer_username } => {
+            touch_activity(state).await;
+            open_direct(state, sender_id, &peer_username).await
+        }
     }
 }
 
 async fn join_room(state: &AppState, client_id: Uuid, chat_id: String) -> Result<(), String> {
+    let (_, username) = client_identity(state, client_id).await?;
+    if conversation_access(state, &username, &chat_id)
+        .await
+        .is_none()
+    {
+        return Err("conversation unavailable".to_string());
+    }
     state
         .rooms
         .lock()
@@ -1501,7 +1796,10 @@ async fn join_room(state: &AppState, client_id: Uuid, chat_id: String) -> Result
         .pending
         .lock()
         .await
-        .remove(&chat_id)
+        .remove(&PendingKey {
+            chat_id,
+            recipient_username: username,
+        })
         .unwrap_or_default();
     for frame in pending {
         send_to_client(state, client_id, &frame).await;
@@ -1522,31 +1820,98 @@ async fn broadcast_to_room(
     chat_id: &str,
     frame: OutboundFrame,
 ) -> Result<(), String> {
-    let recipients = state
-        .rooms
-        .lock()
+    let (_, sender_username) = client_identity(state, sender_id).await?;
+    let access = conversation_access(state, &sender_username, chat_id)
         .await
-        .get(chat_id)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|id| *id != sender_id)
-        .collect::<Vec<_>>();
-
-    if recipients.is_empty() {
-        let mut pending = state.pending.lock().await;
-        let queue = pending.entry(chat_id.to_string()).or_default();
-        if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
-            queue.remove(0);
+        .ok_or_else(|| "conversation unavailable".to_string())?;
+    let (recipients, pending_usernames) = match access {
+        ConversationAccess::Room(_) => {
+            let members = state
+                .rooms
+                .lock()
+                .await
+                .get(chat_id)
+                .cloned()
+                .unwrap_or_default();
+            let recipient_clients = state
+                .clients
+                .lock()
+                .await
+                .iter()
+                .filter_map(|(client_id, client)| {
+                    (members.contains(client_id) && client.username != sender_username)
+                        .then_some((*client_id, client.username.clone()))
+                })
+                .collect::<Vec<_>>();
+            let delivered_usernames = recipient_clients
+                .iter()
+                .map(|(_, username)| username.clone())
+                .collect::<HashSet<_>>();
+            let pending_usernames = state
+                .accounts
+                .lock()
+                .await
+                .values()
+                .map(|account| account.username.clone())
+                .filter(|username| {
+                    username != &sender_username && !delivered_usernames.contains(username)
+                })
+                .collect::<Vec<_>>();
+            (
+                recipient_clients
+                    .into_iter()
+                    .map(|(client_id, _)| client_id)
+                    .collect(),
+                pending_usernames,
+            )
         }
-        queue.push(frame);
-        return Ok(());
-    }
+        ConversationAccess::Direct => {
+            let peer = state
+                .direct_catalog
+                .lock()
+                .await
+                .get(chat_id)
+                .and_then(|direct| direct.peer_for(&sender_username))
+                .ok_or_else(|| "direct conversation unavailable".to_string())?;
+            let recipients = state
+                .clients
+                .lock()
+                .await
+                .iter()
+                .filter_map(|(client_id, client)| (client.username == peer).then_some(*client_id))
+                .collect::<Vec<_>>();
+            let pending_usernames = recipients.is_empty().then_some(peer).into_iter().collect();
+            (recipients, pending_usernames)
+        }
+    };
 
     for recipient in recipients {
         send_to_client(state, recipient, &frame).await;
     }
+    for username in pending_usernames {
+        queue_pending_frame(state, chat_id, username, frame.clone()).await;
+    }
     Ok(())
+}
+
+async fn queue_pending_frame(
+    state: &AppState,
+    chat_id: &str,
+    recipient_username: String,
+    frame: OutboundFrame,
+) {
+    let mut pending = state.pending.lock().await;
+    let queue = pending
+        .entry(PendingKey {
+            chat_id: chat_id.to_string(),
+            recipient_username,
+        })
+        .or_default();
+    if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
+        let mut evicted = queue.remove(0);
+        evicted.zeroize_sensitive();
+    }
+    queue.push(frame);
 }
 
 async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String> {
@@ -1572,14 +1937,38 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
         }
     }
 
-    state.pending.lock().await.clear();
+    let mut pending = state.pending.lock().await;
+    for (_, mut frames) in pending.drain() {
+        for frame in &mut frames {
+            frame.zeroize_sensitive();
+        }
+    }
+    drop(pending);
     state.attachments.lock().await.clear();
     state.room_catalog.lock().await.clear();
+    state.direct_catalog.lock().await.clear();
     state.rooms.lock().await.clear();
-    state.sessions.lock().await.clear();
-    state.accounts.lock().await.clear();
-    state.available_codes.lock().await.clear();
+    let mut sessions = state.sessions.lock().await;
+    for (mut token, _) in sessions.drain() {
+        token.zeroize();
+    }
+    drop(sessions);
+    let mut accounts = state.accounts.lock().await;
+    for (mut code, _) in accounts.drain() {
+        code.zeroize();
+    }
+    drop(accounts);
+    let mut available_codes = state.available_codes.lock().await;
+    for mut code in available_codes.drain() {
+        code.zeroize();
+    }
+    drop(available_codes);
     state.frame_limits.lock().await.clear();
+    let mut login_limits = state.login_limits.lock().await;
+    for (mut code, _) in login_limits.drain() {
+        code.zeroize();
+    }
+    drop(login_limits);
     state.clients.lock().await.clear();
 }
 
@@ -1626,7 +2015,21 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
     }
     catalog.remove(chat_id);
     drop(catalog);
-    state.pending.lock().await.remove(chat_id);
+    {
+        let mut pending = state.pending.lock().await;
+        let keys = pending
+            .keys()
+            .filter(|key| key.chat_id == chat_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(mut frames) = pending.remove(&key) {
+                for frame in &mut frames {
+                    frame.zeroize_sensitive();
+                }
+            }
+        }
+    }
     state.rooms.lock().await.remove(chat_id);
     broadcast_to_all(
         state,
@@ -1647,6 +2050,97 @@ async fn send_room_catalog(state: &AppState, client_id: Uuid) {
         .map(|entry| entry.room.clone())
         .collect::<Vec<_>>();
     send_to_client(state, client_id, &OutboundFrame::Rooms { rooms }).await;
+}
+
+impl DirectEntry {
+    fn contains(&self, username: &str) -> bool {
+        self.user_a == username || self.user_b == username
+    }
+
+    fn peer_for(&self, username: &str) -> Option<String> {
+        if self.user_a == username {
+            Some(self.user_b.clone())
+        } else if self.user_b == username {
+            Some(self.user_a.clone())
+        } else {
+            None
+        }
+    }
+
+    fn record_for(&self, username: &str) -> Option<DirectRecord> {
+        self.peer_for(username).map(|peer_username| DirectRecord {
+            id: self.id.clone(),
+            peer_username,
+        })
+    }
+}
+
+async fn open_direct(state: &AppState, sender_id: Uuid, peer_username: &str) -> Result<(), String> {
+    let (_, sender_username) = client_identity(state, sender_id).await?;
+    let requested = peer_username.trim();
+    if requested.is_empty() || requested.len() > MAX_USERNAME_BYTES {
+        return Err("direct recipient unavailable".to_string());
+    }
+    let peer_username = state
+        .accounts
+        .lock()
+        .await
+        .values()
+        .find(|account| account.username.eq_ignore_ascii_case(requested))
+        .map(|account| account.username.clone())
+        .filter(|peer| peer != &sender_username)
+        .ok_or_else(|| "direct recipient unavailable".to_string())?;
+
+    let direct = {
+        let mut catalog = state.direct_catalog.lock().await;
+        if let Some(existing) = catalog
+            .values()
+            .find(|direct| direct.contains(&sender_username) && direct.contains(&peer_username))
+            .cloned()
+        {
+            existing
+        } else {
+            let direct = DirectEntry {
+                id: format!("dm_{}", Uuid::new_v4().simple()),
+                user_a: sender_username.clone(),
+                user_b: peer_username.clone(),
+            };
+            catalog.insert(direct.id.clone(), direct.clone());
+            direct
+        }
+    };
+
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(client_id, client)| {
+            direct
+                .record_for(&client.username)
+                .map(|record| (*client_id, record))
+        })
+        .collect::<Vec<_>>();
+    for (client_id, record) in clients {
+        send_to_client(
+            state,
+            client_id,
+            &OutboundFrame::DirectOpened { direct: record },
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn send_direct_catalog(state: &AppState, client_id: Uuid, username: &str) {
+    let directs = state
+        .direct_catalog
+        .lock()
+        .await
+        .values()
+        .filter_map(|direct| direct.record_for(username))
+        .collect::<Vec<_>>();
+    send_to_client(state, client_id, &OutboundFrame::Directs { directs }).await;
 }
 
 async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(String, String), String> {
@@ -1676,8 +2170,14 @@ fn has_room_capacity(
 
 fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
     room.id = room.id.trim().to_string();
-    room.name = room.name.trim().chars().take(36).collect::<String>();
-    if room.id.is_empty() || !room.id.starts_with("forum_") {
+    room.name = room
+        .name
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(36)
+        .collect::<String>();
+    if !room.id.starts_with("forum_") || !valid_chat_id(&room.id) {
         return Err("room id rejected".to_string());
     }
     if room.name.is_empty() {
@@ -1740,8 +2240,16 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
         }
     };
 
-    if let Some(client) = state.clients.lock().await.get(&client_id) {
-        let _ = client.tx.send(Message::Text(serialized));
+    let tx = state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| client.tx.clone());
+    if let Some(tx) = tx {
+        if tx.try_send(Message::Text(serialized)).is_err() {
+            warn!("dropping frame for slow or closed client {client_id}");
+        }
     }
 }
 
@@ -1752,7 +2260,7 @@ async fn cleanup_client(state: &AppState, client_id: Uuid) {
         .lock()
         .await
         .remove(&client_id)
-        .map(|client| client.code);
+        .map(|client| client.code.clone());
     for members in state.rooms.lock().await.values_mut() {
         members.remove(&client_id);
     }
@@ -1804,6 +2312,20 @@ mod tests {
         assert!(!valid_code_shape("-ABCD12345678"));
         assert!(!valid_code_shape("ABCD12345678-"));
         assert!(!valid_code_shape("ABCD_12345678"));
+        assert!(!valid_code_shape(&"A".repeat(MAX_CODE_BYTES + 1)));
+    }
+
+    #[test]
+    fn rate_windows_enforce_limit_and_reset_at_boundary() {
+        let mut state = RateState {
+            window_start_ms: 1_000,
+            count: 0,
+        };
+        assert!(record_rate_attempt(&mut state, 1_001, 100, 2));
+        assert!(record_rate_attempt(&mut state, 1_002, 100, 2));
+        assert!(!record_rate_attempt(&mut state, 1_003, 100, 2));
+        assert!(record_rate_attempt(&mut state, 1_100, 100, 2));
+        assert_eq!(state.count, 1);
     }
 
     #[test]
@@ -1890,6 +2412,297 @@ mod tests {
         );
         assert!(normalize_web_origin("https://web.example/path").is_err());
         assert!(normalize_web_origin("file://web.example").is_err());
+    }
+
+    #[test]
+    fn chat_ids_and_room_metadata_are_strictly_normalized() {
+        assert!(valid_chat_id("forum_alpha-1"));
+        assert!(!valid_chat_id("forum/alpha"));
+        assert!(!valid_chat_id("forum_alpha\nmessage"));
+        assert!(!valid_chat_id(&"a".repeat(MAX_CHAT_ID_BYTES + 1)));
+
+        let mut room = test_room("forum_safe");
+        room.name = "  Ops\nRoom\u{0000}  ".to_string();
+        normalize_room_record(&mut room).expect("room should normalize");
+        assert_eq!(room.name, "OpsRoom");
+
+        room.id = "forum/unsafe".to_string();
+        assert!(normalize_room_record(&mut room).is_err());
+    }
+
+    #[test]
+    fn attachment_ttl_cannot_exceed_enforced_room_policy() {
+        let mut room = test_room("forum_policy");
+        room.enforce_text_absolute_expiry = true;
+        room.overall_expiry_sec = 60;
+        room.enforce_video_absolute_expiry = true;
+        room.video_overall_expiry_sec = 20;
+        let access = ConversationAccess::Room(room);
+
+        assert_eq!(
+            effective_attachment_ttl_sec(Some(100), &access, "VIDEO"),
+            20
+        );
+        assert_eq!(effective_attachment_ttl_sec(None, &access, "VIDEO"), 20);
+        assert_eq!(effective_attachment_ttl_sec(Some(10), &access, "VIDEO"), 10);
+        assert_eq!(
+            effective_attachment_ttl_sec(Some(u64::MAX), &ConversationAccess::Direct, "FILE"),
+            86_400
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_conversations_are_canonical_and_participant_restricted() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        add_test_account(&state, "code-e", "Eve").await;
+        let (alice_id, mut alice_rx) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
+        let (eve_id, mut eve_rx) = add_test_client(&state, "code-e", "Eve").await;
+
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct should open");
+        open_direct(&state, bob_id, "Alice")
+            .await
+            .expect("opening the same pair should be idempotent");
+
+        let catalog = state.direct_catalog.lock().await;
+        assert_eq!(catalog.len(), 1);
+        let direct_id = catalog.values().next().expect("direct").id.clone();
+        drop(catalog);
+        assert!(join_room(&state, alice_id, direct_id.clone()).await.is_ok());
+        assert!(join_room(&state, bob_id, direct_id.clone()).await.is_ok());
+        assert!(join_room(&state, eve_id, direct_id.clone()).await.is_err());
+        assert!(join_room(&state, eve_id, "dm_guessed".to_string())
+            .await
+            .is_err());
+
+        while alice_rx.try_recv().is_ok() {}
+        while bob_rx.try_recv().is_ok() {}
+        while eve_rx.try_recv().is_ok() {}
+        broadcast_to_room(
+            &state,
+            alice_id,
+            &direct_id,
+            OutboundFrame::Message {
+                chat_id: direct_id.clone(),
+                payload_b64: "ciphertext".to_string(),
+                sender_username: "Alice".to_string(),
+            },
+        )
+        .await
+        .expect("participant message should route");
+
+        let delivered = bob_rx.try_recv().expect("Bob receives the DM");
+        assert!(matches!(delivered, Message::Text(text) if text.contains("ciphertext")));
+        assert!(eve_rx.try_recv().is_err());
+        assert!(conversation_access(&state, "Eve", &direct_id)
+            .await
+            .is_none());
+        assert!(conversation_access(&state, "Alice", &direct_id)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_catalog_is_private_to_each_participant() {
+        let state = test_state();
+        state.direct_catalog.lock().await.insert(
+            "dm_private".to_string(),
+            DirectEntry {
+                id: "dm_private".to_string(),
+                user_a: "Alice".to_string(),
+                user_b: "Bob".to_string(),
+            },
+        );
+        let records_for_alice = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .filter_map(|direct| direct.record_for("Alice"))
+            .collect::<Vec<_>>();
+        let records_for_eve = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .filter_map(|direct| direct.record_for("Eve"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(records_for_alice.len(), 1);
+        assert_eq!(records_for_alice[0].peer_username, "Bob");
+        assert!(records_for_eve.is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_direct_frames_are_consumed_only_by_the_peer() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, mut alice_rx) = add_test_client(&state, "code-a", "Alice").await;
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct should open");
+        while alice_rx.try_recv().is_ok() {}
+
+        let direct_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("direct")
+            .id
+            .clone();
+        broadcast_to_room(
+            &state,
+            alice_id,
+            &direct_id,
+            OutboundFrame::Message {
+                chat_id: direct_id.clone(),
+                payload_b64: "offline-ciphertext".to_string(),
+                sender_username: "Alice".to_string(),
+            },
+        )
+        .await
+        .expect("offline direct should queue");
+
+        join_room(&state, alice_id, direct_id.clone())
+            .await
+            .expect("sender can join");
+        assert!(alice_rx.try_recv().is_err());
+        assert_eq!(state.pending.lock().await.len(), 1);
+
+        let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
+        join_room(&state, bob_id, direct_id)
+            .await
+            .expect("peer can join");
+        let delivered = bob_rx.try_recv().expect("peer receives queued frame");
+        assert!(matches!(delivered, Message::Text(text) if text.contains("offline-ciphertext")));
+        assert!(state.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn room_frames_wait_for_each_existing_account_to_join() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, mut alice_rx) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
+        let room = test_room("forum_replay");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room: room.clone(),
+                owner_code: "code-a".to_string(),
+            },
+        );
+        join_room(&state, alice_id, room.id.clone())
+            .await
+            .expect("owner joins room");
+
+        broadcast_to_room(
+            &state,
+            alice_id,
+            &room.id,
+            OutboundFrame::Message {
+                chat_id: room.id.clone(),
+                payload_b64: "room-ciphertext".to_string(),
+                sender_username: "Alice".to_string(),
+            },
+        )
+        .await
+        .expect("room frame should queue");
+        assert!(alice_rx.try_recv().is_err());
+        assert!(bob_rx.try_recv().is_err());
+
+        join_room(&state, bob_id, room.id)
+            .await
+            .expect("peer joins room");
+        let delivered = bob_rx.try_recv().expect("peer receives queued room frame");
+        assert!(matches!(delivered, Message::Text(text) if text.contains("room-ciphertext")));
+        assert!(state.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_code_allows_only_one_unexpired_session() {
+        let state = test_state();
+        let code = "ABYS-SESSION-0001";
+        state.sessions.lock().await.insert(
+            "active-token".to_string(),
+            AuthSession {
+                code: code.to_string(),
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+        assert!(code_has_active_session(&state, code).await);
+
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut("active-token")
+            .expect("session")
+            .last_activity_ms = 0;
+        assert!(!code_has_active_session(&state, code).await);
+        assert!(state.sessions.lock().await.is_empty());
+    }
+
+    fn test_state() -> AppState {
+        AppState {
+            node_id: "test-node".to_string(),
+            attachment_ram_limit_bytes: 8 * 1024 * 1024,
+            max_rooms_per_user: 2,
+            web_origins: Vec::new(),
+            session_inactivity_ms: 60_000,
+            inactivity_limit_ms: None,
+            last_activity_ms: Arc::new(Mutex::new(now_ms())),
+            account_ops: Arc::new(Mutex::new(())),
+            available_codes: Arc::new(Mutex::new(HashSet::new())),
+            accounts: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            frame_limits: Arc::new(Mutex::new(HashMap::new())),
+            login_limits: Arc::new(Mutex::new(HashMap::new())),
+            rooms: Arc::new(Mutex::new(HashMap::new())),
+            room_catalog: Arc::new(Mutex::new(HashMap::new())),
+            direct_catalog: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            attachments: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn add_test_account(state: &AppState, code: &str, username: &str) {
+        state.accounts.lock().await.insert(
+            code.to_string(),
+            Account {
+                username: username.to_string(),
+                password_hash: "test-only".to_string(),
+                connected: true,
+            },
+        );
+    }
+
+    async fn add_test_client(
+        state: &AppState,
+        code: &str,
+        username: &str,
+    ) -> (Uuid, mpsc::Receiver<Message>) {
+        let client_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code: code.to_string(),
+                username: username.to_string(),
+                tx,
+            },
+        );
+        (client_id, rx)
     }
 
     fn test_room(id: &str) -> RoomRecord {

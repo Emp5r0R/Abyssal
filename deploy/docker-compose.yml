@@ -5,17 +5,26 @@ services:
       dockerfile: mirage-server/Dockerfile
     image: mirage-server:latest
     restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+    pids_limit: 128
+    mem_limit: ${ABYSSAL_CONTAINER_MEMORY_LIMIT:-1g}
     env_file:
       - path: ../mirage-server/.env
         required: false
     environment:
       ABYSSAL_BIND_ADDR: 0.0.0.0:4020
     ports:
-      - "4020:4020"
+      - "127.0.0.1:4020:4020"
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "1m"
+        max-file: "1"

@@ -113,6 +113,10 @@ export class RelaySocket {
     return this.send({ type: "delete_room", chat_id: chatId });
   }
 
+  openDirect(peerUsername: string): boolean {
+    return this.send({ type: "open_direct", peer_username: peerUsername });
+  }
+
   wipe(): boolean {
     return this.send({ type: "global_wipe" });
   }

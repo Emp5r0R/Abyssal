@@ -102,6 +102,17 @@ class RealChatTransport(
         }
     }
 
+    override suspend fun openDirect(peerUsername: String) {
+        val frame = JSONObject()
+            .put("type", "open_direct")
+            .put("peer_username", peerUsername)
+            .toString()
+
+        if (webSocket?.send(frame) != true) {
+            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+        }
+    }
+
     override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray): Boolean {
         val encodedPayload = Base64.encodeToString(payload, Base64.NO_WRAP)
         val frame = JSONObject()
@@ -188,6 +199,21 @@ class RealChatTransport(
                             joinedChatIds.remove(chatId)
                             _roomChanges.tryEmit(RoomChange("delete", chatId = chatId))
                         }
+                        "directs" -> {
+                            val directs = json.optJSONArray("directs") ?: JSONArray()
+                            (0 until directs.length()).forEach { index ->
+                                directs.optJSONObject(index)?.toDirectSession()?.let { session ->
+                                    joinedChatIds.add(session.id)
+                                    _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                                }
+                            }
+                        }
+                        "direct_opened" -> {
+                            json.optJSONObject("direct")?.toDirectSession()?.let { session ->
+                                joinedChatIds.add(session.id)
+                                _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                            }
+                        }
                         else -> Unit
                     }
                 }
@@ -262,5 +288,25 @@ class RealChatTransport(
             enforceFileAbsoluteExpiry = optBoolean("enforce_file_absolute_expiry", false),
             ownerUsername = optString("owner_username").takeIf { it.isNotBlank() }
         )
+    }
+
+    private fun JSONObject.toDirectSession(): ChatSession? {
+        val chatId = optString("id").takeIf { it.matches(DIRECT_ID_REGEX) } ?: return null
+        val peerUsername = optString("peer_username")
+            .trim()
+            .takeIf { it.isNotEmpty() && it.length <= 80 }
+            ?: return null
+        return ChatSession(
+            id = chatId,
+            name = peerUsername,
+            isForum = false,
+            lastMessage = null,
+            unreadCount = 0,
+            selfDestructTimerSec = 5
+        )
+    }
+
+    private companion object {
+        val DIRECT_ID_REGEX = Regex("^dm_[A-Za-z0-9_-]{1,125}$")
     }
 }

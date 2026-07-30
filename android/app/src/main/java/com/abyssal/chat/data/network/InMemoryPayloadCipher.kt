@@ -9,55 +9,111 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 class InMemoryPayloadCipher {
-    private var key: SecretKey? = null
+    private var nodeSecret: ByteArray? = null
     private val random = SecureRandom()
 
     fun deriveSessionKey(nodeId: String) {
-        val material = "ABYSSAL_NODE_PAYLOAD_V1:${normalize(nodeId)}"
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest(material.toByteArray(Charsets.UTF_8))
-        key = SecretKeySpec(digest, "AES")
+        clear()
+        val normalized = normalizeNodeId(nodeId)
+        require(normalized.isNotEmpty() && normalized.toByteArray(Charsets.UTF_8).size <= MAX_NODE_ID_BYTES) {
+            "Node identity unavailable."
+        }
+        val material = "ABYSSAL_NODE_SECRET_V2:$normalized".toByteArray(Charsets.UTF_8)
+        try {
+            nodeSecret = MessageDigest.getInstance("SHA-256").digest(material)
+        } finally {
+            material.fill(0)
+        }
     }
 
-    fun encrypt(plainText: String): ByteArray {
-        return encryptBytes(plainText.toByteArray(Charsets.UTF_8))
+    fun encrypt(chatId: String, plainText: String): ByteArray {
+        val plainBytes = plainText.toByteArray(Charsets.UTF_8)
+        return try {
+            encryptBytes(chatId, plainBytes)
+        } finally {
+            plainBytes.fill(0)
+        }
     }
 
-    fun decrypt(payload: ByteArray): String {
-        return String(decryptBytes(payload), Charsets.UTF_8)
+    fun decrypt(chatId: String, payload: ByteArray): String {
+        val plainBytes = decryptBytes(chatId, payload)
+        return try {
+            String(plainBytes, Charsets.UTF_8)
+        } finally {
+            plainBytes.fill(0)
+        }
     }
 
-    fun encryptBytes(plainBytes: ByteArray): ByteArray {
+    fun encryptBytes(chatId: String, plainBytes: ByteArray): ByteArray {
+        val normalizedChatId = normalizeChatId(chatId)
         val nonce = ByteArray(12)
         random.nextBytes(nonce)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, requireKey(), GCMParameterSpec(128, nonce))
-        val ciphertext = cipher.doFinal(plainBytes)
-        return nonce + ciphertext
+        cipher.init(Cipher.ENCRYPT_MODE, conversationKey(normalizedChatId), GCMParameterSpec(128, nonce))
+        val aad = additionalData(normalizedChatId)
+        return try {
+            cipher.updateAAD(aad)
+            val ciphertext = cipher.doFinal(plainBytes)
+            byteArrayOf(PAYLOAD_VERSION) + nonce + ciphertext
+        } finally {
+            aad.fill(0)
+        }
     }
 
-    fun decryptBytes(payload: ByteArray): ByteArray {
-        require(payload.size > NONCE_SIZE_BYTES) { "Encrypted payload is too short." }
-        val nonce = payload.copyOfRange(0, NONCE_SIZE_BYTES)
-        val ciphertext = payload.copyOfRange(NONCE_SIZE_BYTES, payload.size)
+    fun decryptBytes(chatId: String, payload: ByteArray): ByteArray {
+        val normalizedChatId = normalizeChatId(chatId)
+        require(payload.size > VERSION_BYTES + NONCE_SIZE_BYTES && payload[0] == PAYLOAD_VERSION) {
+            "Encrypted payload is unavailable."
+        }
+        val nonce = payload.copyOfRange(VERSION_BYTES, VERSION_BYTES + NONCE_SIZE_BYTES)
+        val ciphertext = payload.copyOfRange(VERSION_BYTES + NONCE_SIZE_BYTES, payload.size)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, requireKey(), GCMParameterSpec(128, nonce))
-        return cipher.doFinal(ciphertext)
+        cipher.init(Cipher.DECRYPT_MODE, conversationKey(normalizedChatId), GCMParameterSpec(128, nonce))
+        val aad = additionalData(normalizedChatId)
+        return try {
+            cipher.updateAAD(aad)
+            cipher.doFinal(ciphertext)
+        } finally {
+            aad.fill(0)
+            nonce.fill(0)
+            ciphertext.fill(0)
+        }
     }
 
     fun clear() {
-        key = null
+        nodeSecret?.fill(0)
+        nodeSecret = null
     }
 
-    private fun requireKey(): SecretKey {
-        return key ?: throw IllegalStateException("Payload cipher is not initialized.")
+    private fun conversationKey(chatId: String): SecretKey {
+        val secret = nodeSecret ?: throw IllegalStateException("Payload cipher is not initialized.")
+        val prefix = "ABYSSAL_CONVERSATION_KEY_V2:".toByteArray(Charsets.UTF_8)
+        val suffix = ":$chatId".toByteArray(Charsets.UTF_8)
+        val material = prefix + secret + suffix
+        val digest = MessageDigest.getInstance("SHA-256").digest(material)
+        material.fill(0)
+        return SecretKeySpec(digest, "AES").also { digest.fill(0) }
     }
 
-    private fun normalize(value: String): String {
+    private fun normalizeNodeId(value: String): String {
         return value.trim().uppercase(Locale.ROOT)
     }
 
+    private fun normalizeChatId(value: String): String {
+        val normalized = value.trim()
+        require(CHAT_ID_REGEX.matches(normalized)) { "Conversation unavailable." }
+        return normalized
+    }
+
+    private fun additionalData(chatId: String): ByteArray {
+        return "ABYSSAL_CONVERSATION_PAYLOAD_V2:$chatId".toByteArray(Charsets.UTF_8)
+    }
+
     private companion object {
+        const val PAYLOAD_VERSION: Byte = 2
+        const val VERSION_BYTES = 1
         const val NONCE_SIZE_BYTES = 12
+        const val MAX_NODE_ID_BYTES = 128
+        val CHAT_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,128}$")
     }
 }

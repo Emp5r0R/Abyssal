@@ -43,6 +43,19 @@ object NodeUrlNormalizer {
                 throw IllegalArgumentException("Use http, https, ws, or wss.")
             }
             val host = uri.host ?: throw IllegalArgumentException("Node URL needs a host.")
+            val normalizedHost = host
+                .lowercase(Locale.ROOT)
+                .removePrefix("[")
+                .removeSuffix("]")
+            if (uri.userInfo != null || uri.rawQuery != null || uri.rawFragment != null) {
+                throw IllegalArgumentException("Node URL is unavailable.")
+            }
+            if (!uri.rawPath.isNullOrBlank() && uri.rawPath != "/") {
+                throw IllegalArgumentException("Node URL must not include a path.")
+            }
+            if (scheme in setOf("http", "ws") && !isLoopbackDevelopmentHost(normalizedHost)) {
+                throw IllegalArgumentException("Remote nodes require HTTPS.")
+            }
             val apiScheme = when (scheme) {
                 "ws" -> "http"
                 "wss" -> "https"
@@ -54,21 +67,25 @@ object NodeUrlNormalizer {
                 else -> scheme
             }
 
-            val normalizedPath = uri.rawPath
-                ?.trimEnd('/')
-                ?.takeIf { it.isNotBlank() }
-                ?: ""
             val authority = buildString {
-                append(host.lowercase(Locale.ROOT))
+                if (':' in normalizedHost) append("[").append(normalizedHost).append("]")
+                else append(normalizedHost)
                 if (uri.port > 0) append(":").append(uri.port)
             }
 
             NodeEndpoint(
                 inputUrl = trimmed,
-                apiBaseUrl = "$apiScheme://$authority$normalizedPath",
-                wsBaseUrl = "$wsScheme://$authority$normalizedPath",
+                apiBaseUrl = "$apiScheme://$authority",
+                wsBaseUrl = "$wsScheme://$authority",
                 displayHost = authority
             )
         }
+    }
+
+    private fun isLoopbackDevelopmentHost(host: String): Boolean {
+        return host.equals("localhost", ignoreCase = true) ||
+            host == "127.0.0.1" ||
+            host == "::1" ||
+            host == "10.0.2.2"
     }
 }

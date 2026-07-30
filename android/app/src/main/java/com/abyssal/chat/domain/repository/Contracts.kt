@@ -68,6 +68,7 @@ interface IChatTransport {
     suspend fun joinChat(chatId: String)
     suspend fun createForum(session: ChatSession)
     suspend fun deleteForum(chatId: String)
+    suspend fun openDirect(peerUsername: String)
     suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray): Boolean
     suspend fun signalUserActivity(): Boolean
     suspend fun broadcastGlobalWipe()
@@ -85,7 +86,7 @@ interface IEncryptedAttachmentService {
     ): AttachmentUploadResult
 
     suspend fun downloadEncryptedAttachment(attachmentId: String): ByteArray?
-    suspend fun saveDecryptedAttachment(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
+    suspend fun saveEncryptedAttachmentExport(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
 }
 
 interface IDisguiseManager {

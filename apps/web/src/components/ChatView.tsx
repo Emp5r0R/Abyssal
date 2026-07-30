@@ -56,6 +56,7 @@ export function ChatView({
   onExportAttachment,
   onSendGif,
 }: ChatViewProps) {
+  const isDirect = room.conversation_type === "direct";
   const [draft, setDraft] = useState("");
   const [showGifs, setShowGifs] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -145,11 +146,11 @@ export function ChatView({
   return (
     <section className="chat-view">
       <header className="chat-header">
-        <IconButton className="mobile-only" label="Back to rooms" onClick={onBack}><ArrowLeft size={20} /></IconButton>
-        <div className="room-avatar">#</div>
+        <IconButton className="mobile-only" label="Back to conversations" onClick={onBack}><ArrowLeft size={20} /></IconButton>
+        <div className={`room-avatar ${isDirect ? "is-direct" : ""}`}>{isDirect ? "@" : "#"}</div>
         <div className="chat-title">
           <h1>{room.name}</h1>
-          <span><ShieldCheck size={13} /> {room.self_destruct_timer_sec}s after read</span>
+          <span><ShieldCheck size={13} /> {isDirect ? "Private route" : `${room.self_destruct_timer_sec}s after read`}</span>
         </div>
         <div className={`connection-pill state-${connected ? "connected" : "disconnected"}`}>
           <span />{connected ? "LIVE" : "OFFLINE"}
@@ -167,8 +168,8 @@ export function ChatView({
         {messages.length === 0 ? (
           <div className="empty-chat">
             <LockKeyhole size={28} />
-            <strong>ROOM EMPTY</strong>
-            <span>Waiting for encrypted traffic</span>
+            <strong>{isDirect ? "DIRECT EMPTY" : "ROOM EMPTY"}</strong>
+            <span>{isDirect ? "Send the first private message" : "Waiting for encrypted traffic"}</span>
           </div>
         ) : messages.map((message) => {
           const original = message.replyToId ? byId.get(message.replyToId) : undefined;

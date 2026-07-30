@@ -109,6 +109,7 @@ class ChatViewModel(
     private var sessionInactivityTimeoutSec = DEFAULT_SESSION_INACTIVITY_SEC
     private var externalSystemUiOpen = false
     private var lastRemoteActivitySignalMs = 0L
+    private var requestedDirectUsername: String? = null
     private val ownMessageIds = mutableSetOf<String>()
 
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
@@ -135,7 +136,7 @@ class ChatViewModel(
 
         viewModelScope.launch {
             chatTransport.getIncomingPayloads().collect { incoming ->
-                val decryptedContent = runCatching { payloadCipher.decrypt(incoming.payload) }
+                val decryptedContent = runCatching { payloadCipher.decrypt(incoming.chatId, incoming.payload) }
                     .getOrElse { "Encrypted payload received." }
                 val message = parseIncomingMessage(
                     incoming.chatId,
@@ -152,6 +153,11 @@ class ChatViewModel(
                     "upsert" -> change.session?.let { session ->
                         messageRepository.createForumSession(session)
                         chatTransport.joinChat(session.id)
+                        if (!session.isForum && requestedDirectUsername.equals(session.name, ignoreCase = true)) {
+                            requestedDirectUsername = null
+                            _activeChatId.value = session.id
+                            _currentScreen.value = Screen.Chat(session.id)
+                        }
                     }
                     "delete" -> change.chatId?.let { chatId ->
                         messageRepository.deleteChatSession(chatId)
@@ -255,7 +261,7 @@ class ChatViewModel(
             )
             val accepted = chatTransport.sendEncryptedPayload(
                 chatId,
-                payloadCipher.encrypt(textMetadata(message))
+                payloadCipher.encrypt(chatId, textMetadata(message))
             )
             if (accepted) {
                 ownMessageIds += message.id
@@ -302,7 +308,7 @@ class ChatViewModel(
                 mediaType = mediaType,
                 totalBytes = bytes.size.toLong()
             )
-            val encryptedBytes = payloadCipher.encryptBytes(bytes)
+            val encryptedBytes = payloadCipher.encryptBytes(chatId, bytes)
             val upload = attachmentService.uploadEncryptedAttachment(
                 chatId = chatId,
                 mediaType = mediaType,
@@ -344,7 +350,7 @@ class ChatViewModel(
             )
             val accepted = chatTransport.sendEncryptedPayload(
                 chatId,
-                payloadCipher.encrypt(attachmentMetadata(message))
+                payloadCipher.encrypt(chatId, attachmentMetadata(message))
             )
             if (accepted) {
                 ownMessageIds += message.id
@@ -357,11 +363,14 @@ class ChatViewModel(
     }
 
     fun viewAttachment(message: Message) {
+        val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
         viewModelScope.launch {
             _attachmentError.value = null
             val encrypted = attachmentService.downloadEncryptedAttachment(attachmentId)
-            val bytes = encrypted?.let { runCatching { payloadCipher.decryptBytes(it) }.getOrNull() }
+            val bytes = encrypted?.let {
+                runCatching { payloadCipher.decryptBytes(chatId, it) }.getOrNull()
+            }
             if (bytes == null) {
                 _attachmentError.value = "Wrong information."
                 return@launch
@@ -380,13 +389,16 @@ class ChatViewModel(
 
     fun saveAttachment(message: Message, outputUri: Uri) {
         if (!message.saveAllowed || message.oneTimeView) return
+        val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
         viewModelScope.launch {
             _attachmentError.value = null
             val cached = attachmentPreview.value?.takeIf { it.messageId == message.id }
             val attachment = cached ?: run {
                 val encrypted = attachmentService.downloadEncryptedAttachment(attachmentId)
-                val bytes = encrypted?.let { runCatching { payloadCipher.decryptBytes(it) }.getOrNull() }
+                val bytes = encrypted?.let {
+                    runCatching { payloadCipher.decryptBytes(chatId, it) }.getOrNull()
+                }
                 if (bytes == null) {
                     _attachmentError.value = "Wrong information."
                     return@launch
@@ -400,7 +412,7 @@ class ChatViewModel(
                     oneTimeView = false
                 )
             }
-            if (!attachmentService.saveDecryptedAttachment(attachment, outputUri)) {
+            if (!attachmentService.saveEncryptedAttachmentExport(attachment, outputUri)) {
                 _attachmentError.value = "Wrong information."
             }
             markMessageAsRead(message.id)
@@ -476,6 +488,21 @@ class ChatViewModel(
         viewModelScope.launch {
             chatTransport.deleteForum(chatId)
         }
+    }
+
+    fun openDirect(peerUsername: String) {
+        val peer = peerUsername.trim()
+        val currentUsername = currentUser.value?.username ?: return
+        if (peer.isEmpty() || peer.length > 80 || peer.equals(currentUsername, ignoreCase = true)) return
+        val existing = sessions.value.firstOrNull {
+            !it.isForum && it.name.equals(peer, ignoreCase = true)
+        }
+        if (existing != null) {
+            navigateTo(Screen.Chat(existing.id))
+            return
+        }
+        requestedDirectUsername = peer
+        viewModelScope.launch { chatTransport.openDirect(peer) }
     }
 
     private suspend fun joinAvailableSessions() {
@@ -613,6 +640,7 @@ class ChatViewModel(
         sessionInactivityPolicy.clear()
         retainSessionInBackground = false
         lastRemoteActivitySignalMs = 0L
+        requestedDirectUsername = null
         _roomCreationLimit.value = DEFAULT_MAX_ROOMS_PER_USER
         updateSessionSecurityState()
         messageRepository.clearAllData()

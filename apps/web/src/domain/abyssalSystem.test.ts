@@ -141,8 +141,8 @@ describe("Abyssal System Security & Feature Suite", () => {
     });
   });
 
-  describe("6. E2E Cryptography Verification (DMs, Rooms, & Attachments)", () => {
-    it("ensures message payload encrypts and decrypts correctly across private rooms and DMs using node key material", async () => {
+  describe("6. Conversation-scoped payload cryptography", () => {
+    it("encrypts messages for one conversation and rejects another conversation or node", async () => {
       const senderCipher = new InMemoryPayloadCipher();
       const receiverCipher = new InMemoryPayloadCipher();
       
@@ -151,15 +151,16 @@ describe("Abyssal System Security & Feature Suite", () => {
 
       const plainText = "Super secret message content";
       
-      const encrypted = await senderCipher.encryptText(plainText);
+      const encrypted = await senderCipher.encryptText("dm_random_identifier", plainText);
       expect(encrypted).not.toEqual(new TextEncoder().encode(plainText));
 
-      const decrypted = await receiverCipher.decryptText(encrypted);
+      const decrypted = await receiverCipher.decryptText("dm_random_identifier", encrypted);
       expect(decrypted).toBe(plainText);
+      await expect(receiverCipher.decryptText("forum_other", encrypted)).rejects.toThrow();
 
       const evilCipher = new InMemoryPayloadCipher();
       await evilCipher.initialize("NODE-BETA-2");
-      await expect(evilCipher.decryptText(encrypted)).rejects.toThrow();
+      await expect(evilCipher.decryptText("dm_random_identifier", encrypted)).rejects.toThrow();
     });
 
     it("verifies attachment client-side pre-encryption and in-memory decryption boundaries", async () => {
@@ -168,13 +169,13 @@ describe("Abyssal System Security & Feature Suite", () => {
 
       const attachmentBytes = new Uint8Array([12, 34, 56, 78]);
 
-      const encrypted = await cipher.encryptBytes(attachmentBytes);
+      const encrypted = await cipher.encryptBytes("forum_media", attachmentBytes);
       expect(encrypted).not.toEqual(attachmentBytes);
 
       const downloadedBytes = encrypted.slice();
       expect(downloadedBytes).toEqual(encrypted);
 
-      const decrypted = await cipher.decryptBytes(downloadedBytes);
+      const decrypted = await cipher.decryptBytes("forum_media", downloadedBytes);
       expect(decrypted).toEqual(attachmentBytes);
     });
   });
