@@ -7,11 +7,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use argon2::{
-    password_hash::{
-        rand_core::OsRng as SaltOsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    },
-    Argon2,
+use abyssal_core::secure_protocol::{
+    opaque_server_finish_login, opaque_server_finish_registration,
+    opaque_server_registration_response, opaque_server_setup, opaque_server_start_login,
 };
 use axum::{
     body::Bytes,
@@ -26,6 +24,7 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -55,6 +54,12 @@ const MAX_CODE_BYTES: usize = 128;
 const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
 const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
+const OPAQUE_HANDSHAKE_TTL_MS: u64 = 60_000;
+const IDENTITY_PUBLIC_BYTES: usize = 64;
+const MAX_IDENTITY_ENVELOPE_BYTES: usize = 256;
+const MESSAGE_NONCE_BYTES: usize = 12;
+const MESSAGE_SIGNATURE_BYTES: usize = 64;
+const WRAPPED_KEY_BYTES: usize = 92;
 
 #[derive(Clone)]
 struct AppState {
@@ -66,6 +71,8 @@ struct AppState {
     inactivity_limit_ms: Option<u64>,
     last_activity_ms: Arc<Mutex<u64>>,
     account_ops: Arc<Mutex<()>>,
+    opaque_setup: Arc<Vec<u8>>,
+    opaque_handshakes: Arc<Mutex<HashMap<Uuid, OpaqueHandshake>>>,
     available_codes: Arc<Mutex<HashSet<String>>>,
     accounts: Arc<Mutex<HashMap<String, Account>>>,
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
@@ -82,8 +89,23 @@ struct AppState {
 #[derive(Clone)]
 struct Account {
     username: String,
-    password_hash: String,
+    password_file: Vec<u8>,
+    identity_public: Vec<u8>,
+    identity_envelope: Vec<u8>,
     connected: bool,
+}
+
+enum OpaqueHandshake {
+    Registration {
+        code: String,
+        created_at_ms: u64,
+    },
+    Login {
+        code: String,
+        username: String,
+        server_state: Vec<u8>,
+        created_at_ms: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -152,7 +174,27 @@ impl Drop for AttachmentRecord {
 impl Drop for Account {
     fn drop(&mut self) {
         self.username.zeroize();
-        self.password_hash.zeroize();
+        self.password_file.zeroize();
+        self.identity_public.zeroize();
+        self.identity_envelope.zeroize();
+    }
+}
+
+impl Drop for OpaqueHandshake {
+    fn drop(&mut self) {
+        match self {
+            Self::Registration { code, .. } => code.zeroize(),
+            Self::Login {
+                code,
+                username,
+                server_state,
+                ..
+            } => {
+                code.zeroize();
+                username.zeroize();
+                server_state.zeroize();
+            }
+        }
     }
 }
 
@@ -214,15 +256,35 @@ struct RoomRecord {
 }
 
 #[derive(Deserialize)]
-struct AccountRequest {
+struct OpaqueAccountStartRequest {
     code: String,
-    password: String,
+    registration_request_b64: String,
+    credential_request_b64: String,
 }
 
-impl Drop for AccountRequest {
+impl Drop for OpaqueAccountStartRequest {
     fn drop(&mut self) {
         self.code.zeroize();
-        self.password.zeroize();
+        self.registration_request_b64.zeroize();
+        self.credential_request_b64.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
+struct OpaqueAccountFinishRequest {
+    handshake_id: Uuid,
+    registration_upload_b64: Option<String>,
+    credential_finalization_b64: Option<String>,
+    identity_public_b64: Option<String>,
+    identity_envelope_b64: Option<String>,
+}
+
+impl Drop for OpaqueAccountFinishRequest {
+    fn drop(&mut self) {
+        self.registration_upload_b64.zeroize();
+        self.credential_finalization_b64.zeroize();
+        self.identity_public_b64.zeroize();
+        self.identity_envelope_b64.zeroize();
     }
 }
 
@@ -244,7 +306,21 @@ struct AccountResponse {
     username: Option<String>,
     max_rooms_per_user: usize,
     session_inactivity_sec: u64,
+    identity_public_b64: Option<String>,
+    identity_envelope_b64: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OpaqueAccountStartResponse {
+    accepted: bool,
+    mode: Option<&'static str>,
+    handshake_id: Option<Uuid>,
+    response_b64: Option<String>,
+    node_id: String,
+    identity_public_b64: Option<String>,
+    identity_envelope_b64: Option<String>,
+    error: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -270,12 +346,12 @@ enum InboundFrame {
     #[serde(rename = "message")]
     Message {
         chat_id: String,
-        payload_b64: String,
-    },
-    #[serde(rename = "read_receipt")]
-    ReadReceipt {
-        chat_id: String,
-        message_id: Option<String>,
+        version: u32,
+        message_id: String,
+        nonce_b64: String,
+        ciphertext_b64: String,
+        signature_b64: String,
+        envelopes: Vec<InboundRecipientEnvelope>,
     },
     #[serde(rename = "global_wipe")]
     GlobalWipe,
@@ -292,19 +368,26 @@ enum InboundFrame {
     },
 }
 
+#[derive(Deserialize)]
+struct InboundRecipientEnvelope {
+    recipient_username: String,
+    wrapped_key_b64: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 enum OutboundFrame {
     #[serde(rename = "message")]
     Message {
         chat_id: String,
-        payload_b64: String,
+        version: u32,
+        message_id: String,
+        nonce_b64: String,
+        ciphertext_b64: String,
+        signature_b64: String,
+        wrapped_key_b64: String,
         sender_username: String,
-    },
-    #[serde(rename = "read_receipt")]
-    ReadReceipt {
-        chat_id: String,
-        message_id: Option<String>,
+        sender_public_key_b64: String,
     },
     #[serde(rename = "presence")]
     Presence { users: Vec<PresenceUser> },
@@ -324,25 +407,33 @@ enum OutboundFrame {
 
 impl OutboundFrame {
     fn zeroize_sensitive(&mut self) {
-        match self {
-            Self::Message {
-                chat_id,
-                payload_b64,
-                sender_username,
-            } => {
-                chat_id.zeroize();
-                payload_b64.zeroize();
-                sender_username.zeroize();
-            }
-            Self::ReadReceipt {
-                chat_id,
-                message_id,
-            } => {
-                chat_id.zeroize();
-                message_id.zeroize();
-            }
-            _ => {}
+        if let Self::Message {
+            chat_id,
+            message_id,
+            nonce_b64,
+            ciphertext_b64,
+            signature_b64,
+            wrapped_key_b64,
+            sender_username,
+            sender_public_key_b64,
+            ..
+        } = self
+        {
+            chat_id.zeroize();
+            message_id.zeroize();
+            nonce_b64.zeroize();
+            ciphertext_b64.zeroize();
+            signature_b64.zeroize();
+            wrapped_key_b64.zeroize();
+            sender_username.zeroize();
+            sender_public_key_b64.zeroize();
         }
+    }
+}
+
+impl Drop for OutboundFrame {
+    fn drop(&mut self) {
+        self.zeroize_sensitive();
     }
 }
 
@@ -350,6 +441,7 @@ impl OutboundFrame {
 struct PresenceUser {
     username: String,
     connected: bool,
+    identity_public_b64: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -383,11 +475,9 @@ async fn main() {
 
     let attachment_body_limit = FILE_ATTACHMENT_LIMIT_BYTES + ENCRYPTION_OVERHEAD_BYTES;
     let account_routes = Router::new()
-        .route("/v1/account/create", post(create_account))
-        .route("/v1/account/login", post(login_account))
-        .route("/v1/account/enter", post(enter_account))
+        .route("/v2/account/start", post(start_opaque_account))
+        .route("/v2/account/finish", post(finish_opaque_account))
         .route("/v1/account/logout", post(logout_account))
-        .route("/v1/invite/validate", post(login_account))
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
     let attachment_routes = Router::new()
         .route("/v1/attachment", post(upload_attachment))
@@ -485,6 +575,8 @@ impl AppState {
             inactivity_limit_ms,
             last_activity_ms: Arc::new(Mutex::new(now_ms())),
             account_ops: Arc::new(Mutex::new(())),
+            opaque_setup: Arc::new(opaque_server_setup()),
+            opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
             available_codes: Arc::new(Mutex::new(available_codes)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -504,6 +596,21 @@ impl AppState {
         info!("ABYSSAL RAM-ONLY ACCESS CODES - copy these now; they are not written to disk");
         for code in codes.iter() {
             info!("ABYSSAL_CODE code={code}");
+        }
+        if let Ok(path) = env::var("ABYSSAL_CODE_OUTPUT_PATH") {
+            if path.starts_with("/tmp/") {
+                let mut sorted_codes = codes.iter().cloned().collect::<Vec<_>>();
+                sorted_codes.sort_unstable();
+                let mut output = sorted_codes.join("\n");
+                output.push('\n');
+                if let Err(error) = tokio::fs::write(&path, output.as_bytes()).await {
+                    warn!("failed to write RAM-only code output: {error}");
+                }
+                output.zeroize();
+                sorted_codes.iter_mut().for_each(Zeroize::zeroize);
+            } else {
+                warn!("ABYSSAL_CODE_OUTPUT_PATH must be under /tmp");
+            }
         }
         info!(
             "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
@@ -736,36 +843,8 @@ fn valid_code_shape(code: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
-fn validate_password(password: &str) -> Result<(), String> {
-    if password.len() < 8 {
-        return Err("Password must be at least 8 characters.".to_string());
-    }
-    if password.len() > 256 {
-        return Err("Password is too long.".to_string());
-    }
-    Ok(())
-}
-
 fn code_log_label(code: &str) -> String {
     format!("len={}", code.len())
-}
-
-fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut SaltOsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|err| err.to_string())
-}
-
-fn verify_password(password: &str, encoded_hash: &str) -> bool {
-    let parsed_hash = match PasswordHash::new(encoded_hash) {
-        Ok(hash) => hash,
-        Err(_) => return false,
-    };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok()
 }
 
 fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: usize) -> bool {
@@ -1053,245 +1132,259 @@ async fn inactivity_watcher(state: AppState) {
     }
 }
 
-async fn create_account(
+async fn start_opaque_account(
     State(state): State<AppState>,
-    Json(request): Json<AccountRequest>,
+    Json(request): Json<OpaqueAccountStartRequest>,
 ) -> impl IntoResponse {
     touch_activity(&state).await;
     let _account_guard = state.account_ops.lock().await;
+    prune_opaque_handshakes(&state).await;
     let code = match normalize_code(&request.code) {
         Ok(code) => code,
-        Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
+        Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
     };
-    info!("account_create_attempt {}", code_log_label(&code));
-    if let Err(error) = validate_password(&request.password) {
-        warn!(
-            "account_create_rejected {} reason=password_shape",
-            code_log_label(&code)
-        );
-        return account_error(StatusCode::BAD_REQUEST, &state, error).await;
-    }
-
-    if !state.available_codes.lock().await.remove(&code) {
-        if state.accounts.lock().await.contains_key(&code) {
-            warn!(
-                "account_create_rejected {} reason=already_created",
-                code_log_label(&code)
-            );
-            return account_error(
-                StatusCode::CONFLICT,
-                &state,
-                "Code already has an account. Use login.".to_string(),
-            )
-            .await;
-        }
-        warn!(
-            "account_create_rejected {} reason=unknown_code",
-            code_log_label(&code)
-        );
-        return account_error(
-            StatusCode::UNAUTHORIZED,
-            &state,
-            "Code rejected.".to_string(),
-        )
-        .await;
-    }
-
-    let password_hash = match hash_password(&request.password) {
-        Ok(hash) => hash,
-        Err(error) => return account_error(StatusCode::INTERNAL_SERVER_ERROR, &state, error).await,
-    };
-    let mut accounts = state.accounts.lock().await;
-    let username = random_unique_username(&accounts);
-    accounts.insert(
-        code.clone(),
-        Account {
-            username: username.clone(),
-            password_hash,
-            connected: false,
-        },
-    );
-    drop(accounts);
-    info!("account_create_accepted {}", code_log_label(&code));
-
-    issue_session(&state, code, username, true).await
-}
-
-async fn login_account(
-    State(state): State<AppState>,
-    Json(request): Json<AccountRequest>,
-) -> impl IntoResponse {
-    touch_activity(&state).await;
-    let _account_guard = state.account_ops.lock().await;
-    let code = match normalize_code(&request.code) {
-        Ok(code) => code,
-        Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
-    };
-    info!("account_login_attempt {}", code_log_label(&code));
-    if let Err(error) = validate_password(&request.password) {
-        warn!(
-            "account_login_rejected {} reason=password_shape",
-            code_log_label(&code)
-        );
-        return account_error(StatusCode::BAD_REQUEST, &state, error).await;
-    }
-
-    let account = match state.accounts.lock().await.get(&code).cloned() {
-        Some(account) => account,
-        None => {
-            warn!(
-                "account_login_rejected {} reason=no_account",
-                code_log_label(&code)
-            );
-            return account_error(
-                StatusCode::UNAUTHORIZED,
-                &state,
-                "No RAM account for this code. Create it first or restart generated a new code set.".to_string(),
-            )
-            .await;
-        }
-    };
-
     if !login_attempt_allowed(&state, &code).await {
-        warn!(
-            "account_login_rejected {} reason=rate_limit",
-            code_log_label(&code)
-        );
-        return account_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            &state,
-            "Wrong information.".to_string(),
-        )
-        .await;
+        return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
     }
-
-    if !verify_password(&request.password, &account.password_hash) {
-        warn!(
-            "account_login_rejected {} reason=bad_password",
-            code_log_label(&code)
-        );
-        return account_error(
-            StatusCode::UNAUTHORIZED,
-            &state,
-            "Invalid password.".to_string(),
-        )
-        .await;
-    }
-
-    clear_login_limit(&state, &code).await;
-
     if code_has_active_session(&state, &code).await {
-        warn!(
-            "account_login_rejected {} reason=active_session",
-            code_log_label(&code)
-        );
-        return account_error(
-            StatusCode::CONFLICT,
-            &state,
-            "Wrong information.".to_string(),
-        )
-        .await;
+        return opaque_start_error(StatusCode::CONFLICT, &state);
     }
 
-    info!("account_login_accepted {}", code_log_label(&code));
-    issue_session(&state, code, account.username.clone(), false).await
+    let handshake_id = Uuid::new_v4();
+    if let Some(account) = state.accounts.lock().await.get(&code).cloned() {
+        let request_bytes =
+            match decode_bounded(&request.credential_request_b64, ACCOUNT_BODY_LIMIT_BYTES) {
+                Ok(bytes) => bytes,
+                Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
+            };
+        let (server_state, response) = match opaque_server_start_login(
+            &state.opaque_setup,
+            &account.password_file,
+            &request_bytes,
+            code.as_bytes(),
+        ) {
+            Ok(result) => result,
+            Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
+        };
+        state.opaque_handshakes.lock().await.insert(
+            handshake_id,
+            OpaqueHandshake::Login {
+                code,
+                username: account.username.clone(),
+                server_state,
+                created_at_ms: now_ms(),
+            },
+        );
+        return (
+            StatusCode::OK,
+            Json(OpaqueAccountStartResponse {
+                accepted: true,
+                mode: Some("login"),
+                handshake_id: Some(handshake_id),
+                response_b64: Some(URL_SAFE_NO_PAD.encode(response)),
+                node_id: state.node_id.clone(),
+                identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&account.identity_public)),
+                identity_envelope_b64: Some(URL_SAFE_NO_PAD.encode(&account.identity_envelope)),
+                error: None,
+            }),
+        );
+    }
+
+    if !state.available_codes.lock().await.contains(&code) {
+        return opaque_start_error(StatusCode::UNAUTHORIZED, &state);
+    }
+    let request_bytes =
+        match decode_bounded(&request.registration_request_b64, ACCOUNT_BODY_LIMIT_BYTES) {
+            Ok(bytes) => bytes,
+            Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
+        };
+    let response = match opaque_server_registration_response(
+        &state.opaque_setup,
+        &request_bytes,
+        code.as_bytes(),
+    ) {
+        Ok(response) => response,
+        Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
+    };
+    state.opaque_handshakes.lock().await.insert(
+        handshake_id,
+        OpaqueHandshake::Registration {
+            code,
+            created_at_ms: now_ms(),
+        },
+    );
+    (
+        StatusCode::OK,
+        Json(OpaqueAccountStartResponse {
+            accepted: true,
+            mode: Some("registration"),
+            handshake_id: Some(handshake_id),
+            response_b64: Some(URL_SAFE_NO_PAD.encode(response)),
+            node_id: state.node_id.clone(),
+            identity_public_b64: None,
+            identity_envelope_b64: None,
+            error: None,
+        }),
+    )
 }
 
-async fn enter_account(
+async fn finish_opaque_account(
     State(state): State<AppState>,
-    Json(request): Json<AccountRequest>,
+    Json(request): Json<OpaqueAccountFinishRequest>,
 ) -> impl IntoResponse {
     touch_activity(&state).await;
     let _account_guard = state.account_ops.lock().await;
-    let code = match normalize_code(&request.code) {
-        Ok(code) => code,
-        Err(error) => return account_error(StatusCode::BAD_REQUEST, &state, error).await,
+    prune_opaque_handshakes(&state).await;
+    let Some(handshake) = state
+        .opaque_handshakes
+        .lock()
+        .await
+        .remove(&request.handshake_id)
+    else {
+        return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
     };
-    info!("account_enter_attempt {}", code_log_label(&code));
-    if let Err(error) = validate_password(&request.password) {
-        warn!(
-            "account_enter_rejected {} reason=password_shape",
-            code_log_label(&code)
-        );
-        return account_error(StatusCode::BAD_REQUEST, &state, error).await;
-    }
 
-    if let Some(account) = state.accounts.lock().await.get(&code).cloned() {
-        if !login_attempt_allowed(&state, &code).await {
-            warn!(
-                "account_enter_rejected {} reason=rate_limit",
-                code_log_label(&code)
+    match &handshake {
+        OpaqueHandshake::Registration { code, .. } => {
+            if state.accounts.lock().await.contains_key(code)
+                || !state.available_codes.lock().await.contains(code)
+            {
+                return account_error(StatusCode::CONFLICT, &state, String::new()).await;
+            }
+            let upload = match request
+                .registration_upload_b64
+                .as_deref()
+                .ok_or(())
+                .and_then(|value| decode_bounded(value, ACCOUNT_BODY_LIMIT_BYTES).map_err(|_| ()))
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
+                }
+            };
+            let identity_public = match request
+                .identity_public_b64
+                .as_deref()
+                .ok_or(())
+                .and_then(|value| decode_exact(value, IDENTITY_PUBLIC_BYTES).map_err(|_| ()))
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
+                }
+            };
+            let identity_envelope = match request
+                .identity_envelope_b64
+                .as_deref()
+                .ok_or(())
+                .and_then(|value| {
+                    decode_bounded(value, MAX_IDENTITY_ENVELOPE_BYTES).map_err(|_| ())
+                }) {
+                Ok(value) if !value.is_empty() => value,
+                _ => return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await,
+            };
+            let password_file = match opaque_server_finish_registration(&upload) {
+                Ok(value) => value,
+                Err(_) => {
+                    return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await
+                }
+            };
+            state.available_codes.lock().await.remove(code);
+            let mut accounts = state.accounts.lock().await;
+            let username = random_unique_username(&accounts);
+            accounts.insert(
+                code.clone(),
+                Account {
+                    username: username.clone(),
+                    password_file,
+                    identity_public,
+                    identity_envelope,
+                    connected: false,
+                },
             );
-            return account_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                &state,
-                "Wrong information.".to_string(),
-            )
-            .await;
+            drop(accounts);
+            clear_login_limit(&state, code).await;
+            info!("opaque_account_created {}", code_log_label(code));
+            issue_session(&state, code.clone(), username, true).await
         }
-        if !verify_password(&request.password, &account.password_hash) {
-            warn!(
-                "account_enter_rejected {} reason=bad_password",
-                code_log_label(&code)
-            );
-            return account_error(
-                StatusCode::UNAUTHORIZED,
-                &state,
-                "Wrong information.".to_string(),
-            )
-            .await;
+        OpaqueHandshake::Login {
+            code,
+            username,
+            server_state,
+            ..
+        } => {
+            let finalization = match request
+                .credential_finalization_b64
+                .as_deref()
+                .ok_or(())
+                .and_then(|value| decode_bounded(value, ACCOUNT_BODY_LIMIT_BYTES).map_err(|_| ()))
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
+                }
+            };
+            if opaque_server_finish_login(server_state, &finalization).is_err() {
+                return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
+            }
+            if code_has_active_session(&state, code).await {
+                return account_error(StatusCode::CONFLICT, &state, String::new()).await;
+            }
+            clear_login_limit(&state, code).await;
+            info!("opaque_account_login {}", code_log_label(code));
+            issue_session(&state, code.clone(), username.clone(), false).await
         }
-
-        clear_login_limit(&state, &code).await;
-
-        if code_has_active_session(&state, &code).await {
-            warn!(
-                "account_enter_rejected {} reason=active_session",
-                code_log_label(&code)
-            );
-            return account_error(
-                StatusCode::CONFLICT,
-                &state,
-                "Wrong information.".to_string(),
-            )
-            .await;
-        }
-
-        info!("account_enter_login {}", code_log_label(&code));
-        return issue_session(&state, code, account.username.clone(), false).await;
     }
+}
 
-    if !state.available_codes.lock().await.remove(&code) {
-        warn!(
-            "account_enter_rejected {} reason=unknown_code",
-            code_log_label(&code)
-        );
-        return account_error(
-            StatusCode::UNAUTHORIZED,
-            &state,
-            "Wrong information.".to_string(),
-        )
-        .await;
+fn opaque_start_error(
+    status: StatusCode,
+    state: &AppState,
+) -> (StatusCode, Json<OpaqueAccountStartResponse>) {
+    (
+        status,
+        Json(OpaqueAccountStartResponse {
+            accepted: false,
+            mode: None,
+            handshake_id: None,
+            response_b64: None,
+            node_id: state.node_id.clone(),
+            identity_public_b64: None,
+            identity_envelope_b64: None,
+            error: Some("Wrong information."),
+        }),
+    )
+}
+
+async fn prune_opaque_handshakes(state: &AppState) {
+    let now = now_ms();
+    state.opaque_handshakes.lock().await.retain(|_, handshake| {
+        let created_at_ms = match handshake {
+            OpaqueHandshake::Registration { created_at_ms, .. }
+            | OpaqueHandshake::Login { created_at_ms, .. } => *created_at_ms,
+        };
+        now.saturating_sub(created_at_ms) < OPAQUE_HANDSHAKE_TTL_MS
+    });
+}
+
+fn decode_bounded(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    if value.is_empty() || value.len() > max_bytes.saturating_mul(2) {
+        return Err("Wrong information".to_string());
     }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| "Wrong information".to_string())?;
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err("Wrong information".to_string());
+    }
+    Ok(bytes)
+}
 
-    let password_hash = match hash_password(&request.password) {
-        Ok(hash) => hash,
-        Err(error) => return account_error(StatusCode::INTERNAL_SERVER_ERROR, &state, error).await,
-    };
-    let mut accounts = state.accounts.lock().await;
-    let username = random_unique_username(&accounts);
-    accounts.insert(
-        code.clone(),
-        Account {
-            username: username.clone(),
-            password_hash,
-            connected: false,
-        },
-    );
-    drop(accounts);
-    info!("account_enter_created {}", code_log_label(&code));
-
-    issue_session(&state, code, username, true).await
+fn decode_exact(value: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
+    let bytes = decode_bounded(value, expected_bytes)?;
+    (bytes.len() == expected_bytes)
+        .then_some(bytes)
+        .ok_or_else(|| "Wrong information".to_string())
 }
 
 async fn replace_connected_clients_for_code(state: &AppState, code: &str) {
@@ -1515,6 +1608,8 @@ async fn account_error(
             username: None,
             max_rooms_per_user: state.max_rooms_per_user,
             session_inactivity_sec: state.session_inactivity_ms / 1000,
+            identity_public_b64: None,
+            identity_envelope_b64: None,
             error: Some("Wrong information.".to_string()),
         }),
     )
@@ -1526,6 +1621,15 @@ async fn issue_session(
     username: String,
     created: bool,
 ) -> (StatusCode, Json<AccountResponse>) {
+    let account_identity = state.accounts.lock().await.get(&code).map(|account| {
+        (
+            URL_SAFE_NO_PAD.encode(&account.identity_public),
+            URL_SAFE_NO_PAD.encode(&account.identity_envelope),
+        )
+    });
+    let Some((identity_public_b64, identity_envelope_b64)) = account_identity else {
+        return account_error(StatusCode::UNAUTHORIZED, state, String::new()).await;
+    };
     let token = Uuid::new_v4().to_string();
     let now = now_ms();
     let mut sessions = state.sessions.lock().await;
@@ -1550,6 +1654,8 @@ async fn issue_session(
             username: Some(username),
             max_rooms_per_user: state.max_rooms_per_user,
             session_inactivity_sec: state.session_inactivity_ms / 1000,
+            identity_public_b64: Some(identity_public_b64),
+            identity_envelope_b64: Some(identity_envelope_b64),
             error: None,
         }),
     )
@@ -1729,33 +1835,26 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
         }
         InboundFrame::Message {
             chat_id,
-            payload_b64,
-        } => {
-            touch_activity(state).await;
-            let sender_username = state
-                .clients
-                .lock()
-                .await
-                .get(&sender_id)
-                .map(|client| client.username.clone())
-                .ok_or_else(|| "authenticated client required".to_string())?;
-            let outbound = OutboundFrame::Message {
-                chat_id: chat_id.clone(),
-                payload_b64,
-                sender_username,
-            };
-            broadcast_to_room(state, sender_id, &chat_id, outbound).await
-        }
-        InboundFrame::ReadReceipt {
-            chat_id,
+            version,
             message_id,
+            nonce_b64,
+            ciphertext_b64,
+            signature_b64,
+            envelopes,
         } => {
             touch_activity(state).await;
-            let outbound = OutboundFrame::ReadReceipt {
-                chat_id: chat_id.clone(),
+            route_encrypted_message(
+                state,
+                sender_id,
+                chat_id,
+                version,
                 message_id,
-            };
-            broadcast_to_room(state, sender_id, &chat_id, outbound).await
+                nonce_b64,
+                ciphertext_b64,
+                signature_b64,
+                envelopes,
+            )
+            .await
         }
         InboundFrame::GlobalWipe => {
             touch_activity(state).await;
@@ -1814,82 +1913,113 @@ async fn leave_room(state: &AppState, client_id: Uuid, chat_id: &str) -> Result<
     Ok(())
 }
 
-async fn broadcast_to_room(
+#[allow(clippy::too_many_arguments)]
+async fn route_encrypted_message(
     state: &AppState,
     sender_id: Uuid,
-    chat_id: &str,
-    frame: OutboundFrame,
+    chat_id: String,
+    version: u32,
+    message_id: String,
+    nonce_b64: String,
+    ciphertext_b64: String,
+    signature_b64: String,
+    envelopes: Vec<InboundRecipientEnvelope>,
 ) -> Result<(), String> {
-    let (_, sender_username) = client_identity(state, sender_id).await?;
-    let access = conversation_access(state, &sender_username, chat_id)
+    if version != 3 || !valid_chat_id(&chat_id) || !valid_chat_id(&message_id) {
+        return Err("encrypted message rejected".to_string());
+    }
+    decode_exact(&nonce_b64, MESSAGE_NONCE_BYTES)?;
+    decode_exact(&signature_b64, MESSAGE_SIGNATURE_BYTES)?;
+    decode_bounded(&ciphertext_b64, WS_MAX_FRAME_BYTES)?;
+
+    let (sender_code, sender_username) = client_identity(state, sender_id).await?;
+    let sender_public_key_b64 = state
+        .accounts
+        .lock()
+        .await
+        .get(&sender_code)
+        .map(|account| URL_SAFE_NO_PAD.encode(&account.identity_public))
+        .ok_or_else(|| "authenticated identity required".to_string())?;
+    let access = conversation_access(state, &sender_username, &chat_id)
         .await
         .ok_or_else(|| "conversation unavailable".to_string())?;
-    let (recipients, pending_usernames) = match access {
-        ConversationAccess::Room(_) => {
-            let members = state
-                .rooms
-                .lock()
-                .await
-                .get(chat_id)
-                .cloned()
-                .unwrap_or_default();
-            let recipient_clients = state
-                .clients
-                .lock()
-                .await
-                .iter()
-                .filter_map(|(client_id, client)| {
-                    (members.contains(client_id) && client.username != sender_username)
-                        .then_some((*client_id, client.username.clone()))
-                })
-                .collect::<Vec<_>>();
-            let delivered_usernames = recipient_clients
-                .iter()
-                .map(|(_, username)| username.clone())
-                .collect::<HashSet<_>>();
-            let pending_usernames = state
-                .accounts
-                .lock()
-                .await
-                .values()
-                .map(|account| account.username.clone())
-                .filter(|username| {
-                    username != &sender_username && !delivered_usernames.contains(username)
-                })
-                .collect::<Vec<_>>();
-            (
-                recipient_clients
-                    .into_iter()
-                    .map(|(client_id, _)| client_id)
-                    .collect(),
-                pending_usernames,
-            )
-        }
+    let expected_recipients = match access {
+        ConversationAccess::Room(_) => state
+            .accounts
+            .lock()
+            .await
+            .values()
+            .map(|account| account.username.clone())
+            .filter(|username| username != &sender_username)
+            .collect::<HashSet<_>>(),
         ConversationAccess::Direct => {
             let peer = state
                 .direct_catalog
                 .lock()
                 .await
-                .get(chat_id)
+                .get(&chat_id)
                 .and_then(|direct| direct.peer_for(&sender_username))
                 .ok_or_else(|| "direct conversation unavailable".to_string())?;
-            let recipients = state
-                .clients
-                .lock()
-                .await
-                .iter()
-                .filter_map(|(client_id, client)| (client.username == peer).then_some(*client_id))
-                .collect::<Vec<_>>();
-            let pending_usernames = recipients.is_empty().then_some(peer).into_iter().collect();
-            (recipients, pending_usernames)
+            HashSet::from([peer])
         }
     };
 
-    for recipient in recipients {
-        send_to_client(state, recipient, &frame).await;
+    if envelopes.len() != expected_recipients.len() {
+        return Err("recipient envelope set rejected".to_string());
     }
-    for username in pending_usernames {
-        queue_pending_frame(state, chat_id, username, frame.clone()).await;
+    let mut envelope_map = HashMap::with_capacity(envelopes.len());
+    for envelope in envelopes {
+        if !expected_recipients.contains(&envelope.recipient_username)
+            || envelope_map.contains_key(&envelope.recipient_username)
+        {
+            return Err("recipient envelope rejected".to_string());
+        }
+        decode_exact(&envelope.wrapped_key_b64, WRAPPED_KEY_BYTES)?;
+        envelope_map.insert(envelope.recipient_username, envelope.wrapped_key_b64);
+    }
+    if envelope_map.keys().collect::<HashSet<_>>()
+        != expected_recipients.iter().collect::<HashSet<_>>()
+    {
+        return Err("recipient envelope set rejected".to_string());
+    }
+
+    let joined = state
+        .rooms
+        .lock()
+        .await
+        .get(&chat_id)
+        .cloned()
+        .unwrap_or_default();
+    let clients = state.clients.lock().await.clone();
+    for recipient_username in expected_recipients {
+        let wrapped_key_b64 = envelope_map
+            .remove(&recipient_username)
+            .ok_or_else(|| "recipient envelope rejected".to_string())?;
+        let frame = OutboundFrame::Message {
+            chat_id: chat_id.clone(),
+            version,
+            message_id: message_id.clone(),
+            nonce_b64: nonce_b64.clone(),
+            ciphertext_b64: ciphertext_b64.clone(),
+            signature_b64: signature_b64.clone(),
+            wrapped_key_b64,
+            sender_username: sender_username.clone(),
+            sender_public_key_b64: sender_public_key_b64.clone(),
+        };
+        let recipient_ids = clients
+            .iter()
+            .filter_map(|(client_id, client)| {
+                (client.username == recipient_username && joined.contains(client_id))
+                    .then_some(*client_id)
+            })
+            .collect::<Vec<_>>();
+        if recipient_ids.is_empty() {
+            queue_pending_frame(state, &chat_id, recipient_username, frame).await;
+        } else {
+            for recipient_id in recipient_ids {
+                send_to_client(state, recipient_id, &frame).await;
+            }
+        }
     }
     Ok(())
 }
@@ -1964,6 +2094,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     }
     drop(available_codes);
     state.frame_limits.lock().await.clear();
+    state.opaque_handshakes.lock().await.clear();
     let mut login_limits = state.login_limits.lock().await;
     for (mut code, _) in login_limits.drain() {
         code.zeroize();
@@ -2203,6 +2334,7 @@ async fn broadcast_presence(state: &AppState) {
         .map(|account| PresenceUser {
             username: account.username.clone(),
             connected: account.connected,
+            identity_public_b64: URL_SAFE_NO_PAD.encode(&account.identity_public),
         })
         .collect::<Vec<_>>();
     let frame = OutboundFrame::Presence { users };
@@ -2329,10 +2461,14 @@ mod tests {
     }
 
     #[test]
-    fn password_hash_round_trips() {
-        let hash = hash_password("strong-password").expect("hash");
-        assert!(verify_password("strong-password", &hash));
-        assert!(!verify_password("wrong-password", &hash));
+    fn protocol_base64_requires_exact_unpadded_lengths() {
+        let encoded = URL_SAFE_NO_PAD.encode([7_u8; MESSAGE_NONCE_BYTES]);
+        assert_eq!(
+            decode_exact(&encoded, MESSAGE_NONCE_BYTES).unwrap(),
+            vec![7; 12]
+        );
+        assert!(decode_exact(&encoded, MESSAGE_NONCE_BYTES + 1).is_err());
+        assert!(decode_bounded("not base64!", 128).is_err());
     }
 
     #[test]
@@ -2482,21 +2618,14 @@ mod tests {
         while alice_rx.try_recv().is_ok() {}
         while bob_rx.try_recv().is_ok() {}
         while eve_rx.try_recv().is_ok() {}
-        broadcast_to_room(
-            &state,
-            alice_id,
-            &direct_id,
-            OutboundFrame::Message {
-                chat_id: direct_id.clone(),
-                payload_b64: "ciphertext".to_string(),
-                sender_username: "Alice".to_string(),
-            },
-        )
-        .await
-        .expect("participant message should route");
+        route_test_message(&state, alice_id, &direct_id, &["Bob"])
+            .await
+            .expect("participant message should route");
 
         let delivered = bob_rx.try_recv().expect("Bob receives the DM");
-        assert!(matches!(delivered, Message::Text(text) if text.contains("ciphertext")));
+        assert!(
+            matches!(delivered, Message::Text(text) if text.contains("ciphertext_b64") && text.contains("wrapped_key_b64"))
+        );
         assert!(eve_rx.try_recv().is_err());
         assert!(conversation_access(&state, "Eve", &direct_id)
             .await
@@ -2538,6 +2667,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_rejects_missing_duplicate_and_unauthorized_recipient_envelopes() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        add_test_account(&state, "code-e", "Eve").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct should open");
+        let direct_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("direct")
+            .id
+            .clone();
+
+        assert!(route_test_message(&state, alice_id, &direct_id, &[])
+            .await
+            .is_err());
+        assert!(
+            route_test_message(&state, alice_id, &direct_id, &["Bob", "Bob"])
+                .await
+                .is_err()
+        );
+        assert!(route_test_message(&state, alice_id, &direct_id, &["Eve"])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn offline_direct_frames_are_consumed_only_by_the_peer() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
@@ -2557,18 +2719,9 @@ mod tests {
             .expect("direct")
             .id
             .clone();
-        broadcast_to_room(
-            &state,
-            alice_id,
-            &direct_id,
-            OutboundFrame::Message {
-                chat_id: direct_id.clone(),
-                payload_b64: "offline-ciphertext".to_string(),
-                sender_username: "Alice".to_string(),
-            },
-        )
-        .await
-        .expect("offline direct should queue");
+        route_test_message(&state, alice_id, &direct_id, &["Bob"])
+            .await
+            .expect("offline direct should queue");
 
         join_room(&state, alice_id, direct_id.clone())
             .await
@@ -2581,7 +2734,7 @@ mod tests {
             .await
             .expect("peer can join");
         let delivered = bob_rx.try_recv().expect("peer receives queued frame");
-        assert!(matches!(delivered, Message::Text(text) if text.contains("offline-ciphertext")));
+        assert!(matches!(delivered, Message::Text(text) if text.contains("ciphertext_b64")));
         assert!(state.pending.lock().await.is_empty());
     }
 
@@ -2604,18 +2757,9 @@ mod tests {
             .await
             .expect("owner joins room");
 
-        broadcast_to_room(
-            &state,
-            alice_id,
-            &room.id,
-            OutboundFrame::Message {
-                chat_id: room.id.clone(),
-                payload_b64: "room-ciphertext".to_string(),
-                sender_username: "Alice".to_string(),
-            },
-        )
-        .await
-        .expect("room frame should queue");
+        route_test_message(&state, alice_id, &room.id, &["Bob"])
+            .await
+            .expect("room frame should queue");
         assert!(alice_rx.try_recv().is_err());
         assert!(bob_rx.try_recv().is_err());
 
@@ -2623,7 +2767,7 @@ mod tests {
             .await
             .expect("peer joins room");
         let delivered = bob_rx.try_recv().expect("peer receives queued room frame");
-        assert!(matches!(delivered, Message::Text(text) if text.contains("room-ciphertext")));
+        assert!(matches!(delivered, Message::Text(text) if text.contains("ciphertext_b64")));
         assert!(state.pending.lock().await.is_empty());
     }
 
@@ -2662,6 +2806,8 @@ mod tests {
             inactivity_limit_ms: None,
             last_activity_ms: Arc::new(Mutex::new(now_ms())),
             account_ops: Arc::new(Mutex::new(())),
+            opaque_setup: Arc::new(opaque_server_setup()),
+            opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
             available_codes: Arc::new(Mutex::new(HashSet::new())),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2681,10 +2827,38 @@ mod tests {
             code.to_string(),
             Account {
                 username: username.to_string(),
-                password_hash: "test-only".to_string(),
+                password_file: vec![1; 192],
+                identity_public: vec![username.as_bytes()[0]; IDENTITY_PUBLIC_BYTES],
+                identity_envelope: vec![1; 93],
                 connected: true,
             },
         );
+    }
+
+    async fn route_test_message(
+        state: &AppState,
+        sender_id: Uuid,
+        chat_id: &str,
+        recipients: &[&str],
+    ) -> Result<(), String> {
+        route_encrypted_message(
+            state,
+            sender_id,
+            chat_id.to_string(),
+            3,
+            Uuid::new_v4().to_string(),
+            URL_SAFE_NO_PAD.encode([2_u8; MESSAGE_NONCE_BYTES]),
+            URL_SAFE_NO_PAD.encode(b"ciphertext"),
+            URL_SAFE_NO_PAD.encode([3_u8; MESSAGE_SIGNATURE_BYTES]),
+            recipients
+                .iter()
+                .map(|username| InboundRecipientEnvelope {
+                    recipient_username: (*username).to_string(),
+                    wrapped_key_b64: URL_SAFE_NO_PAD.encode([4_u8; WRAPPED_KEY_BYTES]),
+                })
+                .collect(),
+        )
+        .await
     }
 
     async fn add_test_client(

@@ -5,7 +5,8 @@ import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.repository.IIdentityService
-import java.io.IOException
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -13,9 +14,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import uniffi.abyssal_core.OpaqueClientStart
+import uniffi.abyssal_core.opaqueClientFinishLogin
+import uniffi.abyssal_core.opaqueClientFinishRegistration
+import uniffi.abyssal_core.opaqueClientStart
 
 class NetworkIdentityService(
-    private val client: OkHttpClient
+    private val client: OkHttpClient,
+    private val payloadCipher: InMemoryPayloadCipher
 ) : IIdentityService {
     private var currentUser: User? = null
 
@@ -23,95 +29,121 @@ class NetworkIdentityService(
         code: String,
         password: String,
         endpoint: NodeEndpoint
-    ): IdentityValidationResult {
-        val unified = authenticate(endpoint, "/v1/account/enter", code, password)
-        if (unified.accepted) return unified
+    ): IdentityValidationResult = withContext(Dispatchers.IO) {
+        val passwordBytes = password.toByteArray(StandardCharsets.UTF_8)
+        var opaque: OpaqueClientStart? = null
+        var responseBytes: ByteArray? = null
+        var context: ByteArray? = null
+        try {
+            opaque = opaqueClientStart(passwordBytes)
+            val start = postJson(
+                endpoint,
+                "/v2/account/start",
+                JSONObject()
+                    .put("code", code)
+                    .put("registration_request_b64", encode(opaque.registrationRequest))
+                    .put("credential_request_b64", encode(opaque.credentialRequest))
+            ) ?: return@withContext rejected()
+            if (!start.optBoolean("accepted", false)) return@withContext rejected()
 
-        val login = authenticate(endpoint, "/v1/account/login", code, password)
-        if (login.accepted) return login
+            val handshakeId = start.optString("handshake_id").takeIf { it.isNotBlank() }
+                ?: return@withContext rejected()
+            val mode = start.optString("mode")
+            val nodeId = start.optString("node_id").takeIf { it.isNotBlank() }
+                ?: return@withContext rejected()
+            responseBytes = decode(start.optString("response_b64"))
+            context = identityContext(nodeId, code)
 
-        return authenticate(endpoint, "/v1/account/create", code, password)
+            val finishBody = JSONObject().put("handshake_id", handshakeId)
+            when (mode) {
+                "registration" -> {
+                    val result = opaqueClientFinishRegistration(
+                        passwordBytes,
+                        opaque.registrationState,
+                        responseBytes
+                    )
+                    try {
+                        val identity = payloadCipher.createIdentity(result.exportKey, context)
+                        try {
+                            finishBody
+                                .put("registration_upload_b64", encode(result.registrationUpload))
+                                .put("identity_public_b64", encode(identity.publicKey))
+                                .put("identity_envelope_b64", encode(identity.envelope))
+                        } finally {
+                            identity.publicKey.fill(0)
+                            identity.envelope.fill(0)
+                        }
+                    } finally {
+                        result.registrationUpload.fill(0)
+                        result.exportKey.fill(0)
+                    }
+                }
+                "login" -> {
+                    val identityPublic = decode(start.optString("identity_public_b64"))
+                    val identityEnvelope = decode(start.optString("identity_envelope_b64"))
+                    val result = opaqueClientFinishLogin(
+                        passwordBytes,
+                        opaque.loginState,
+                        responseBytes
+                    )
+                    try {
+                        payloadCipher.recoverIdentity(
+                            result.exportKey,
+                            context,
+                            identityEnvelope,
+                            identityPublic
+                        )
+                        finishBody.put(
+                            "credential_finalization_b64",
+                            encode(result.credentialFinalization)
+                        )
+                    } finally {
+                        result.credentialFinalization.fill(0)
+                        result.exportKey.fill(0)
+                        result.sessionKey.fill(0)
+                        identityPublic.fill(0)
+                        identityEnvelope.fill(0)
+                    }
+                }
+                else -> return@withContext rejected()
+            }
+
+            val finish = postJson(endpoint, "/v2/account/finish", finishBody)
+                ?: return@withContext rejectedAndClear()
+            if (!finish.optBoolean("accepted", false)) return@withContext rejectedAndClear()
+            val publicKey = payloadCipher.publicKey()
+            val serverPublicKey = decode(finish.optString("identity_public_b64"))
+            if (!publicKey.contentEquals(serverPublicKey)) {
+                publicKey.fill(0)
+                serverPublicKey.fill(0)
+                return@withContext rejectedAndClear()
+            }
+            serverPublicKey.fill(0)
+            parseAccepted(finish, publicKey)
+        } catch (_: Exception) {
+            rejectedAndClear()
+        } finally {
+            passwordBytes.fill(0)
+            responseBytes?.fill(0)
+            context?.fill(0)
+            opaque?.registrationState?.fill(0)
+            opaque?.registrationRequest?.fill(0)
+            opaque?.loginState?.fill(0)
+            opaque?.credentialRequest?.fill(0)
+        }
     }
 
     override suspend fun createAccount(
         code: String,
         password: String,
         endpoint: NodeEndpoint
-    ): IdentityValidationResult = authenticate(
-        endpoint = endpoint,
-        path = "/v1/account/create",
-        code = code,
-        password = password
-    )
+    ): IdentityValidationResult = enterAccount(code, password, endpoint)
 
     override suspend fun login(
         code: String,
         password: String,
         endpoint: NodeEndpoint
-    ): IdentityValidationResult = authenticate(
-        endpoint = endpoint,
-        path = "/v1/account/login",
-        code = code,
-        password = password
-    )
-
-    private suspend fun authenticate(
-        endpoint: NodeEndpoint,
-        path: String,
-        code: String,
-        password: String
-    ): IdentityValidationResult = withContext(Dispatchers.IO) {
-        val body = JSONObject()
-            .put("code", code)
-            .put("password", password)
-            .toString()
-            .toRequestBody("application/json; charset=utf-8".toMediaType())
-
-        val request = Request.Builder()
-            .url("${endpoint.apiBaseUrl}$path")
-            .post(body)
-            .build()
-
-        try {
-            client.newCall(request).execute().use { response ->
-                val responseBody = response.body?.string().orEmpty()
-                val json = responseBody.takeIf { it.isNotBlank() }?.let { JSONObject(it) }
-                if (!response.isSuccessful) {
-                    return@use IdentityValidationResult(
-                        accepted = false,
-                        error = "Wrong information."
-                    )
-                }
-
-                IdentityValidationResult(
-                    accepted = json?.optBoolean("accepted", false) == true,
-                    created = json?.optBoolean("created", false) == true,
-                    token = json?.optString("token")?.takeIf { it.isNotBlank() },
-                    nodeId = json?.optString("node_id")?.takeIf { it.isNotBlank() },
-                    username = json?.optString("username")?.takeIf { it.isNotBlank() },
-                    maxRoomsPerUser = json
-                        ?.optInt("max_rooms_per_user", DEFAULT_MAX_ROOMS_PER_USER)
-                        ?.coerceIn(MIN_MAX_ROOMS_PER_USER, MAX_MAX_ROOMS_PER_USER)
-                        ?: DEFAULT_MAX_ROOMS_PER_USER,
-                    sessionInactivitySec = json
-                        ?.optInt("session_inactivity_sec", DEFAULT_SESSION_INACTIVITY_SEC)
-                        ?.coerceIn(MIN_SESSION_INACTIVITY_SEC, MAX_SESSION_INACTIVITY_SEC)
-                        ?: DEFAULT_SESSION_INACTIVITY_SEC,
-                    error = json?.optString("error")?.takeIf { it.isNotBlank() }
-                )
-            }
-        } catch (e: IOException) {
-            IdentityValidationResult(
-                accepted = false,
-                error = "Wrong information."
-            )
-        } catch (e: Exception) {
-            IdentityValidationResult(
-                accepted = false,
-                error = "Wrong information."
-            )
-        }
-    }
+    ): IdentityValidationResult = enterAccount(code, password, endpoint)
 
     override fun setCurrentUser(user: User) {
         currentUser = user
@@ -125,7 +157,6 @@ class NetworkIdentityService(
             .header("Authorization", "Bearer ${session.token}")
             .post(ByteArray(0).toRequestBody(null))
             .build()
-
         runCatching {
             client.newCall(request).execute().use { response -> response.isSuccessful }
         }.getOrDefault(false)
@@ -135,6 +166,50 @@ class NetworkIdentityService(
         currentUser = null
     }
 
+    private fun postJson(endpoint: NodeEndpoint, path: String, json: JSONObject): JSONObject? {
+        val request = Request.Builder()
+            .url("${endpoint.apiBaseUrl}$path")
+            .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        return client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+            response.body?.string()?.takeIf { it.isNotBlank() }?.let(::JSONObject)
+        }
+    }
+
+    private fun parseAccepted(json: JSONObject, publicKey: ByteArray): IdentityValidationResult {
+        return IdentityValidationResult(
+            accepted = true,
+            created = json.optBoolean("created", false),
+            token = json.optString("token").takeIf { it.isNotBlank() },
+            nodeId = json.optString("node_id").takeIf { it.isNotBlank() },
+            username = json.optString("username").takeIf { it.isNotBlank() },
+            maxRoomsPerUser = json
+                .optInt("max_rooms_per_user", DEFAULT_MAX_ROOMS_PER_USER)
+                .coerceIn(MIN_MAX_ROOMS_PER_USER, MAX_MAX_ROOMS_PER_USER),
+            sessionInactivitySec = json
+                .optInt("session_inactivity_sec", DEFAULT_SESSION_INACTIVITY_SEC)
+                .coerceIn(MIN_SESSION_INACTIVITY_SEC, MAX_SESSION_INACTIVITY_SEC),
+            publicKey = publicKey
+        )
+    }
+
+    private fun rejected(): IdentityValidationResult =
+        IdentityValidationResult(accepted = false, error = "Wrong information.")
+
+    private fun rejectedAndClear(): IdentityValidationResult {
+        payloadCipher.clear()
+        return rejected()
+    }
+
+    private fun identityContext(nodeId: String, code: String): ByteArray {
+        val node = nodeId.trim()
+        val credential = code.trim().uppercase()
+        require(node.isNotEmpty() && node.length <= 128)
+        require(credential.isNotEmpty() && credential.length <= 128)
+        return "ABYSSAL_IDENTITY_V1:$node:$credential".toByteArray(StandardCharsets.UTF_8)
+    }
+
     private companion object {
         const val MIN_SESSION_INACTIVITY_SEC = 60
         const val MAX_SESSION_INACTIVITY_SEC = 24 * 60 * 60
@@ -142,5 +217,13 @@ class NetworkIdentityService(
         const val MIN_MAX_ROOMS_PER_USER = 1
         const val MAX_MAX_ROOMS_PER_USER = 100
         const val DEFAULT_MAX_ROOMS_PER_USER = 5
+        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+        fun decode(value: String): ByteArray {
+            require(value.isNotBlank())
+            return Base64.getUrlDecoder().decode(value)
+        }
     }
 }

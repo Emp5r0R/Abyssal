@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountSession, IncomingFrame, NodeEndpoint } from "../domain/types";
-import { enterAccount, RelaySocket, revokeSession } from "./nodeClient";
+import { bytesToBase64 } from "../security/crypto";
+import {
+  finishOpaqueAccount,
+  RelaySocket,
+  revokeSession,
+  startOpaqueAccount,
+} from "./nodeClient";
 
 const endpoint: NodeEndpoint = {
   apiBaseUrl: "https://node.example",
@@ -16,6 +22,7 @@ const session: AccountSession = {
   sessionInactivitySec: 900,
   endpoint,
   created: false,
+  identityPublicKey: new Uint8Array(64),
 };
 
 afterEach(() => {
@@ -23,7 +30,50 @@ afterEach(() => {
 });
 
 describe("account transport", () => {
-  it("enters an account without browser credentials or referrer leakage", async () => {
+  it("starts OPAQUE without sending password or browser credentials", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      accepted: true,
+      mode: "login",
+      handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
+      response_b64: "AQID",
+      node_id: "node-1",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    await expect(startOpaqueAccount(
+      endpoint,
+      " CODE-1234567 ",
+      new Uint8Array([1]),
+      new Uint8Array([2]),
+    )).resolves.toMatchObject({
+      mode: "login",
+      node_id: "node-1",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("https://node.example/v2/account/start", expect.objectContaining({
+      method: "POST",
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      body: JSON.stringify({
+        code: "CODE-1234567",
+        registration_request_b64: "AQ",
+        credential_request_b64: "Ag",
+      }),
+    }));
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("password1");
+  });
+
+  it("uses the same vague error for malformed and rejected responses", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not-json", { status: 401 }));
+    await expect(startOpaqueAccount(
+      endpoint,
+      "CODE-1234567",
+      new Uint8Array([1]),
+      new Uint8Array([2]),
+    )).rejects.toThrow("Wrong information");
+  });
+
+  it("finishes OPAQUE and validates returned identity material", async () => {
+    const publicKey = new Uint8Array(64).fill(7);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       accepted: true,
       created: true,
@@ -32,25 +82,18 @@ describe("account transport", () => {
       username: "Alice",
       max_rooms_per_user: 3,
       session_inactivity_sec: 900,
+      identity_public_b64: bytesToBase64(publicKey),
+      identity_envelope_b64: "AQID",
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
 
-    await expect(enterAccount(endpoint, " CODE-1234567 ", "password1")).resolves.toMatchObject({
-      token: "token-123",
-      username: "Alice",
-      created: true,
-    });
-    expect(fetchMock).toHaveBeenCalledWith("https://node.example/v1/account/enter", expect.objectContaining({
+    await expect(finishOpaqueAccount(endpoint, {
+      handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
+      credentialFinalization: new Uint8Array([9]),
+    })).resolves.toMatchObject({ username: "Alice", identityPublicKey: publicKey });
+    expect(fetchMock).toHaveBeenCalledWith("https://node.example/v2/account/finish", expect.objectContaining({
       method: "POST",
-      cache: "no-store",
       credentials: "omit",
-      referrerPolicy: "no-referrer",
-      body: JSON.stringify({ code: "CODE-1234567", password: "password1" }),
     }));
-  });
-
-  it("uses the same vague error for malformed and rejected responses", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not-json", { status: 401 }));
-    await expect(enterAccount(endpoint, "CODE-1234567", "password1")).rejects.toThrow("Wrong information");
   });
 
   it("revokes a token with a no-store bearer request", async () => {

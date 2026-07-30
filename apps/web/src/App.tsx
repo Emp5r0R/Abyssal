@@ -157,6 +157,7 @@ function SecureWorkspace({
           room={abyssal.activeRoom}
           username={session.username}
           connected={abyssal.connection === "connected"}
+          safetyNumber={abyssal.safetyNumber}
           messages={abyssal.messages[abyssal.activeRoom.id] ?? []}
           users={abyssal.presence}
           upload={abyssal.upload}

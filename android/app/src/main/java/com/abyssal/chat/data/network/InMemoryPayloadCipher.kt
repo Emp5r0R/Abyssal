@@ -1,119 +1,160 @@
 package com.abyssal.chat.data.network
 
-import java.security.MessageDigest
-import java.security.SecureRandom
-import java.util.Locale
-import javax.crypto.Cipher
-import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
+import com.abyssal.chat.domain.model.EncryptedTransportPayload
+import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.RecipientEnvelope
+import com.abyssal.chat.domain.model.RecipientIdentity
+import java.nio.charset.StandardCharsets
+import java.util.Base64
+import org.json.JSONArray
+import org.json.JSONObject
+import uniffi.abyssal_core.E2eeSession
+import uniffi.abyssal_core.RecipientPublicKey
 
 class InMemoryPayloadCipher {
-    private var nodeSecret: ByteArray? = null
-    private val random = SecureRandom()
+    private var session: E2eeSession? = null
 
-    fun deriveSessionKey(nodeId: String) {
+    @Synchronized
+    fun createIdentity(exportKey: ByteArray, context: ByteArray): IdentityMaterial {
         clear()
-        val normalized = normalizeNodeId(nodeId)
-        require(normalized.isNotEmpty() && normalized.toByteArray(Charsets.UTF_8).size <= MAX_NODE_ID_BYTES) {
-            "Node identity unavailable."
-        }
-        val material = "ABYSSAL_NODE_SECRET_V2:$normalized".toByteArray(Charsets.UTF_8)
-        try {
-            nodeSecret = MessageDigest.getInstance("SHA-256").digest(material)
-        } finally {
-            material.fill(0)
-        }
-    }
-
-    fun encrypt(chatId: String, plainText: String): ByteArray {
-        val plainBytes = plainText.toByteArray(Charsets.UTF_8)
+        val next = E2eeSession.create(exportKey)
         return try {
-            encryptBytes(chatId, plainBytes)
-        } finally {
-            plainBytes.fill(0)
+            session = next
+            IdentityMaterial(
+                publicKey = next.publicKey(),
+                envelope = next.sealIdentity(exportKey, context)
+            )
+        } catch (error: Exception) {
+            next.close()
+            throw error
         }
     }
 
-    fun decrypt(chatId: String, payload: ByteArray): String {
-        val plainBytes = decryptBytes(chatId, payload)
-        return try {
-            String(plainBytes, Charsets.UTF_8)
-        } finally {
-            plainBytes.fill(0)
-        }
+    @Synchronized
+    fun recoverIdentity(
+        exportKey: ByteArray,
+        context: ByteArray,
+        envelope: ByteArray,
+        expectedPublicKey: ByteArray
+    ) {
+        clear()
+        session = E2eeSession.recover(exportKey, context, envelope, expectedPublicKey)
     }
 
-    fun encryptBytes(chatId: String, plainBytes: ByteArray): ByteArray {
-        val normalizedChatId = normalizeChatId(chatId)
-        val nonce = ByteArray(12)
-        random.nextBytes(nonce)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, conversationKey(normalizedChatId), GCMParameterSpec(128, nonce))
-        val aad = additionalData(normalizedChatId)
-        return try {
-            cipher.updateAAD(aad)
-            val ciphertext = cipher.doFinal(plainBytes)
-            byteArrayOf(PAYLOAD_VERSION) + nonce + ciphertext
-        } finally {
-            aad.fill(0)
-        }
+    @Synchronized
+    fun publicKey(): ByteArray = requireSession().publicKey()
+
+    @Synchronized
+    fun encrypt(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        plainBytes: ByteArray,
+        recipients: List<RecipientIdentity>
+    ): EncryptedTransportPayload {
+        val uniqueRecipients = recipients
+            .distinctBy { it.username.lowercase() }
+            .map { RecipientPublicKey(it.username, it.publicKey) }
+        val encrypted = requireSession().encrypt(
+            chatId,
+            messageId,
+            senderUsername,
+            plainBytes,
+            uniqueRecipients
+        )
+        return EncryptedTransportPayload(
+            version = encrypted.version.toInt(),
+            messageId = encrypted.messageId,
+            nonce = encrypted.nonce,
+            ciphertext = encrypted.ciphertext,
+            signature = encrypted.signature,
+            envelopes = encrypted.envelopes.map {
+                RecipientEnvelope(it.username, it.wrappedKey)
+            }
+        )
     }
 
-    fun decryptBytes(chatId: String, payload: ByteArray): ByteArray {
-        val normalizedChatId = normalizeChatId(chatId)
-        require(payload.size > VERSION_BYTES + NONCE_SIZE_BYTES && payload[0] == PAYLOAD_VERSION) {
-            "Encrypted payload is unavailable."
-        }
-        val nonce = payload.copyOfRange(VERSION_BYTES, VERSION_BYTES + NONCE_SIZE_BYTES)
-        val ciphertext = payload.copyOfRange(VERSION_BYTES + NONCE_SIZE_BYTES, payload.size)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, conversationKey(normalizedChatId), GCMParameterSpec(128, nonce))
-        val aad = additionalData(normalizedChatId)
-        return try {
-            cipher.updateAAD(aad)
-            cipher.doFinal(ciphertext)
-        } finally {
-            aad.fill(0)
-            nonce.fill(0)
-            ciphertext.fill(0)
-        }
+    @Synchronized
+    fun decrypt(payload: IncomingTransportPayload, recipientUsername: String): ByteArray {
+        return requireSession().decrypt(
+            payload.chatId,
+            payload.messageId,
+            payload.senderUsername,
+            payload.senderPublicKey,
+            payload.nonce,
+            payload.ciphertext,
+            payload.signature,
+            payload.wrappedKey,
+            recipientUsername
+        )
     }
 
+    fun serialize(payload: EncryptedTransportPayload): ByteArray {
+        val json = JSONObject()
+            .put("version", payload.version)
+            .put("message_id", payload.messageId)
+            .put("nonce_b64", encode(payload.nonce))
+            .put("ciphertext_b64", encode(payload.ciphertext))
+            .put("signature_b64", encode(payload.signature))
+            .put("envelopes", JSONArray().apply {
+                payload.envelopes.forEach { envelope ->
+                    put(
+                        JSONObject()
+                            .put("recipient_username", envelope.recipientUsername)
+                            .put("wrapped_key_b64", encode(envelope.wrappedKey))
+                    )
+                }
+            })
+        return json.toString().toByteArray(StandardCharsets.UTF_8)
+    }
+
+    fun deserializeForRecipient(
+        chatId: String,
+        bytes: ByteArray,
+        senderUsername: String,
+        senderPublicKey: ByteArray,
+        recipientUsername: String
+    ): IncomingTransportPayload {
+        val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+        require(json.optInt("version") == PROTOCOL_VERSION)
+        val envelopes = json.getJSONArray("envelopes")
+        val wrappedKey = (0 until envelopes.length())
+            .asSequence()
+            .map { envelopes.getJSONObject(it) }
+            .firstOrNull { it.getString("recipient_username") == recipientUsername }
+            ?.getString("wrapped_key_b64")
+            ?.let(::decode)
+            ?: throw IllegalArgumentException("Recipient unavailable")
+        return IncomingTransportPayload(
+            chatId = chatId,
+            messageId = json.getString("message_id"),
+            nonce = decode(json.getString("nonce_b64")),
+            ciphertext = decode(json.getString("ciphertext_b64")),
+            signature = decode(json.getString("signature_b64")),
+            wrappedKey = wrappedKey,
+            senderUsername = senderUsername,
+            senderPublicKey = senderPublicKey
+        )
+    }
+
+    @Synchronized
     fun clear() {
-        nodeSecret?.fill(0)
-        nodeSecret = null
+        session?.close()
+        session = null
     }
 
-    private fun conversationKey(chatId: String): SecretKey {
-        val secret = nodeSecret ?: throw IllegalStateException("Payload cipher is not initialized.")
-        val prefix = "ABYSSAL_CONVERSATION_KEY_V2:".toByteArray(Charsets.UTF_8)
-        val suffix = ":$chatId".toByteArray(Charsets.UTF_8)
-        val material = prefix + secret + suffix
-        val digest = MessageDigest.getInstance("SHA-256").digest(material)
-        material.fill(0)
-        return SecretKeySpec(digest, "AES").also { digest.fill(0) }
-    }
+    private fun requireSession(): E2eeSession =
+        session ?: throw IllegalStateException("Identity unavailable")
 
-    private fun normalizeNodeId(value: String): String {
-        return value.trim().uppercase(Locale.ROOT)
-    }
-
-    private fun normalizeChatId(value: String): String {
-        val normalized = value.trim()
-        require(CHAT_ID_REGEX.matches(normalized)) { "Conversation unavailable." }
-        return normalized
-    }
-
-    private fun additionalData(chatId: String): ByteArray {
-        return "ABYSSAL_CONVERSATION_PAYLOAD_V2:$chatId".toByteArray(Charsets.UTF_8)
-    }
+    data class IdentityMaterial(
+        val publicKey: ByteArray,
+        val envelope: ByteArray
+    )
 
     private companion object {
-        const val PAYLOAD_VERSION: Byte = 2
-        const val VERSION_BYTES = 1
-        const val NONCE_SIZE_BYTES = 12
-        const val MAX_NODE_ID_BYTES = 128
-        val CHAT_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,128}$")
+        const val PROTOCOL_VERSION = 3
+        fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+        fun decode(value: String): ByteArray = Base64.getUrlDecoder().decode(value)
     }
 }

@@ -33,9 +33,9 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> =
     directs: [{ id: "dm_random", peer_username: "Bob" }],
     messages: {},
     presence: [
-      { username: "Alice", connected: true },
-      { username: "Bob", connected: true },
-      { username: "Carol", connected: false },
+      { username: "Alice", connected: true, identity_public_b64: "AA" },
+      { username: "Bob", connected: true, identity_public_b64: "AA" },
+      { username: "Carol", connected: false, identity_public_b64: "AA" },
     ],
     activeRoomId: null,
     maxRooms: 2,

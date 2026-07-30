@@ -7,7 +7,7 @@ GRADLE_HOME="${ABYSSAL_GRADLE_HOME:-$ROOT_DIR/.gradle-local}"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/test-all.sh [all|quick|web|rust|android|integration|shell]
+Usage: ./scripts/test-all.sh [all|quick|web|rust|android|integration|crypto|shell]
 
   all          Run every repository check, including the live relay test.
   quick        Run formatting, web, and Rust checks without Android or integration.
@@ -15,6 +15,7 @@ Usage: ./scripts/test-all.sh [all|quick|web|rust|android|integration|shell]
   rust         Run rustfmt, all Rust tests, and clippy with warnings denied.
   android      Run Android JVM tests, release lint, debug APK, and release bundles.
   integration  Start a disposable relay and verify account, DM, and access control flows.
+  crypto       Regenerate the shared WASM, Kotlin, and Android native bindings.
   shell        Parse every tracked Bash script and check patch whitespace.
 EOF
 }
@@ -77,6 +78,7 @@ case "$MODE" in
   rust) run_rust ;;
   android) run_android ;;
   integration) run_integration ;;
+  crypto) "$ROOT_DIR/scripts/build-crypto-bindings.sh" ;;
   shell) run_shell ;;
   -h|--help) usage ;;
   *)

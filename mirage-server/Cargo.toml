@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-argon2 = "0.5"
 axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 rand = "0.8"
@@ -16,3 +15,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.7"
+abyssal-core = { path = "../rust-core" }
+base64 = "0.22"

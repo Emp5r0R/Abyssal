@@ -22,14 +22,28 @@ import type {
   RoomRecord,
   UploadProgress,
 } from "../domain/types";
-import { base64ToBytes, bytesToBase64, InMemoryPayloadCipher, wipeBytes } from "../security/crypto";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  conversationSafetyNumber,
+  finishOpaqueLogin,
+  finishOpaqueRegistration,
+  identityContext,
+  InMemoryPayloadCipher,
+  payloadToFrame,
+  startOpaque,
+  type EncryptedPayload,
+  wipeBytes,
+  wipeOpaqueStart,
+} from "../security/crypto";
 import { encryptedAttachmentBlob, encryptedExportName } from "../security/attachmentExport";
 import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   downloadEncryptedAttachment,
-  enterAccount,
+  finishOpaqueAccount,
   RelaySocket,
   revokeSession,
+  startOpaqueAccount,
   uploadEncryptedAttachment,
 } from "../transport/nodeClient";
 
@@ -77,9 +91,11 @@ export function useAbyssalSession() {
   const sessionRef = useRef<AccountSession | null>(null);
   const roomsRef = useRef<RoomRecord[]>([]);
   const directsRef = useRef<DirectRecord[]>([]);
+  const presenceRef = useRef<PresenceUser[]>([]);
   const activeRoomRef = useRef<string | null>(null);
   const requestedDirectRef = useRef<string | null>(null);
   const ownMessageIdsRef = useRef(new Set<string>());
+  const sendReadReceiptRef = useRef<(chatId: string, messageId: string) => void>(() => undefined);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -92,6 +108,10 @@ export function useAbyssalSession() {
   useEffect(() => {
     directsRef.current = directs;
   }, [directs]);
+
+  useEffect(() => {
+    presenceRef.current = presence;
+  }, [presence]);
 
   useEffect(() => {
     activeRoomRef.current = activeRoomId;
@@ -121,6 +141,7 @@ export function useAbyssalSession() {
     ownMessageIdsRef.current.clear();
     roomsRef.current = [];
     directsRef.current = [];
+    presenceRef.current = [];
     activeRoomRef.current = null;
     requestedDirectRef.current = null;
     retainWhenHiddenRef.current = false;
@@ -152,23 +173,9 @@ export function useAbyssalSession() {
       return;
     }
     if (frame.type === "presence") {
-      setPresence(frame.users.filter((user) => typeof user.username === "string"));
-      return;
-    }
-    if (frame.type === "read_receipt") {
-      if (!frame.message_id) return;
-      const readAtMs = Date.now();
-      setMessages((current) => {
-        const list = current[frame.chat_id];
-        if (!list) return current;
-        let changed = false;
-        const next = list.map((message) => {
-          if (message.id !== frame.message_id || message.readAtMs !== undefined) return message;
-          changed = true;
-          return { ...message, readAtMs };
-        });
-        return changed ? { ...current, [frame.chat_id]: next } : current;
-      });
+      const next = frame.users.filter(validPresence);
+      presenceRef.current = next;
+      setPresence(next);
       return;
     }
     if (frame.type === "rooms") {
@@ -214,13 +221,43 @@ export function useAbyssalSession() {
       socketRef.current?.join(direct.id);
       return;
     }
-    if (frame.type !== "message" || typeof frame.payload_b64 !== "string") return;
+    if (frame.type !== "message" || frame.version !== 3) return;
 
     try {
-      const decrypted = await cipherRef.current.decryptText(frame.chat_id, base64ToBytes(frame.payload_b64));
-      const payload = JSON.parse(decrypted) as Record<string, unknown>;
       const currentSession = sessionRef.current;
       if (!currentSession) return;
+      const senderPublicKey = base64ToBytes(frame.sender_public_key_b64);
+      const decrypted = cipherRef.current.decryptText(
+        frame.chat_id,
+        frame.message_id,
+        frame.sender_username,
+        senderPublicKey,
+        {
+          nonce: base64ToBytes(frame.nonce_b64),
+          ciphertext: base64ToBytes(frame.ciphertext_b64),
+          signature: base64ToBytes(frame.signature_b64),
+        },
+        base64ToBytes(frame.wrapped_key_b64),
+        currentSession.username,
+      );
+      const payload = JSON.parse(decrypted) as Record<string, unknown>;
+      if (payload.kind === "read_receipt") {
+        const targetId = typeof payload.message_id === "string" ? payload.message_id : "";
+        if (!ownMessageIdsRef.current.has(targetId)) return;
+        const readAtMs = Date.now();
+        setMessages((current) => {
+          const list = current[frame.chat_id];
+          if (!list) return current;
+          let changed = false;
+          const next = list.map((message) => {
+            if (message.id !== targetId || message.readAtMs !== undefined) return message;
+            changed = true;
+            return { ...message, readAtMs };
+          });
+          return changed ? { ...current, [frame.chat_id]: next } : current;
+        });
+        return;
+      }
       const room = conversationForId(roomsRef.current, directsRef.current, frame.chat_id);
       const message = parsePayload(
         frame.chat_id,
@@ -228,13 +265,14 @@ export function useAbyssalSession() {
         room,
         currentSession.username,
         frame.sender_username,
+        frame.sender_public_key_b64,
         ownMessageIdsRef.current,
       );
       if (!message || isExpired(message, Date.now())) return;
       if (message.mine) ownMessageIdsRef.current.add(message.id);
       if (activeRoomRef.current === frame.chat_id) {
         message.readAtMs = Date.now();
-        socketRef.current?.send({ type: "read_receipt", chat_id: frame.chat_id, message_id: message.id });
+        sendReadReceiptRef.current(frame.chat_id, message.id);
       }
       setMessages((current) => appendUnique(current, message));
     } catch {
@@ -245,8 +283,64 @@ export function useAbyssalSession() {
   const login = useCallback(async (input: LoginInput): Promise<AccountSession> => {
     setNotice(null);
     const endpoint = normalizeNodeUrl(input.nodeUrl);
-    const nextSession = await enterAccount(endpoint, input.code, input.password);
-    await cipherRef.current.initialize(nextSession.nodeId);
+    const opaque = await startOpaque(input.password);
+    let nextSession: AccountSession;
+    try {
+      const start = await startOpaqueAccount(
+        endpoint,
+        input.code,
+        opaque.registrationRequest,
+        opaque.credentialRequest,
+      );
+      const context = identityContext(start.node_id, input.code);
+      const response = base64ToBytes(start.response_b64!);
+      try {
+        if (start.mode === "registration") {
+          const result = await finishOpaqueRegistration(input.password, opaque, response);
+          const identity = cipherRef.current.createIdentity(result.exportKey, context);
+          nextSession = await finishOpaqueAccount(endpoint, {
+            handshakeId: start.handshake_id!,
+            registrationUpload: result.registrationUpload,
+            identityPublicKey: identity.publicKey,
+            identityEnvelope: identity.envelope,
+          });
+          wipeBytes(result.registrationUpload);
+          wipeBytes(result.exportKey);
+          wipeBytes(identity.publicKey);
+          wipeBytes(identity.envelope);
+        } else {
+          const result = await finishOpaqueLogin(input.password, opaque, response);
+          const identityPublic = base64ToBytes(start.identity_public_b64!);
+          const identityEnvelope = base64ToBytes(start.identity_envelope_b64!);
+          cipherRef.current.recoverIdentity(
+            result.exportKey,
+            context,
+            identityEnvelope,
+            identityPublic,
+          );
+          nextSession = await finishOpaqueAccount(endpoint, {
+            handshakeId: start.handshake_id!,
+            credentialFinalization: result.credentialFinalization,
+          });
+          wipeBytes(result.credentialFinalization);
+          wipeBytes(result.exportKey);
+          wipeBytes(result.sessionKey);
+          wipeBytes(identityPublic);
+          wipeBytes(identityEnvelope);
+        }
+      } finally {
+        wipeBytes(context);
+        wipeBytes(response);
+      }
+    } catch (error) {
+      wipeOpaqueStart(opaque);
+      cipherRef.current.clear();
+      throw error;
+    }
+    if (!equalBytes(cipherRef.current.publicKey(), nextSession.identityPublicKey)) {
+      cipherRef.current.clear();
+      throw new Error("Wrong information");
+    }
     retainWhenHiddenRef.current = input.retainWhenHidden;
     lastActivityRef.current = Date.now();
     lastActivitySignalRef.current = Date.now();
@@ -304,7 +398,7 @@ export function useAbyssalSession() {
       const nextMessages = roomMessages.map((message) => {
         if (message.mine || message.readAtMs !== undefined) return message;
         changed = true;
-        socketRef.current?.send({ type: "read_receipt", chat_id: chatId, message_id: message.id });
+        sendReadReceiptRef.current(chatId, message.id);
         return { ...message, readAtMs: now };
       });
       return changed ? { ...current, [chatId]: nextMessages } : current;
@@ -333,6 +427,55 @@ export function useAbyssalSession() {
     return socketRef.current?.openDirect(peerUsername.trim()) ?? false;
   }, [connection, openRoom]);
 
+  const recipientKeysFor = useCallback((chatId: string, includeSelf = false) => {
+    const currentSession = sessionRef.current;
+    if (!currentSession) return [];
+    const direct = directsRef.current.find((candidate) => candidate.id === chatId);
+    const usernames = direct
+      ? new Set([direct.peer_username])
+      : new Set(
+          presenceRef.current
+            .map((user) => user.username)
+            .filter((username) => username !== currentSession.username),
+        );
+    const recipients = presenceRef.current
+      .filter((user) => usernames.has(user.username))
+      .map((user) => ({
+        username: user.username,
+        publicKey: base64ToBytes(user.identity_public_b64),
+      }));
+    if (includeSelf) {
+      recipients.push({
+        username: currentSession.username,
+        publicKey: currentSession.identityPublicKey.slice(),
+      });
+    }
+    return recipients;
+  }, []);
+
+  const sendReadReceipt = useCallback((chatId: string, messageId: string) => {
+    const currentSession = sessionRef.current;
+    if (!currentSession || !validControlId(messageId)) return;
+    const receiptId = crypto.randomUUID();
+    const encrypted = cipherRef.current.encryptText(
+      chatId,
+      receiptId,
+      currentSession.username,
+      JSON.stringify({ kind: "read_receipt", message_id: messageId }),
+      recipientKeysFor(chatId),
+    );
+    socketRef.current?.send({
+      type: "message",
+      chat_id: chatId,
+      ...payloadToFrame(encrypted),
+    });
+    wipeEncryptedPayload(encrypted);
+  }, [recipientKeysFor]);
+
+  useEffect(() => {
+    sendReadReceiptRef.current = sendReadReceipt;
+  }, [sendReadReceipt]);
+
   const sendText = useCallback(async (content: string, replyToId?: string): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
@@ -353,15 +496,25 @@ export function useAbyssalSession() {
       replyToId: validReplyId(messages[chatId], replyToId),
       mine: true,
     };
-    const encrypted = await cipherRef.current.encryptText(chatId, JSON.stringify(messagePayload(message)));
-    const accepted = socketRef.current?.send({ type: "message", chat_id: chatId, payload_b64: bytesToBase64(encrypted) }) ?? false;
-    wipeBytes(encrypted);
+    const encrypted = cipherRef.current.encryptText(
+      chatId,
+      message.id,
+      currentSession.username,
+      JSON.stringify(messagePayload(message)),
+      recipientKeysFor(chatId),
+    );
+    const accepted = socketRef.current?.send({
+      type: "message",
+      chat_id: chatId,
+      ...payloadToFrame(encrypted),
+    }) ?? false;
+    wipeEncryptedPayload(encrypted);
     if (accepted) {
       ownMessageIdsRef.current.add(message.id);
       setMessages((current) => appendUnique(current, message));
     }
     return accepted;
-  }, [activeRoomId, connection, messages]);
+  }, [activeRoomId, connection, messages, recipientKeysFor]);
 
   const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
@@ -393,7 +546,14 @@ export function useAbyssalSession() {
       setUpload({ active: true, name: file.name || "attachment", loaded: 0, total: file.size });
       const fileBuffer = await file.arrayBuffer();
       plain = new Uint8Array(fileBuffer);
-      encrypted = await cipherRef.current.encryptBytes(chatId, fileBuffer);
+      const attachmentCryptoId = crypto.randomUUID();
+      encrypted = cipherRef.current.encryptBytes(
+        chatId,
+        attachmentCryptoId,
+        currentSession.username,
+        plain,
+        recipientKeysFor(chatId, true),
+      );
       wipeBytes(plain);
       const ttlSec = absoluteRetention(room, mediaType);
       const attachmentId = await uploadEncryptedAttachment(
@@ -417,6 +577,7 @@ export function useAbyssalSession() {
         absoluteExpirySec: ttlSec,
         replyToId: validReplyId(messages[chatId], replyToId),
         mine: true,
+        senderPublicKeyB64: bytesToBase64(currentSession.identityPublicKey),
         attachment: {
           id: attachmentId,
           name: (file.name || "attachment").slice(0, 160),
@@ -428,9 +589,19 @@ export function useAbyssalSession() {
           reactionShortcode: reaction?.shortcode,
         },
       };
-      const metadata = await cipherRef.current.encryptText(chatId, JSON.stringify(messagePayload(message)));
-      const accepted = socketRef.current?.send({ type: "message", chat_id: chatId, payload_b64: bytesToBase64(metadata) }) ?? false;
-      wipeBytes(metadata);
+      const metadata = cipherRef.current.encryptText(
+        chatId,
+        message.id,
+        currentSession.username,
+        JSON.stringify(messagePayload(message)),
+        recipientKeysFor(chatId),
+      );
+      const accepted = socketRef.current?.send({
+        type: "message",
+        chat_id: chatId,
+        ...payloadToFrame(metadata),
+      }) ?? false;
+      wipeEncryptedPayload(metadata);
       if (accepted) {
         ownMessageIdsRef.current.add(message.id);
         setMessages((current) => appendUnique(current, message));
@@ -444,7 +615,7 @@ export function useAbyssalSession() {
       wipeBytes(encrypted);
       setUpload(EMPTY_UPLOAD);
     }
-  }, [activeRoomId, connection, messages]);
+  }, [activeRoomId, connection, messages, recipientKeysFor]);
 
   const viewAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
@@ -454,7 +625,15 @@ export function useAbyssalSession() {
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     try {
       encrypted = await downloadEncryptedAttachment(currentSession, message.attachment.id);
-      plain = await cipherRef.current.decryptBytes(message.chatId, encrypted);
+      plain = cipherRef.current.decryptBytes(
+        message.chatId,
+        message.sender,
+        base64ToBytes(
+          message.senderPublicKeyB64 ?? bytesToBase64(currentSession.identityPublicKey),
+        ),
+        encrypted,
+        currentSession.username,
+      );
       const blob = new Blob([plain.slice().buffer], { type: message.attachment.mimeType });
       setMedia({
         messageId: message.id,
@@ -509,6 +688,19 @@ export function useAbyssalSession() {
     () => conversationForId(rooms, directs, activeRoomId),
     [activeRoomId, directs, rooms],
   );
+  const safetyNumber = useMemo(() => {
+    if (!session || activeRoom?.conversation_type !== "direct") return null;
+    const peer = presence.find((user) => user.username === activeRoom.peer_username);
+    if (!peer) return null;
+    try {
+      return conversationSafetyNumber(
+        session.identityPublicKey,
+        base64ToBytes(peer.identity_public_b64),
+      );
+    } catch {
+      return null;
+    }
+  }, [activeRoom, presence, session]);
 
   return {
     session,
@@ -519,6 +711,7 @@ export function useAbyssalSession() {
     messages,
     activeRoom,
     activeRoomId,
+    safetyNumber,
     remainingSessionSec,
     upload,
     media,
@@ -554,6 +747,25 @@ function validDirect(value: unknown): value is DirectRecord {
   const direct = value as Partial<DirectRecord>;
   return typeof direct.id === "string" && /^dm_[A-Za-z0-9_-]{1,125}$/.test(direct.id) &&
     typeof direct.peer_username === "string" && direct.peer_username.length > 0 && direct.peer_username.length <= 80;
+}
+
+function validPresence(value: unknown): value is PresenceUser {
+  if (!value || typeof value !== "object") return false;
+  const user = value as Partial<PresenceUser>;
+  if (
+    typeof user.username !== "string" ||
+    user.username.length === 0 ||
+    user.username.length > 80 ||
+    typeof user.connected !== "boolean" ||
+    typeof user.identity_public_b64 !== "string"
+  ) {
+    return false;
+  }
+  try {
+    return base64ToBytes(user.identity_public_b64).byteLength === 64;
+  } catch {
+    return false;
+  }
 }
 
 function conversationForId(
@@ -595,6 +807,7 @@ function parsePayload(
   room: RoomRecord | undefined,
   currentUsername: string,
   authoritativeSender?: string,
+  authoritativeSenderPublicKeyB64?: string,
   ownMessageIds: ReadonlySet<string> = new Set(),
 ): ChatMessage | null {
   const kind = payload.kind;
@@ -622,6 +835,7 @@ function parsePayload(
       mine: sender === currentUsername,
       mentionsCurrentUser: sender !== currentUsername && mentionsUsername(content, currentUsername),
       repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
+      senderPublicKeyB64: authoritativeSenderPublicKeyB64,
     };
   }
 
@@ -647,6 +861,7 @@ function parsePayload(
     replyToId,
     mine: sender === currentUsername,
     repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
+    senderPublicKeyB64: authoritativeSenderPublicKeyB64,
     attachment: {
       id: attachmentId,
       name,
@@ -707,6 +922,10 @@ function validReplyId(messages: ChatMessage[] | undefined, value?: string): stri
   return value;
 }
 
+function validControlId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
 function normalizeMediaType(value: unknown): MediaType | null {
   if (value === "IMAGE" || value === "VIDEO" || value === "FILE") return value;
   return null;
@@ -725,4 +944,20 @@ function safeTimestamp(value: unknown, fallback: number): number {
   const lower = fallback - MAX_MESSAGE_AGE_MS;
   const upper = fallback + 60_000;
   return Math.min(upper, Math.max(lower, Math.floor(value)));
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
+}
+
+function wipeEncryptedPayload(payload: EncryptedPayload): void {
+  wipeBytes(payload.nonce);
+  wipeBytes(payload.ciphertext);
+  wipeBytes(payload.signature);
+  payload.envelopes.forEach((envelope) => wipeBytes(envelope.wrappedKey));
 }

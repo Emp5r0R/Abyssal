@@ -8,6 +8,20 @@ use std::sync::{Arc, Mutex};
 use x25519_dalek::{PublicKey as X2PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub mod secure_protocol;
+
+#[derive(Debug, PartialEq, thiserror::Error, uniffi::Error)]
+pub enum AbyssalError {
+    #[error("{detail}")]
+    Failure { detail: String },
+}
+
+impl From<String> for AbyssalError {
+    fn from(message: String) -> Self {
+        Self::Failure { detail: message }
+    }
+}
+
 uniffi::setup_scaffolding!();
 
 // ==========================================
@@ -40,9 +54,9 @@ impl CryptoEngine {
         &self,
         key: Arc<SecureKey>,
         plaintext: String,
-    ) -> Result<EncryptedPayload, String> {
+    ) -> Result<EncryptedPayload, AbyssalError> {
         if key.key_bytes.len() != 32 {
-            return Err("Invalid key size".to_string());
+            return Err("Invalid key size".to_string().into());
         }
         let key_ref = Key::from_slice(&key.key_bytes);
         let cipher = ChaCha20Poly1305::new(key_ref);
@@ -53,7 +67,7 @@ impl CryptoEngine {
 
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_bytes())
-            .map_err(|e| format!("Encryption failed: {:?}", e))?;
+            .map_err(|e| AbyssalError::from(format!("Encryption failed: {:?}", e)))?;
 
         Ok(EncryptedPayload {
             ciphertext,
@@ -66,12 +80,12 @@ impl CryptoEngine {
         &self,
         key: Arc<SecureKey>,
         payload: EncryptedPayload,
-    ) -> Result<String, String> {
+    ) -> Result<String, AbyssalError> {
         if key.key_bytes.len() != 32 {
-            return Err("Invalid key size".to_string());
+            return Err("Invalid key size".to_string().into());
         }
         if payload.nonce.len() != 12 {
-            return Err("Invalid nonce size".to_string());
+            return Err("Invalid nonce size".to_string().into());
         }
         let key_ref = Key::from_slice(&key.key_bytes);
         let cipher = ChaCha20Poly1305::new(key_ref);
@@ -79,9 +93,10 @@ impl CryptoEngine {
 
         let plaintext_bytes = cipher
             .decrypt(nonce, payload.ciphertext.as_slice())
-            .map_err(|e| format!("Decryption failed: {:?}", e))?;
+            .map_err(|e| AbyssalError::from(format!("Decryption failed: {:?}", e)))?;
 
-        String::from_utf8(plaintext_bytes).map_err(|e| format!("Invalid UTF-8 payload: {:?}", e))
+        String::from_utf8(plaintext_bytes)
+            .map_err(|e| AbyssalError::from(format!("Invalid UTF-8 payload: {:?}", e)))
     }
 
     /// Perform ephemeral Diffie-Hellman to derive a shared secret
@@ -89,9 +104,9 @@ impl CryptoEngine {
         &self,
         private_seed: Vec<u8>,
         public_key_bytes: Vec<u8>,
-    ) -> Result<Arc<SecureKey>, String> {
+    ) -> Result<Arc<SecureKey>, AbyssalError> {
         if private_seed.len() != 32 || public_key_bytes.len() != 32 {
-            return Err("Invalid key sizes".to_string());
+            return Err("Invalid key sizes".to_string().into());
         }
 
         let mut seed = [0u8; 32];
@@ -105,7 +120,7 @@ impl CryptoEngine {
 
         let shared_secret = secret.diffie_hellman(&public);
         if !shared_secret.was_contributory() {
-            return Err("Invalid public key".to_string());
+            return Err("Invalid public key".to_string().into());
         }
         let key_bytes = shared_secret.as_bytes().to_vec();
 
@@ -117,9 +132,9 @@ impl CryptoEngine {
 #[uniffi::export]
 impl SecureKey {
     #[uniffi::constructor]
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, String> {
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, AbyssalError> {
         if bytes.len() != 32 {
-            return Err("Invalid key size".to_string());
+            return Err("Invalid key size".to_string().into());
         }
         Ok(Arc::new(SecureKey { key_bytes: bytes }))
     }

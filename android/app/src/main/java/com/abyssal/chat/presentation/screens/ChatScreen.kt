@@ -122,6 +122,7 @@ import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import uniffi.abyssal_core.conversationSafetyNumber
 
 @Composable
 fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
@@ -143,6 +144,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         uploadProgress = uploadProgress,
         attachmentError = attachmentError,
         currentUsername = currentUser?.username,
+        currentPublicKey = currentUser?.publicKey,
         presence = presence,
         onBack = { viewModel.navigateTo(Screen.Dashboard) },
         onSendMessage = viewModel::sendMessage,
@@ -166,6 +168,7 @@ private fun ChatContent(
     uploadProgress: AttachmentUploadProgress,
     attachmentError: String?,
     currentUsername: String?,
+    currentPublicKey: ByteArray?,
     presence: List<UserPresence>,
     onBack: () -> Unit,
     onSendMessage: (String, Int, String?) -> Unit,
@@ -225,6 +228,17 @@ private fun ChatContent(
                 .toList()
         }
     }
+    val safetyNumber = remember(session?.id, currentPublicKey, presence) {
+        if (session?.isForum != false || currentPublicKey == null) {
+            null
+        } else {
+            presence.firstOrNull { it.username.equals(session.name, ignoreCase = true) }
+                ?.publicKey
+                ?.let { peerKey ->
+                    runCatching { conversationSafetyNumber(currentPublicKey, peerKey) }.getOrNull()
+                }
+        }
+    }
 
     LaunchedEffect(replyingToMessageId, replyingToMessage) {
         if (replyingToMessageId != null && replyingToMessage == null) {
@@ -267,6 +281,7 @@ private fun ChatContent(
             ChatHeader(
                 session = session,
                 status = status,
+                safetyNumber = safetyNumber,
                 onBack = onBack
             )
 
@@ -459,6 +474,7 @@ private fun ChatContent(
 private fun ChatHeader(
     session: ChatSession?,
     status: ServerStatus,
+    safetyNumber: String?,
     onBack: () -> Unit
 ) {
     Column {
@@ -490,11 +506,14 @@ private fun ChatHeader(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     LockIcon(modifier = Modifier.size(10.dp), color = NeonGreen)
                     Text(
-                        text = "Encrypted  ${status.latencyMs}ms",
+                        text = safetyNumber?.let { "Safety $it" }
+                            ?: "Encrypted  ${status.latencyMs}ms",
                         color = NeonGreen,
-                        fontSize = 12.sp,
+                        fontSize = if (safetyNumber == null) 12.sp else 10.sp,
                         fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(start = 6.dp)
+                        modifier = Modifier.padding(start = 6.dp),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -1951,7 +1970,8 @@ private fun ChatContentPreview() {
         uploadProgress = AttachmentUploadProgress(),
         attachmentError = null,
         currentUsername = "NebulaTiger93",
-        presence = listOf(UserPresence("SilentFox482", true)),
+        currentPublicKey = ByteArray(64),
+        presence = listOf(UserPresence("SilentFox482", true, ByteArray(64))),
         onBack = {},
         onSendMessage = { _, _, _ -> },
         onSendAttachment = { _, _, _, _, _, _, _, _, _ -> },

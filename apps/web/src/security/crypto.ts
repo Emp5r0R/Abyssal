@@ -1,38 +1,224 @@
-const NONCE_BYTES = 12;
-const PAYLOAD_VERSION = 2;
+import initWasm, {
+  conversationSafetyNumber as rustConversationSafetyNumber,
+  opaqueClientFinishLogin,
+  opaqueClientFinishRegistration,
+  opaqueClientStart,
+  WasmE2eeSession,
+} from "../generated/abyssal_core/abyssal_core";
+
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder("utf-8", { fatal: true });
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-const MAX_NODE_ID_BYTES = 128;
+const USERNAME_PATTERN = /^[\x20-\x7e]{1,80}$/;
+const MAX_PAYLOAD_BYTES = 220 * 1024 * 1024;
+
+let wasmReady: Promise<unknown> | null = null;
+
+export interface OpaqueStartState {
+  registrationState: Uint8Array;
+  registrationRequest: Uint8Array;
+  loginState: Uint8Array;
+  credentialRequest: Uint8Array;
+}
+
+export interface OpaqueRegistrationResult {
+  registrationUpload: Uint8Array;
+  exportKey: Uint8Array;
+}
+
+export interface OpaqueLoginResult {
+  credentialFinalization: Uint8Array;
+  exportKey: Uint8Array;
+  sessionKey: Uint8Array;
+}
+
+export interface RecipientKey {
+  username: string;
+  publicKey: Uint8Array;
+}
+
+export interface RecipientEnvelope {
+  username: string;
+  wrappedKey: Uint8Array;
+}
+
+export interface EncryptedPayload {
+  version: 3;
+  messageId: string;
+  nonce: Uint8Array;
+  ciphertext: Uint8Array;
+  signature: Uint8Array;
+  envelopes: RecipientEnvelope[];
+}
+
+interface RustOpaqueStart {
+  registration_state: number[];
+  registration_request: number[];
+  login_state: number[];
+  credential_request: number[];
+}
+
+interface RustRegistrationFinish {
+  registration_upload: number[];
+  export_key: number[];
+}
+
+interface RustLoginFinish {
+  credential_finalization: number[];
+  export_key: number[];
+  session_key: number[];
+}
+
+interface RustEncryptedPayload {
+  version: number;
+  message_id: string;
+  nonce: number[];
+  ciphertext: number[];
+  signature: number[];
+  envelopes: Array<{ username: string; wrapped_key: number[] }>;
+}
+
+export async function initializeCrypto(): Promise<void> {
+  wasmReady ??= initWasm();
+  await wasmReady;
+}
+
+export async function startOpaque(password: string): Promise<OpaqueStartState> {
+  await initializeCrypto();
+  const passwordBytes = ENCODER.encode(password);
+  try {
+    const result = parseJson<RustOpaqueStart>(opaqueClientStart(passwordBytes));
+    return {
+      registrationState: bytes(result.registration_state),
+      registrationRequest: bytes(result.registration_request),
+      loginState: bytes(result.login_state),
+      credentialRequest: bytes(result.credential_request),
+    };
+  } finally {
+    passwordBytes.fill(0);
+  }
+}
+
+export async function finishOpaqueRegistration(
+  password: string,
+  state: OpaqueStartState,
+  response: Uint8Array,
+): Promise<OpaqueRegistrationResult> {
+  await initializeCrypto();
+  const passwordBytes = ENCODER.encode(password);
+  try {
+    const result = parseJson<RustRegistrationFinish>(
+      opaqueClientFinishRegistration(passwordBytes, state.registrationState, response),
+    );
+    return {
+      registrationUpload: bytes(result.registration_upload),
+      exportKey: bytes(result.export_key),
+    };
+  } finally {
+    passwordBytes.fill(0);
+    wipeOpaqueStart(state);
+  }
+}
+
+export async function finishOpaqueLogin(
+  password: string,
+  state: OpaqueStartState,
+  response: Uint8Array,
+): Promise<OpaqueLoginResult> {
+  await initializeCrypto();
+  const passwordBytes = ENCODER.encode(password);
+  try {
+    const result = parseJson<RustLoginFinish>(
+      opaqueClientFinishLogin(passwordBytes, state.loginState, response),
+    );
+    return {
+      credentialFinalization: bytes(result.credential_finalization),
+      exportKey: bytes(result.export_key),
+      sessionKey: bytes(result.session_key),
+    };
+  } finally {
+    passwordBytes.fill(0);
+    wipeOpaqueStart(state);
+  }
+}
+
+export function identityContext(nodeId: string, code: string): Uint8Array {
+  const node = nodeId.trim();
+  const credential = code.trim().toUpperCase();
+  if (!node || node.length > 128 || !credential || credential.length > 128) {
+    throw new Error("Identity unavailable");
+  }
+  return ENCODER.encode(`ABYSSAL_IDENTITY_V1:${node}:${credential}`);
+}
+
+export function conversationSafetyNumber(firstPublicKey: Uint8Array, secondPublicKey: Uint8Array): string {
+  return rustConversationSafetyNumber(firstPublicKey, secondPublicKey);
+}
 
 export class InMemoryPayloadCipher {
-  #nodeSecret: Uint8Array | null = null;
+  #session: WasmE2eeSession | null = null;
 
-  async initialize(nodeId: string): Promise<void> {
-    const normalized = nodeId.trim().toUpperCase();
-    if (!normalized || ENCODER.encode(normalized).byteLength > MAX_NODE_ID_BYTES) {
-      throw new Error("Node identity unavailable");
-    }
-    const material = ENCODER.encode(`ABYSSAL_NODE_SECRET_V2:${normalized}`);
+  createIdentity(exportKey: Uint8Array, context: Uint8Array): {
+    publicKey: Uint8Array;
+    envelope: Uint8Array;
+  } {
     this.clear();
-    try {
-      this.#nodeSecret = new Uint8Array(await crypto.subtle.digest("SHA-256", material));
-    } finally {
-      material.fill(0);
-    }
+    const session = WasmE2eeSession.create(exportKey);
+    this.#session = session;
+    return {
+      publicKey: session.publicKey(),
+      envelope: session.sealIdentity(exportKey, context),
+    };
   }
 
-  async encryptText(chatId: string, value: string): Promise<Uint8Array> {
+  recoverIdentity(
+    exportKey: Uint8Array,
+    context: Uint8Array,
+    envelope: Uint8Array,
+    expectedPublicKey: Uint8Array,
+  ): void {
+    this.clear();
+    this.#session = WasmE2eeSession.recover(exportKey, context, envelope, expectedPublicKey);
+  }
+
+  publicKey(): Uint8Array {
+    if (!this.#session) throw new Error("Identity unavailable");
+    return this.#session.publicKey();
+  }
+
+  encryptText(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    value: string,
+    recipients: RecipientKey[],
+  ): EncryptedPayload {
     const plain = ENCODER.encode(value);
     try {
-      return await this.encryptBytes(chatId, plain);
+      return this.encryptPayload(chatId, messageId, senderUsername, plain, recipients);
     } finally {
       plain.fill(0);
     }
   }
 
-  async decryptText(chatId: string, payload: Uint8Array): Promise<string> {
-    const plain = await this.decryptBytes(chatId, payload);
+  decryptText(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    senderPublicKey: Uint8Array,
+    payload: Omit<EncryptedPayload, "version" | "messageId" | "envelopes">,
+    wrappedKey: Uint8Array,
+    recipientUsername: string,
+  ): string {
+    const plain = this.decryptPayload(
+      chatId,
+      messageId,
+      senderUsername,
+      senderPublicKey,
+      payload,
+      wrappedKey,
+      recipientUsername,
+    );
     try {
       return DECODER.decode(plain);
     } finally {
@@ -40,93 +226,208 @@ export class InMemoryPayloadCipher {
     }
   }
 
-  async encryptBytes(chatId: string, value: BufferSource): Promise<Uint8Array> {
-    const normalizedChatId = normalizeChatId(chatId);
-    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES));
-    const key = await this.conversationKey(normalizedChatId);
-    const additionalData = ENCODER.encode(`ABYSSAL_CONVERSATION_PAYLOAD_V2:${normalizedChatId}`);
-    let encrypted: ArrayBuffer;
-    try {
-      encrypted = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv: nonce, additionalData, tagLength: 128 },
-        key,
-        value,
-      );
-    } finally {
-      additionalData.fill(0);
-    }
-    const result = new Uint8Array(1 + nonce.byteLength + encrypted.byteLength);
-    result[0] = PAYLOAD_VERSION;
-    result.set(nonce, 1);
-    result.set(new Uint8Array(encrypted), 1 + nonce.byteLength);
-    return result;
+  encryptBytes(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    value: Uint8Array,
+    recipients: RecipientKey[],
+  ): Uint8Array {
+    const encrypted = this.encryptPayload(chatId, messageId, senderUsername, value, recipients);
+    return ENCODER.encode(JSON.stringify(serializePayload(encrypted)));
   }
 
-  async decryptBytes(chatId: string, payload: Uint8Array): Promise<Uint8Array> {
-    const normalizedChatId = normalizeChatId(chatId);
-    if (payload.byteLength <= 1 + NONCE_BYTES || payload[0] !== PAYLOAD_VERSION) {
-      throw new Error("Encrypted payload unavailable");
+  decryptBytes(
+    chatId: string,
+    senderUsername: string,
+    senderPublicKey: Uint8Array,
+    serialized: Uint8Array,
+    recipientUsername: string,
+  ): Uint8Array {
+    if (serialized.byteLength <= 0 || serialized.byteLength > MAX_PAYLOAD_BYTES + 64 * 1024) {
+      throw new Error("Payload unavailable");
     }
-    const nonce = payload.slice(1, 1 + NONCE_BYTES);
-    const ciphertext = payload.slice(1 + NONCE_BYTES);
-    const key = await this.conversationKey(normalizedChatId);
-    const additionalData = ENCODER.encode(`ABYSSAL_CONVERSATION_PAYLOAD_V2:${normalizedChatId}`);
-    try {
-      const decrypted = await crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: nonce, additionalData, tagLength: 128 },
-        key,
-        ciphertext,
-      );
-      return new Uint8Array(decrypted);
-    } finally {
-      additionalData.fill(0);
-      nonce.fill(0);
-      ciphertext.fill(0);
-    }
+    const parsed = parseJson<ReturnType<typeof serializePayload>>(DECODER.decode(serialized));
+    const payload = deserializePayload(parsed);
+    const envelope = payload.envelopes.find((item) => item.username === recipientUsername);
+    if (!envelope) throw new Error("Payload unavailable");
+    return this.decryptPayload(
+      chatId,
+      payload.messageId,
+      senderUsername,
+      senderPublicKey,
+      payload,
+      envelope.wrappedKey,
+      recipientUsername,
+    );
   }
 
   clear(): void {
-    this.#nodeSecret?.fill(0);
-    this.#nodeSecret = null;
+    this.#session?.free();
+    this.#session = null;
   }
 
-  private async conversationKey(chatId: string): Promise<CryptoKey> {
-    if (!this.#nodeSecret) throw new Error("Payload cipher unavailable");
-    const prefix = ENCODER.encode("ABYSSAL_CONVERSATION_KEY_V2:");
-    const suffix = ENCODER.encode(`:${chatId}`);
-    const material = new Uint8Array(prefix.length + this.#nodeSecret.length + suffix.length);
-    material.set(prefix);
-    material.set(this.#nodeSecret, prefix.length);
-    material.set(suffix, prefix.length + this.#nodeSecret.length);
-    try {
-      const digest = await crypto.subtle.digest("SHA-256", material);
-      return crypto.subtle.importKey("raw", digest, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-    } finally {
-      material.fill(0);
+  private encryptPayload(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    plaintext: Uint8Array,
+    recipients: RecipientKey[],
+  ): EncryptedPayload {
+    if (!this.#session) throw new Error("Payload cipher unavailable");
+    normalizeContext(chatId, messageId, senderUsername);
+    const seen = new Set<string>();
+    const rustRecipients = recipients.map((recipient) => {
+      if (
+        !USERNAME_PATTERN.test(recipient.username) ||
+        recipient.publicKey.byteLength !== 64 ||
+        seen.has(recipient.username)
+      ) {
+        throw new Error("Recipient unavailable");
+      }
+      seen.add(recipient.username);
+      return { username: recipient.username, public_key: [...recipient.publicKey] };
+    });
+    const result = parseJson<RustEncryptedPayload>(
+      this.#session.encrypt(
+        chatId,
+        messageId,
+        senderUsername,
+        plaintext,
+        JSON.stringify(rustRecipients),
+      ),
+    );
+    if (result.version !== 3 || result.message_id !== messageId) {
+      throw new Error("Payload unavailable");
     }
+    return {
+      version: 3,
+      messageId: result.message_id,
+      nonce: bytes(result.nonce),
+      ciphertext: bytes(result.ciphertext),
+      signature: bytes(result.signature),
+      envelopes: result.envelopes.map((envelope) => ({
+        username: envelope.username,
+        wrappedKey: bytes(envelope.wrapped_key),
+      })),
+    };
+  }
+
+  private decryptPayload(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    senderPublicKey: Uint8Array,
+    payload: Pick<EncryptedPayload, "nonce" | "ciphertext" | "signature">,
+    wrappedKey: Uint8Array,
+    recipientUsername: string,
+  ): Uint8Array {
+    if (!this.#session) throw new Error("Payload cipher unavailable");
+    normalizeContext(chatId, messageId, senderUsername);
+    return this.#session.decrypt(
+      chatId,
+      messageId,
+      senderUsername,
+      senderPublicKey,
+      payload.nonce,
+      payload.ciphertext,
+      payload.signature,
+      wrappedKey,
+      recipientUsername,
+    );
   }
 }
 
-function normalizeChatId(chatId: string): string {
-  const normalized = chatId.trim();
-  if (!CHAT_ID_PATTERN.test(normalized)) throw new Error("Conversation unavailable");
-  return normalized;
+export function payloadToFrame(payload: EncryptedPayload): Record<string, unknown> {
+  return {
+    version: payload.version,
+    message_id: payload.messageId,
+    nonce_b64: bytesToBase64(payload.nonce),
+    ciphertext_b64: bytesToBase64(payload.ciphertext),
+    signature_b64: bytesToBase64(payload.signature),
+    envelopes: payload.envelopes.map((envelope) => ({
+      recipient_username: envelope.username,
+      wrapped_key_b64: bytesToBase64(envelope.wrappedKey),
+    })),
+  };
 }
 
-export function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytesValue: Uint8Array): string {
   let binary = "";
   const chunkSize = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  for (let offset = 0; offset < bytesValue.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytesValue.subarray(offset, offset + chunkSize));
   }
-  return btoa(binary);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
 }
 
 export function base64ToBytes(value: string): Uint8Array {
-  const binary = atob(value);
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error("Payload unavailable");
+  const standard = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padded = standard.padEnd(Math.ceil(standard.length / 4) * 4, "=");
+  const binary = atob(padded);
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-export function wipeBytes(bytes: Uint8Array): void {
-  bytes.fill(0);
+export function wipeBytes(bytesValue: Uint8Array): void {
+  bytesValue.fill(0);
+}
+
+export function wipeOpaqueStart(state: OpaqueStartState): void {
+  state.registrationState.fill(0);
+  state.registrationRequest.fill(0);
+  state.loginState.fill(0);
+  state.credentialRequest.fill(0);
+}
+
+function normalizeContext(chatId: string, messageId: string, username: string): void {
+  if (!CHAT_ID_PATTERN.test(chatId) || !CHAT_ID_PATTERN.test(messageId) || !USERNAME_PATTERN.test(username)) {
+    throw new Error("Payload unavailable");
+  }
+}
+
+function bytes(value: number[]): Uint8Array {
+  if (!Array.isArray(value) || value.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) {
+    throw new Error("Payload unavailable");
+  }
+  return Uint8Array.from(value);
+}
+
+function parseJson<T>(value: string): T {
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    throw new Error("Payload unavailable");
+  }
+}
+
+function serializePayload(payload: EncryptedPayload) {
+  return {
+    version: payload.version,
+    message_id: payload.messageId,
+    nonce_b64: bytesToBase64(payload.nonce),
+    ciphertext_b64: bytesToBase64(payload.ciphertext),
+    signature_b64: bytesToBase64(payload.signature),
+    envelopes: payload.envelopes.map((envelope) => ({
+      username: envelope.username,
+      wrapped_key_b64: bytesToBase64(envelope.wrappedKey),
+    })),
+  };
+}
+
+function deserializePayload(value: ReturnType<typeof serializePayload>): EncryptedPayload {
+  if (value.version !== 3 || !CHAT_ID_PATTERN.test(value.message_id) || !Array.isArray(value.envelopes)) {
+    throw new Error("Payload unavailable");
+  }
+  return {
+    version: 3,
+    messageId: value.message_id,
+    nonce: base64ToBytes(value.nonce_b64),
+    ciphertext: base64ToBytes(value.ciphertext_b64),
+    signature: base64ToBytes(value.signature_b64),
+    envelopes: value.envelopes.map((envelope) => ({
+      username: envelope.username,
+      wrappedKey: base64ToBytes(envelope.wrapped_key_b64),
+    })),
+  };
 }

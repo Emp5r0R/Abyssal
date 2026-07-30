@@ -22,10 +22,13 @@ android {
         applicationId = "com.abyssal.chat"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "1.6.0"
+        versionCode = 10
+        versionName = "1.7.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        }
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -79,6 +82,13 @@ android {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    systemProperty(
+        "jna.library.path",
+        rootProject.layout.projectDirectory.dir("../target/release").asFile.absolutePath
+    )
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -92,8 +102,12 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.okhttp)
+    implementation("net.java.dev.jna:jna:5.18.1@aar")
 
     testImplementation(libs.junit)
+    testImplementation("net.java.dev.jna:jna:5.18.1")
+    testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

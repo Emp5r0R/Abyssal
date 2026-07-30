@@ -15,6 +15,7 @@ export interface AccountSession {
   sessionInactivitySec: number;
   endpoint: NodeEndpoint;
   created: boolean;
+  identityPublicKey: Uint8Array;
 }
 
 export interface AccountResponse {
@@ -25,12 +26,26 @@ export interface AccountResponse {
   username?: string | null;
   max_rooms_per_user: number;
   session_inactivity_sec: number;
+  identity_public_b64?: string | null;
+  identity_envelope_b64?: string | null;
+  error?: string | null;
+}
+
+export interface OpaqueAccountStartResponse {
+  accepted: boolean;
+  mode?: "registration" | "login" | null;
+  handshake_id?: string | null;
+  response_b64?: string | null;
+  node_id: string;
+  identity_public_b64?: string | null;
+  identity_envelope_b64?: string | null;
   error?: string | null;
 }
 
 export interface PresenceUser {
   username: string;
   connected: boolean;
+  identity_public_b64: string;
 }
 
 export interface RoomRecord {
@@ -76,6 +91,7 @@ export interface ChatMessage {
   mine: boolean;
   mentionsCurrentUser?: boolean;
   repliesToCurrentUser?: boolean;
+  senderPublicKeyB64?: string;
   attachment?: {
     id: string;
     name: string;
@@ -98,8 +114,18 @@ export interface DecryptedMedia {
 }
 
 export type IncomingFrame =
-  | { type: "message"; chat_id: string; payload_b64: string; sender_username?: string }
-  | { type: "read_receipt"; chat_id: string; message_id?: string | null }
+  | {
+      type: "message";
+      chat_id: string;
+      version: number;
+      message_id: string;
+      nonce_b64: string;
+      ciphertext_b64: string;
+      signature_b64: string;
+      wrapped_key_b64: string;
+      sender_username: string;
+      sender_public_key_b64: string;
+    }
   | { type: "presence"; users: PresenceUser[] }
   | { type: "GLOBAL_WIPE" | "global_wipe" }
   | { type: "rooms"; rooms: RoomRecord[] }
