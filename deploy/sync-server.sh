@@ -14,7 +14,7 @@ trap cleanup EXIT INT TERM
 
 git -C "$ROOT_DIR" archive --format=tar HEAD | tar -xf - -C "$SYNC_DIR"
 
-rsync -az --delete --partial --human-readable --info=progress2,stats2 \
+rsync -az --checksum --delete --partial --human-readable --info=progress2,stats2 \
   -e "ssh -o StrictHostKeyChecking=accept-new -i $ABYSSAL_SSH_KEY" \
   --rsync-path="mkdir -p '$ABYSSAL_REMOTE_DIR' && rsync" \
   --exclude '.git/' \
