@@ -14,6 +14,7 @@ import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.model.RecipientIdentity
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.SessionInactivityPolicy
 import com.abyssal.chat.domain.model.SessionSecurityState
@@ -26,7 +27,7 @@ import com.abyssal.chat.domain.repository.IIdentityService
 import com.abyssal.chat.domain.repository.IMessageRepository
 import com.abyssal.chat.domain.repository.IMessageSender
 import com.abyssal.chat.domain.repository.INodeConfigService
-import java.security.SecureRandom
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -136,14 +137,31 @@ class ChatViewModel(
 
         viewModelScope.launch {
             chatTransport.getIncomingPayloads().collect { incoming ->
-                val decryptedContent = runCatching { payloadCipher.decrypt(incoming.chatId, incoming.payload) }
-                    .getOrElse { "Encrypted payload received." }
-                val message = parseIncomingMessage(
-                    incoming.chatId,
-                    decryptedContent,
-                    incoming.senderUsername
-                ) ?: return@collect
-                messageRepository.saveMessage(incoming.chatId, message)
+                val username = currentUser.value?.username ?: return@collect
+                val plainBytes = runCatching { payloadCipher.decrypt(incoming, username) }
+                    .getOrNull() ?: return@collect
+                try {
+                    val decryptedContent = String(plainBytes, StandardCharsets.UTF_8)
+                    val control = runCatching { JSONObject(decryptedContent) }.getOrNull()
+                    if (control?.optString("kind") == "read_receipt") {
+                        val targetId = MessageReplyPolicy.sanitizeMessageId(
+                            control.optString("message_id")
+                        )
+                        if (targetId != null && targetId in ownMessageIds) {
+                            messageRepository.markAsRead(incoming.chatId, targetId)
+                        }
+                        return@collect
+                    }
+                    val message = parseIncomingMessage(
+                        incoming.chatId,
+                        decryptedContent,
+                        incoming.senderUsername,
+                        incoming.senderPublicKey
+                    ) ?: return@collect
+                    messageRepository.saveMessage(incoming.chatId, message)
+                } finally {
+                    plainBytes.fill(0)
+                }
             }
         }
 
@@ -213,10 +231,14 @@ class ChatViewModel(
                 val nodeId = validation.nodeId ?: endpoint.displayHost
                 val identity = User(
                     username = validation.username ?: "AbyssalUser",
-                    publicKey = ByteArray(32).also { SecureRandom().nextBytes(it) }
+                    publicKey = validation.publicKey ?: run {
+                        _inviteCodeError.value = "Wrong information."
+                        payloadCipher.clear()
+                        _isVerifyingCode.value = false
+                        return@launch
+                    }
                 )
                 identityService.setCurrentUser(identity)
-                payloadCipher.deriveSessionKey(nodeId)
                 nodeConfigService.setActiveSession(
                     NodeSession(endpoint, validation.token, nodeId, validation.maxRoomsPerUser)
                 )
@@ -261,7 +283,7 @@ class ChatViewModel(
             )
             val accepted = chatTransport.sendEncryptedPayload(
                 chatId,
-                payloadCipher.encrypt(chatId, textMetadata(message))
+                encryptMetadata(chatId, message.id, textMetadata(message)) ?: return@launch
             )
             if (accepted) {
                 ownMessageIds += message.id
@@ -308,7 +330,29 @@ class ChatViewModel(
                 mediaType = mediaType,
                 totalBytes = bytes.size.toLong()
             )
-            val encryptedBytes = payloadCipher.encryptBytes(chatId, bytes)
+            val sender = currentUser.value ?: run {
+                _attachmentUploadProgress.value = AttachmentUploadProgress()
+                return@launch
+            }
+            val attachmentRecipients = recipientIdentities(chatId, includeSelf = true) ?: run {
+                _attachmentError.value = "Wrong information."
+                _attachmentUploadProgress.value = AttachmentUploadProgress()
+                return@launch
+            }
+            val attachmentPayload = runCatching {
+                payloadCipher.encrypt(
+                    chatId = chatId,
+                    messageId = "${UUID.randomUUID()}_attachment",
+                    senderUsername = sender.username,
+                    plainBytes = bytes,
+                    recipients = attachmentRecipients
+                )
+            }.getOrElse {
+                _attachmentError.value = "Wrong information."
+                _attachmentUploadProgress.value = AttachmentUploadProgress()
+                return@launch
+            }
+            val encryptedBytes = payloadCipher.serialize(attachmentPayload)
             val upload = attachmentService.uploadEncryptedAttachment(
                 chatId = chatId,
                 mediaType = mediaType,
@@ -346,11 +390,12 @@ class ChatViewModel(
                 oneTimeView = oneTimeView,
                 deleteAfterDownload = deleteAfterDownload,
                 replyToMessageId = validReplyTarget(replyToMessageId),
-                reactionShortcode = safeReactionShortcode
+                reactionShortcode = safeReactionShortcode,
+                senderPublicKey = sender.publicKey
             )
             val accepted = chatTransport.sendEncryptedPayload(
                 chatId,
-                payloadCipher.encrypt(chatId, attachmentMetadata(message))
+                encryptMetadata(chatId, message.id, attachmentMetadata(message)) ?: return@launch
             )
             if (accepted) {
                 ownMessageIds += message.id
@@ -369,7 +414,7 @@ class ChatViewModel(
             _attachmentError.value = null
             val encrypted = attachmentService.downloadEncryptedAttachment(attachmentId)
             val bytes = encrypted?.let {
-                runCatching { payloadCipher.decryptBytes(chatId, it) }.getOrNull()
+                decryptAttachment(chatId, message, it)
             }
             if (bytes == null) {
                 _attachmentError.value = "Wrong information."
@@ -397,7 +442,7 @@ class ChatViewModel(
             val attachment = cached ?: run {
                 val encrypted = attachmentService.downloadEncryptedAttachment(attachmentId)
                 val bytes = encrypted?.let {
-                    runCatching { payloadCipher.decryptBytes(chatId, it) }.getOrNull()
+                    decryptAttachment(chatId, message, it)
                 }
                 if (bytes == null) {
                     _attachmentError.value = "Wrong information."
@@ -426,7 +471,18 @@ class ChatViewModel(
     fun markMessageAsRead(messageId: String) {
         val chatId = _activeChatId.value ?: return
         viewModelScope.launch {
+            val message = activeMessages.value.firstOrNull { it.id == messageId }
             messageRepository.markAsRead(chatId, messageId)
+            if (message != null && message.sender != "You" && serverStatus.value.state == "CONNECTED") {
+                val receiptId = UUID.randomUUID().toString()
+                val metadata = JSONObject()
+                    .put("kind", "read_receipt")
+                    .put("message_id", messageId)
+                    .toString()
+                encryptMetadata(chatId, receiptId, metadata)?.let { encrypted ->
+                    chatTransport.sendEncryptedPayload(chatId, encrypted)
+                }
+            }
         }
     }
 
@@ -686,14 +742,77 @@ class ChatViewModel(
 
     private fun elapsedRealtimeMs(): Long = System.nanoTime() / 1_000_000L
 
+    private fun encryptMetadata(
+        chatId: String,
+        messageId: String,
+        metadata: String
+    ): com.abyssal.chat.domain.model.EncryptedTransportPayload? {
+        val sender = currentUser.value ?: return null
+        val recipients = recipientIdentities(chatId, includeSelf = false) ?: return null
+        val plainBytes = metadata.toByteArray(StandardCharsets.UTF_8)
+        return try {
+            payloadCipher.encrypt(
+                chatId = chatId,
+                messageId = messageId,
+                senderUsername = sender.username,
+                plainBytes = plainBytes,
+                recipients = recipients
+            )
+        } catch (_: Exception) {
+            null
+        } finally {
+            plainBytes.fill(0)
+        }
+    }
+
+    private fun recipientIdentities(chatId: String, includeSelf: Boolean): List<RecipientIdentity>? {
+        val self = currentUser.value ?: return null
+        val known = presence.value
+            .filter { it.publicKey.size == IDENTITY_PUBLIC_KEY_BYTES }
+            .associateBy { it.username.lowercase() }
+        val recipients = if (chatId.startsWith("dm_")) {
+            val peer = sessions.value.firstOrNull { it.id == chatId && !it.isForum }?.name
+                ?: return null
+            listOfNotNull(known[peer.lowercase()])
+                .takeIf { it.isNotEmpty() }
+                ?: return null
+        } else {
+            known.values.filterNot { it.username.equals(self.username, ignoreCase = true) }
+        }.map { RecipientIdentity(it.username, it.publicKey) }.toMutableList()
+
+        if (includeSelf && recipients.none { it.username.equals(self.username, ignoreCase = true) }) {
+            recipients += RecipientIdentity(self.username, self.publicKey)
+        }
+        return recipients
+    }
+
+    private fun decryptAttachment(chatId: String, message: Message, encrypted: ByteArray): ByteArray? {
+        val self = currentUser.value ?: return null
+        val senderUsername = if (message.sender == "You") self.username else message.sender
+        val senderPublicKey = message.senderPublicKey
+            ?: if (senderUsername.equals(self.username, ignoreCase = true)) self.publicKey else null
+            ?: return null
+        return runCatching {
+            val payload = payloadCipher.deserializeForRecipient(
+                chatId = chatId,
+                bytes = encrypted,
+                senderUsername = senderUsername,
+                senderPublicKey = senderPublicKey,
+                recipientUsername = self.username
+            )
+            payloadCipher.decrypt(payload, self.username)
+        }.getOrNull()
+    }
+
     private fun parseIncomingMessage(
         chatId: String,
         decryptedContent: String,
-        authoritativeSender: String?
+        authoritativeSender: String,
+        senderPublicKey: ByteArray
     ): Message? {
         val json = runCatching { JSONObject(decryptedContent) }.getOrNull()
         val sender = authoritativeSender
-            ?.takeIf { it.isNotBlank() }
+            .takeIf { it.isNotBlank() }
             ?: json?.optString("sender")?.takeIf { it.isNotBlank() }
             ?: "Remote node"
         if (sender == currentUser.value?.username) return null
@@ -727,7 +846,8 @@ class ChatViewModel(
                     fileName,
                     mimeType
                 ),
-                repliesToCurrentUser = repliesToCurrentUser
+                repliesToCurrentUser = repliesToCurrentUser,
+                senderPublicKey = senderPublicKey
             )
         }
 
@@ -746,7 +866,8 @@ class ChatViewModel(
                     content,
                     currentUser.value?.username
                 ),
-                repliesToCurrentUser = repliesToCurrentUser
+                repliesToCurrentUser = repliesToCurrentUser,
+                senderPublicKey = senderPublicKey
             )
         }
 
@@ -761,7 +882,8 @@ class ChatViewModel(
             mentionsCurrentUser = MessageAttentionPolicy.mentionsUsername(
                 decryptedContent,
                 currentUser.value?.username
-            )
+            ),
+            senderPublicKey = senderPublicKey
         )
     }
 
@@ -823,7 +945,8 @@ class ChatViewModel(
         deleteAfterDownload: Boolean,
         replyToMessageId: String? = null,
         reactionShortcode: String? = null,
-        repliesToCurrentUser: Boolean = false
+        repliesToCurrentUser: Boolean = false,
+        senderPublicKey: ByteArray? = null
     ): Message {
         val safeName = fileName.ifBlank { "attachment" }
         return Message(
@@ -846,7 +969,8 @@ class ChatViewModel(
             absoluteExpirySec = absoluteExpirySec,
             replyToMessageId = replyToMessageId,
             reactionShortcode = reactionShortcode,
-            repliesToCurrentUser = repliesToCurrentUser
+            repliesToCurrentUser = repliesToCurrentUser,
+            senderPublicKey = senderPublicKey
         )
     }
 
@@ -969,5 +1093,6 @@ class ChatViewModel(
         private const val SESSION_WATCHDOG_INTERVAL_MS = 1_000L
         private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
+        private const val IDENTITY_PUBLIC_KEY_BYTES = 64
     }
 }

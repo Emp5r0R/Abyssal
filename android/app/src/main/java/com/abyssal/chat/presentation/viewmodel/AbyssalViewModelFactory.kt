@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModelProvider
 import com.abyssal.chat.data.network.CloudflareFallbackDns
 import com.abyssal.chat.data.network.EncryptedAttachmentService
 import com.abyssal.chat.data.network.InMemoryNodeConfigService
+import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.data.network.NetworkIdentityService
 import com.abyssal.chat.data.network.RealChatTransport
 import com.abyssal.chat.data.repository.AndroidDisguiseManager
@@ -28,7 +29,8 @@ class AbyssalViewModelFactory(
             .writeTimeout(120, TimeUnit.SECONDS)
             .build()
         val nodeConfigService = InMemoryNodeConfigService()
-        val identityService = NetworkIdentityService(httpClient)
+        val payloadCipher = InMemoryPayloadCipher()
+        val identityService = NetworkIdentityService(httpClient, payloadCipher)
         val messageRepository = InMemoryMessageRepository()
         val chatTransport = RealChatTransport(nodeConfigService, httpClient)
         val attachmentService = EncryptedAttachmentService(appContext, nodeConfigService, httpClient)
@@ -42,7 +44,8 @@ class AbyssalViewModelFactory(
             messageSender = messageRepository,
             chatTransport = chatTransport,
             attachmentService = attachmentService,
-            disguiseManager = disguiseManager
+            disguiseManager = disguiseManager,
+            payloadCipher = payloadCipher
         ) as T
     }
 }

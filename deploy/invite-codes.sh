@@ -8,4 +8,4 @@ ssh \
   -o StrictHostKeyChecking=accept-new \
   -i "$ABYSSAL_SSH_KEY" \
   "$ABYSSAL_SSH_HOST" \
-  "cd '$ABYSSAL_REMOTE_DIR' && docker compose -f deploy/docker-compose.yml ps && curl --fail --silent http://127.0.0.1:4020/health"
+  "cd '$ABYSSAL_REMOTE_DIR' && docker compose -f deploy/docker-compose.yml exec -T mirage-server cat /tmp/abyssal-invite-codes"

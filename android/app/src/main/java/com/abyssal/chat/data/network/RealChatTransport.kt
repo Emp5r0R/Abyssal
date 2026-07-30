@@ -1,7 +1,7 @@
 package com.abyssal.chat.data.network
 
-import android.util.Base64
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
@@ -9,6 +9,7 @@ import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.INodeConfigService
 import java.util.Collections
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -113,12 +114,27 @@ class RealChatTransport(
         }
     }
 
-    override suspend fun sendEncryptedPayload(chatId: String, payload: ByteArray): Boolean {
-        val encodedPayload = Base64.encodeToString(payload, Base64.NO_WRAP)
+    override suspend fun sendEncryptedPayload(
+        chatId: String,
+        payload: EncryptedTransportPayload
+    ): Boolean {
         val frame = JSONObject()
             .put("type", "message")
             .put("chat_id", chatId)
-            .put("payload_b64", encodedPayload)
+            .put("version", payload.version)
+            .put("message_id", payload.messageId)
+            .put("nonce_b64", encode(payload.nonce))
+            .put("ciphertext_b64", encode(payload.ciphertext))
+            .put("signature_b64", encode(payload.signature))
+            .put("envelopes", JSONArray().apply {
+                payload.envelopes.forEach { envelope ->
+                    put(
+                        JSONObject()
+                            .put("recipient_username", envelope.recipientUsername)
+                            .put("wrapped_key_b64", encode(envelope.wrappedKey))
+                    )
+                }
+            })
             .toString()
 
         val accepted = webSocket?.send(frame) == true
@@ -162,10 +178,22 @@ class RealChatTransport(
                     when (json.optString("type")) {
                         "GLOBAL_WIPE", "global_wipe" -> _wipeCommands.tryEmit(Unit)
                         "message" -> {
+                            if (json.optInt("version") != PROTOCOL_VERSION) return
                             val chatId = json.optString("chat_id").takeIf { it.isNotBlank() } ?: return
-                            val payload = Base64.decode(json.optString("payload_b64"), Base64.NO_WRAP)
-                            val senderUsername = json.optString("sender_username").takeIf { it.isNotBlank() }
-                            _incomingPayloads.tryEmit(IncomingTransportPayload(chatId, payload, senderUsername))
+                            val messageId = json.optString("message_id").takeIf { it.isNotBlank() } ?: return
+                            val senderUsername = json.optString("sender_username").takeIf { it.isNotBlank() } ?: return
+                            _incomingPayloads.tryEmit(
+                                IncomingTransportPayload(
+                                    chatId = chatId,
+                                    messageId = messageId,
+                                    nonce = decode(json.getString("nonce_b64")),
+                                    ciphertext = decode(json.getString("ciphertext_b64")),
+                                    signature = decode(json.getString("signature_b64")),
+                                    wrappedKey = decode(json.getString("wrapped_key_b64")),
+                                    senderUsername = senderUsername,
+                                    senderPublicKey = decode(json.getString("sender_public_key_b64"))
+                                )
+                            )
                         }
                         "presence" -> {
                             val users = json.optJSONArray("users") ?: return
@@ -175,7 +203,8 @@ class RealChatTransport(
                                     ?: return@mapNotNull null
                                 UserPresence(
                                     username = username,
-                                    connected = user.optBoolean("connected", false)
+                                    connected = user.optBoolean("connected", false),
+                                    publicKey = decode(user.getString("identity_public_b64"))
                                 )
                             }
                         }
@@ -307,6 +336,11 @@ class RealChatTransport(
     }
 
     private companion object {
+        const val PROTOCOL_VERSION = 3
         val DIRECT_ID_REGEX = Regex("^dm_[A-Za-z0-9_-]{1,125}$")
+
+        fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+        fun decode(value: String): ByteArray = Base64.getUrlDecoder().decode(value)
     }
 }

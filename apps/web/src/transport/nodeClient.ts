@@ -4,29 +4,92 @@ import type {
   AttachmentOptions,
   IncomingFrame,
   NodeEndpoint,
+  OpaqueAccountStartResponse,
   RoomRecord,
   UploadProgress,
 } from "../domain/types";
+import { base64ToBytes, bytesToBase64 } from "../security/crypto";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 
-export async function enterAccount(
+export async function startOpaqueAccount(
   endpoint: NodeEndpoint,
   code: string,
-  password: string,
+  registrationRequest: Uint8Array,
+  credentialRequest: Uint8Array,
   signal?: AbortSignal,
-): Promise<AccountSession> {
-  const response = await fetch(`${endpoint.apiBaseUrl}/v1/account/enter`, {
+): Promise<OpaqueAccountStartResponse> {
+  const response = await fetch(`${endpoint.apiBaseUrl}/v2/account/start`, {
     method: "POST",
     cache: "no-store",
     credentials: "omit",
     referrerPolicy: "no-referrer",
     headers: JSON_HEADERS,
-    body: JSON.stringify({ code: code.trim(), password }),
+    body: JSON.stringify({
+      code: code.trim(),
+      registration_request_b64: bytesToBase64(registrationRequest),
+      credential_request_b64: bytesToBase64(credentialRequest),
+    }),
+    signal,
+  });
+  const payload = (await response.json().catch(() => null)) as OpaqueAccountStartResponse | null;
+  if (
+    !response.ok ||
+    !payload?.accepted ||
+    !payload.handshake_id ||
+    !payload.response_b64 ||
+    (payload.mode !== "registration" && payload.mode !== "login")
+  ) {
+    throw new Error("Wrong information");
+  }
+  return payload;
+}
+
+interface FinishOpaqueAccountInput {
+  handshakeId: string;
+  registrationUpload?: Uint8Array;
+  credentialFinalization?: Uint8Array;
+  identityPublicKey?: Uint8Array;
+  identityEnvelope?: Uint8Array;
+}
+
+export async function finishOpaqueAccount(
+  endpoint: NodeEndpoint,
+  input: FinishOpaqueAccountInput,
+  signal?: AbortSignal,
+): Promise<AccountSession> {
+  const response = await fetch(`${endpoint.apiBaseUrl}/v2/account/finish`, {
+    method: "POST",
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      handshake_id: input.handshakeId,
+      registration_upload_b64: input.registrationUpload
+        ? bytesToBase64(input.registrationUpload)
+        : undefined,
+      credential_finalization_b64: input.credentialFinalization
+        ? bytesToBase64(input.credentialFinalization)
+        : undefined,
+      identity_public_b64: input.identityPublicKey
+        ? bytesToBase64(input.identityPublicKey)
+        : undefined,
+      identity_envelope_b64: input.identityEnvelope
+        ? bytesToBase64(input.identityEnvelope)
+        : undefined,
+    }),
     signal,
   });
   const payload = (await response.json().catch(() => null)) as AccountResponse | null;
-  if (!response.ok || !payload?.accepted || !payload.token || !payload.username) {
+  if (
+    !response.ok ||
+    !payload?.accepted ||
+    !payload.token ||
+    !payload.username ||
+    !payload.identity_public_b64 ||
+    !payload.identity_envelope_b64
+  ) {
     throw new Error("Wrong information");
   }
   return {
@@ -37,6 +100,7 @@ export async function enterAccount(
     sessionInactivitySec: payload.session_inactivity_sec,
     endpoint,
     created: payload.created,
+    identityPublicKey: base64ToBytes(payload.identity_public_b64),
   };
 }
 

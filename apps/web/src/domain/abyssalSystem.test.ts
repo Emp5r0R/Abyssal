@@ -141,41 +141,68 @@ describe("Abyssal System Security & Feature Suite", () => {
     });
   });
 
-  describe("6. Conversation-scoped payload cryptography", () => {
-    it("encrypts messages for one conversation and rejects another conversation or node", async () => {
+  describe("6. Recipient-scoped payload cryptography", () => {
+    it("encrypts messages for one recipient and rejects another conversation", () => {
       const senderCipher = new InMemoryPayloadCipher();
       const receiverCipher = new InMemoryPayloadCipher();
-      
-      await senderCipher.initialize("NODE-ALPHA-1");
-      await receiverCipher.initialize("NODE-ALPHA-1");
+      const context = new TextEncoder().encode("identity-context");
+      senderCipher.createIdentity(new Uint8Array(64).fill(1), context);
+      receiverCipher.createIdentity(new Uint8Array(64).fill(2), context);
 
       const plainText = "Super secret message content";
-      
-      const encrypted = await senderCipher.encryptText("dm_random_identifier", plainText);
-      expect(encrypted).not.toEqual(new TextEncoder().encode(plainText));
+      const encrypted = senderCipher.encryptText(
+        "dm_random_identifier",
+        "message_1",
+        "Alice",
+        plainText,
+        [{ username: "Bob", publicKey: receiverCipher.publicKey() }],
+      );
+      expect(encrypted.ciphertext).not.toEqual(new TextEncoder().encode(plainText));
 
-      const decrypted = await receiverCipher.decryptText("dm_random_identifier", encrypted);
+      const decrypted = receiverCipher.decryptText(
+        "dm_random_identifier",
+        "message_1",
+        "Alice",
+        senderCipher.publicKey(),
+        encrypted,
+        encrypted.envelopes[0].wrappedKey,
+        "Bob",
+      );
       expect(decrypted).toBe(plainText);
-      await expect(receiverCipher.decryptText("forum_other", encrypted)).rejects.toThrow();
-
-      const evilCipher = new InMemoryPayloadCipher();
-      await evilCipher.initialize("NODE-BETA-2");
-      await expect(evilCipher.decryptText("dm_random_identifier", encrypted)).rejects.toThrow();
+      expect(() => receiverCipher.decryptText(
+        "forum_other",
+        "message_1",
+        "Alice",
+        senderCipher.publicKey(),
+        encrypted,
+        encrypted.envelopes[0].wrappedKey,
+        "Bob",
+      )).toThrow();
     });
 
-    it("verifies attachment client-side pre-encryption and in-memory decryption boundaries", async () => {
-      const cipher = new InMemoryPayloadCipher();
-      await cipher.initialize("NODE-XYZ-9");
+    it("verifies attachment pre-encryption and recipient decryption boundaries", () => {
+      const sender = new InMemoryPayloadCipher();
+      const recipient = new InMemoryPayloadCipher();
+      const context = new TextEncoder().encode("identity-context");
+      sender.createIdentity(new Uint8Array(64).fill(3), context);
+      recipient.createIdentity(new Uint8Array(64).fill(4), context);
 
       const attachmentBytes = new Uint8Array([12, 34, 56, 78]);
-
-      const encrypted = await cipher.encryptBytes("forum_media", attachmentBytes);
+      const encrypted = sender.encryptBytes(
+        "forum_media",
+        "attachment_1",
+        "Alice",
+        attachmentBytes,
+        [{ username: "Bob", publicKey: recipient.publicKey() }],
+      );
       expect(encrypted).not.toEqual(attachmentBytes);
-
-      const downloadedBytes = encrypted.slice();
-      expect(downloadedBytes).toEqual(encrypted);
-
-      const decrypted = await cipher.decryptBytes("forum_media", downloadedBytes);
+      const decrypted = recipient.decryptBytes(
+        "forum_media",
+        "Alice",
+        sender.publicKey(),
+        encrypted,
+        "Bob",
+      );
       expect(decrypted).toEqual(attachmentBytes);
     });
   });

@@ -1,136 +1,185 @@
 import { describe, expect, it } from "vitest";
-import { base64ToBytes, bytesToBase64, InMemoryPayloadCipher, wipeBytes } from "./crypto";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  conversationSafetyNumber,
+  finishOpaqueLogin,
+  finishOpaqueRegistration,
+  identityContext,
+  InMemoryPayloadCipher,
+  startOpaque,
+  wipeBytes,
+} from "./crypto";
 
 const CHAT_ID = "forum_security";
+const MESSAGE_ID = "message_1";
+const CONTEXT = new TextEncoder().encode("ABYSSAL_IDENTITY_V1:test:CODE-1234567");
 
-describe("InMemoryPayloadCipher", () => {
-  it("round-trips authenticated text without exporting its key", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await cipher.initialize("abyssal-test-node");
-    const encrypted = await cipher.encryptText(CHAT_ID, "classified");
+function identity(fill: number): InMemoryPayloadCipher {
+  const cipher = new InMemoryPayloadCipher();
+  cipher.createIdentity(new Uint8Array(64).fill(fill), CONTEXT);
+  return cipher;
+}
 
-    expect(encrypted.byteLength).toBeGreaterThan("classified".length + 12);
-    expect(await cipher.decryptText(CHAT_ID, encrypted)).toBe("classified");
+describe("OPAQUE client bindings", () => {
+  it("creates independent registration and login requests without exposing password bytes", async () => {
+    const state = await startOpaque("correct horse battery staple");
+    expect(state.registrationRequest.byteLength).toBeGreaterThan(16);
+    expect(state.credentialRequest.byteLength).toBeGreaterThan(16);
+    expect(state.registrationRequest).not.toEqual(state.credentialRequest);
+    expect(new TextDecoder().decode(state.registrationRequest)).not.toContain("correct horse");
+    state.registrationState.fill(0);
+    state.registrationRequest.fill(0);
+    state.loginState.fill(0);
+    state.credentialRequest.fill(0);
   });
 
-  it("rejects ciphertext after key clear", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await cipher.initialize("node");
-    const encrypted = await cipher.encryptText(CHAT_ID, "message");
-    cipher.clear();
-    await expect(cipher.decryptText(CHAT_ID, encrypted)).rejects.toThrow("Payload cipher unavailable");
+  it("rejects malformed server responses", async () => {
+    const registration = await startOpaque("password-one");
+    await expect(
+      finishOpaqueRegistration("password-one", registration, new Uint8Array([1, 2, 3])),
+    ).rejects.toThrow();
+
+    const login = await startOpaque("password-one");
+    await expect(
+      finishOpaqueLogin("password-one", login, new Uint8Array([1, 2, 3])),
+    ).rejects.toThrow();
+  });
+});
+
+describe("conversation safety numbers", () => {
+  it("is symmetric and changes when either identity changes", () => {
+    const alice = identity(1).publicKey();
+    const bob = identity(2).publicKey();
+    const eve = identity(3).publicKey();
+
+    expect(conversationSafetyNumber(alice, bob)).toBe(conversationSafetyNumber(bob, alice));
+    expect(conversationSafetyNumber(alice, bob)).not.toBe(conversationSafetyNumber(alice, eve));
+    expect(conversationSafetyNumber(alice, bob)).toMatch(/^[0-9A-F]{4}( [0-9A-F]{4}){4}$/);
+  });
+});
+
+describe("recipient E2EE", () => {
+  it("decrypts only for intended recipient and verifies sender signature", () => {
+    const alice = identity(1);
+    const bob = identity(2);
+    const eve = identity(3);
+    const payload = alice.encryptText(CHAT_ID, MESSAGE_ID, "Alice", "classified", [
+      { username: "Bob", publicKey: bob.publicKey() },
+    ]);
+    const envelope = payload.envelopes[0];
+
+    expect(payload.ciphertext).not.toEqual(new TextEncoder().encode("classified"));
+    expect(
+      bob.decryptText(
+        CHAT_ID,
+        MESSAGE_ID,
+        "Alice",
+        alice.publicKey(),
+        payload,
+        envelope.wrappedKey,
+        "Bob",
+      ),
+    ).toBe("classified");
+    expect(() =>
+      eve.decryptText(
+        CHAT_ID,
+        MESSAGE_ID,
+        "Alice",
+        alice.publicKey(),
+        payload,
+        envelope.wrappedKey,
+        "Bob",
+      ),
+    ).toThrow();
   });
 
-  it("decrypts attachment bytes for another participant on the same node", async () => {
-    const sender = new InMemoryPayloadCipher();
-    const recipient = new InMemoryPayloadCipher();
-    await sender.initialize("node-alpha");
-    await recipient.initialize("NODE-ALPHA");
-    const attachment = new Uint8Array([0, 255, 1, 2, 3, 128, 64]);
-
-    const uploaded = await sender.encryptBytes(CHAT_ID, attachment);
-
-    expect(uploaded).not.toEqual(attachment);
-    await expect(recipient.decryptBytes(CHAT_ID, uploaded)).resolves.toEqual(attachment);
+  it("rejects ciphertext, signature, sender-key, and conversation tampering", () => {
+    const alice = identity(4);
+    const bob = identity(5);
+    const payload = alice.encryptText(CHAT_ID, MESSAGE_ID, "Alice", "secret", [
+      { username: "Bob", publicKey: bob.publicKey() },
+    ]);
+    const decrypt = () => bob.decryptText(
+      CHAT_ID,
+      MESSAGE_ID,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      payload.envelopes[0].wrappedKey,
+      "Bob",
+    );
+    payload.ciphertext[0] ^= 1;
+    expect(decrypt).toThrow();
+    payload.ciphertext[0] ^= 1;
+    payload.signature[0] ^= 1;
+    expect(decrypt).toThrow();
+    payload.signature[0] ^= 1;
+    expect(() => bob.decryptText(
+      "forum_other",
+      MESSAGE_ID,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      payload.envelopes[0].wrappedKey,
+      "Bob",
+    )).toThrow();
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      MESSAGE_ID,
+      "Alice",
+      bob.publicKey(),
+      payload,
+      payload.envelopes[0].wrappedKey,
+      "Bob",
+    )).toThrow();
   });
 
-  it("uses a fresh nonce and rejects tampered or cross-node attachment ciphertext", async () => {
-    const sender = new InMemoryPayloadCipher();
-    const otherNode = new InMemoryPayloadCipher();
-    await sender.initialize("node-alpha");
-    await otherNode.initialize("node-beta");
-    const payload = new Uint8Array([1, 2, 3, 4]);
-    const first = await sender.encryptBytes(CHAT_ID, payload);
-    const second = await sender.encryptBytes(CHAT_ID, payload);
-    const tampered = first.slice();
-    tampered[tampered.length - 1] ^= 1;
-
-    expect(first).not.toEqual(second);
-    await expect(sender.decryptBytes(CHAT_ID, tampered)).rejects.toThrow();
-    await expect(otherNode.decryptBytes(CHAT_ID, first)).rejects.toThrow();
-    await expect(sender.decryptBytes("forum_other", first)).rejects.toThrow();
+  it("round-trips signed binary attachments and rejects another recipient", () => {
+    const alice = identity(6);
+    const bob = identity(7);
+    const eve = identity(8);
+    const plain = new Uint8Array([0, 255, 1, 128, 64]);
+    const encrypted = alice.encryptBytes(CHAT_ID, "attachment_1", "Alice", plain, [
+      { username: "Bob", publicKey: bob.publicKey() },
+    ]);
+    expect(encrypted).not.toEqual(plain);
+    expect(bob.decryptBytes(CHAT_ID, "Alice", alice.publicKey(), encrypted, "Bob")).toEqual(plain);
+    expect(() => eve.decryptBytes(CHAT_ID, "Alice", alice.publicKey(), encrypted, "Eve")).toThrow();
   });
 
-  it("rejects malformed encrypted payloads and invalid base64 frames", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await cipher.initialize("node");
+  it("recovers stable identity only with correct OPAQUE export key and context", () => {
+    const exportKey = new Uint8Array(64).fill(9);
+    const first = new InMemoryPayloadCipher();
+    const created = first.createIdentity(exportKey, CONTEXT);
+    const recovered = new InMemoryPayloadCipher();
+    recovered.recoverIdentity(exportKey, CONTEXT, created.envelope, created.publicKey);
+    expect(recovered.publicKey()).toEqual(created.publicKey);
 
-    await expect(cipher.decryptBytes(CHAT_ID, new Uint8Array(12))).rejects.toThrow("Encrypted payload unavailable");
-    await expect(cipher.decryptBytes("invalid/chat", new Uint8Array(64))).rejects.toThrow("Conversation unavailable");
+    const wrong = new InMemoryPayloadCipher();
+    expect(() => wrong.recoverIdentity(
+      new Uint8Array(64).fill(10),
+      CONTEXT,
+      created.envelope,
+      created.publicKey,
+    )).toThrow();
+  });
+});
+
+describe("wire helpers", () => {
+  it("uses URL-safe unpadded base64", () => {
+    const value = new Uint8Array([0, 1, 127, 128, 254, 255]);
+    const encoded = bytesToBase64(value);
+    expect(encoded).not.toMatch(/[+/=]/u);
+    expect(base64ToBytes(encoded)).toEqual(value);
     expect(() => base64ToBytes("not base64!")).toThrow();
   });
 
-  it("preserves binary payloads through base64 framing", () => {
-    const bytes = new Uint8Array([0, 1, 127, 128, 254, 255]);
-    expect(base64ToBytes(bytesToBase64(bytes))).toEqual(bytes);
-  });
-
-  it("wipeBytes zeros the buffer in place", () => {
-    const buffer = new Uint8Array([10, 20, 30, 40, 50]);
-    wipeBytes(buffer);
-    expect(buffer).toEqual(new Uint8Array(5));
-  });
-
-  it("handles empty Uint8Array roundtrip through encrypt/decrypt", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await cipher.initialize("empty-test");
-    const empty = new Uint8Array(0);
-    const encrypted = await cipher.encryptBytes(CHAT_ID, empty);
-    const decrypted = await cipher.decryptBytes(CHAT_ID, encrypted);
-    expect(decrypted.byteLength).toBe(0);
-  });
-
-  it("case-insensitive node ID normalization in initialize", async () => {
-    const a = new InMemoryPayloadCipher();
-    const b = new InMemoryPayloadCipher();
-    await a.initialize("MyNode");
-    await b.initialize("mynode");
-    const msg = await a.encryptText(CHAT_ID, "hi");
-    expect(await b.decryptText(CHAT_ID, msg)).toBe("hi");
-  });
-
-  it("rejects empty and oversized node identities", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await expect(cipher.initialize("   ")).rejects.toThrow("Node identity unavailable");
-    await expect(cipher.initialize("n".repeat(129))).rejects.toThrow("Node identity unavailable");
-  });
-
-  it("sustains multiple encrypt/decrypt cycles without state corruption", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await cipher.initialize("cycle-test");
-    for (let i = 0; i < 10; i++) {
-      const text = `message-${i}`;
-      const encrypted = await cipher.encryptText(CHAT_ID, text);
-      expect(await cipher.decryptText(CHAT_ID, encrypted)).toBe(text);
-    }
-  });
-
-  it("base64ToBytes returns empty array for empty string", () => {
-    expect(base64ToBytes("")).toEqual(new Uint8Array(0));
-  });
-
-  it("bytesToBase64 produces valid base64 for empty input", () => {
-    expect(bytesToBase64(new Uint8Array(0))).toBe("");
-  });
-
-  it("rejects payload shorter than nonce size", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await cipher.initialize("short");
-    const tiny = new Uint8Array(6);
-    await expect(cipher.decryptBytes(CHAT_ID, tiny)).rejects.toThrow("Encrypted payload unavailable");
-  });
-
-  it("encryptBytes before initialize throws", async () => {
-    const cipher = new InMemoryPayloadCipher();
-    await expect(cipher.encryptBytes(CHAT_ID, new Uint8Array([1]))).rejects.toThrow("Payload cipher unavailable");
-  });
-
-  it("decryptText rejects invalid UTF-8 payload from different key", async () => {
-    const a = new InMemoryPayloadCipher();
-    const b = new InMemoryPayloadCipher();
-    await a.initialize("node-x");
-    await b.initialize("node-y");
-    const encrypted = await a.encryptText(CHAT_ID, "secret");
-    await expect(b.decryptText(CHAT_ID, encrypted)).rejects.toThrow();
+  it("wipes mutable buffers and validates identity context", () => {
+    const value = new Uint8Array([1, 2, 3]);
+    wipeBytes(value);
+    expect(value).toEqual(new Uint8Array(3));
+    expect(identityContext("node", "code-12345678").byteLength).toBeGreaterThan(16);
+    expect(() => identityContext("", "code-12345678")).toThrow();
   });
 });

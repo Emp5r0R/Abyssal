@@ -1,22 +1,106 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import {
+  initSync,
+  opaqueClientFinishRegistration,
+  opaqueClientStart,
+  WasmE2eeSession,
+} from "../apps/web/src/generated/abyssal_core/abyssal_core.js";
+
+initSync({
+  module: readFileSync(new URL(
+    "../apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm",
+    import.meta.url,
+  )),
+});
 
 const baseUrl = process.env.ABYSSAL_TEST_BASE_URL;
 assert.ok(baseUrl, "ABYSSAL_TEST_BASE_URL is required");
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
-async function enter(code, password) {
-  const response = await fetch(`${baseUrl}/v1/account/enter`, {
+const encode = (value) => Buffer.from(value).toString("base64url");
+const decode = (value) => new Uint8Array(Buffer.from(value, "base64url"));
+
+async function register(code, password) {
+  const passwordBytes = encoder.encode(password);
+  const opaque = JSON.parse(opaqueClientStart(passwordBytes));
+  const startRequest = {
+    code,
+    registration_request_b64: encode(opaque.registration_request),
+    credential_request_b64: encode(opaque.credential_request),
+  };
+  assert.equal(JSON.stringify(startRequest).includes(password), false);
+  const startResponse = await fetch(`${baseUrl}/v2/account/start`, {
     method: "POST",
     cache: "no-store",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, password }),
+    body: JSON.stringify(startRequest),
   });
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("cache-control") ?? "", /no-store/);
-  const body = await response.json();
-  assert.equal(body.accepted, true);
-  assert.ok(body.token);
-  assert.ok(body.username);
-  return body;
+  assert.equal(startResponse.status, 200);
+  assert.match(startResponse.headers.get("cache-control") ?? "", /no-store/);
+  const start = await startResponse.json();
+  assert.equal(start.mode, "registration");
+
+  const finished = JSON.parse(opaqueClientFinishRegistration(
+    passwordBytes,
+    new Uint8Array(opaque.registration_state),
+    decode(start.response_b64),
+  ));
+  const identity = WasmE2eeSession.create(new Uint8Array(finished.export_key));
+  const context = encoder.encode(`ABYSSAL_IDENTITY_V1:${start.node_id}:${code.toUpperCase()}`);
+  const identityPublic = identity.publicKey();
+  const identityEnvelope = identity.sealIdentity(new Uint8Array(finished.export_key), context);
+  const finishResponse = await fetch(`${baseUrl}/v2/account/finish`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      handshake_id: start.handshake_id,
+      registration_upload_b64: encode(finished.registration_upload),
+      identity_public_b64: encode(identityPublic),
+      identity_envelope_b64: encode(identityEnvelope),
+    }),
+  });
+  assert.equal(finishResponse.status, 200);
+  const account = await finishResponse.json();
+  assert.equal(account.accepted, true);
+  assert.ok(account.token);
+  assert.ok(account.username);
+  assert.equal(account.identity_public_b64, encode(identityPublic));
+
+  passwordBytes.fill(0);
+  context.fill(0);
+  identityEnvelope.fill(0);
+  opaque.registration_state.fill(0);
+  opaque.registration_request.fill(0);
+  opaque.login_state.fill(0);
+  opaque.credential_request.fill(0);
+  finished.export_key.fill(0);
+  finished.registration_upload.fill(0);
+  return { ...account, identity };
+}
+
+async function opaqueStartStatus(code, password) {
+  const passwordBytes = encoder.encode(password);
+  const opaque = JSON.parse(opaqueClientStart(passwordBytes));
+  passwordBytes.fill(0);
+  const response = await fetch(`${baseUrl}/v2/account/start`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      code,
+      registration_request_b64: encode(opaque.registration_request),
+      credential_request_b64: encode(opaque.credential_request),
+    }),
+  });
+  opaque.registration_state.fill(0);
+  opaque.registration_request.fill(0);
+  opaque.login_state.fill(0);
+  opaque.credential_request.fill(0);
+  return response.status;
 }
 
 function connect(token) {
@@ -54,23 +138,51 @@ function waitForFrame(socket, predicate) {
   });
 }
 
-const alice = await enter("ABYS-ALICE-0001", "alice-password");
-const bob = await enter("ABYS-BOB-000002", "bob-password");
+function encryptedFrame(sender, recipient, chatId, text) {
+  const messageId = randomUUID();
+  const payload = JSON.parse(sender.identity.encrypt(
+    chatId,
+    messageId,
+    sender.username,
+    encoder.encode(text),
+    JSON.stringify([{
+      username: recipient.username,
+      public_key: [...recipient.identity.publicKey()],
+    }]),
+  ));
+  return {
+    type: "message",
+    chat_id: chatId,
+    version: payload.version,
+    message_id: payload.message_id,
+    nonce_b64: encode(payload.nonce),
+    ciphertext_b64: encode(payload.ciphertext),
+    signature_b64: encode(payload.signature),
+    envelopes: payload.envelopes.map((envelope) => ({
+      recipient_username: envelope.username,
+      wrapped_key_b64: encode(envelope.wrapped_key),
+    })),
+  };
+}
 
-const concurrentLogin = await fetch(`${baseUrl}/v1/account/enter`, {
-  method: "POST",
-  cache: "no-store",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ code: "ABYS-ALICE-0001", password: "alice-password" }),
-});
-assert.equal(concurrentLogin.status, 409);
+function decryptFrame(recipient, frame) {
+  return decoder.decode(recipient.identity.decrypt(
+    frame.chat_id,
+    frame.message_id,
+    frame.sender_username,
+    decode(frame.sender_public_key_b64),
+    decode(frame.nonce_b64),
+    decode(frame.ciphertext_b64),
+    decode(frame.signature_b64),
+    decode(frame.wrapped_key_b64),
+    recipient.username,
+  ));
+}
 
-const duplicate = await fetch(`${baseUrl}/v1/account/create`, {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify({ code: "ABYS-ALICE-0001", password: "other-password" }),
-});
-assert.equal(duplicate.status, 409);
+const alice = await register("ABYS-ALICE-0001", "alice-password");
+const bob = await register("ABYS-BOB-000002", "bob-password");
+assert.equal(await opaqueStartStatus("ABYS-ALICE-0001", "alice-password"), 409);
+assert.equal(await opaqueStartStatus("ABYS-ALICE-0001", "other-password"), 409);
 
 const aliceSocket = await connect(alice.token);
 let bobSocket = await connect(bob.token);
@@ -95,14 +207,8 @@ try {
     bobSocket,
     (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
   );
-  aliceSocket.send(JSON.stringify({
-    type: "message",
-    chat_id: aliceOpened.direct.id,
-    payload_b64: "Y2lwaGVydGV4dA==",
-  }));
-  const message = await delivered;
-  assert.equal(message.sender_username, alice.username);
-  assert.equal(message.payload_b64, "Y2lwaGVydGV4dA==");
+  aliceSocket.send(JSON.stringify(encryptedFrame(alice, bob, aliceOpened.direct.id, "live secret")));
+  assert.equal(decryptFrame(bob, await delivered), "live secret");
 
   const bobDisconnected = waitForFrame(
     aliceSocket,
@@ -112,11 +218,7 @@ try {
   );
   bobSocket.close();
   await bobDisconnected;
-  aliceSocket.send(JSON.stringify({
-    type: "message",
-    chat_id: aliceOpened.direct.id,
-    payload_b64: "b2ZmbGluZS1jaXBoZXJ0ZXh0",
-  }));
+  aliceSocket.send(JSON.stringify(encryptedFrame(alice, bob, aliceOpened.direct.id, "offline secret")));
 
   bobReconnect = await connect(bob.token);
   const replayed = waitForFrame(
@@ -124,9 +226,7 @@ try {
     (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
   );
   bobReconnect.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
-  const offlineMessage = await replayed;
-  assert.equal(offlineMessage.sender_username, alice.username);
-  assert.equal(offlineMessage.payload_b64, "b2ZmbGluZS1jaXBoZXJ0ZXh0");
+  assert.equal(decryptFrame(bob, await replayed), "offline secret");
 
   const unauthorizedUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=dm_guessed&media_type=FILE`, {
     method: "POST",
@@ -138,6 +238,8 @@ try {
   aliceSocket.close();
   bobSocket.close();
   bobReconnect?.close();
+  alice.identity.free();
+  bob.identity.free();
 }
 
-console.log("relay integration passed: account lock, canonical DM, offline replay, routing, and access control");
+console.log("relay integration passed: OPAQUE auth, E2EE DM, offline replay, and access control");

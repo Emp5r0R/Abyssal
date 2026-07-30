@@ -1,82 +1,130 @@
 package com.abyssal.chat.data.network
 
+import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.RecipientIdentity
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InMemoryPayloadCipherTest {
     @Test
-    fun sameNodeDecryptsPayloadAcrossAccounts() {
-        val sender = InMemoryPayloadCipher()
-        val receiver = InMemoryPayloadCipher()
-        sender.deriveSessionKey("oracle-1")
-        receiver.deriveSessionKey("ORACLE-1")
+    fun listedRecipientDecryptsAuthenticatedPayload() {
+        val sender = identity(1)
+        val receiver = identity(2)
+        val payload = sender.encrypt(
+            CHAT_ID,
+            MESSAGE_ID,
+            "Alice",
+            "hello from RAM".encodeToByteArray(),
+            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+        )
 
-        val encrypted = sender.encrypt("forum_general", "hello from RAM")
+        val plain = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
 
-        assertEquals("hello from RAM", receiver.decrypt("forum_general", encrypted))
+        assertEquals("hello from RAM", plain.decodeToString())
     }
 
     @Test
-    fun differentNodeCannotDecryptPayload() {
-        val sender = InMemoryPayloadCipher()
-        val receiver = InMemoryPayloadCipher()
-        sender.deriveSessionKey("oracle-1")
-        receiver.deriveSessionKey("oracle-2")
+    fun unlistedIdentityCannotDecryptRecipientEnvelope() {
+        val sender = identity(1)
+        val receiver = identity(2)
+        val intruder = identity(3)
+        val payload = sender.encrypt(
+            CHAT_ID,
+            MESSAGE_ID,
+            "Alice",
+            "secret".encodeToByteArray(),
+            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+        )
+        val incoming = incoming(payload, sender.publicKey(), "Alice", "Mallory", wrappedFor = "Bob")
 
-        val encrypted = sender.encrypt("forum_general", "secret")
-        val failed = runCatching { receiver.decrypt("forum_general", encrypted) }.isFailure
-
-        assertTrue(failed)
+        assertTrue(runCatching { intruder.decrypt(incoming, "Mallory") }.isFailure)
     }
 
     @Test
-    fun encryptedBytesRoundTrip() {
-        val sender = InMemoryPayloadCipher()
-        val receiver = InMemoryPayloadCipher()
-        sender.deriveSessionKey("oracle-1")
-        receiver.deriveSessionKey("oracle-1")
+    fun signatureCiphertextAndConversationTamperingAreRejected() {
+        val sender = identity(1)
+        val receiver = identity(2)
+        val payload = sender.encrypt(
+            CHAT_ID,
+            MESSAGE_ID,
+            "Alice",
+            byteArrayOf(1, 2, 3, 4),
+            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+        )
+        val original = incoming(payload, sender.publicKey(), "Alice", "Bob")
+        val tampered = original.copy(ciphertext = original.ciphertext.clone().also {
+            it[it.lastIndex] = (it.last() + 1).toByte()
+        })
 
-        val encrypted = sender.encryptBytes("forum_general", byteArrayOf(1, 2, 3, 4))
-        val decrypted = receiver.decryptBytes("forum_general", encrypted)
-
-        assertTrue(byteArrayOf(1, 2, 3, 4).contentEquals(decrypted))
+        assertTrue(runCatching { receiver.decrypt(tampered, "Bob") }.isFailure)
+        assertTrue(runCatching { receiver.decrypt(original.copy(chatId = "forum_other"), "Bob") }.isFailure)
+        assertTrue(runCatching {
+            receiver.decrypt(original.copy(senderPublicKey = ByteArray(64)), "Bob")
+        }.isFailure)
     }
 
     @Test
-    fun differentConversationCannotDecryptPayload() {
-        val cipher = InMemoryPayloadCipher()
-        cipher.deriveSessionKey("oracle-1")
-        val encrypted = cipher.encrypt("dm_private", "secret")
+    fun serializedAttachmentEnvelopeRoundTrips() {
+        val sender = identity(1)
+        val receiver = identity(2)
+        val payload = sender.encrypt(
+            CHAT_ID,
+            "${MESSAGE_ID}_attachment",
+            "Alice",
+            byteArrayOf(9, 8, 7),
+            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+        )
+        val serialized = sender.serialize(payload)
+        val incoming = receiver.deserializeForRecipient(
+            CHAT_ID,
+            serialized,
+            "Alice",
+            sender.publicKey(),
+            "Bob"
+        )
 
-        assertTrue(runCatching { cipher.decrypt("forum_public", encrypted) }.isFailure)
+        assertTrue(byteArrayOf(9, 8, 7).contentEquals(receiver.decrypt(incoming, "Bob")))
     }
 
     @Test
-    fun tamperingAndMalformedConversationIdsAreRejected() {
-        val cipher = InMemoryPayloadCipher()
-        cipher.deriveSessionKey("oracle-1")
-        val encrypted = cipher.encrypt("forum_general", "secret")
-        encrypted[encrypted.lastIndex] = (encrypted.last() + 1).toByte()
-
-        assertTrue(runCatching { cipher.decrypt("forum_general", encrypted) }.isFailure)
-        assertTrue(runCatching { cipher.encrypt("bad/chat", "secret") }.isFailure)
-    }
-
-    @Test
-    fun clearRemovesActiveKeyMaterial() {
-        val cipher = InMemoryPayloadCipher()
-        cipher.deriveSessionKey("oracle-1")
+    fun clearDestroysActiveIdentity() {
+        val cipher = identity(1)
         cipher.clear()
 
-        assertTrue(runCatching { cipher.encrypt("forum_general", "secret") }.isFailure)
+        assertTrue(runCatching { cipher.publicKey() }.isFailure)
     }
 
-    @Test
-    fun emptyAndOversizedNodeIdentitiesAreRejected() {
-        val cipher = InMemoryPayloadCipher()
+    private fun identity(fill: Int): InMemoryPayloadCipher = InMemoryPayloadCipher().also {
+        val exportKey = ByteArray(64) { fill.toByte() }
+        val context = "ABYSSAL_IDENTITY_V1:node:CODE-12345678".encodeToByteArray()
+        try {
+            it.createIdentity(exportKey, context)
+        } finally {
+            exportKey.fill(0)
+            context.fill(0)
+        }
+    }
 
-        assertTrue(runCatching { cipher.deriveSessionKey("   ") }.isFailure)
-        assertTrue(runCatching { cipher.deriveSessionKey("n".repeat(129)) }.isFailure)
+    private fun incoming(
+        payload: com.abyssal.chat.domain.model.EncryptedTransportPayload,
+        senderPublicKey: ByteArray,
+        sender: String,
+        recipient: String,
+        wrappedFor: String = recipient
+    ): IncomingTransportPayload = IncomingTransportPayload(
+        chatId = CHAT_ID,
+        messageId = payload.messageId,
+        nonce = payload.nonce,
+        ciphertext = payload.ciphertext,
+        signature = payload.signature,
+        wrappedKey = payload.envelopes.single { it.recipientUsername == wrappedFor }.wrappedKey,
+        senderUsername = sender,
+        senderPublicKey = senderPublicKey
+    )
+
+    private companion object {
+        const val CHAT_ID = "forum_general"
+        const val MESSAGE_ID = "5dbf06b8-fca4-46c4-8f26-5589e7024d94"
     }
 }

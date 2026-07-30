@@ -27,6 +27,7 @@ interface ChatViewProps {
   room: RoomRecord;
   username: string;
   connected: boolean;
+  safetyNumber: string | null;
   messages: ChatMessage[];
   users: PresenceUser[];
   upload: UploadProgress & { active: boolean; name: string };
@@ -44,6 +45,7 @@ export function ChatView({
   room,
   username,
   connected,
+  safetyNumber,
   messages,
   users,
   upload,
@@ -150,7 +152,9 @@ export function ChatView({
         <div className={`room-avatar ${isDirect ? "is-direct" : ""}`}>{isDirect ? "@" : "#"}</div>
         <div className="chat-title">
           <h1>{room.name}</h1>
-          <span><ShieldCheck size={13} /> {isDirect ? "Private route" : `${room.self_destruct_timer_sec}s after read`}</span>
+          <span>
+            <ShieldCheck size={13} /> {isDirect && safetyNumber ? `Safety ${safetyNumber}` : isDirect ? "Private route" : `${room.self_destruct_timer_sec}s after read`}
+          </span>
         </div>
         <div className={`connection-pill state-${connected ? "connected" : "disconnected"}`}>
           <span />{connected ? "LIVE" : "OFFLINE"}

@@ -29,7 +29,7 @@ Root `package.json` owns the npm workspace. Root `Cargo.toml` and `Cargo.lock` o
 - Every authenticated session has a strict node-provided inactivity deadline. User interaction refreshes it; background time and time spent behind the calculator cover do not. Expiry clears local RAM state, disconnects transport, and requires account entry again. Process death, explicit logout, wipe, or relay restart also clears session state.
 - Explicit logout and client-side expiry also make a best-effort relay call to revoke the bearer token immediately. The relay independently rejects expired tokens and closes idle WebSockets, so client enforcement is not the only boundary.
 - The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe.
-- The relay stores generated codes, accounts, password hashes, sessions, rooms, clients, presence, and pending encrypted frames in RAM only. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
+- The relay stores generated codes, OPAQUE password records, encrypted identity envelopes, sessions, rooms, clients, presence, and pending recipient-specific ciphertext in RAM only. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
 - Files, images, and videos may only be written to disk through an explicit user save/export flow. Android saves attachments as device-bound `.abyssal` AES-GCM export envelopes using Android Keystore, preferring StrongBox when the device supports it. There is not yet an in-app import flow, so these exports are archival ciphertext rather than portable files.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
 - Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
@@ -73,6 +73,7 @@ For an Android emulator talking to a server on the development machine, use `htt
 - The composer remains editable while reconnecting, but send and attachment actions stay disabled until the WebSocket is connected so a local bubble is not mistaken for a relayed message.
 - The chat initially opens at the latest active message and follows new messages only while the user remains near the bottom.
 - Direct messages appear under `DIRECT`. Select a peer in the live presence rail to ask the relay for a canonical private conversation; guessed DM identifiers are rejected by the relay.
+- Direct headers display a symmetric safety number derived from both identity keys. Both participants see the same number and can compare it through a separate channel to detect relay key substitution.
 
 ### Signed release build
 
@@ -115,7 +116,7 @@ Web client behavior:
 - Every bundled reaction has a `:filename:` shortcut, such as `:fire:`. Picker reactions carry a validated shortcut inside encrypted attachment metadata and render in equal-size inline frames without exposing the selection to the relay.
 - Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
 - The calculator cover PIN and optional duress PIN exist only in the current tab. Reload, tab close, logout, wipe, session expiry, or process termination loses them.
-- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Old Android APKs using `?token=` must be replaced with Abyssal `1.4.0` or newer.
+- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v3 E2EE requires Abyssal `1.7.0` clients; older builds are incompatible.
 
 Run web checks:
 
@@ -131,7 +132,7 @@ Run the complete repository suite from the root:
 ./check.sh all
 ```
 
-Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, and a live disposable-relay account/DM/offline-replay/access-control integration test.
+Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, `crypto`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, and a live disposable-relay OPAQUE/E2EE DM/offline-replay/access-control integration test. `crypto` regenerates the shared WASM, Kotlin, and four Android ABI libraries.
 
 ## Rust Server
 
@@ -170,11 +171,11 @@ Security-related relay knobs:
 
 The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
 
-Current crypto warning: Android and web derive an AES-GCM compatibility key per node and conversation, and authenticate the conversation ID as additional data. This prevents ciphertext from one conversation being replayed into another, but the node ID and conversation ID are not secret. A relay operator can derive every payload key, and a room participant can derive that room's key. This is authenticated transport payload encryption, but it is **not end-to-end encryption against the relay**. Passwords also reach the relay over TLS because OPAQUE is not implemented. Do not describe the current release as Signal-grade or absolutely secure. See [SECURITY.md](SECURITY.md).
+Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Messages, attachment bytes, and read receipts use recipient-specific X25519 key wrapping, ChaCha20-Poly1305, and Ed25519 signatures; the relay routes ciphertext and cannot passively decrypt or forge it. Identity secret keys are recovered from an envelope encrypted by the OPAQUE export key and remain client-side in process memory. This is real baseline E2EE, but it is not Signal-grade: the current protocol has no Double Ratchet/MLS forward secrecy or post-compromise recovery, and safety numbers must be compared out of band to detect an actively malicious relay substituting recipient keys. See [SECURITY.md](SECURITY.md).
 
 ## Docker
 
-The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs/logs, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly.
+The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly.
 
 ```bash
 cp mirage-server/.env.example mirage-server/.env
@@ -189,7 +190,7 @@ Stop it:
 docker compose -f deploy/docker-compose.yml down
 ```
 
-Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env`, systemd environment entries, or your server secret manager. Read the generated codes from restricted process logs. Docker logging is bounded but may still write those startup credentials to the host; use a reviewed volatile logging configuration when disk persistence of codes is unacceptable.
+Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env`, systemd environment entries, or your server secret manager. The process prints codes to stdout and also writes them to `/tmp/abyssal-invite-codes`, which is backed by the container's bounded tmpfs. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs.
 
 ## Remote Docker Deploy
 
@@ -231,10 +232,16 @@ Run only the Docker rebuild/restart:
 ./deploy/restart-docker.sh
 ```
 
-Follow logs and copy the RAM-only access codes printed at boot:
+Check container health without persistent logs:
 
 ```bash
 ./deploy/logs-docker.sh
+```
+
+Print the current RAM-only invite codes:
+
+```bash
+./deploy/invite-codes.sh
 ```
 
 Stop the server:

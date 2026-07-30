@@ -1,12 +1,16 @@
 # Abyssal Security Model
 
-No application has absolute security. Abyssal currently remains a prototype and must not be presented as a Signal-equivalent system.
+No application has absolute security. Abyssal implements baseline end-to-end encryption and OPAQUE authentication, but it has not received an independent audit and must not be presented as Signal-equivalent.
 
 ## Current Protections
 
-- Relay state is process memory only: codes, password hashes, accounts, sessions, room catalog, presence, pending frames, and attachments have no database or volume.
+- Relay state is process memory only: codes, OPAQUE password files, encrypted identity envelopes, sessions, room catalog, presence, recipient-specific pending ciphertext, and attachments have no database or volume.
 - Android app-owned account, message, endpoint, PIN, password, token, and key state is process memory only. `FLAG_SECURE` blocks normal Android screenshots and recents snapshots.
-- Web client uses no persistent browser storage, cookies, service worker, source maps, or third-party runtime scripts. Crypto keys are non-extractable Web Crypto keys. Typed plaintext and ciphertext buffers are overwritten on a best-effort basis after use.
+- Web client uses no persistent browser storage, cookies, service worker, source maps, or third-party runtime scripts. Identity keys live in the shared Rust/WASM core; typed password, plaintext, and key buffers are overwritten on a best-effort basis after use.
+- OPAQUE registration and login use the shared Rust `opaque-ke` implementation. Password bytes never appear in relay application requests, and stable identity secret keys are recovered from an envelope encrypted by the OPAQUE export key.
+- Protocol-v3 text, attachment, and read-receipt payloads use a fresh content key, ChaCha20-Poly1305 with conversation/message/sender additional data, recipient-specific ephemeral X25519 key wrapping, and Ed25519 signatures. The relay receives only ciphertext, signatures, public identity keys, and recipient envelopes.
+- The relay authoritatively binds delivered sender usernames/public keys to authenticated accounts and rejects missing, duplicate, or unauthorized recipient envelope sets. Clients reject malformed, tampered, wrongly addressed, or misbound payloads before parsing plaintext.
+- Direct conversations display a symmetric safety number derived from both identity public keys. Comparing it through a separate channel detects active relay key substitution for that conversation.
 - TLS/WSS is required for remote web nodes loaded from HTTPS. Loopback HTTP remains available for development.
 - WebSocket bearer tokens are sent as a WebSocket subprotocol value, not in request URLs. Browser WebSocket origins must match the node host or an exact `ABYSSAL_WEB_ORIGINS` entry.
 - Relay responses set a restrictive CSP, no-store caching, frame denial, no-referrer, MIME sniffing denial, HSTS, permissions restrictions, and cross-origin headers.
@@ -18,17 +22,17 @@ No application has absolute security. Abyssal currently remains a prototype and 
 
 ## Known High-Risk Gaps
 
-### Payload encryption is not E2EE
+### No Double Ratchet or MLS
 
-`InMemoryPayloadCipher` derives a distinct AES-GCM key from `ABYSSAL_NODE_PAYLOAD_V2`, the public node ID, and the conversation ID. It also authenticates the conversation ID as AES-GCM additional data. This gives integrity and cross-conversation domain separation, but no secret key agreement: the relay can derive all keys, and a room participant can derive that room's key. AES-GCM itself is not the problem; key distribution and participant authentication are.
+Protocol v3 provides authenticated recipient E2EE against passive relay access and forgery, but identity encryption keys are stable for the lifetime of a RAM-only account. Compromise of a recipient identity secret can decrypt previously captured recipient envelopes. There is no Signal Double Ratchet forward secrecy/post-compromise recovery, MLS group epoch management, prekey lifecycle, device list, or formal replay window.
 
-Required replacement: an audited, interoperable group and pairwise protocol such as Signal Protocol for direct sessions and MLS for groups. It needs authenticated identity keys, prekeys, forward secrecy, post-compromise recovery, replay protection, device changes, offline delivery, and key verification. Do not create a custom ratchet.
+Required replacement: integrate an audited interoperable pairwise ratchet and group protocol rather than extending the custom envelope protocol. Until that work and an external audit are complete, releases remain security previews.
 
-### Password authentication is not PAKE
+### Active relay and web-delivery trust
 
-Passwords reach the relay inside TLS and are Argon2-hashed in RAM. A malicious relay binary or compromised TLS endpoint can capture plaintext during entry.
+An actively malicious relay can substitute recipient public keys before a sender has independently verified the direct safety number. Abyssal deliberately does not persist trust decisions because client account state is RAM-only, so verification must be repeated after process restart. For rooms there is no scalable key-transparency or participant-verification system yet.
 
-Required replacement: audited OPAQUE registration and login shared by Android, web/WASM, and Rust. Passwords must never become application-level relay input.
+The relay also serves the browser bundle. A compromised web origin can deliver modified JavaScript/WASM and capture plaintext before encryption. Signed native Android builds avoid this code-delivery dependency but still require release-key and device integrity.
 
 ### Browser RAM-only claims are limited
 
@@ -47,11 +51,11 @@ Required replacement depends on threat model: sealed sender, message padding, ba
 1. Serve production web and API from one HTTPS origin. Leave `ABYSSAL_WEB_ORIGINS` empty unless a separate reviewed origin is required.
 2. Keep port `4020` private behind TLS tunnel or reverse proxy. Do not expose plaintext relay HTTP to internet.
 3. Use the supplied Docker read-only runtime, no volumes, non-root UID, dropped capabilities, bounded memory/PIDs, and `no-new-privileges`.
-4. Restrict process logs. Startup access codes are credentials and intentionally appear in stdout. The supplied Docker log rotation limits size but does not make logs RAM-only.
-5. Restart wipes all state. Verify backups are not configured for relay/container memory or logs.
-6. Rebuild Android clients after protocol changes; version `1.4.0` removes WebSocket query-token authentication.
+4. Startup codes intentionally appear in process stdout. The supplied Compose deployment disables Docker log persistence and mirrors codes into `/tmp/abyssal-invite-codes` on a bounded tmpfs for host-only retrieval. Do not replace this with a disk-backed log driver.
+5. Restart wipes all relay state and recreates the tmpfs. Verify backups, host tracing, crash dumps, and swap are not configured to capture process/container memory.
+6. Rebuild Android clients after protocol changes; protocol-v3 OPAQUE/E2EE requires version `1.7.0` clients.
 7. Keep the Android release keystore offline and backed up. Never commit `deploy/release.env`, `.secrets/`, APK signing credentials, or generated access codes.
-8. Commission independent cryptographic and application security review before real sensitive use. Until the E2EE and PAKE gaps are closed, publish builds as security previews rather than production-secure releases.
+8. Commission independent cryptographic and application security review before real sensitive use. Until ratcheting, group key management, key transparency, and audit gaps are closed, publish builds as security previews rather than production-secure releases.
 
 ## Reporting
 

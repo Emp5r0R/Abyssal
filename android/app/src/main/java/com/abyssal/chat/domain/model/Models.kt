@@ -39,7 +39,8 @@ data class Message(
     val replyToMessageId: String? = null,
     val reactionShortcode: String? = null,
     val mentionsCurrentUser: Boolean = false,
-    val repliesToCurrentUser: Boolean = false
+    val repliesToCurrentUser: Boolean = false,
+    val senderPublicKey: ByteArray? = null
 ) {
     val isExpired: Boolean
         get() {
@@ -112,6 +113,7 @@ data class IdentityValidationResult(
     val username: String? = null,
     val maxRoomsPerUser: Int = 5,
     val sessionInactivitySec: Int = 15 * 60,
+    val publicKey: ByteArray? = null,
     val error: String? = null
 )
 
@@ -124,24 +126,58 @@ data class SessionSecurityState(
 
 data class IncomingTransportPayload(
     val chatId: String,
-    val payload: ByteArray,
-    val senderUsername: String? = null
+    val messageId: String,
+    val nonce: ByteArray,
+    val ciphertext: ByteArray,
+    val signature: ByteArray,
+    val wrappedKey: ByteArray,
+    val senderUsername: String,
+    val senderPublicKey: ByteArray
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is IncomingTransportPayload) return false
         return chatId == other.chatId &&
+            messageId == other.messageId &&
             senderUsername == other.senderUsername &&
-            payload.contentEquals(other.payload)
+            nonce.contentEquals(other.nonce) &&
+            ciphertext.contentEquals(other.ciphertext) &&
+            signature.contentEquals(other.signature) &&
+            wrappedKey.contentEquals(other.wrappedKey) &&
+            senderPublicKey.contentEquals(other.senderPublicKey)
     }
 
     override fun hashCode(): Int {
         var result = chatId.hashCode()
-        result = 31 * result + payload.contentHashCode()
-        result = 31 * result + (senderUsername?.hashCode() ?: 0)
+        result = 31 * result + messageId.hashCode()
+        result = 31 * result + nonce.contentHashCode()
+        result = 31 * result + ciphertext.contentHashCode()
+        result = 31 * result + signature.contentHashCode()
+        result = 31 * result + wrappedKey.contentHashCode()
+        result = 31 * result + senderUsername.hashCode()
+        result = 31 * result + senderPublicKey.contentHashCode()
         return result
     }
 }
+
+data class RecipientEnvelope(
+    val recipientUsername: String,
+    val wrappedKey: ByteArray
+)
+
+data class EncryptedTransportPayload(
+    val version: Int,
+    val messageId: String,
+    val nonce: ByteArray,
+    val ciphertext: ByteArray,
+    val signature: ByteArray,
+    val envelopes: List<RecipientEnvelope>
+)
+
+data class RecipientIdentity(
+    val username: String,
+    val publicKey: ByteArray
+)
 
 data class RoomChange(
     val action: String,
@@ -157,7 +193,8 @@ data class DisguiseSettings(
 
 data class UserPresence(
     val username: String,
-    val connected: Boolean
+    val connected: Boolean,
+    val publicKey: ByteArray
 )
 
 data class AttachmentUploadResult(
