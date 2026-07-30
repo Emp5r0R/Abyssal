@@ -9,4 +9,4 @@ ssh \
   -o StrictHostKeyChecking=accept-new \
   -i "$ABYSSAL_SSH_KEY" \
   "$ABYSSAL_SSH_HOST" \
-  "cd '$ABYSSAL_REMOTE_DIR' && docker compose -f deploy/docker-compose.yml up -d --build --remove-orphans && docker compose -f deploy/docker-compose.yml ps && docker compose -f deploy/docker-compose.yml logs --tail=120 mirage-server"
+  "cd '$ABYSSAL_REMOTE_DIR' && bash deploy/prepare-runtime-env.sh && docker compose -f deploy/docker-compose.yml up -d --build --remove-orphans && docker compose -f deploy/docker-compose.yml ps && docker compose -f deploy/docker-compose.yml logs --tail=120 mirage-server"

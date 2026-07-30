@@ -60,7 +60,11 @@ APK_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-universal-release.apk"
 AAB_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-release.aab"
 cp "$APK_SOURCE" "$APK_OUTPUT"
 cp "$AAB_SOURCE" "$AAB_OUTPUT"
-sha256sum "$APK_OUTPUT" "$AAB_OUTPUT" >"$OUTPUT_DIR/abyssal-android-$VERSION-SHA256SUMS.txt"
+(
+  cd "$OUTPUT_DIR"
+  sha256sum "$(basename "$APK_OUTPUT")" "$(basename "$AAB_OUTPUT")" \
+    >"abyssal-android-$VERSION-SHA256SUMS.txt"
+)
 
 printf 'Release APK: %s\n' "$APK_OUTPUT"
 printf 'Release AAB: %s\n' "$AAB_OUTPUT"
