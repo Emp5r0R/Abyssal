@@ -241,7 +241,7 @@ impl InMemoryStore {
     /// Purge messages that have completed their self-destruct countdown
     pub fn purge_expired_messages(&self, current_time_ms: i64) {
         let mut map = self.messages.lock().unwrap();
-        for (_, msgs) in map.iter_mut() {
+        for msgs in map.values_mut() {
             msgs.retain_mut(|msg| {
                 if let Some(read_time) = msg.read_timestamp_ms {
                     let elapsed_sec = (current_time_ms - read_time) / 1000;
@@ -260,7 +260,7 @@ impl InMemoryStore {
     /// Erase all local in-memory data.
     pub fn admin_clear_all_data(&self) {
         let mut map = self.messages.lock().unwrap();
-        for (_, msgs) in map.iter_mut() {
+        for msgs in map.values_mut() {
             for msg in msgs.iter_mut() {
                 msg.zeroize_fields();
             }
