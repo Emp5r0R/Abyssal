@@ -84,4 +84,15 @@ describe("AppShell direct-message navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "WIPE NOW" }));
     expect(props.onWipe).toHaveBeenCalledOnce();
   });
+
+  it("keeps room navigation and destructive actions as separate controls", () => {
+    const props = renderShell();
+    expect(document.querySelector("button button")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open room Operations" }));
+    expect(props.onOpenRoom).toHaveBeenCalledWith(room.id);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete room" }));
+    expect(props.onDeleteRoom).toHaveBeenCalledWith(room.id);
+  });
 });

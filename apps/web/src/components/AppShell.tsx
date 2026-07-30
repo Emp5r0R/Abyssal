@@ -283,18 +283,20 @@ function Dashboard({
           const latest = latestByRoom[room.id];
           const owner = room.owner_username === username;
           return (
-            <button className="room-row" type="button" key={room.id} onClick={() => onOpenRoom(room.id)} role="listitem">
-              <span className="room-row-icon"><Hash size={20} /></span>
-              <span className="room-row-main">
-                <strong>{room.name}</strong>
-                <span>{latest ? `${latest.sender}: ${latest.content}` : "No active messages"}</span>
-              </span>
-              <span className="room-policy">{room.self_destruct_timer_sec}s</span>
-              <span className="room-media">{[room.allow_images && "IMG", room.allow_videos && "VID", room.allow_files && "FILE"].filter(Boolean).join(" · ") || "TEXT"}</span>
+            <div className="room-row" key={room.id} role="listitem">
+              <button className="room-row-open" type="button" onClick={() => onOpenRoom(room.id)} aria-label={`Open room ${room.name}`}>
+                <span className="room-row-icon"><Hash size={20} /></span>
+                <span className="room-row-main">
+                  <strong>{room.name}</strong>
+                  <span>{latest ? `${latest.sender}: ${latest.content}` : "No active messages"}</span>
+                </span>
+                <span className="room-policy">{room.self_destruct_timer_sec}s</span>
+                <span className="room-media">{[room.allow_images && "IMG", room.allow_videos && "VID", room.allow_files && "FILE"].filter(Boolean).join(" · ") || "TEXT"}</span>
+              </button>
               {owner ? (
-                <IconButton label="Delete room" onClick={(event) => { event.stopPropagation(); onDeleteRoom(room.id); }}><Trash2 size={17} /></IconButton>
+                <IconButton label="Delete room" onClick={() => onDeleteRoom(room.id)}><Trash2 size={17} /></IconButton>
               ) : <span className="room-owner">{room.owner_username || "NODE"}</span>}
-            </button>
+            </div>
           );
         })}
       </div>
