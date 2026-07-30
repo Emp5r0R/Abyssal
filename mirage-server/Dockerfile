@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM node:22-bookworm-slim AS web-builder
 
 WORKDIR /repo
@@ -13,7 +15,12 @@ WORKDIR /repo
 COPY Cargo.toml Cargo.lock ./
 COPY mirage-server ./mirage-server
 COPY rust-core ./rust-core
-RUN cargo build --release --locked --package mirage-server
+RUN --mount=type=cache,id=abyssal-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=abyssal-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=abyssal-rust-target,target=/repo/target,sharing=locked \
+    cargo build --release --locked --package mirage-server \
+    && mkdir -p /out \
+    && cp /repo/target/release/mirage-server /out/mirage-server
 
 FROM debian:bookworm-slim AS runtime
 
@@ -22,7 +29,7 @@ RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nolog
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=rust-builder /repo/target/release/mirage-server /usr/local/bin/mirage-server
+COPY --from=rust-builder /out/mirage-server /usr/local/bin/mirage-server
 COPY --from=web-builder /repo/apps/web/dist /opt/abyssal/web
 
 USER mirage:mirage
