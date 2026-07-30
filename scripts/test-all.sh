@@ -42,6 +42,11 @@ run_rust() {
 
 run_android() {
   echo "==> Android checks"
+  cargo build \
+    --manifest-path "$ROOT_DIR/Cargo.toml" \
+    --package abyssal-core \
+    --release \
+    --locked
   (
     cd "$ROOT_DIR/android"
     GRADLE_USER_HOME="$GRADLE_HOME" ./gradlew \
