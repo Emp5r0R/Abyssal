@@ -31,6 +31,5 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-          cache: gradle
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
       - run: bash ./scripts/test-all.sh android
