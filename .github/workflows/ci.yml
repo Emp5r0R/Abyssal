@@ -20,8 +20,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: npm ci
-      - run: ./scripts/test-all.sh quick
-      - run: ./scripts/test-all.sh integration
+      - run: bash ./scripts/test-all.sh quick
+      - run: bash ./scripts/test-all.sh integration
 
   android:
     runs-on: ubuntu-latest
@@ -33,4 +33,4 @@ jobs:
           java-version: 17
           cache: gradle
       - uses: android-actions/setup-android@v3
-      - run: ./scripts/test-all.sh android
+      - run: bash ./scripts/test-all.sh android

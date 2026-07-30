@@ -206,6 +206,8 @@ Sync the repo and rebuild/restart Docker on the server:
 ./deploy/deploy-server.sh
 ```
 
+The first deploy creates `mirage-server/.env` from the tracked template with mode `600`. Later syncs preserve that file and its node-specific settings. Review it on the server before issuing production invite codes.
+
 Run that command from your local machine, not from inside the server shell. It uses SSH and rsync to reach the configured remote host.
 
 If you are already SSH'd into the server at `/home/ubuntu/abyssal`, use the server-local scripts instead:
