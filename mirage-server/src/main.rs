@@ -1,6 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Write,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -603,7 +606,7 @@ impl AppState {
                 sorted_codes.sort_unstable();
                 let mut output = sorted_codes.join("\n");
                 output.push('\n');
-                if let Err(error) = tokio::fs::write(&path, output.as_bytes()).await {
+                if let Err(error) = write_sensitive_file(&path, output.as_bytes()) {
                     warn!("failed to write RAM-only code output: {error}");
                 }
                 output.zeroize();
@@ -631,6 +634,17 @@ impl AppState {
             info!("ABYSSAL_DEAD_MAN_SWITCH inactivity_limit_ms={limit_ms}");
         }
     }
+}
+
+fn write_sensitive_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(bytes)
 }
 
 fn now_ms() -> u64 {
@@ -2434,6 +2448,24 @@ mod tests {
 
         let unique_lengths = codes.iter().map(|code| code.len()).collect::<HashSet<_>>();
         assert_eq!(codes.len(), unique_lengths.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sensitive_file_restricts_existing_permissions() {
+        let path = std::env::temp_dir().join(format!("abyssal-code-mode-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"old").expect("seed code file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("seed permissions");
+
+        write_sensitive_file(path.to_str().expect("UTF-8 path"), b"secret\n")
+            .expect("write code file");
+        let metadata = std::fs::metadata(&path).expect("code file metadata");
+        let contents = std::fs::read(&path).expect("code file contents");
+        std::fs::remove_file(&path).expect("remove code file");
+
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(contents, b"secret\n");
     }
 
     #[test]
