@@ -54,14 +54,18 @@ export function isExpired(message: ChatMessage, nowMs: number): boolean {
   const absoluteExpired =
     message.absoluteExpirySec > 0 && nowMs >= message.createdAtMs + message.absoluteExpirySec * 1000;
   const readExpired =
-    message.readAtMs !== undefined && nowMs >= message.readAtMs + message.selfDestructSec * 1000;
+    message.selfDestructSec > 0 &&
+    message.readAtMs !== undefined &&
+    nowMs >= message.readAtMs + message.selfDestructSec * 1000;
   return absoluteExpired || readExpired;
 }
 
 export function remainingSeconds(message: ChatMessage, nowMs: number): number | null {
   const deadlines: number[] = [];
   if (message.absoluteExpirySec > 0) deadlines.push(message.createdAtMs + message.absoluteExpirySec * 1000);
-  if (message.readAtMs !== undefined) deadlines.push(message.readAtMs + message.selfDestructSec * 1000);
+  if (message.selfDestructSec > 0 && message.readAtMs !== undefined) {
+    deadlines.push(message.readAtMs + message.selfDestructSec * 1000);
+  }
   if (!deadlines.length) return null;
   return Math.max(0, Math.ceil((Math.min(...deadlines) - nowMs) / 1000));
 }
@@ -74,13 +78,13 @@ export function clampRoom(room: RoomRecord): RoomRecord {
   return {
     ...room,
     name: room.name.trim().slice(0, 36),
-    self_destruct_timer_sec: clamp(room.self_destruct_timer_sec, 1, 86_400),
+    self_destruct_timer_sec: clamp(room.self_destruct_timer_sec, 0, 86_400),
     overall_expiry_sec: clamp(room.overall_expiry_sec, 0, 86_400),
-    image_read_timer_sec: clamp(room.image_read_timer_sec, 1, 86_400),
+    image_read_timer_sec: clamp(room.image_read_timer_sec, 0, 86_400),
     image_overall_expiry_sec: clamp(room.image_overall_expiry_sec, 0, 86_400),
-    video_read_timer_sec: clamp(room.video_read_timer_sec, 1, 86_400),
+    video_read_timer_sec: clamp(room.video_read_timer_sec, 0, 86_400),
     video_overall_expiry_sec: clamp(room.video_overall_expiry_sec, 0, 86_400),
-    file_read_timer_sec: clamp(room.file_read_timer_sec, 1, 86_400),
+    file_read_timer_sec: clamp(room.file_read_timer_sec, 0, 86_400),
     file_overall_expiry_sec: clamp(room.file_overall_expiry_sec, 0, 86_400),
   };
 }

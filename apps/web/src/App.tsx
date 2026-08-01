@@ -17,6 +17,7 @@ export default function App() {
   const [locked, setLocked] = useState(false);
   const [showCreateRoom, setShowCreateRoom] = useState(false);
   const [showAttachment, setShowAttachment] = useState(false);
+  const [attachmentRetentionSec, setAttachmentRetentionSec] = useState(5);
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const externalPickerRef = useRef(false);
 
@@ -50,7 +51,7 @@ export default function App() {
   if (!coverPin) {
     return (
       <div className="secure-root" onPointerDownCapture={abyssal.touchActivity} onKeyDownCapture={abyssal.touchActivity}>
-        <SecureWorkspace abyssal={abyssal} replyTarget={replyTarget} setReplyTarget={setReplyTarget} setLocked={setLocked} setShowAttachment={setShowAttachment} setShowCreateRoom={setShowCreateRoom} resetLocal={resetLocal} />
+        <SecureWorkspace abyssal={abyssal} replyTarget={replyTarget} setReplyTarget={setReplyTarget} setLocked={setLocked} setAttachmentRetentionSec={setAttachmentRetentionSec} setShowAttachment={setShowAttachment} setShowCreateRoom={setShowCreateRoom} resetLocal={resetLocal} />
         <PinSetup onComplete={(pin, duress) => { setCoverPin(pin); setDuressPin(duress); }} />
       </div>
     );
@@ -69,15 +70,20 @@ export default function App() {
 
   return (
     <div className="secure-root" onPointerDownCapture={abyssal.touchActivity} onKeyDownCapture={abyssal.touchActivity}>
-      <SecureWorkspace abyssal={abyssal} replyTarget={replyTarget} setReplyTarget={setReplyTarget} setLocked={setLocked} setShowAttachment={setShowAttachment} setShowCreateRoom={setShowCreateRoom} resetLocal={resetLocal} />
+      <SecureWorkspace abyssal={abyssal} replyTarget={replyTarget} setReplyTarget={setReplyTarget} setLocked={setLocked} setAttachmentRetentionSec={setAttachmentRetentionSec} setShowAttachment={setShowAttachment} setShowCreateRoom={setShowCreateRoom} resetLocal={resetLocal} />
 
       {showCreateRoom ? <CreateRoomDialog onCancel={() => setShowCreateRoom(false)} onCreate={abyssal.createRoom} /> : null}
       {showAttachment && abyssal.activeRoom ? (
         <AttachmentDialog
           room={abyssal.activeRoom}
+          retentionSec={attachmentRetentionSec}
           onCancel={() => { externalPickerRef.current = false; setShowAttachment(false); }}
           onPickerState={(active) => { externalPickerRef.current = active; }}
-          onSend={(file, options) => abyssal.sendAttachment({ file, options, replyToId: replyTarget?.id })}
+          onSend={(file, options) => abyssal.sendAttachment({
+            file,
+            options: { ...options, readSec: attachmentRetentionSec },
+            replyToId: replyTarget?.id,
+          })}
         />
       ) : null}
       {abyssal.media ? <MediaViewer media={abyssal.media} onClose={abyssal.clearMedia} /> : null}
@@ -93,6 +99,7 @@ function SecureWorkspace({
   replyTarget,
   setReplyTarget,
   setLocked,
+  setAttachmentRetentionSec,
   setShowAttachment,
   setShowCreateRoom,
   resetLocal,
@@ -101,6 +108,7 @@ function SecureWorkspace({
   replyTarget: ChatMessage | null;
   setReplyTarget: (message: ChatMessage | null) => void;
   setLocked: (locked: boolean) => void;
+  setAttachmentRetentionSec: (seconds: number) => void;
   setShowAttachment: (show: boolean) => void;
   setShowCreateRoom: (show: boolean) => void;
   resetLocal: () => Promise<void>;
@@ -108,14 +116,14 @@ function SecureWorkspace({
   const session = abyssal.session;
   if (!session) return null;
 
-  const sendGif = async (reaction: ReactionAsset, replyToId?: string): Promise<boolean> => {
+  const sendGif = async (reaction: ReactionAsset, replyToId?: string, retentionSec?: number): Promise<boolean> => {
     try {
       const response = await fetch(reaction.path, { cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer" });
       if (!response.ok) return false;
       const blob = await response.blob();
       return await abyssal.sendAttachment({
         file: new File([blob], reaction.filename, { type: reaction.mimeType }),
-        options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
+        options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0, readSec: retentionSec },
         replyToId,
         reactionShortcode: reaction.shortcode,
       });
@@ -165,7 +173,7 @@ function SecureWorkspace({
           onSend={abyssal.sendText}
           onReply={setReplyTarget}
           replyTarget={replyTarget}
-          onOpenAttachment={() => setShowAttachment(true)}
+          onOpenAttachment={(retentionSec) => { setAttachmentRetentionSec(retentionSec); setShowAttachment(true); }}
           onViewAttachment={abyssal.viewAttachment}
           onExportAttachment={abyssal.exportAttachment}
           onSendGif={sendGif}

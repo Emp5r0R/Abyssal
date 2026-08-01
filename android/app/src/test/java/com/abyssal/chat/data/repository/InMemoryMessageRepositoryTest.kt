@@ -3,6 +3,7 @@ package com.abyssal.chat.data.repository
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.Message
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -67,6 +68,19 @@ class InMemoryMessageRepositoryTest {
         repository.createForumSession(testRoom(timer = 5))
         repository.clearAllData()
         assertTrue(repository.getChatSessions().first().isEmpty())
+    }
+
+    @Test
+    fun zeroReadTimerKeepsMessageAfterRead() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val message = testMessage("kept").copy(selfDestructDurationSec = 0)
+        repository.saveMessage("dm_kept", message)
+        repository.markAsRead("dm_kept", message.id)
+
+        delay(250)
+
+        assertEquals(message.id, repository.getMessages("dm_kept").first().single().id)
+        assertFalse(repository.getMessages("dm_kept").first().single().isExpired)
     }
 
     private fun testMessage(id: String) = Message(

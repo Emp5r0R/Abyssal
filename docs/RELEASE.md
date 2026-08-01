@@ -32,7 +32,7 @@ The script requires `deploy/release.env`, verifies the APK signature with `apksi
 2. Commit and push `main`.
 3. Create a signed Git tag matching the Android version.
 4. Upload only the release APK, AAB, and checksum manifest from `build-outputs/`.
-5. Mark the release as a prerelease while the documented E2EE and PAKE gaps remain.
+5. Publish stable product releases only with the known cryptographic limits copied into release notes. Never describe Abyssal as Signal-grade, independently audited, or high-assurance until that work exists.
 
 ## Deploy relay
 
@@ -41,6 +41,6 @@ The script requires `deploy/release.env`, verifies the APK signature with `apksi
 curl --fail https://chat.example.com/health
 ```
 
-Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appear only in restricted logs. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments.
+Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appeared once in the attached deployment terminal. Codes must not exist in Docker logs, relay files, or environment configuration. After startup, inspect only counts through health data; there is deliberately no code-retrieval workflow. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments.
 
 The sync helper transfers a clean archive of committed `HEAD` only. It explicitly protects the remote relay `.env` and excludes local signing credentials even if future ignore rules change. If the relay environment is missing on a first deployment, the restart helper installs the tracked template with mode `600`; review that file before distributing its generated invite codes.

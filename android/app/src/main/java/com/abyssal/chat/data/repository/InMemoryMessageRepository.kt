@@ -72,7 +72,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                         
                         // 2. Read-destruct check (expires X seconds after read)
                         val readTime = msg.readTimestampMs
-                        if (readTime != null) {
+                        if (readTime != null && msg.selfDestructDurationSec > 0) {
                             val elapsed = now - readTime
                             val keep = elapsed < msg.selfDestructDurationSec * 1000L
                             if (!keep) updated = true

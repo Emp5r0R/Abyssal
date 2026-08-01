@@ -138,6 +138,7 @@ export interface AttachmentOptions {
   oneTime: boolean;
   deleteAfterDownload: boolean;
   ttlSec: number;
+  readSec?: number;
 }
 
 export interface UploadProgress {

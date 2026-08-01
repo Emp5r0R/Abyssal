@@ -34,6 +34,7 @@ class RealChatTransport(
     private val _presence = MutableStateFlow<List<UserPresence>>(emptyList())
     private val _serverStatus = MutableStateFlow(ServerStatus("DISCONNECTED", "No node", 0))
     private val connecting = AtomicBoolean(false)
+    private val identityPins = Collections.synchronizedMap(mutableMapOf<String, String>())
 
     private var webSocket: WebSocket? = null
     private val joinedChatIds = Collections.synchronizedSet(mutableSetOf<String>())
@@ -62,6 +63,7 @@ class RealChatTransport(
         webSocket?.close(1000, "client disconnect")
         webSocket = null
         joinedChatIds.clear()
+        identityPins.clear()
         _presence.value = emptyList()
         _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
     }
@@ -197,16 +199,27 @@ class RealChatTransport(
                         }
                         "presence" -> {
                             val users = json.optJSONArray("users") ?: return
-                            _presence.value = (0 until users.length()).mapNotNull { index ->
+                            val nextPresence = (0 until users.length()).mapNotNull { index ->
                                 val user = users.optJSONObject(index) ?: return@mapNotNull null
                                 val username = user.optString("username").takeIf { it.isNotBlank() }
                                     ?: return@mapNotNull null
+                                val publicKeyB64 = user.getString("identity_public_b64")
+                                val pinKey = username.lowercase()
+                                val pinned = identityPins[pinKey]
+                                if (pinned != null && pinned != publicKeyB64) {
+                                    webSocket.close(1008, "identity changed")
+                                    this@RealChatTransport.webSocket = null
+                                    _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+                                    return
+                                }
+                                identityPins[pinKey] = publicKeyB64
                                 UserPresence(
                                     username = username,
                                     connected = user.optBoolean("connected", false),
-                                    publicKey = decode(user.getString("identity_public_b64"))
+                                    publicKey = decode(publicKeyB64)
                                 )
                             }
+                            _presence.value = nextPresence
                         }
                         "rooms" -> {
                             val rooms = json.optJSONArray("rooms") ?: JSONArray()
@@ -300,19 +313,19 @@ class RealChatTransport(
             isForum = true,
             lastMessage = null,
             unreadCount = 0,
-            selfDestructTimerSec = optInt("self_destruct_timer_sec", 5).coerceAtLeast(1),
+            selfDestructTimerSec = optInt("self_destruct_timer_sec", 5).coerceIn(0, 86_400),
             overallExpirySec = optInt("overall_expiry_sec", 0).coerceAtLeast(0),
             allowImages = optBoolean("allow_images", true),
             allowVideos = optBoolean("allow_videos", true),
             allowFiles = optBoolean("allow_files", true),
             enforceTextAbsoluteExpiry = optBoolean("enforce_text_absolute_expiry", false),
-            imageReadTimerSec = optInt("image_read_timer_sec", 5).coerceAtLeast(1),
+            imageReadTimerSec = optInt("image_read_timer_sec", 5).coerceIn(0, 86_400),
             imageOverallExpirySec = optInt("image_overall_expiry_sec", 0).coerceAtLeast(0),
             enforceImageAbsoluteExpiry = optBoolean("enforce_image_absolute_expiry", false),
-            videoReadTimerSec = optInt("video_read_timer_sec", 5).coerceAtLeast(1),
+            videoReadTimerSec = optInt("video_read_timer_sec", 5).coerceIn(0, 86_400),
             videoOverallExpirySec = optInt("video_overall_expiry_sec", 0).coerceAtLeast(0),
             enforceVideoAbsoluteExpiry = optBoolean("enforce_video_absolute_expiry", false),
-            fileReadTimerSec = optInt("file_read_timer_sec", 5).coerceAtLeast(1),
+            fileReadTimerSec = optInt("file_read_timer_sec", 5).coerceIn(0, 86_400),
             fileOverallExpirySec = optInt("file_overall_expiry_sec", 0).coerceAtLeast(0),
             enforceFileAbsoluteExpiry = optBoolean("enforce_file_absolute_expiry", false),
             ownerUsername = optString("owner_username").takeIf { it.isNotBlank() }

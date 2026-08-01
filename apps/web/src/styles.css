@@ -1663,6 +1663,55 @@ button:disabled {
   background: #0a0f15;
 }
 
+.composer-retention {
+  display: flex;
+  min-height: 34px;
+  margin-bottom: 7px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.composer-retention > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 750;
+}
+
+.composer-retention > div {
+  display: flex;
+  min-width: 0;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.composer-retention button {
+  min-width: 42px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 750;
+  background: #0a0f15;
+  cursor: pointer;
+}
+
+.composer-retention button:hover:not(:disabled),
+.composer-retention button.is-active {
+  border-color: rgba(0, 217, 232, 0.45);
+  color: var(--cyan);
+  background: rgba(0, 217, 232, 0.08);
+}
+
+.composer-retention button:disabled {
+  cursor: default;
+}
+
 .composer textarea {
   width: 100%;
   min-height: 38px;

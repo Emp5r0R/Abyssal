@@ -112,9 +112,9 @@ describe("room message policy", () => {
       file_overall_expiry_sec: -4,
     });
     expect(clamped.name).toHaveLength(36);
-    expect(clamped.self_destruct_timer_sec).toBe(1);
+    expect(clamped.self_destruct_timer_sec).toBe(0);
     expect(clamped.overall_expiry_sec).toBe(86_400);
-    expect(clamped.image_read_timer_sec).toBe(1);
+    expect(clamped.image_read_timer_sec).toBe(0);
     expect(clamped.file_overall_expiry_sec).toBe(0);
   });
 
@@ -212,6 +212,24 @@ describe("room message policy", () => {
     expect(remainingSeconds(message, 5_000)).toBeNull();
   });
 
+  it("zero read retention remains active after a read receipt", () => {
+    const message: ChatMessage = {
+      id: "kept-after-read",
+      chatId: "chat",
+      sender: "User",
+      content: "hi",
+      kind: "text",
+      createdAtMs: 1_000,
+      receivedAtMs: 1_000,
+      readAtMs: 2_000,
+      selfDestructSec: 0,
+      absoluteExpirySec: 0,
+      mine: false,
+    };
+    expect(isExpired(message, 999_999_000)).toBe(false);
+    expect(remainingSeconds(message, 999_999_000)).toBeNull();
+  });
+
   it("remainingSeconds returns 0 after expiry", () => {
     const message: ChatMessage = {
       id: "expired",
@@ -248,7 +266,7 @@ describe("room message policy", () => {
     expect(clamped.image_overall_expiry_sec).toBe(0);
     expect(clamped.video_read_timer_sec).toBe(3);
     expect(clamped.video_overall_expiry_sec).toBe(80);
-    expect(clamped.file_read_timer_sec).toBe(1);
+    expect(clamped.file_read_timer_sec).toBe(0);
     expect(clamped.file_overall_expiry_sec).toBe(10);
   });
 
@@ -258,7 +276,7 @@ describe("room message policy", () => {
       self_destruct_timer_sec: NaN,
       overall_expiry_sec: NaN,
     });
-    expect(clamped.self_destruct_timer_sec).toBe(1);
+    expect(clamped.self_destruct_timer_sec).toBe(0);
     expect(clamped.overall_expiry_sec).toBe(0);
   });
 

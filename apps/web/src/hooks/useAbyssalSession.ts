@@ -95,6 +95,8 @@ export function useAbyssalSession() {
   const activeRoomRef = useRef<string | null>(null);
   const requestedDirectRef = useRef<string | null>(null);
   const ownMessageIdsRef = useRef(new Set<string>());
+  const receivedFrameIdsRef = useRef(new Set<string>());
+  const identityPinsRef = useRef(new Map<string, string>());
   const sendReadReceiptRef = useRef<(chatId: string, messageId: string) => void>(() => undefined);
 
   useEffect(() => {
@@ -139,6 +141,8 @@ export function useAbyssalSession() {
     setRemainingSessionSec(0);
     setUpload(EMPTY_UPLOAD);
     ownMessageIdsRef.current.clear();
+    receivedFrameIdsRef.current.clear();
+    identityPinsRef.current.clear();
     roomsRef.current = [];
     directsRef.current = [];
     presenceRef.current = [];
@@ -174,6 +178,17 @@ export function useAbyssalSession() {
     }
     if (frame.type === "presence") {
       const next = frame.users.filter(validPresence);
+      const identityChanged = next.some((user) => {
+        const key = user.username.toLowerCase();
+        const pinned = identityPinsRef.current.get(key);
+        if (pinned && pinned !== user.identity_public_b64) return true;
+        identityPinsRef.current.set(key, user.identity_public_b64);
+        return false;
+      });
+      if (identityChanged) {
+        clearMemory();
+        return;
+      }
       presenceRef.current = next;
       setPresence(next);
       return;
@@ -226,6 +241,13 @@ export function useAbyssalSession() {
     try {
       const currentSession = sessionRef.current;
       if (!currentSession) return;
+      const replayKey = `${frame.chat_id}\u0000${frame.sender_username}\u0000${frame.message_id}`;
+      if (receivedFrameIdsRef.current.has(replayKey)) return;
+      if (receivedFrameIdsRef.current.size >= 10_000) {
+        const oldest = receivedFrameIdsRef.current.values().next().value;
+        if (oldest) receivedFrameIdsRef.current.delete(oldest);
+      }
+      receivedFrameIdsRef.current.add(replayKey);
       const senderPublicKey = base64ToBytes(frame.sender_public_key_b64);
       const decrypted = cipherRef.current.decryptText(
         frame.chat_id,
@@ -476,7 +498,7 @@ export function useAbyssalSession() {
     sendReadReceiptRef.current = sendReadReceipt;
   }, [sendReadReceipt]);
 
-  const sendText = useCallback(async (content: string, replyToId?: string): Promise<boolean> => {
+  const sendText = useCallback(async (content: string, replyToId?: string, retentionSec?: number): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
     const room = conversationForId(roomsRef.current, directsRef.current, chatId);
@@ -491,7 +513,9 @@ export function useAbyssalSession() {
       kind: "text",
       createdAtMs: now,
       receivedAtMs: now,
-      selfDestructSec: readRetention(room),
+      selfDestructSec: room.conversation_type === "direct"
+        ? clampDirectRetention(retentionSec)
+        : readRetention(room),
       absoluteExpirySec: absoluteRetention(room),
       replyToId: validReplyId(messages[chatId], replyToId),
       mine: true,
@@ -573,7 +597,9 @@ export function useAbyssalSession() {
         kind: "attachment",
         createdAtMs: now,
         receivedAtMs: now,
-        selfDestructSec: readRetention(room, mediaType),
+        selfDestructSec: room.conversation_type === "direct"
+          ? clampDirectRetention(options.readSec)
+          : readRetention(room, mediaType),
         absoluteExpirySec: ttlSec,
         replyToId: validReplyId(messages[chatId], replyToId),
         mine: true,
@@ -801,6 +827,11 @@ function conversationForId(
   };
 }
 
+function clampDirectRetention(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 5;
+  return Math.min(86_400, Math.max(0, Math.floor(value)));
+}
+
 function parsePayload(
   chatId: string,
   payload: Record<string, unknown>,
@@ -829,7 +860,7 @@ function parsePayload(
       kind,
       createdAtMs: sentAt,
       receivedAtMs,
-      selfDestructSec: readRetention(room),
+      selfDestructSec: incomingReadRetention(room, payload.self_destruct_sec),
       absoluteExpirySec: absoluteRetention(room),
       replyToId,
       mine: sender === currentUsername,
@@ -856,7 +887,7 @@ function parsePayload(
     kind,
     createdAtMs: sentAt,
     receivedAtMs,
-    selfDestructSec: readRetention(room, mediaType),
+    selfDestructSec: incomingReadRetention(room, payload.self_destruct_sec, mediaType),
     absoluteExpirySec: absoluteRetention(room, mediaType),
     replyToId,
     mine: sender === currentUsername,
@@ -873,6 +904,17 @@ function parsePayload(
       reactionShortcode,
     },
   };
+}
+
+function incomingReadRetention(
+  room: RoomRecord | undefined,
+  requested: unknown,
+  mediaType?: MediaType,
+): number {
+  if (room?.conversation_type === "direct") {
+    return clampDirectRetention(typeof requested === "number" ? requested : undefined);
+  }
+  return readRetention(room, mediaType);
 }
 
 function messagePayload(message: ChatMessage): Record<string, unknown> {
