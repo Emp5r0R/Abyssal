@@ -135,10 +135,9 @@ function NumberPair({
 }) {
   return (
     <>
-      <Field label="After read (seconds)" type="number" inputMode="numeric" min={1} max={86400} value={read} onChange={(event) => onRead(event.target.value)} />
+      <Field label="After read (seconds, 0 = never)" type="number" inputMode="numeric" min={0} max={86400} value={read} onChange={(event) => onRead(event.target.value)} />
       <Field label="Absolute lifetime (seconds)" type="number" inputMode="numeric" min={0} max={86400} value={absolute} disabled={!enforce} onChange={(event) => onAbsolute(event.target.value)} />
       <Toggle checked={enforce} onChange={onEnforce} label="Enforce absolute lifetime" />
     </>
   );
 }
-

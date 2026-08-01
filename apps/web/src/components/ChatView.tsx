@@ -32,13 +32,13 @@ interface ChatViewProps {
   users: PresenceUser[];
   upload: UploadProgress & { active: boolean; name: string };
   onBack: () => void;
-  onSend: (content: string, replyToId?: string) => Promise<boolean>;
+  onSend: (content: string, replyToId?: string, retentionSec?: number) => Promise<boolean>;
   onReply: (message: ChatMessage | null) => void;
   replyTarget: ChatMessage | null;
-  onOpenAttachment: () => void;
+  onOpenAttachment: (retentionSec: number) => void;
   onViewAttachment: (message: ChatMessage) => void;
   onExportAttachment: (message: ChatMessage) => void;
-  onSendGif: (reaction: ReactionAsset, replyToId?: string) => Promise<boolean>;
+  onSendGif: (reaction: ReactionAsset, replyToId?: string, retentionSec?: number) => Promise<boolean>;
 }
 
 export function ChatView({
@@ -61,6 +61,7 @@ export function ChatView({
   const isDirect = room.conversation_type === "direct";
   const [draft, setDraft] = useState("");
   const [showGifs, setShowGifs] = useState(false);
+  const [directRetentionSec, setDirectRetentionSec] = useState(5);
   const [submitting, setSubmitting] = useState(false);
   const [now, setNow] = useState(0);
   const [flashTargetId, setFlashTargetId] = useState<string | null>(null);
@@ -89,13 +90,13 @@ export function ChatView({
     const reaction = exactReactionShortcut(draft);
     try {
       if (reaction) {
-        if (await onSendGif(reaction, replyTarget?.id)) {
+        if (await onSendGif(reaction, replyTarget?.id, effectiveRetentionSec)) {
           setDraft("");
           onReply(null);
         }
         return;
       }
-      if (await onSend(draft, replyTarget?.id)) {
+      if (await onSend(draft, replyTarget?.id, effectiveRetentionSec)) {
         setDraft("");
         onReply(null);
       }
@@ -132,7 +133,7 @@ export function ChatView({
     if (submitting || upload.active) return;
     setSubmitting(true);
     try {
-      if (!await onSendGif(reaction, replyTarget?.id)) return;
+      if (!await onSendGif(reaction, replyTarget?.id, effectiveRetentionSec)) return;
       setShowGifs(false);
       onReply(null);
     } finally {
@@ -144,6 +145,7 @@ export function ChatView({
     setFlashTargetId(messageId);
     window.setTimeout(() => setFlashTargetId((current) => current === messageId ? null : current), 1_300);
   };
+  const effectiveRetentionSec = isDirect ? directRetentionSec : room.self_destruct_timer_sec;
 
   return (
     <section className="chat-view">
@@ -153,7 +155,7 @@ export function ChatView({
         <div className="chat-title">
           <h1>{room.name}</h1>
           <span>
-            <ShieldCheck size={13} /> {isDirect && safetyNumber ? `Safety ${safetyNumber}` : isDirect ? "Private route" : `${room.self_destruct_timer_sec}s after read`}
+            <ShieldCheck size={13} /> {isDirect && safetyNumber ? `Safety ${safetyNumber}` : isDirect ? "Private route" : retentionLabel(room.self_destruct_timer_sec)}
           </span>
         </div>
         <div className={`connection-pill state-${connected ? "connected" : "disconnected"}`}>
@@ -242,6 +244,22 @@ export function ChatView({
             <strong>{upload.total ? Math.round(upload.loaded / upload.total * 100) : 0}%</strong>
           </div>
         ) : null}
+        <div className="composer-retention" aria-label="Message retention">
+          <span><Clock3 size={13} />{isDirect ? "MESSAGE RETENTION" : "ROOM RETENTION"}</span>
+          <div role="group" aria-label="Disappearing message timer">
+            {(isDirect ? [0, 5, 10, 30, 60] : [room.self_destruct_timer_sec]).map((seconds) => (
+              <button
+                type="button"
+                key={seconds}
+                className={effectiveRetentionSec === seconds ? "is-active" : ""}
+                disabled={!isDirect}
+                onClick={() => setDirectRetentionSec(seconds)}
+              >
+                {seconds === 0 ? "NEVER" : seconds === 60 ? "1M" : `${seconds}S`}
+              </button>
+            ))}
+          </div>
+        </div>
         {replyTarget ? (
           <div className="composer-reply">
             <MessageSquareReply size={16} />
@@ -271,7 +289,7 @@ export function ChatView({
           </div>
         ) : null}
         <form className="composer" onSubmit={submit}>
-          <IconButton label="Attach file" disabled={!connected || submitting || upload.active} onClick={onOpenAttachment}><Paperclip size={20} /></IconButton>
+          <IconButton label="Attach file" disabled={!connected || submitting || upload.active} onClick={() => onOpenAttachment(effectiveRetentionSec)}><Paperclip size={20} /></IconButton>
           <IconButton label="Send GIF" disabled={!connected || !room.allow_images || submitting || upload.active} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>
           <textarea
             ref={textareaRef}
@@ -372,8 +390,13 @@ function formatTime(timestamp: number): string {
 }
 
 function expiryLabel(message: ChatMessage, now: number): string {
-  if (now === 0) return `${message.selfDestructSec}s on read`;
+  if (message.selfDestructSec === 0 && message.absoluteExpirySec === 0) return "kept in session";
+  if (now === 0) return message.selfDestructSec === 0 ? "absolute timer" : `${message.selfDestructSec}s on read`;
   const remaining = remainingSeconds(message, now);
-  if (remaining === null) return `${message.selfDestructSec}s on read`;
+  if (remaining === null) return message.selfDestructSec === 0 ? "kept in session" : `${message.selfDestructSec}s on read`;
   return `${remaining}s`;
+}
+
+function retentionLabel(seconds: number): string {
+  return seconds === 0 ? "No read expiry" : `${seconds}s after read`;
 }

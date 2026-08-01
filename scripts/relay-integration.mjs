@@ -16,7 +16,11 @@ initSync({
 });
 
 const baseUrl = process.env.ABYSSAL_TEST_BASE_URL;
+const aliceCode = process.env.ABYSSAL_TEST_CODE_A;
+const bobCode = process.env.ABYSSAL_TEST_CODE_B;
 assert.ok(baseUrl, "ABYSSAL_TEST_BASE_URL is required");
+assert.ok(aliceCode, "ABYSSAL_TEST_CODE_A is required");
+assert.ok(bobCode, "ABYSSAL_TEST_CODE_B is required");
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -179,10 +183,10 @@ function decryptFrame(recipient, frame) {
   ));
 }
 
-const alice = await register("ABYS-ALICE-0001", "alice-password");
-const bob = await register("ABYS-BOB-000002", "bob-password");
-assert.equal(await opaqueStartStatus("ABYS-ALICE-0001", "alice-password"), 409);
-assert.equal(await opaqueStartStatus("ABYS-ALICE-0001", "other-password"), 409);
+const alice = await register(aliceCode, "alice-password");
+const bob = await register(bobCode, "bob-password");
+assert.equal(await opaqueStartStatus(aliceCode, "alice-password"), 409);
+assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
 
 const aliceSocket = await connect(alice.token);
 let bobSocket = await connect(bob.token);

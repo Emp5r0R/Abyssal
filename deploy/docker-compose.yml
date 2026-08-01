@@ -14,7 +14,7 @@ services:
         required: false
     environment:
       ABYSSAL_BIND_ADDR: 0.0.0.0:4020
-      ABYSSAL_CODE_OUTPUT_PATH: /tmp/abyssal-invite-codes
+      ABYSSAL_CODE_PRINT_DELAY_MS: 4000
     ports:
       - "127.0.0.1:4020:4020"
     read_only: true

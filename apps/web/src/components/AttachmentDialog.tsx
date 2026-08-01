@@ -7,11 +7,13 @@ import { Dialog, IconButton, Toggle } from "./Ui";
 
 export function AttachmentDialog({
   room,
+  retentionSec,
   onCancel,
   onPickerState,
   onSend,
 }: {
   room: RoomRecord;
+  retentionSec: number;
   onCancel: () => void;
   onPickerState: (active: boolean) => void;
   onSend: (file: File, options: AttachmentOptions) => Promise<boolean>;
@@ -48,7 +50,7 @@ export function AttachmentDialog({
   return (
     <Dialog
       title="Encrypted attachment"
-      description="Plaintext stays in current browser process. Save is explicit."
+      description={`Plaintext stays in current browser process. ${retentionSec === 0 ? "No read expiry." : `Expires ${retentionSec}s after read.`}`}
       actions={
         <>
           <button className="secondary-button" type="button" onClick={onCancel}>CANCEL</button>

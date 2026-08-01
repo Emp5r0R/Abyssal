@@ -707,7 +707,7 @@ private fun CreateForumDialog(
         }
 
         Text(
-            text = "Absolute timers use seconds after send. Enforced timers cannot be overridden in the room.",
+            text = "Read timer 0 means never. Absolute timers use seconds after send and cannot be overridden in the room.",
             color = SteelMuted,
             fontSize = 12.sp,
             modifier = Modifier
@@ -761,19 +761,19 @@ private fun CreateForumDialog(
             onConfirm = {
                 onCreate(
                     forumName.trim(),
-                    readExpiryText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    readExpiryText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
                     overallExpiryText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
                     textAbsoluteEnforced,
                     imagesAllowed,
                     videosAllowed,
                     filesAllowed,
-                    imageReadText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    imageReadText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
                     imageAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
                     imageAbsoluteEnforced,
-                    videoReadText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    videoReadText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
                     videoAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
                     videoAbsoluteEnforced,
-                    fileReadText.toIntOrNull()?.coerceAtLeast(1) ?: 5,
+                    fileReadText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
                     fileAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
                     fileAbsoluteEnforced
                 )

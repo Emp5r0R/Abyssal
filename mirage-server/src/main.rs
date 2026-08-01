@@ -1,9 +1,6 @@
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     collections::{HashMap, HashSet},
     env,
-    io::Write,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -29,8 +26,10 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::{
     cors::CorsLayer,
@@ -39,7 +38,7 @@ use tower_http::{
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
@@ -63,6 +62,12 @@ const MAX_IDENTITY_ENVELOPE_BYTES: usize = 256;
 const MESSAGE_NONCE_BYTES: usize = 12;
 const MESSAGE_SIGNATURE_BYTES: usize = 64;
 const WRAPPED_KEY_BYTES: usize = 92;
+const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_REPLAY_IDS: usize = 50_000;
+const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_INVITE_CODE_ID_V1";
+
+type CodeId = [u8; 32];
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 struct AppState {
@@ -76,12 +81,15 @@ struct AppState {
     account_ops: Arc<Mutex<()>>,
     opaque_setup: Arc<Vec<u8>>,
     opaque_handshakes: Arc<Mutex<HashMap<Uuid, OpaqueHandshake>>>,
-    available_codes: Arc<Mutex<HashSet<String>>>,
-    accounts: Arc<Mutex<HashMap<String, Account>>>,
+    invite_code_pepper: Arc<CodeId>,
+    boot_codes: Arc<Mutex<Option<Vec<String>>>>,
+    available_codes: Arc<Mutex<HashSet<CodeId>>>,
+    accounts: Arc<Mutex<HashMap<CodeId, Account>>>,
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
-    login_limits: Arc<Mutex<HashMap<String, RateState>>>,
+    login_limits: Arc<Mutex<HashMap<CodeId, RateState>>>,
+    replay_ids: Arc<Mutex<HashMap<ReplayKey, u64>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     room_catalog: Arc<Mutex<HashMap<String, RoomEntry>>>,
     direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
@@ -100,11 +108,11 @@ struct Account {
 
 enum OpaqueHandshake {
     Registration {
-        code: String,
+        code_id: CodeId,
         created_at_ms: u64,
     },
     Login {
-        code: String,
+        code_id: CodeId,
         username: String,
         server_state: Vec<u8>,
         created_at_ms: u64,
@@ -113,14 +121,14 @@ enum OpaqueHandshake {
 
 #[derive(Clone)]
 struct AuthSession {
-    code: String,
+    code_id: CodeId,
     username: String,
     last_activity_ms: u64,
 }
 
 #[derive(Clone)]
 struct ClientHandle {
-    code: String,
+    code_id: CodeId,
     username: String,
     tx: mpsc::Sender<Message>,
 }
@@ -128,7 +136,7 @@ struct ClientHandle {
 #[derive(Clone)]
 struct RoomEntry {
     room: RoomRecord,
-    owner_code: String,
+    owner_code_id: CodeId,
 }
 
 #[derive(Clone)]
@@ -148,6 +156,21 @@ struct RateState {
 struct PendingKey {
     chat_id: String,
     recipient_username: String,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ReplayKey {
+    chat_id: String,
+    sender_username: String,
+    message_id: String,
+}
+
+impl Drop for ReplayKey {
+    fn drop(&mut self) {
+        self.chat_id.zeroize();
+        self.sender_username.zeroize();
+        self.message_id.zeroize();
+    }
 }
 
 impl Drop for PendingKey {
@@ -186,14 +209,14 @@ impl Drop for Account {
 impl Drop for OpaqueHandshake {
     fn drop(&mut self) {
         match self {
-            Self::Registration { code, .. } => code.zeroize(),
+            Self::Registration { code_id, .. } => code_id.zeroize(),
             Self::Login {
-                code,
+                code_id,
                 username,
                 server_state,
                 ..
             } => {
-                code.zeroize();
+                code_id.zeroize();
                 username.zeroize();
                 server_state.zeroize();
             }
@@ -203,7 +226,7 @@ impl Drop for OpaqueHandshake {
 
 impl Drop for AuthSession {
     fn drop(&mut self) {
-        self.code.zeroize();
+        self.code_id.zeroize();
         self.username.zeroize();
     }
 }
@@ -218,13 +241,13 @@ impl Drop for DirectEntry {
 
 impl Drop for RoomEntry {
     fn drop(&mut self) {
-        self.owner_code.zeroize();
+        self.owner_code_id.zeroize();
     }
 }
 
 impl Drop for ClientHandle {
     fn drop(&mut self) {
-        self.code.zeroize();
+        self.code_id.zeroize();
         self.username.zeroize();
     }
 }
@@ -463,7 +486,6 @@ async fn main() {
         .init();
 
     let state = AppState::from_env();
-    state.print_boot_codes().await;
     tokio::spawn(attachment_sweeper(state.clone()));
     tokio::spawn(session_sweeper(state.clone()));
     if state.inactivity_limit_ms.is_some() {
@@ -495,7 +517,7 @@ async fn main() {
         .route("/v1/ws", get(ws_handler))
         .route("/v1/*path", any(api_not_found))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     if let Some(web_root) = resolve_web_root() {
         info!("serving Abyssal web client from {}", web_root.display());
@@ -527,6 +549,11 @@ async fn main() {
         .expect("failed to bind ABYSSAL_BIND_ADDR");
 
     info!("abyssal relay listening on {bind_addr}");
+    let code_print_delay_ms = read_usize_env("ABYSSAL_CODE_PRINT_DELAY_MS", 0).min(30_000) as u64;
+    if code_print_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(code_print_delay_ms)).await;
+    }
+    state.print_boot_codes().await;
     axum::serve(listener, app).await.expect("server failed");
 }
 
@@ -536,12 +563,17 @@ impl AppState {
             .or_else(|_| env::var("MIRAGE_NODE_ID"))
             .unwrap_or_else(|_| format!("abyssal-{}", Uuid::new_v4().simple()));
 
-        let user_count = read_usize_env("ABYSSAL_CODE_COUNT", 5);
-        let min_len = read_usize_env("ABYSSAL_CODE_MIN_LEN", 12).max(12);
-        let requested_max_len = read_usize_env("ABYSSAL_CODE_MAX_LEN", min_len + user_count);
-        let max_len = requested_max_len.max(min_len + user_count);
-        let mut available_codes = HashSet::new();
+        let min_len = read_usize_env("ABYSSAL_CODE_MIN_LEN", 12).clamp(12, MAX_CODE_BYTES);
+        let max_distinct_lengths = MAX_CODE_BYTES - min_len + 1;
+        let user_count = read_usize_env("ABYSSAL_CODE_COUNT", 5).min(max_distinct_lengths);
+        let required_max_len = min_len.saturating_add(user_count.saturating_sub(1));
+        let requested_max_len =
+            read_usize_env("ABYSSAL_CODE_MAX_LEN", required_max_len).clamp(min_len, MAX_CODE_BYTES);
+        let max_len = requested_max_len.max(required_max_len);
+        let mut boot_code_set = HashSet::new();
         let mut generated_lengths = HashSet::new();
+        let mut invite_code_pepper = [0_u8; 32];
+        OsRng.fill_bytes(&mut invite_code_pepper);
         let attachment_ram_limit_bytes =
             read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512).saturating_mul(1024 * 1024);
         let max_rooms_per_user = read_usize_env("ABYSSAL_MAX_ROOMS_PER_USER", 5).clamp(1, 100);
@@ -554,20 +586,18 @@ impl AppState {
             .filter(|limit| *limit > 0)
             .map(|limit| limit as u64);
 
-        for code in parse_codes_from_env("ABYSSAL_INVITE_CODES")
-            .into_iter()
-            .chain(parse_codes_from_env("MIRAGE_INVITE_CODES"))
-        {
-            available_codes.insert(code);
-        }
-
         generate_codes(
-            &mut available_codes,
+            &mut boot_code_set,
             &mut generated_lengths,
             user_count,
             min_len,
             max_len,
         );
+        let boot_codes = boot_code_set.into_iter().collect::<Vec<_>>();
+        let available_codes = boot_codes
+            .iter()
+            .map(|code| derive_code_id(&invite_code_pepper, code))
+            .collect::<HashSet<_>>();
 
         Self {
             node_id,
@@ -580,12 +610,15 @@ impl AppState {
             account_ops: Arc::new(Mutex::new(())),
             opaque_setup: Arc::new(opaque_server_setup()),
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            invite_code_pepper: Arc::new(invite_code_pepper),
+            boot_codes: Arc::new(Mutex::new(Some(boot_codes))),
             available_codes: Arc::new(Mutex::new(available_codes)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
+            replay_ids: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
@@ -595,26 +628,17 @@ impl AppState {
     }
 
     async fn print_boot_codes(&self) {
-        let codes = self.available_codes.lock().await;
-        info!("ABYSSAL RAM-ONLY ACCESS CODES - copy these now; they are not written to disk");
+        let Some(mut codes) = self.boot_codes.lock().await.take() else {
+            return;
+        };
+        println!("ABYSSAL RAM-ONLY ACCESS CODES - copy these now; they are not written to disk");
         for code in codes.iter() {
-            info!("ABYSSAL_CODE code={code}");
+            println!("ABYSSAL_CODE code={code}");
         }
-        if let Ok(path) = env::var("ABYSSAL_CODE_OUTPUT_PATH") {
-            if path.starts_with("/tmp/") {
-                let mut sorted_codes = codes.iter().cloned().collect::<Vec<_>>();
-                sorted_codes.sort_unstable();
-                let mut output = sorted_codes.join("\n");
-                output.push('\n');
-                if let Err(error) = write_sensitive_file(&path, output.as_bytes()) {
-                    warn!("failed to write RAM-only code output: {error}");
-                }
-                output.zeroize();
-                sorted_codes.iter_mut().for_each(Zeroize::zeroize);
-            } else {
-                warn!("ABYSSAL_CODE_OUTPUT_PATH must be under /tmp");
-            }
+        for code in &mut codes {
+            code.zeroize();
         }
+        drop(codes);
         info!(
             "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
             self.attachment_ram_limit_bytes
@@ -634,17 +658,6 @@ impl AppState {
             info!("ABYSSAL_DEAD_MAN_SWITCH inactivity_limit_ms={limit_ms}");
         }
     }
-}
-
-fn write_sensitive_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(bytes)
 }
 
 fn now_ms() -> u64 {
@@ -768,12 +781,11 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-fn parse_codes_from_env(key: &str) -> Vec<String> {
-    env::var(key)
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|code| normalize_code(code).ok())
-        .collect()
+fn derive_code_id(pepper: &[u8], code: &str) -> CodeId {
+    let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC accepts any key length");
+    mac.update(CODE_ID_DOMAIN);
+    mac.update(code.as_bytes());
+    mac.finalize().into_bytes().into()
 }
 
 fn generate_codes(
@@ -819,7 +831,7 @@ fn generate_code(rng: &mut OsRng, len: usize) -> String {
     let char_count = len - dash_count;
     let mut raw = String::with_capacity(char_count);
     for _ in 0..char_count {
-        let idx = (rng.next_u32() as usize) % ALPHABET.len();
+        let idx = rng.gen_range(0..ALPHABET.len());
         raw.push(ALPHABET[idx] as char);
     }
 
@@ -857,10 +869,6 @@ fn valid_code_shape(code: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
-fn code_log_label(code: &str) -> String {
-    format!("len={}", code.len())
-}
-
 fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: usize) -> bool {
     if now.saturating_sub(state.window_start_ms) >= window_ms {
         state.window_start_ms = now;
@@ -870,10 +878,10 @@ fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: u
     state.count <= limit
 }
 
-async fn login_attempt_allowed(state: &AppState, code: &str) -> bool {
+async fn login_attempt_allowed(state: &AppState, code_id: &CodeId) -> bool {
     let now = now_ms();
     let mut limits = state.login_limits.lock().await;
-    let rate = limits.entry(code.to_string()).or_insert(RateState {
+    let rate = limits.entry(*code_id).or_insert(RateState {
         window_start_ms: now,
         count: 0,
     });
@@ -885,8 +893,8 @@ async fn login_attempt_allowed(state: &AppState, code: &str) -> bool {
     )
 }
 
-async fn clear_login_limit(state: &AppState, code: &str) {
-    state.login_limits.lock().await.remove(code);
+async fn clear_login_limit(state: &AppState, code_id: &CodeId) {
+    state.login_limits.lock().await.remove(code_id);
 }
 
 fn random_username() -> String {
@@ -917,7 +925,7 @@ fn random_username() -> String {
     format!("{prefix}{suffix}{number}")
 }
 
-fn random_unique_username(accounts: &HashMap<String, Account>) -> String {
+fn random_unique_username(accounts: &HashMap<CodeId, Account>) -> String {
     for _ in 0..128 {
         let candidate = random_username();
         if accounts
@@ -1009,11 +1017,11 @@ async fn active_session(state: &AppState, token: &str, touch: bool) -> Option<Au
     Some(session.clone())
 }
 
-async fn code_has_active_session(state: &AppState, code: &str) -> bool {
+async fn code_has_active_session(state: &AppState, code_id: &CodeId) -> bool {
     let now = now_ms();
     let mut sessions = state.sessions.lock().await;
     sessions.retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
-    sessions.values().any(|session| session.code == code)
+    sessions.values().any(|session| session.code_id == *code_id)
 }
 
 fn normalize_media_type(media_type: Option<&str>) -> String {
@@ -1154,18 +1162,19 @@ async fn start_opaque_account(
     let _account_guard = state.account_ops.lock().await;
     prune_opaque_handshakes(&state).await;
     let code = match normalize_code(&request.code) {
-        Ok(code) => code,
+        Ok(code) => Zeroizing::new(code),
         Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
     };
-    if !login_attempt_allowed(&state, &code).await {
+    let code_id = derive_code_id(&state.invite_code_pepper[..], &code);
+    if !login_attempt_allowed(&state, &code_id).await {
         return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
     }
-    if code_has_active_session(&state, &code).await {
+    if code_has_active_session(&state, &code_id).await {
         return opaque_start_error(StatusCode::CONFLICT, &state);
     }
 
     let handshake_id = Uuid::new_v4();
-    if let Some(account) = state.accounts.lock().await.get(&code).cloned() {
+    if let Some(account) = state.accounts.lock().await.get(&code_id).cloned() {
         let request_bytes =
             match decode_bounded(&request.credential_request_b64, ACCOUNT_BODY_LIMIT_BYTES) {
                 Ok(bytes) => bytes,
@@ -1183,7 +1192,7 @@ async fn start_opaque_account(
         state.opaque_handshakes.lock().await.insert(
             handshake_id,
             OpaqueHandshake::Login {
-                code,
+                code_id,
                 username: account.username.clone(),
                 server_state,
                 created_at_ms: now_ms(),
@@ -1204,7 +1213,7 @@ async fn start_opaque_account(
         );
     }
 
-    if !state.available_codes.lock().await.contains(&code) {
+    if !state.available_codes.lock().await.contains(&code_id) {
         return opaque_start_error(StatusCode::UNAUTHORIZED, &state);
     }
     let request_bytes =
@@ -1223,7 +1232,7 @@ async fn start_opaque_account(
     state.opaque_handshakes.lock().await.insert(
         handshake_id,
         OpaqueHandshake::Registration {
-            code,
+            code_id,
             created_at_ms: now_ms(),
         },
     );
@@ -1259,9 +1268,9 @@ async fn finish_opaque_account(
     };
 
     match &handshake {
-        OpaqueHandshake::Registration { code, .. } => {
-            if state.accounts.lock().await.contains_key(code)
-                || !state.available_codes.lock().await.contains(code)
+        OpaqueHandshake::Registration { code_id, .. } => {
+            if state.accounts.lock().await.contains_key(code_id)
+                || !state.available_codes.lock().await.contains(code_id)
             {
                 return account_error(StatusCode::CONFLICT, &state, String::new()).await;
             }
@@ -1303,11 +1312,11 @@ async fn finish_opaque_account(
                     return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await
                 }
             };
-            state.available_codes.lock().await.remove(code);
+            state.available_codes.lock().await.remove(code_id);
             let mut accounts = state.accounts.lock().await;
             let username = random_unique_username(&accounts);
             accounts.insert(
-                code.clone(),
+                *code_id,
                 Account {
                     username: username.clone(),
                     password_file,
@@ -1317,12 +1326,12 @@ async fn finish_opaque_account(
                 },
             );
             drop(accounts);
-            clear_login_limit(&state, code).await;
-            info!("opaque_account_created {}", code_log_label(code));
-            issue_session(&state, code.clone(), username, true).await
+            clear_login_limit(&state, code_id).await;
+            info!("opaque_account_created");
+            issue_session(&state, *code_id, username, true).await
         }
         OpaqueHandshake::Login {
-            code,
+            code_id,
             username,
             server_state,
             ..
@@ -1341,12 +1350,12 @@ async fn finish_opaque_account(
             if opaque_server_finish_login(server_state, &finalization).is_err() {
                 return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
             }
-            if code_has_active_session(&state, code).await {
+            if code_has_active_session(&state, code_id).await {
                 return account_error(StatusCode::CONFLICT, &state, String::new()).await;
             }
-            clear_login_limit(&state, code).await;
-            info!("opaque_account_login {}", code_log_label(code));
-            issue_session(&state, code.clone(), username.clone(), false).await
+            clear_login_limit(&state, code_id).await;
+            info!("opaque_account_login");
+            issue_session(&state, *code_id, username.clone(), false).await
         }
     }
 }
@@ -1401,14 +1410,14 @@ fn decode_exact(value: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "Wrong information".to_string())
 }
 
-async fn replace_connected_clients_for_code(state: &AppState, code: &str) {
+async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) {
     let old_clients = state
         .clients
         .lock()
         .await
         .iter()
         .filter_map(|(client_id, client)| {
-            if client.code == code {
+            if client.code_id == *code_id {
                 Some((*client_id, client.tx.clone()))
             } else {
                 None
@@ -1436,7 +1445,7 @@ async fn replace_connected_clients_for_code(state: &AppState, code: &str) {
     for members in state.rooms.lock().await.values_mut() {
         members.retain(|client_id| !old_ids.contains(client_id));
     }
-    if let Some(account) = state.accounts.lock().await.get_mut(code) {
+    if let Some(account) = state.accounts.lock().await.get_mut(code_id) {
         account.connected = false;
     }
     broadcast_presence(state).await;
@@ -1470,7 +1479,7 @@ async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> St
         return StatusCode::UNAUTHORIZED;
     };
 
-    replace_connected_clients_for_code(&state, &session.code).await;
+    replace_connected_clients_for_code(&state, &session.code_id).await;
     touch_activity(&state).await;
     StatusCode::NO_CONTENT
 }
@@ -1631,11 +1640,11 @@ async fn account_error(
 
 async fn issue_session(
     state: &AppState,
-    code: String,
+    code_id: CodeId,
     username: String,
     created: bool,
 ) -> (StatusCode, Json<AccountResponse>) {
-    let account_identity = state.accounts.lock().await.get(&code).map(|account| {
+    let account_identity = state.accounts.lock().await.get(&code_id).map(|account| {
         (
             URL_SAFE_NO_PAD.encode(&account.identity_public),
             URL_SAFE_NO_PAD.encode(&account.identity_envelope),
@@ -1647,11 +1656,11 @@ async fn issue_session(
     let token = Uuid::new_v4().to_string();
     let now = now_ms();
     let mut sessions = state.sessions.lock().await;
-    sessions.retain(|_, session| session.code != code);
+    sessions.retain(|_, session| session.code_id != code_id);
     sessions.insert(
         token.clone(),
         AuthSession {
-            code,
+            code_id,
             username: username.clone(),
             last_activity_ms: now,
         },
@@ -1740,12 +1749,12 @@ async fn socket_loop(state: AppState, session_token: String, auth: AuthSession, 
     state.clients.lock().await.insert(
         client_id,
         ClientHandle {
-            code: auth.code.clone(),
+            code_id: auth.code_id,
             username: auth.username.clone(),
             tx,
         },
     );
-    if let Some(account) = state.accounts.lock().await.get_mut(&auth.code) {
+    if let Some(account) = state.accounts.lock().await.get_mut(&auth.code_id) {
         account.connected = true;
     }
     info!("client_connected id={client_id}");
@@ -1946,12 +1955,13 @@ async fn route_encrypted_message(
     decode_exact(&signature_b64, MESSAGE_SIGNATURE_BYTES)?;
     decode_bounded(&ciphertext_b64, WS_MAX_FRAME_BYTES)?;
 
-    let (sender_code, sender_username) = client_identity(state, sender_id).await?;
+    let (sender_code_id, sender_username) = client_identity(state, sender_id).await?;
+    register_message_id(state, &chat_id, &sender_username, &message_id).await?;
     let sender_public_key_b64 = state
         .accounts
         .lock()
         .await
-        .get(&sender_code)
+        .get(&sender_code_id)
         .map(|account| URL_SAFE_NO_PAD.encode(&account.identity_public))
         .ok_or_else(|| "authenticated identity required".to_string())?;
     let access = conversation_access(state, &sender_username, &chat_id)
@@ -2038,6 +2048,36 @@ async fn route_encrypted_message(
     Ok(())
 }
 
+async fn register_message_id(
+    state: &AppState,
+    chat_id: &str,
+    sender_username: &str,
+    message_id: &str,
+) -> Result<(), String> {
+    let now = now_ms();
+    let mut replay_ids = state.replay_ids.lock().await;
+    replay_ids.retain(|_, seen_at| now.saturating_sub(*seen_at) < REPLAY_WINDOW_MS);
+    let key = ReplayKey {
+        chat_id: chat_id.to_string(),
+        sender_username: sender_username.to_string(),
+        message_id: message_id.to_string(),
+    };
+    if replay_ids.contains_key(&key) {
+        return Err("message replay rejected".to_string());
+    }
+    if replay_ids.len() >= MAX_REPLAY_IDS {
+        if let Some(oldest) = replay_ids
+            .iter()
+            .min_by_key(|(_, seen_at)| **seen_at)
+            .map(|(key, _)| key.clone())
+        {
+            replay_ids.remove(&oldest);
+        }
+    }
+    replay_ids.insert(key, now);
+    Ok(())
+}
+
 async fn queue_pending_frame(
     state: &AppState,
     chat_id: &str,
@@ -2097,23 +2137,17 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
         token.zeroize();
     }
     drop(sessions);
-    let mut accounts = state.accounts.lock().await;
-    for (mut code, _) in accounts.drain() {
-        code.zeroize();
+    state.accounts.lock().await.clear();
+    state.available_codes.lock().await.clear();
+    if let Some(mut boot_codes) = state.boot_codes.lock().await.take() {
+        for code in &mut boot_codes {
+            code.zeroize();
+        }
     }
-    drop(accounts);
-    let mut available_codes = state.available_codes.lock().await;
-    for mut code in available_codes.drain() {
-        code.zeroize();
-    }
-    drop(available_codes);
     state.frame_limits.lock().await.clear();
+    state.replay_ids.lock().await.clear();
     state.opaque_handshakes.lock().await.clear();
-    let mut login_limits = state.login_limits.lock().await;
-    for (mut code, _) in login_limits.drain() {
-        code.zeroize();
-    }
-    drop(login_limits);
+    state.login_limits.lock().await.clear();
     state.clients.lock().await.clear();
 }
 
@@ -2122,22 +2156,22 @@ async fn create_room(
     sender_id: Uuid,
     mut room: RoomRecord,
 ) -> Result<(), String> {
-    let (owner_code, owner_username) = client_identity(state, sender_id).await?;
+    let (owner_code_id, owner_username) = client_identity(state, sender_id).await?;
     room.owner_username = owner_username;
     normalize_room_record(&mut room)?;
     let mut catalog = state.room_catalog.lock().await;
     if let Some(existing) = catalog.get(&room.id) {
-        if existing.owner_code != owner_code {
+        if existing.owner_code_id != owner_code_id {
             return Err("room id rejected".to_string());
         }
-    } else if !has_room_capacity(&catalog, &owner_code, state.max_rooms_per_user) {
+    } else if !has_room_capacity(&catalog, &owner_code_id, state.max_rooms_per_user) {
         return Err("room limit reached".to_string());
     }
     catalog.insert(
         room.id.clone(),
         RoomEntry {
             room: room.clone(),
-            owner_code,
+            owner_code_id,
         },
     );
     drop(catalog);
@@ -2146,7 +2180,7 @@ async fn create_room(
 }
 
 async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result<(), String> {
-    let (owner_code, _) = client_identity(state, sender_id).await?;
+    let (owner_code_id, _) = client_identity(state, sender_id).await?;
     let chat_id = chat_id.trim();
     if chat_id.is_empty() {
         return Err("room id is required".to_string());
@@ -2155,7 +2189,7 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
     let Some(entry) = catalog.get(chat_id) else {
         return Err("room unavailable".to_string());
     };
-    if entry.owner_code != owner_code {
+    if entry.owner_code_id != owner_code_id {
         return Err("room owner required".to_string());
     }
     catalog.remove(chat_id);
@@ -2288,29 +2322,29 @@ async fn send_direct_catalog(state: &AppState, client_id: Uuid, username: &str) 
     send_to_client(state, client_id, &OutboundFrame::Directs { directs }).await;
 }
 
-async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(String, String), String> {
+async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(CodeId, String), String> {
     state
         .clients
         .lock()
         .await
         .get(&client_id)
-        .map(|client| (client.code.clone(), client.username.clone()))
+        .map(|client| (client.code_id, client.username.clone()))
         .ok_or_else(|| "authenticated client required".to_string())
 }
 
-fn owned_room_count(catalog: &HashMap<String, RoomEntry>, owner_code: &str) -> usize {
+fn owned_room_count(catalog: &HashMap<String, RoomEntry>, owner_code_id: &CodeId) -> usize {
     catalog
         .values()
-        .filter(|entry| entry.owner_code == owner_code)
+        .filter(|entry| entry.owner_code_id == *owner_code_id)
         .count()
 }
 
 fn has_room_capacity(
     catalog: &HashMap<String, RoomEntry>,
-    owner_code: &str,
+    owner_code_id: &CodeId,
     max_rooms_per_user: usize,
 ) -> bool {
-    owned_room_count(catalog, owner_code) < max_rooms_per_user
+    owned_room_count(catalog, owner_code_id) < max_rooms_per_user
 }
 
 fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
@@ -2328,13 +2362,13 @@ fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
     if room.name.is_empty() {
         return Err("room name rejected".to_string());
     }
-    room.self_destruct_timer_sec = room.self_destruct_timer_sec.clamp(1, 86_400);
+    room.self_destruct_timer_sec = room.self_destruct_timer_sec.min(86_400);
     room.overall_expiry_sec = room.overall_expiry_sec.min(86_400);
-    room.image_read_timer_sec = room.image_read_timer_sec.clamp(1, 86_400);
+    room.image_read_timer_sec = room.image_read_timer_sec.min(86_400);
     room.image_overall_expiry_sec = room.image_overall_expiry_sec.min(86_400);
-    room.video_read_timer_sec = room.video_read_timer_sec.clamp(1, 86_400);
+    room.video_read_timer_sec = room.video_read_timer_sec.min(86_400);
     room.video_overall_expiry_sec = room.video_overall_expiry_sec.min(86_400);
-    room.file_read_timer_sec = room.file_read_timer_sec.clamp(1, 86_400);
+    room.file_read_timer_sec = room.file_read_timer_sec.min(86_400);
     room.file_overall_expiry_sec = room.file_overall_expiry_sec.min(86_400);
     Ok(())
 }
@@ -2401,24 +2435,24 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
 
 async fn cleanup_client(state: &AppState, client_id: Uuid) {
     state.frame_limits.lock().await.remove(&client_id);
-    let code = state
+    let code_id = state
         .clients
         .lock()
         .await
         .remove(&client_id)
-        .map(|client| client.code.clone());
+        .map(|client| client.code_id);
     for members in state.rooms.lock().await.values_mut() {
         members.remove(&client_id);
     }
-    if let Some(code) = code {
+    if let Some(code_id) = code_id {
         let still_connected = state
             .clients
             .lock()
             .await
             .values()
-            .any(|client| client.code == code);
+            .any(|client| client.code_id == code_id);
         if !still_connected {
-            if let Some(account) = state.accounts.lock().await.get_mut(&code) {
+            if let Some(account) = state.accounts.lock().await.get_mut(&code_id) {
                 account.connected = false;
             }
         }
@@ -2456,22 +2490,18 @@ mod tests {
         assert_eq!(codes.len(), unique_lengths.len());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn sensitive_file_restricts_existing_permissions() {
-        let path = std::env::temp_dir().join(format!("abyssal-code-mode-{}", Uuid::new_v4()));
-        std::fs::write(&path, b"old").expect("seed code file");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("seed permissions");
+    fn invite_code_ids_are_keyed_and_do_not_embed_plaintext() {
+        let code = "ABYS-PRIVATE-0001";
+        let first = derive_code_id(&[1_u8; 32], code);
+        let repeated = derive_code_id(&[1_u8; 32], code);
+        let different_process = derive_code_id(&[2_u8; 32], code);
 
-        write_sensitive_file(path.to_str().expect("UTF-8 path"), b"secret\n")
-            .expect("write code file");
-        let metadata = std::fs::metadata(&path).expect("code file metadata");
-        let contents = std::fs::read(&path).expect("code file contents");
-        std::fs::remove_file(&path).expect("remove code file");
-
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        assert_eq!(contents, b"secret\n");
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_process);
+        assert!(!first
+            .windows(code.len())
+            .any(|window| window == code.as_bytes()));
     }
 
     #[test]
@@ -2512,7 +2542,7 @@ mod tests {
     #[test]
     fn session_expiration_uses_strict_boundary() {
         let session = AuthSession {
-            code: "ABCD-1234-WXYZ".to_string(),
+            code_id: test_code_id("ABCD-1234-WXYZ"),
             username: "SilentNode123".to_string(),
             last_activity_ms: 1_000,
         };
@@ -2533,14 +2563,14 @@ mod tests {
                 id.to_string(),
                 RoomEntry {
                     room: test_room(id),
-                    owner_code: owner_code.to_string(),
+                    owner_code_id: test_code_id(owner_code),
                 },
             );
         }
 
-        assert_eq!(owned_room_count(&catalog, "code-a"), 2);
-        assert!(!has_room_capacity(&catalog, "code-a", 2));
-        assert!(has_room_capacity(&catalog, "code-b", 2));
+        assert_eq!(owned_room_count(&catalog, &test_code_id("code-a")), 2);
+        assert!(!has_room_capacity(&catalog, &test_code_id("code-a"), 2));
+        assert!(has_room_capacity(&catalog, &test_code_id("code-b"), 2));
     }
 
     #[test]
@@ -2600,8 +2630,37 @@ mod tests {
         normalize_room_record(&mut room).expect("room should normalize");
         assert_eq!(room.name, "OpsRoom");
 
+        room.self_destruct_timer_sec = 0;
+        room.image_read_timer_sec = 0;
+        normalize_room_record(&mut room).expect("never-expire policy should normalize");
+        assert_eq!(room.self_destruct_timer_sec, 0);
+        assert_eq!(room.image_read_timer_sec, 0);
+
         room.id = "forum/unsafe".to_string();
         assert!(normalize_room_record(&mut room).is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_window_rejects_duplicate_sender_message_ids() {
+        let state = test_state();
+        register_message_id(&state, "forum_alpha", "Alice", "message-1")
+            .await
+            .expect("first message should register");
+        assert!(
+            register_message_id(&state, "forum_alpha", "Alice", "message-1")
+                .await
+                .is_err()
+        );
+        assert!(
+            register_message_id(&state, "forum_alpha", "Bob", "message-1")
+                .await
+                .is_ok()
+        );
+        assert!(
+            register_message_id(&state, "forum_beta", "Alice", "message-1")
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2788,7 +2847,7 @@ mod tests {
             room.id.clone(),
             RoomEntry {
                 room: room.clone(),
-                owner_code: "code-a".to_string(),
+                owner_code_id: test_code_id("code-a"),
             },
         );
         join_room(&state, alice_id, room.id.clone())
@@ -2813,15 +2872,16 @@ mod tests {
     async fn account_code_allows_only_one_unexpired_session() {
         let state = test_state();
         let code = "ABYS-SESSION-0001";
+        let code_id = test_code_id(code);
         state.sessions.lock().await.insert(
             "active-token".to_string(),
             AuthSession {
-                code: code.to_string(),
+                code_id,
                 username: "Alice".to_string(),
                 last_activity_ms: now_ms(),
             },
         );
-        assert!(code_has_active_session(&state, code).await);
+        assert!(code_has_active_session(&state, &code_id).await);
 
         state
             .sessions
@@ -2830,7 +2890,7 @@ mod tests {
             .get_mut("active-token")
             .expect("session")
             .last_activity_ms = 0;
-        assert!(!code_has_active_session(&state, code).await);
+        assert!(!code_has_active_session(&state, &code_id).await);
         assert!(state.sessions.lock().await.is_empty());
     }
 
@@ -2846,12 +2906,15 @@ mod tests {
             account_ops: Arc::new(Mutex::new(())),
             opaque_setup: Arc::new(opaque_server_setup()),
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            invite_code_pepper: Arc::new([7_u8; 32]),
+            boot_codes: Arc::new(Mutex::new(None)),
             available_codes: Arc::new(Mutex::new(HashSet::new())),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
+            replay_ids: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
@@ -2862,7 +2925,7 @@ mod tests {
 
     async fn add_test_account(state: &AppState, code: &str, username: &str) {
         state.accounts.lock().await.insert(
-            code.to_string(),
+            test_code_id(code),
             Account {
                 username: username.to_string(),
                 password_file: vec![1; 192],
@@ -2909,12 +2972,16 @@ mod tests {
         state.clients.lock().await.insert(
             client_id,
             ClientHandle {
-                code: code.to_string(),
+                code_id: test_code_id(code),
                 username: username.to_string(),
                 tx,
             },
         );
         (client_id, rx)
+    }
+
+    fn test_code_id(code: &str) -> CodeId {
+        derive_code_id(&[7_u8; 32], code)
     }
 
     fn test_room(id: &str) -> RoomRecord {

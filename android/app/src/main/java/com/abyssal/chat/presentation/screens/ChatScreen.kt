@@ -533,7 +533,7 @@ private fun RetentionPicker(
     lockedTimerSec: Int?,
     onSelected: (Int) -> Unit
 ) {
-    val timerOptions = listOf(5, 10, 30, 60)
+    val timerOptions = listOf(0, 5, 10, 30, 60)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -563,14 +563,18 @@ private fun RetentionPicker(
         ) {
             if (lockedTimerSec != null) {
                 TimerChip(
-                    text = "${lockedTimerSec}s locked",
+                    text = if (lockedTimerSec == 0) "Never (locked)" else "${lockedTimerSec}s locked",
                     selected = true,
                     onClick = {}
                 )
             } else {
                 timerOptions.forEach { option ->
                     TimerChip(
-                        text = "${option}s",
+                        text = when (option) {
+                            0 -> "Never"
+                            60 -> "1m"
+                            else -> "${option}s"
+                        },
                         selected = selectedTimerSec == option,
                         onClick = { onSelected(option) }
                     )
@@ -896,9 +900,10 @@ private fun AttachmentDialog(
     MirageDialog(title = "Add attachment", onDismiss = onDismiss) {
         Text(
             text = if (session?.isForum == true) {
-                "Room rules: image ${session.imageReadTimerSec}s, video ${session.videoReadTimerSec}s, file ${session.fileReadTimerSec}s after read."
+                "Room rules: image ${retentionLabel(session.imageReadTimerSec)}, video ${retentionLabel(session.videoReadTimerSec)}, file ${retentionLabel(session.fileReadTimerSec)} after read."
             } else {
-                "Encrypted upload. ${selectedTimerSec}s retention after read."
+                if (selectedTimerSec == 0) "Encrypted upload. No read expiry."
+                else "Encrypted upload. ${selectedTimerSec}s retention after read."
             },
             color = SteelMuted,
             fontSize = 13.sp,
@@ -973,6 +978,8 @@ private fun AttachmentDialog(
         )
     }
 }
+
+private fun retentionLabel(seconds: Int): String = if (seconds == 0) "never" else "${seconds}s"
 
 @Composable
 private fun AttachmentOptionToggle(
@@ -1222,10 +1229,15 @@ private fun MessageBubbleItem(
     }
 
     var progressFraction by remember { mutableFloatStateOf(1f) }
-    var millisRemaining by remember { mutableFloatStateOf(message.selfDestructDurationSec * 1000f) }
+    var millisRemaining by remember {
+        mutableFloatStateOf(
+            if (message.selfDestructDurationSec > 0) message.selfDestructDurationSec * 1000f
+            else Float.POSITIVE_INFINITY
+        )
+    }
 
     LaunchedEffect(message.readTimestampMs) {
-        message.readTimestampMs?.let { readTime ->
+        message.readTimestampMs?.takeIf { message.selfDestructDurationSec > 0 }?.let { readTime ->
             val limit = message.selfDestructDurationSec * 1000f
             while (true) {
                 val elapsed = System.currentTimeMillis() - readTime
@@ -1238,8 +1250,8 @@ private fun MessageBubbleItem(
         }
     }
 
-    val expiringSoon = millisRemaining <= 3000f && message.readTimestampMs != null
-    val visible = millisRemaining > 0f
+    val expiringSoon = message.selfDestructDurationSec > 0 && millisRemaining <= 3000f && message.readTimestampMs != null
+    val visible = message.selfDestructDurationSec == 0 || millisRemaining > 0f
     val alpha by animateFloatAsState(
         targetValue = if (expiringSoon) 0.82f else 1f,
         animationSpec = tween(250),
@@ -1326,7 +1338,7 @@ private fun MessageBubbleItem(
                             )
                         }
 
-                        if (message.readTimestampMs != null) {
+                        if (message.readTimestampMs != null && message.selfDestructDurationSec > 0) {
                             CountdownRow(
                                 millisRemaining = millisRemaining,
                                 progressFraction = progressFraction,

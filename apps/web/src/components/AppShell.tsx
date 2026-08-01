@@ -290,7 +290,7 @@ function Dashboard({
                   <strong>{room.name}</strong>
                   <span>{latest ? `${latest.sender}: ${latest.content}` : "No active messages"}</span>
                 </span>
-                <span className="room-policy">{room.self_destruct_timer_sec}s</span>
+                <span className="room-policy">{room.self_destruct_timer_sec === 0 ? "NEVER" : `${room.self_destruct_timer_sec}s`}</span>
                 <span className="room-media">{[room.allow_images && "IMG", room.allow_videos && "VID", room.allow_files && "FILE"].filter(Boolean).join(" · ") || "TEXT"}</span>
               </button>
               {owner ? (

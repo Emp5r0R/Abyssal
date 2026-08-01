@@ -47,18 +47,18 @@ data class Message(
             val now = System.currentTimeMillis()
             val absoluteExpired = absoluteExpirySec > 0 &&
                 now - timestampMs >= absoluteExpirySec * 1000L
-            val readExpired = readTimestampMs?.let { readAt ->
+            val readExpired = readTimestampMs?.takeIf { selfDestructDurationSec > 0 }?.let { readAt ->
                 now - readAt >= selfDestructDurationSec * 1000L
             } ?: false
             return absoluteExpired || readExpired
         }
 
     val timeRemainingMs: Long
-        get() = readTimestampMs?.let {
+        get() = readTimestampMs?.takeIf { selfDestructDurationSec > 0 }?.let {
             val limit = selfDestructDurationSec * 1000L
             val elapsed = System.currentTimeMillis() - it
             (limit - elapsed).coerceAtLeast(0)
-        } ?: (selfDestructDurationSec * 1000L)
+        } ?: if (selfDestructDurationSec > 0) selfDestructDurationSec * 1000L else Long.MAX_VALUE
 }
 
 data class ChatSession(

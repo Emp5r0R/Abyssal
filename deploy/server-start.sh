@@ -7,4 +7,11 @@ cd "$ROOT_DIR"
 bash deploy/prepare-runtime-env.sh
 docker compose -f deploy/docker-compose.yml up -d --build --remove-orphans
 docker compose -f deploy/docker-compose.yml ps
-docker compose -f deploy/docker-compose.yml logs --tail=120 mirage-server
+container_id="$(docker compose -f deploy/docker-compose.yml ps -q mirage-server)"
+echo "Invite codes print once below. They cannot be retrieved after this attachment closes."
+timeout 9s docker attach --sig-proxy=false "$container_id" || status=$?
+if [[ ${status:-0} -ne 0 && ${status:-0} -ne 124 ]]; then
+  exit "$status"
+fi
+curl --fail --silent http://127.0.0.1:4020/health
+echo

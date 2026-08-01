@@ -112,6 +112,7 @@ class ChatViewModel(
     private var lastRemoteActivitySignalMs = 0L
     private var requestedDirectUsername: String? = null
     private val ownMessageIds = mutableSetOf<String>()
+    private val receivedFrameIds = linkedSetOf<String>()
 
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -138,6 +139,16 @@ class ChatViewModel(
         viewModelScope.launch {
             chatTransport.getIncomingPayloads().collect { incoming ->
                 val username = currentUser.value?.username ?: return@collect
+                val replayKey = "${incoming.chatId}\u0000${incoming.senderUsername}\u0000${incoming.messageId}"
+                if (!receivedFrameIds.add(replayKey)) return@collect
+                if (receivedFrameIds.size > MAX_RECEIVED_FRAME_IDS) {
+                    receivedFrameIds.iterator().run {
+                        if (hasNext()) {
+                            next()
+                            remove()
+                        }
+                    }
+                }
                 val plainBytes = runCatching { payloadCipher.decrypt(incoming, username) }
                     .getOrNull() ?: return@collect
                 try {
@@ -711,6 +722,7 @@ class ChatViewModel(
         _attachmentError.value = null
         _attachmentUploadProgress.value = AttachmentUploadProgress()
         ownMessageIds.clear()
+        receivedFrameIds.clear()
         if (revokeRemote && remoteSession != null) {
             identityService.revokeSession(remoteSession)
         }
@@ -889,13 +901,13 @@ class ChatViewModel(
 
     private fun effectiveRetentionSec(chatId: String, requestedSec: Int, mediaType: String? = null): Int {
         val session = sessions.value.find { it.id == chatId }
-        if (session?.isForum != true) return requestedSec.coerceAtLeast(1)
+        if (session?.isForum != true) return requestedSec.coerceIn(0, 86_400)
         return when (mediaType?.uppercase()) {
             "IMAGE" -> session.imageReadTimerSec
             "VIDEO" -> session.videoReadTimerSec
             "FILE" -> session.fileReadTimerSec
             else -> session.selfDestructTimerSec
-        }.coerceAtLeast(1)
+        }.coerceIn(0, 86_400)
     }
 
     private fun effectiveAbsoluteExpirySec(chatId: String, mediaType: String?): Int {
@@ -1015,6 +1027,7 @@ class ChatViewModel(
 
     override fun onCleared() {
         ownMessageIds.clear()
+        receivedFrameIds.clear()
         payloadCipher.clear()
         chatTransport.disconnect()
         super.onCleared()
@@ -1094,5 +1107,6 @@ class ChatViewModel(
         private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
         private const val IDENTITY_PUBLIC_KEY_BYTES = 64
+        private const val MAX_RECEIVED_FRAME_IDS = 10_000
     }
 }

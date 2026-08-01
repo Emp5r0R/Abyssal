@@ -74,6 +74,8 @@ For an Android emulator talking to a server on the development machine, use `htt
 - The chat initially opens at the latest active message and follows new messages only while the user remains near the bottom.
 - Direct messages appear under `DIRECT`. Select a peer in the live presence rail to ask the relay for a canonical private conversation; guessed DM identifiers are rejected by the relay.
 - Direct headers display a symmetric safety number derived from both identity keys. Both participants see the same number and can compare it through a separate channel to detect relay key substitution.
+- Direct composers choose retention for each text, GIF, or attachment: `Never`, `5s`, `10s`, `30s`, or `1m`. `Never` means retained only for the current client/relay RAM lifetime; restart, wipe, logout, or process loss still removes it.
+- Room creators may set any after-read timer to `0` for no read-triggered expiry. Room policy is locked for participants, including text and media-specific timers; a sender cannot extend it from the composer.
 
 ### Signed release build
 
@@ -115,8 +117,9 @@ Web client behavior:
 - Existing DMs are listed in the sidebar. Select any other account in `DIRECT` or the live presence rail to create/open the canonical pairwise conversation. The relay sends DM frames only to its two participants and rejects unauthorized joins and attachment requests.
 - Every bundled reaction has a `:filename:` shortcut, such as `:fire:`. Picker reactions carry a validated shortcut inside encrypted attachment metadata and render in equal-size inline frames without exposing the selection to the relay.
 - Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
+- Direct composers apply a per-message `Never`, `5s`, `10s`, `30s`, or `1m` timer to text, GIFs, and attachments. Room composers show the creator's locked room timer; room policy can also be configured as no read expiry.
 - The calculator cover PIN and optional duress PIN exist only in the current tab. Reload, tab close, logout, wipe, session expiry, or process termination loses them.
-- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v3 E2EE requires Abyssal `1.7.0` clients; older builds are incompatible.
+- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v3 E2EE requires Abyssal `1.7.x` clients; older builds are incompatible.
 
 Run web checks:
 
@@ -156,7 +159,7 @@ Health check:
 curl http://127.0.0.1:4020/health
 ```
 
-The server prints generated access codes to stdout during boot. Each code has a random variable length of at least 12 characters including dashes, can create exactly one RAM-only account, and is never written to disk by the relay. There are no administrator roles or privileged codes. Only one unexpired bearer session may exist for a code at a time.
+The server prints generated access codes once to attached stdout during boot. Each code has a random variable length of at least 12 characters including dashes, can create exactly one RAM-only account, and is never written to a relay file or Docker log. After printing, plaintext code buffers are zeroized and the relay retains only per-process HMAC identifiers; account, session, client, rate-limit, and room-owner maps never retain plaintext codes. Fixed invite codes cannot be supplied through environment variables. There are no administrator roles or privileged codes. Only one unexpired bearer session may exist for a code at a time. If the operator loses terminal output, codes are deliberately unrecoverable through supported interfaces; restarting the relay destroys all RAM state and creates a new set.
 
 Every authenticated user can create rooms and trigger a relay RAM wipe. Rooms are owned by their creator: only that account can update or delete them. `ABYSSAL_MAX_ROOMS_PER_USER` limits each account's active rooms, and deleting an owned room releases one slot.
 
@@ -190,7 +193,7 @@ Stop it:
 docker compose -f deploy/docker-compose.yml down
 ```
 
-Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env`, systemd environment entries, or your server secret manager. The process prints codes to stdout and also writes them to `/tmp/abyssal-invite-codes`, which is backed by the container's bounded tmpfs. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs.
+Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env`, systemd environment entries, or your server secret manager. The process prints codes once to attached stdout. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs. Terminal scrollback is the operator's only copy and must be protected or cleared after distribution.
 
 ## Remote Docker Deploy
 
@@ -238,10 +241,16 @@ Check container health without persistent logs:
 ./deploy/logs-docker.sh
 ```
 
-Print the current RAM-only invite codes:
+Invite codes cannot be retrieved after startup. This command explains the destructive recovery path and exits:
 
 ```bash
 ./deploy/invite-codes.sh
+```
+
+To generate new codes, restart the relay. This destroys all accounts, rooms, pending messages, attachments, and sessions:
+
+```bash
+./deploy/restart-docker.sh
 ```
 
 Stop the server:
