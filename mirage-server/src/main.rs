@@ -708,6 +708,8 @@ async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http: ws:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'";
+
 async fn security_headers(request: Request, next: Next) -> Response {
     let clear_site_data = request.uri().path() == "/v1/account/logout";
     let mut response = next.run(request).await;
@@ -720,9 +722,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http: ws:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'",
-        ),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
     );
     headers.insert(
         header::STRICT_TRANSPORT_SECURITY,
@@ -2429,6 +2429,12 @@ async fn cleanup_client(state: &AppState, client_id: Uuid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_security_policy_allows_wasm_without_javascript_eval() {
+        assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self' 'wasm-unsafe-eval'"));
+        assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
+    }
 
     #[test]
     fn generated_codes_are_at_least_minimum_length() {
