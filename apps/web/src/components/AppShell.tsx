@@ -13,7 +13,7 @@ import {
   UsersRound,
   X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
 import { Brand, Dialog, IconButton } from "./Ui";
 
@@ -167,7 +167,6 @@ export function AppShell({
             username={username}
             rooms={rooms}
             directs={directs}
-            messages={messages}
             maxRooms={maxRooms}
             connection={connection}
             onOpenRoom={onOpenRoom}
@@ -220,7 +219,6 @@ function Dashboard({
   username,
   rooms,
   directs,
-  messages,
   maxRooms,
   connection,
   onOpenRoom,
@@ -230,7 +228,6 @@ function Dashboard({
   username: string;
   rooms: RoomRecord[];
   directs: DirectRecord[];
-  messages: Record<string, ChatMessage[]>;
   maxRooms: number;
   connection: ConnectionState;
   onOpenRoom: (id: string) => void;
@@ -238,7 +235,6 @@ function Dashboard({
   onDeleteRoom: (id: string) => void;
 }) {
   const owned = rooms.filter((room) => room.owner_username === username).length;
-  const latestByRoom = useMemo(() => Object.fromEntries(rooms.map((room) => [room.id, messages[room.id]?.at(-1)])), [messages, rooms]);
   return (
     <section className="dashboard">
       <header className="dashboard-header">
@@ -260,16 +256,13 @@ function Dashboard({
       <div className="direct-dashboard" role="list" aria-label="Direct messages">
         {directs.length === 0 ? (
           <div className="direct-empty">Select a peer from the Direct list to begin.</div>
-        ) : directs.map((direct) => {
-          const latest = messages[direct.id]?.at(-1);
-          return (
+        ) : directs.map((direct) => (
             <button type="button" key={direct.id} onClick={() => onOpenRoom(direct.id)} role="listitem">
               <span className="presence-avatar">{initials(direct.peer_username)}</span>
-              <span><strong>{direct.peer_username}</strong><small>{latest ? latest.content : "No active messages"}</small></span>
+              <span><strong>{direct.peer_username}</strong><small>DIRECT</small></span>
               <MessageCircle size={16} />
             </button>
-          );
-        })}
+          ))}
       </div>
 
       <div className="room-table" role="list">
@@ -280,7 +273,6 @@ function Dashboard({
             <span>Create first room when relay is connected.</span>
           </div>
         ) : rooms.map((room) => {
-          const latest = latestByRoom[room.id];
           const owner = room.owner_username === username;
           return (
             <div className="room-row" key={room.id} role="listitem">
@@ -288,7 +280,7 @@ function Dashboard({
                 <span className="room-row-icon"><Hash size={20} /></span>
                 <span className="room-row-main">
                   <strong>{room.name}</strong>
-                  <span>{latest ? `${latest.sender}: ${latest.content}` : "No active messages"}</span>
+                  <span>{room.owner_username ? `OWNER ${room.owner_username}` : "NODE ROOM"}</span>
                 </span>
                 <span className="room-policy">{room.self_destruct_timer_sec === 0 ? "NEVER" : `${room.self_destruct_timer_sec}s`}</span>
                 <span className="room-media">{[room.allow_images && "IMG", room.allow_videos && "VID", room.allow_files && "FILE"].filter(Boolean).join(" · ") || "TEXT"}</span>

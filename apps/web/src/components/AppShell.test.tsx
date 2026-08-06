@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RoomRecord } from "../domain/types";
+import type { ChatMessage, RoomRecord } from "../domain/types";
 import { AppShell } from "./AppShell";
 
 const room: RoomRecord = {
@@ -23,6 +23,21 @@ const room: RoomRecord = {
   file_overall_expiry_sec: 0,
   enforce_file_absolute_expiry: false,
 };
+
+function message(chatId: string, content: string): ChatMessage {
+  return {
+    id: `${chatId}_message`,
+    chatId,
+    sender: "Bob",
+    content,
+    kind: "text",
+    createdAtMs: 1_000,
+    receivedAtMs: 1_000,
+    selfDestructSec: 0,
+    absoluteExpirySec: 0,
+    mine: false,
+  };
+}
 
 function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> = {}) {
   const props: React.ComponentProps<typeof AppShell> = {
@@ -94,5 +109,18 @@ describe("AppShell direct-message navigation", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Delete room" }));
     expect(props.onDeleteRoom).toHaveBeenCalledWith(room.id);
+  });
+
+  it("never renders room or direct message plaintext on the dashboard", () => {
+    renderShell({
+      messages: {
+        [room.id]: [message(room.id, "ROOM SECRET PREVIEW")],
+        dm_random: [message("dm_random", "DIRECT SECRET PREVIEW")],
+      },
+    });
+
+    expect(screen.queryByText(/ROOM SECRET PREVIEW/u)).not.toBeInTheDocument();
+    expect(screen.queryByText(/DIRECT SECRET PREVIEW/u)).not.toBeInTheDocument();
+    expect(screen.getByText("OWNER Alice")).toBeInTheDocument();
   });
 });
