@@ -338,7 +338,7 @@ function AttachmentMessage({ message, onView, onExport }: { message: ChatMessage
         </button>
         <div className="inline-reaction-footer">
           <code>{reaction.shortcode}</code>
-          <IconButton label="Save encrypted reaction" onClick={onExport}><ArrowDownToLine size={16} /></IconButton>
+          <IconButton label="Save reaction" onClick={onExport}><ArrowDownToLine size={16} /></IconButton>
         </div>
       </div>
     );
@@ -352,7 +352,7 @@ function AttachmentMessage({ message, onView, onExport }: { message: ChatMessage
         <span>{attachment.mediaType} · {formatBytes(attachment.sizeBytes)}{attachment.oneTime ? " · ONE-TIME" : ""}</span>
       </div>
       <IconButton label="View attachment" onClick={onView}><Play size={17} /></IconButton>
-      {!attachment.oneTime ? <IconButton label="Save encrypted attachment" onClick={onExport}><ArrowDownToLine size={17} /></IconButton> : null}
+      {!attachment.oneTime ? <IconButton label="Save attachment" onClick={onExport}><ArrowDownToLine size={17} /></IconButton> : null}
     </div>
   );
 }

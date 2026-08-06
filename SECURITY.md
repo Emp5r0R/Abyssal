@@ -21,6 +21,7 @@ No application has absolute security. Abyssal implements baseline end-to-end enc
 - Sender usernames on delivered frames come from the authenticated relay session, not user-controlled encrypted metadata.
 - Room ownership and media-retention policy are enforced by the relay. Canonical DMs are visible only to their participants, and guessed chat IDs cannot be used to join a DM or transfer its attachments.
 - Android explicit attachment exports are wrapped in a versioned AES-256-GCM envelope using an Android Keystore key, preferring StrongBox where available. The key is device-bound and is the only intentional persistent secret.
+- Web attachment saves are explicit user actions. The client authenticates and decrypts the attachment in memory, downloads it with a sanitized original filename, and best-effort wipes temporary byte arrays. One-time attachments have no save control.
 
 ## Known High-Risk Gaps
 

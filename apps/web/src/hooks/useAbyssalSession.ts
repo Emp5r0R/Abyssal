@@ -36,7 +36,7 @@ import {
   wipeBytes,
   wipeOpaqueStart,
 } from "../security/crypto";
-import { encryptedAttachmentBlob, encryptedExportName } from "../security/attachmentExport";
+import { attachmentDownloadBlob, attachmentDownloadName } from "../security/attachmentExport";
 import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   downloadEncryptedAttachment,
@@ -682,21 +682,36 @@ export function useAbyssalSession() {
     const currentSession = sessionRef.current;
     if (!currentSession || !message.attachment || message.attachment.oneTime) return;
     let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     try {
       encrypted = await downloadEncryptedAttachment(currentSession, message.attachment.id);
-      const url = URL.createObjectURL(encryptedAttachmentBlob(encrypted));
+      plain = cipherRef.current.decryptBytes(
+        message.chatId,
+        message.sender,
+        base64ToBytes(
+          message.senderPublicKeyB64 ?? bytesToBase64(currentSession.identityPublicKey),
+        ),
+        encrypted,
+        currentSession.username,
+      );
+      const url = URL.createObjectURL(attachmentDownloadBlob(plain, message.attachment.mimeType));
       const link = document.createElement("a");
       link.href = url;
-      link.download = encryptedExportName(message.attachment.name);
+      link.download = attachmentDownloadName(message.attachment.name);
       link.rel = "noopener";
+      link.style.display = "none";
+      document.body.append(link);
       link.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      markRoomRead(message.chatId);
     } catch {
       setNotice("Action unavailable.");
     } finally {
       wipeBytes(encrypted);
+      wipeBytes(plain);
     }
-  }, []);
+  }, [markRoomRead]);
 
   const createRoom = useCallback((room: RoomRecord): boolean => {
     if (connection !== "connected") return false;
