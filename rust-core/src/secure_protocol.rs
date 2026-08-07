@@ -3,7 +3,6 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, KeyInit, Nonce,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use opaque_ke::argon2::Argon2;
 use opaque_ke::rand::{rngs::OsRng, RngCore};
@@ -14,19 +13,30 @@ use opaque_ke::{
     ServerLoginParameters, ServerRegistration, ServerSetup,
 };
 use sha2::{Digest, Sha256, Sha512};
-use std::sync::Arc;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, MutexGuard},
+};
+use vodozemac::{
+    olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle},
+    Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature,
+};
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-const IDENTITY_SECRET_BYTES: usize = 64;
-const IDENTITY_PUBLIC_BYTES: usize = 64;
+const IDENTITY_FINGERPRINT_BYTES: usize = 64;
+const IDENTITY_PUBLIC_BYTES: usize = IDENTITY_FINGERPRINT_BYTES + 32;
 const NONCE_BYTES: usize = 12;
-const WRAPPED_KEY_BYTES: usize = 32 + NONCE_BYTES + 32 + 16;
 const MAX_CONTEXT_BYTES: usize = 512;
 const MAX_PAYLOAD_BYTES: usize = 220 * 1024 * 1024;
+const MAX_IDENTITY_STATE_BYTES: usize = 512 * 1024;
+const MAX_RATCHET_ENVELOPE_BYTES: usize = 4096;
+const MAX_PEERS: usize = 256;
+const MAX_SESSIONS_PER_PEER: usize = 4;
+const PROTOCOL_VERSION: u32 = 4;
+const IDENTITY_ENVELOPE_VERSION: u8 = 2;
 
 pub struct AbyssalOpaqueSuite;
 
@@ -77,12 +87,54 @@ pub struct E2eePayload {
     pub ciphertext: Vec<u8>,
     pub signature: Vec<u8>,
     pub envelopes: Vec<RecipientEnvelope>,
+    pub state_revision: u64,
+    pub identity_envelope: Vec<u8>,
 }
 
-#[derive(uniffi::Object, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, uniffi::Record)]
+pub struct E2eeDecryption {
+    pub plaintext: Vec<u8>,
+    pub state_revision: u64,
+    pub identity_envelope: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredPeerSessions {
+    peer: String,
+    sessions: Vec<SessionPickle>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredE2eeState {
+    revision: u64,
+    fallback_public: [u8; 32],
+    account: AccountPickle,
+    peers: Vec<StoredPeerSessions>,
+}
+
+struct E2eeState {
+    revision: u64,
+    fallback_public: [u8; 32],
+    account: Account,
+    sessions: HashMap<String, Vec<Session>>,
+}
+
+struct SealingMaterial {
+    key: [u8; 32],
+    context: Vec<u8>,
+}
+
+impl Drop for SealingMaterial {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        self.context.zeroize();
+    }
+}
+
+#[derive(uniffi::Object)]
 pub struct E2eeSession {
-    x25519_secret: [u8; 32],
-    signing_secret: [u8; 32],
+    state: Mutex<E2eeState>,
+    sealing: Mutex<Option<SealingMaterial>>,
 }
 
 #[uniffi::export]
@@ -175,7 +227,7 @@ pub fn conversation_safety_number(
         (&second_public_key, &first_public_key)
     };
     let mut hasher = Sha256::new();
-    hasher.update(b"ABYSSAL_SAFETY_NUMBER_V1");
+    hasher.update(b"ABYSSAL_SAFETY_NUMBER_V2");
     hasher.update(first);
     hasher.update(second);
     let digest = hasher.finalize();
@@ -263,13 +315,23 @@ impl E2eeSession {
     pub fn create(export_key: Vec<u8>) -> Result<Arc<Self>, AbyssalError> {
         let export_key = Zeroizing::new(export_key);
         validate_export_key(&export_key)?;
-        let mut x25519_secret = Zeroizing::new([0u8; 32]);
-        let mut signing_secret = Zeroizing::new([0u8; 32]);
-        OsRng.fill_bytes(x25519_secret.as_mut());
-        OsRng.fill_bytes(signing_secret.as_mut());
+        let mut account = Account::new();
+        account.generate_fallback_key();
+        let fallback_public = account
+            .fallback_key()
+            .into_values()
+            .next()
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?
+            .to_bytes();
+        account.mark_keys_as_published();
         Ok(Arc::new(Self {
-            x25519_secret: *x25519_secret,
-            signing_secret: *signing_secret,
+            state: Mutex::new(E2eeState {
+                revision: 0,
+                fallback_public,
+                account,
+                sessions: HashMap::new(),
+            }),
+            sealing: Mutex::new(None),
         }))
     }
 
@@ -283,7 +345,10 @@ impl E2eeSession {
         let export_key = Zeroizing::new(export_key);
         validate_export_key(&export_key)?;
         validate_context(&context)?;
-        if envelope.len() <= 1 + NONCE_BYTES || envelope.first() != Some(&1) {
+        if envelope.len() <= 1 + NONCE_BYTES
+            || envelope.len() > MAX_IDENTITY_STATE_BYTES
+            || envelope.first() != Some(&IDENTITY_ENVELOPE_VERSION)
+        {
             return Err("Identity unavailable".to_string().into());
         }
         let key = Zeroizing::new(identity_wrap_key(&export_key, &context)?);
@@ -300,16 +365,42 @@ impl E2eeSession {
                 )
                 .map_err(|_| "Identity unavailable".to_string())?,
         );
-        if plain.len() != IDENTITY_SECRET_BYTES {
+        if plain.len() > MAX_IDENTITY_STATE_BYTES {
             return Err("Identity unavailable".to_string().into());
         }
-        let mut x25519_secret = Zeroizing::new([0u8; 32]);
-        let mut signing_secret = Zeroizing::new([0u8; 32]);
-        x25519_secret.copy_from_slice(&plain[..32]);
-        signing_secret.copy_from_slice(&plain[32..]);
+        let stored: StoredE2eeState = serde_json::from_slice(&plain)
+            .map_err(|_| AbyssalError::from("Identity unavailable".to_string()))?;
+        if stored.peers.len() > MAX_PEERS {
+            return Err("Identity unavailable".to_string().into());
+        }
+        let mut sessions = HashMap::with_capacity(stored.peers.len());
+        for peer in stored.peers {
+            validate_username(&peer.peer)?;
+            if peer.sessions.is_empty() || peer.sessions.len() > MAX_SESSIONS_PER_PEER {
+                return Err("Identity unavailable".to_string().into());
+            }
+            let peer_key = peer_key(&peer.peer);
+            if sessions
+                .insert(
+                    peer_key,
+                    peer.sessions
+                        .into_iter()
+                        .map(Session::from_pickle)
+                        .collect(),
+                )
+                .is_some()
+            {
+                return Err("Identity unavailable".to_string().into());
+            }
+        }
         let session = Arc::new(Self {
-            x25519_secret: *x25519_secret,
-            signing_secret: *signing_secret,
+            state: Mutex::new(E2eeState {
+                revision: stored.revision,
+                fallback_public: stored.fallback_public,
+                account: Account::from_pickle(stored.account),
+                sessions,
+            }),
+            sealing: Mutex::new(Some(SealingMaterial { key: *key, context })),
         });
         if session.public_key() != expected_public_key {
             return Err("Identity unavailable".to_string().into());
@@ -318,12 +409,14 @@ impl E2eeSession {
     }
 
     pub fn public_key(&self) -> Vec<u8> {
-        let x_secret = StaticSecret::from(self.x25519_secret);
-        let x_public = X25519PublicKey::from(&x_secret);
-        let signing = SigningKey::from_bytes(&self.signing_secret);
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let identity = state.account.identity_keys();
         let mut result = Vec::with_capacity(IDENTITY_PUBLIC_BYTES);
-        result.extend_from_slice(x_public.as_bytes());
-        result.extend_from_slice(signing.verifying_key().as_bytes());
+        result.extend_from_slice(identity.curve25519.as_bytes());
+        result.extend_from_slice(identity.ed25519.as_bytes());
+        result.extend_from_slice(&state.fallback_public);
         result
     }
 
@@ -336,27 +429,13 @@ impl E2eeSession {
         validate_export_key(&export_key)?;
         validate_context(&context)?;
         let key = Zeroizing::new(identity_wrap_key(&export_key, &context)?);
-        let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref())
-            .map_err(|_| "Identity unavailable".to_string())?;
-        let mut nonce = [0u8; NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce);
-        let mut secret = Zeroizing::new(Vec::with_capacity(IDENTITY_SECRET_BYTES));
-        secret.extend_from_slice(&self.x25519_secret);
-        secret.extend_from_slice(&self.signing_secret);
-        let encrypted = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &secret,
-                    aad: &context,
-                },
-            )
-            .map_err(|_| "Identity unavailable".to_string())?;
-        let mut result = Vec::with_capacity(1 + nonce.len() + encrypted.len());
-        result.push(1);
-        result.extend_from_slice(&nonce);
-        result.extend_from_slice(&encrypted);
-        Ok(result)
+        let mut sealing = lock(&self.sealing, "Identity unavailable")?;
+        *sealing = Some(SealingMaterial { key: *key, context });
+        let sealing = sealing
+            .as_ref()
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        let state = lock(&self.state, "Identity unavailable")?;
+        seal_state(&state, sealing).map_err(AbyssalError::from)
     }
 
     pub fn encrypt(
@@ -370,6 +449,18 @@ impl E2eeSession {
         validate_message_context(&chat_id, &message_id, &sender_username)?;
         if plaintext.is_empty() || plaintext.len() > MAX_PAYLOAD_BYTES {
             return Err("Payload unavailable".to_string().into());
+        }
+        if recipients.len() > MAX_PEERS {
+            return Err("Recipient unavailable".to_string().into());
+        }
+        let mut seen = HashSet::with_capacity(recipients.len());
+        for recipient in &recipients {
+            validate_username(&recipient.username)?;
+            if recipient.public_key.len() != IDENTITY_PUBLIC_BYTES
+                || !seen.insert(peer_key(&recipient.username))
+            {
+                return Err("Recipient unavailable".to_string().into());
+            }
         }
         let aad = message_aad(&chat_id, &message_id, &sender_username);
         let mut content_key = Zeroizing::new([0u8; 32]);
@@ -388,35 +479,42 @@ impl E2eeSession {
         plaintext.zeroize();
         let ciphertext = ciphertext_result.map_err(|_| "Payload unavailable".to_string())?;
 
+        let sealing = lock(&self.sealing, "Identity unavailable")?;
+        let sealing = sealing
+            .as_ref()
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        let mut state = lock(&self.state, "Identity unavailable")?;
         let mut envelopes = Vec::with_capacity(recipients.len());
         for recipient in recipients {
-            validate_username(&recipient.username)?;
-            if recipient.public_key.len() != IDENTITY_PUBLIC_BYTES {
-                return Err("Recipient unavailable".to_string().into());
-            }
-            let wrapped_key = wrap_content_key(
+            let wrapped_key = ratchet_wrap_content_key(
+                &mut state,
                 &content_key,
-                &recipient.public_key[..32],
+                &recipient.public_key,
                 &aad,
                 &recipient.username,
-            )?;
+            )
+            .map_err(AbyssalError::from)?;
             envelopes.push(RecipientEnvelope {
                 username: recipient.username,
                 wrapped_key,
             });
         }
         let signature_input = signature_input(&aad, &nonce, &ciphertext);
-        let signature = SigningKey::from_bytes(&self.signing_secret)
-            .sign(&signature_input)
-            .to_bytes()
-            .to_vec();
+        let signature = state.account.sign(&signature_input).to_bytes().to_vec();
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
         Ok(E2eePayload {
-            version: 3,
+            version: PROTOCOL_VERSION,
             message_id,
             nonce: nonce.to_vec(),
             ciphertext,
             signature,
             envelopes,
+            state_revision: state.revision,
+            identity_envelope,
         })
     }
 
@@ -432,7 +530,7 @@ impl E2eeSession {
         signature: Vec<u8>,
         wrapped_key: Vec<u8>,
         recipient_username: String,
-    ) -> Result<Vec<u8>, AbyssalError> {
+    ) -> Result<E2eeDecryption, AbyssalError> {
         validate_message_context(&chat_id, &message_id, &sender_username)?;
         validate_username(&recipient_username)?;
         if sender_public_key.len() != IDENTITY_PUBLIC_BYTES
@@ -443,26 +541,33 @@ impl E2eeSession {
             return Err("Payload unavailable".to_string().into());
         }
         let aad = message_aad(&chat_id, &message_id, &sender_username);
-        let verifying_key = VerifyingKey::from_bytes(
-            sender_public_key[32..]
+        let verifying_key = Ed25519PublicKey::from_slice(
+            sender_public_key[32..IDENTITY_FINGERPRINT_BYTES]
                 .try_into()
                 .map_err(|_| "Sender unavailable".to_string())?,
         )
         .map_err(|_| "Sender unavailable".to_string())?;
-        let signature =
-            Signature::from_slice(&signature).map_err(|_| "Payload unavailable".to_string())?;
+        let signature = Ed25519Signature::from_slice(&signature)
+            .map_err(|_| "Payload unavailable".to_string())?;
         verifying_key
             .verify(&signature_input(&aad, &nonce, &ciphertext), &signature)
             .map_err(|_| "Payload unavailable".to_string())?;
-        let content_key = Zeroizing::new(unwrap_content_key(
-            &self.x25519_secret,
+        let sealing = lock(&self.sealing, "Identity unavailable")?;
+        let sealing = sealing
+            .as_ref()
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        let mut state = lock(&self.state, "Identity unavailable")?;
+        let content_key = Zeroizing::new(ratchet_unwrap_content_key(
+            &mut state,
+            &sender_username,
+            &sender_public_key,
             &wrapped_key,
             &aad,
             &recipient_username,
         )?);
         let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
             .map_err(|_| "Payload unavailable".to_string())?;
-        let result = cipher
+        let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
@@ -470,97 +575,212 @@ impl E2eeSession {
                     aad: &aad,
                 },
             )
-            .map_err(|_| "Payload unavailable".to_string());
-        result.map_err(AbyssalError::from)
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
+        Ok(E2eeDecryption {
+            plaintext,
+            state_revision: state.revision,
+            identity_envelope,
+        })
     }
 }
 
-fn wrap_content_key(
+fn ratchet_wrap_content_key(
+    state: &mut E2eeState,
     content_key: &[u8; 32],
-    recipient_x25519_public: &[u8],
+    recipient_public: &[u8],
     aad: &[u8],
     recipient_username: &str,
 ) -> Result<Vec<u8>, String> {
-    let public_bytes: [u8; 32] = recipient_x25519_public
-        .try_into()
+    let key = peer_key(recipient_username);
+    if !state.sessions.contains_key(&key) {
+        if state.sessions.len() >= MAX_PEERS {
+            return Err("Recipient unavailable".to_string());
+        }
+        let identity_key = Curve25519PublicKey::from_slice(&recipient_public[..32])
+            .map_err(|_| "Recipient unavailable".to_string())?;
+        let fallback_key = Curve25519PublicKey::from_slice(
+            &recipient_public[IDENTITY_FINGERPRINT_BYTES..IDENTITY_PUBLIC_BYTES],
+        )
         .map_err(|_| "Recipient unavailable".to_string())?;
-    let recipient_public = X25519PublicKey::from(public_bytes);
-    let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
-    let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
-    let shared = ephemeral_secret.diffie_hellman(&recipient_public);
-    if !shared.was_contributory() {
+        let session = state
+            .account
+            .create_outbound_session(SessionConfig::version_2(), identity_key, fallback_key)
+            .map_err(|_| "Recipient unavailable".to_string())?;
+        state.sessions.insert(key.clone(), vec![session]);
+    }
+    let sessions = state
+        .sessions
+        .get_mut(&key)
+        .ok_or_else(|| "Recipient unavailable".to_string())?;
+    let session = sessions
+        .last_mut()
+        .ok_or_else(|| "Recipient unavailable".to_string())?;
+    let bound_key = Zeroizing::new(bound_content_key(content_key, aad, recipient_username));
+    let message = session
+        .encrypt(bound_key.as_slice())
+        .map_err(|_| "Recipient unavailable".to_string())?;
+    let encoded = serde_json::to_vec(&message).map_err(|_| "Recipient unavailable".to_string())?;
+    if encoded.len() > MAX_RATCHET_ENVELOPE_BYTES {
         return Err("Recipient unavailable".to_string());
     }
-    let mut key = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(aad), shared.as_bytes())
-        .expand(recipient_username.as_bytes(), key.as_mut())
-        .map_err(|_| "Recipient unavailable".to_string())?;
+    Ok(encoded)
+}
+
+fn ratchet_unwrap_content_key(
+    state: &mut E2eeState,
+    sender_username: &str,
+    sender_public: &[u8],
+    wrapped: &[u8],
+    aad: &[u8],
+    recipient_username: &str,
+) -> Result<[u8; 32], String> {
+    if wrapped.is_empty() || wrapped.len() > MAX_RATCHET_ENVELOPE_BYTES {
+        return Err("Payload unavailable".to_string());
+    }
+    let message: OlmMessage =
+        serde_json::from_slice(wrapped).map_err(|_| "Payload unavailable".to_string())?;
+    let sender_identity = Curve25519PublicKey::from_slice(&sender_public[..32])
+        .map_err(|_| "Sender unavailable".to_string())?;
+    let key = peer_key(sender_username);
+
+    let plain = Zeroizing::new(match &message {
+        OlmMessage::PreKey(prekey) => {
+            let existing = state.sessions.get_mut(&key).and_then(|sessions| {
+                sessions
+                    .iter_mut()
+                    .find(|session| session.session_id() == prekey.session_id())
+            });
+            if let Some(session) = existing {
+                session
+                    .decrypt(&message)
+                    .map_err(|_| "Payload unavailable".to_string())?
+            } else {
+                if !state.sessions.contains_key(&key) && state.sessions.len() >= MAX_PEERS {
+                    return Err("Payload unavailable".to_string());
+                }
+                let created = state
+                    .account
+                    .create_inbound_session(SessionConfig::version_2(), sender_identity, prekey)
+                    .map_err(|_| "Payload unavailable".to_string())?;
+                let plain = created.plaintext;
+                let sessions = state.sessions.entry(key).or_default();
+                if sessions.len() >= MAX_SESSIONS_PER_PEER {
+                    sessions.remove(0);
+                }
+                sessions.push(created.session);
+                plain
+            }
+        }
+        OlmMessage::Normal(_) => {
+            let sessions = state
+                .sessions
+                .get_mut(&key)
+                .ok_or_else(|| "Payload unavailable".to_string())?;
+            let mut decrypted = None;
+            for session in sessions.iter_mut().rev() {
+                if let Ok(plain) = session.decrypt(&message) {
+                    decrypted = Some(plain);
+                    break;
+                }
+            }
+            decrypted.ok_or_else(|| "Payload unavailable".to_string())?
+        }
+    });
+    if plain.len() != 64 {
+        return Err("Payload unavailable".to_string());
+    }
+    let expected_binding = content_key_binding(aad, recipient_username);
+    if plain[32..] != expected_binding {
+        return Err("Payload unavailable".to_string());
+    }
+    plain[..32]
+        .try_into()
+        .map_err(|_| "Payload unavailable".to_string())
+}
+
+fn bound_content_key(content_key: &[u8; 32], aad: &[u8], recipient_username: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(64);
+    result.extend_from_slice(content_key);
+    result.extend_from_slice(&content_key_binding(aad, recipient_username));
+    result
+}
+
+fn content_key_binding(aad: &[u8], recipient_username: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_parts(&[
+        b"ABYSSAL_RATCHET_CONTENT_KEY_V1",
+        aad,
+        recipient_username.as_bytes(),
+    ]));
+    hasher.finalize().into()
+}
+
+fn seal_state(state: &E2eeState, sealing: &SealingMaterial) -> Result<Vec<u8>, String> {
+    let stored = StoredE2eeState {
+        revision: state.revision,
+        fallback_public: state.fallback_public,
+        account: state.account.pickle(),
+        peers: state
+            .sessions
+            .iter()
+            .map(|(peer, sessions)| StoredPeerSessions {
+                peer: peer.clone(),
+                sessions: sessions.iter().map(Session::pickle).collect(),
+            })
+            .collect(),
+    };
+    let plain = Zeroizing::new(
+        serde_json::to_vec(&stored).map_err(|_| "Identity unavailable".to_string())?,
+    );
+    if plain.len() > MAX_IDENTITY_STATE_BYTES - NONCE_BYTES - 32 {
+        return Err("Identity unavailable".to_string());
+    }
+    let cipher = ChaCha20Poly1305::new_from_slice(&sealing.key)
+        .map_err(|_| "Identity unavailable".to_string())?;
     let mut nonce = [0u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce);
-    let encrypted = ChaCha20Poly1305::new_from_slice(key.as_ref())
-        .map_err(|_| "Recipient unavailable".to_string())?
+    let encrypted = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: content_key,
-                aad,
+                msg: &plain,
+                aad: &sealing.context,
             },
         )
-        .map_err(|_| "Recipient unavailable".to_string())?;
-    let mut result = Vec::with_capacity(WRAPPED_KEY_BYTES);
-    result.extend_from_slice(ephemeral_public.as_bytes());
+        .map_err(|_| "Identity unavailable".to_string())?;
+    let mut result = Vec::with_capacity(1 + nonce.len() + encrypted.len());
+    result.push(IDENTITY_ENVELOPE_VERSION);
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&encrypted);
     Ok(result)
 }
 
-fn unwrap_content_key(
-    x25519_secret: &[u8; 32],
-    wrapped: &[u8],
-    aad: &[u8],
-    recipient_username: &str,
-) -> Result<[u8; 32], String> {
-    if wrapped.len() != WRAPPED_KEY_BYTES {
-        return Err("Payload unavailable".to_string());
-    }
-    let ephemeral_public = X25519PublicKey::from(
-        <[u8; 32]>::try_from(&wrapped[..32]).map_err(|_| "Payload unavailable".to_string())?,
-    );
-    let secret = StaticSecret::from(*x25519_secret);
-    let shared = secret.diffie_hellman(&ephemeral_public);
-    if !shared.was_contributory() {
-        return Err("Payload unavailable".to_string());
-    }
-    let mut key = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(aad), shared.as_bytes())
-        .expand(recipient_username.as_bytes(), key.as_mut())
-        .map_err(|_| "Payload unavailable".to_string())?;
-    let plain = ChaCha20Poly1305::new_from_slice(key.as_ref())
-        .map_err(|_| "Payload unavailable".to_string())?
-        .decrypt(
-            Nonce::from_slice(&wrapped[32..32 + NONCE_BYTES]),
-            Payload {
-                msg: &wrapped[32 + NONCE_BYTES..],
-                aad,
-            },
-        )
-        .map_err(|_| "Payload unavailable".to_string())?;
-    plain
-        .try_into()
-        .map_err(|_| "Payload unavailable".to_string())
+fn peer_key(username: &str) -> String {
+    username.to_ascii_lowercase()
+}
+
+fn lock<'a, T>(mutex: &'a Mutex<T>, message: &str) -> Result<MutexGuard<'a, T>, AbyssalError> {
+    mutex
+        .lock()
+        .map_err(|_| AbyssalError::from(message.to_string()))
 }
 
 fn identity_wrap_key(export_key: &[u8], context: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
     Hkdf::<Sha256>::new(Some(context), export_key)
-        .expand(b"ABYSSAL_IDENTITY_WRAP_V1", &mut key)
+        .expand(b"ABYSSAL_IDENTITY_WRAP_V2", &mut key)
         .map_err(|_| "Identity unavailable".to_string())?;
     Ok(key)
 }
 
 fn message_aad(chat_id: &str, message_id: &str, sender_username: &str) -> Vec<u8> {
     canonical_parts(&[
-        b"ABYSSAL_E2EE_PAYLOAD_V3",
+        b"ABYSSAL_E2EE_PAYLOAD_V4",
         chat_id.as_bytes(),
         message_id.as_bytes(),
         sender_username.as_bytes(),
@@ -753,8 +973,9 @@ impl WasmE2eeSession {
         signature: Vec<u8>,
         wrapped_key: Vec<u8>,
         recipient_username: String,
-    ) -> Result<Vec<u8>, JsValue> {
-        self.inner
+    ) -> Result<String, JsValue> {
+        let result = self
+            .inner
             .decrypt(
                 chat_id,
                 message_id,
@@ -766,13 +987,24 @@ impl WasmE2eeSession {
                 wrapped_key,
                 recipient_username,
             )
-            .map_err(js_error)
+            .map_err(js_error)?;
+        serde_json::to_string(&result).map_err(|_| js_error("Payload unavailable".to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed_session(fill: u8) -> Arc<E2eeSession> {
+        let export_key = vec![fill; 64];
+        let context = format!("node:INVITE-CODE-{fill:04}").into_bytes();
+        let session = E2eeSession::create(export_key.clone()).expect("identity");
+        session
+            .seal_identity(export_key, context)
+            .expect("seal identity");
+        session
+    }
 
     fn opaque_registration_and_login(password: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let setup = opaque_server_setup();
@@ -881,7 +1113,7 @@ mod tests {
             .expect("recover");
         assert_eq!(alice.public_key(), recovered.public_key());
 
-        let bob = E2eeSession::create(vec![7; 64]).expect("bob");
+        let bob = sealed_session(7);
         let payload = alice
             .encrypt(
                 "dm_alice_bob".to_string(),
@@ -911,14 +1143,168 @@ mod tests {
                 "Bob".to_string(),
             )
             .expect("decrypt");
-        assert_eq!(plain, b"relay cannot read this");
+        assert_eq!(plain.plaintext, b"relay cannot read this");
+    }
+
+    #[test]
+    fn ratchet_handles_reordering_replay_and_encrypted_state_recovery() {
+        let alice = sealed_session(21);
+        let bob_export = vec![22; 64];
+        let bob_context = b"node:INVITE-CODE-0022".to_vec();
+        let bob = E2eeSession::create(bob_export.clone()).expect("bob");
+        bob.seal_identity(bob_export.clone(), bob_context.clone())
+            .expect("seal bob");
+        let recipient = RecipientPublicKey {
+            username: "Bob".to_string(),
+            public_key: bob.public_key(),
+        };
+        let first = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "message-early".to_string(),
+                "Alice".to_string(),
+                b"early".to_vec(),
+                vec![recipient.clone()],
+            )
+            .expect("first encrypt");
+        let second = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "message-late".to_string(),
+                "Alice".to_string(),
+                b"late".to_vec(),
+                vec![recipient.clone()],
+            )
+            .expect("second encrypt");
+        assert_eq!(
+            alice
+                .state
+                .lock()
+                .expect("Alice ratchet state")
+                .sessions
+                .get("bob")
+                .and_then(|sessions| sessions.last())
+                .expect("Alice-to-Bob session")
+                .session_config()
+                .version(),
+            2
+        );
+
+        let late = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                second.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                second.nonce,
+                second.ciphertext,
+                second.signature,
+                second.envelopes[0].wrapped_key.clone(),
+                "Bob".to_string(),
+            )
+            .expect("late decrypt");
+        assert_eq!(late.plaintext, b"late");
+        let early = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                first.message_id.clone(),
+                "Alice".to_string(),
+                alice.public_key(),
+                first.nonce.clone(),
+                first.ciphertext.clone(),
+                first.signature.clone(),
+                first.envelopes[0].wrapped_key.clone(),
+                "Bob".to_string(),
+            )
+            .expect("early decrypt");
+        assert_eq!(early.plaintext, b"early");
+        assert_eq!(early.state_revision, 2);
+
+        assert!(bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                first.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                first.nonce,
+                first.ciphertext,
+                first.signature,
+                first.envelopes[0].wrapped_key.clone(),
+                "Bob".to_string(),
+            )
+            .is_err());
+
+        let reply = bob
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "message-reply".to_string(),
+                "Bob".to_string(),
+                b"reply".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Alice".to_string(),
+                    public_key: alice.public_key(),
+                }],
+            )
+            .expect("reply encrypt");
+        let reply_olm: OlmMessage =
+            serde_json::from_slice(&reply.envelopes[0].wrapped_key).expect("reply Olm envelope");
+        assert!(matches!(reply_olm, OlmMessage::Normal(_)));
+        let alice_reply = alice
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                reply.message_id,
+                "Bob".to_string(),
+                bob.public_key(),
+                reply.nonce,
+                reply.ciphertext,
+                reply.signature,
+                reply.envelopes[0].wrapped_key.clone(),
+                "Alice".to_string(),
+            )
+            .expect("reply decrypt");
+        assert_eq!(alice_reply.plaintext, b"reply");
+
+        let restored = E2eeSession::recover(
+            bob_export,
+            bob_context,
+            reply.identity_envelope,
+            bob.public_key(),
+        )
+        .expect("restore ratchet state");
+        let third = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "message-after-restore".to_string(),
+                "Alice".to_string(),
+                b"restored".to_vec(),
+                vec![recipient],
+            )
+            .expect("third encrypt");
+        let third_olm: OlmMessage =
+            serde_json::from_slice(&third.envelopes[0].wrapped_key).expect("third Olm envelope");
+        assert!(matches!(third_olm, OlmMessage::Normal(_)));
+        let plain = restored
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                third.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                third.nonce,
+                third.ciphertext,
+                third.signature,
+                third.envelopes[0].wrapped_key.clone(),
+                "Bob".to_string(),
+            )
+            .expect("decrypt after state restore");
+        assert_eq!(plain.plaintext, b"restored");
+        assert_eq!(plain.state_revision, 4);
     }
 
     #[test]
     fn e2ee_rejects_tamper_wrong_recipient_and_sender_key() {
-        let alice = E2eeSession::create(vec![1; 64]).expect("alice");
-        let bob = E2eeSession::create(vec![2; 64]).expect("bob");
-        let eve = E2eeSession::create(vec![3; 64]).expect("eve");
+        let alice = sealed_session(1);
+        let bob = sealed_session(2);
+        let eve = sealed_session(3);
         let mut payload = alice
             .encrypt(
                 "forum_one".to_string(),

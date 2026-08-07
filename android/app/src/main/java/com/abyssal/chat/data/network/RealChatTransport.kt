@@ -3,6 +3,7 @@ package com.abyssal.chat.data.network
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
@@ -128,6 +129,8 @@ class RealChatTransport(
             .put("nonce_b64", encode(payload.nonce))
             .put("ciphertext_b64", encode(payload.ciphertext))
             .put("signature_b64", encode(payload.signature))
+            .put("state_revision", payload.stateRevision.toLong())
+            .put("identity_envelope_b64", encode(payload.identityEnvelope))
             .put("envelopes", JSONArray().apply {
                 payload.envelopes.forEach { envelope ->
                     put(
@@ -143,6 +146,43 @@ class RealChatTransport(
         if (!accepted) {
             _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
         }
+        payload.nonce.fill(0)
+        payload.ciphertext.fill(0)
+        payload.signature.fill(0)
+        payload.identityEnvelope.fill(0)
+        payload.envelopes.forEach { it.wrappedKey.fill(0) }
+        return accepted
+    }
+
+    override suspend fun acknowledgeMessage(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        state: IdentityStateSnapshot
+    ): Boolean {
+        val accepted = webSocket?.send(
+            JSONObject()
+                .put("type", "message_ack")
+                .put("chat_id", chatId)
+                .put("message_id", messageId)
+                .put("sender_username", senderUsername)
+                .put("state_revision", state.revision.toLong())
+                .put("identity_envelope_b64", encode(state.envelope))
+                .toString()
+        ) == true
+        if (!accepted) _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+        return accepted
+    }
+
+    override suspend fun syncIdentityState(state: IdentityStateSnapshot): Boolean {
+        val accepted = webSocket?.send(
+            JSONObject()
+                .put("type", "identity_state")
+                .put("state_revision", state.revision.toLong())
+                .put("identity_envelope_b64", encode(state.envelope))
+                .toString()
+        ) == true
+        if (!accepted) _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
         return accepted
     }
 
@@ -349,7 +389,7 @@ class RealChatTransport(
     }
 
     private companion object {
-        const val PROTOCOL_VERSION = 3
+        const val PROTOCOL_VERSION = 4
         val DIRECT_ID_REGEX = Regex("^dm_[A-Za-z0-9_-]{1,125}$")
 
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)

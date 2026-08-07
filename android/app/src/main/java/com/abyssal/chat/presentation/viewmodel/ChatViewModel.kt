@@ -11,6 +11,7 @@ import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
+import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MessageReplyPolicy
@@ -141,7 +142,47 @@ class ChatViewModel(
             chatTransport.getIncomingPayloads().collect { incoming ->
                 val username = currentUser.value?.username ?: return@collect
                 val replayKey = "${incoming.chatId}\u0000${incoming.senderUsername}\u0000${incoming.messageId}"
-                if (!receivedFrameIds.add(replayKey)) return@collect
+                if (replayKey in receivedFrameIds) {
+                    val state = payloadCipher.stateSnapshot() ?: run {
+                        logoutLocal()
+                        return@collect
+                    }
+                    val acknowledged = try {
+                        chatTransport.acknowledgeMessage(
+                            incoming.chatId,
+                            incoming.messageId,
+                            incoming.senderUsername,
+                            state
+                        )
+                    } finally {
+                        state.envelope.fill(0)
+                    }
+                    if (!acknowledged) logoutLocal()
+                    return@collect
+                }
+                val plainBytes = runCatching { payloadCipher.decrypt(incoming, username) }
+                    .getOrNull() ?: return@collect
+                val state = payloadCipher.stateSnapshot()
+                if (state == null) {
+                    plainBytes.fill(0)
+                    return@collect
+                }
+                val acknowledged = try {
+                    chatTransport.acknowledgeMessage(
+                        incoming.chatId,
+                        incoming.messageId,
+                        incoming.senderUsername,
+                        state
+                    )
+                } finally {
+                    state.envelope.fill(0)
+                }
+                if (!acknowledged) {
+                    plainBytes.fill(0)
+                    logoutLocal()
+                    return@collect
+                }
+                receivedFrameIds.add(replayKey)
                 if (receivedFrameIds.size > MAX_RECEIVED_FRAME_IDS) {
                     receivedFrameIds.iterator().run {
                         if (hasNext()) {
@@ -150,8 +191,6 @@ class ChatViewModel(
                         }
                     }
                 }
-                val plainBytes = runCatching { payloadCipher.decrypt(incoming, username) }
-                    .getOrNull() ?: return@collect
                 try {
                     val decryptedContent = String(plainBytes, StandardCharsets.UTF_8)
                     val control = runCatching { JSONObject(decryptedContent) }.getOrNull()
@@ -364,7 +403,11 @@ class ChatViewModel(
                 _attachmentUploadProgress.value = AttachmentUploadProgress()
                 return@launch
             }
-            val encryptedBytes = payloadCipher.serialize(attachmentPayload)
+            val encryptedBytes = try {
+                payloadCipher.serialize(attachmentPayload)
+            } finally {
+                wipeEncryptedPayload(attachmentPayload)
+            }
             val upload = attachmentService.uploadEncryptedAttachment(
                 chatId = chatId,
                 mediaType = mediaType,
@@ -766,7 +809,7 @@ class ChatViewModel(
         chatId: String,
         messageId: String,
         metadata: String
-    ): com.abyssal.chat.domain.model.EncryptedTransportPayload? {
+    ): EncryptedTransportPayload? {
         val sender = currentUser.value ?: return null
         val recipients = recipientIdentities(chatId, includeSelf = false) ?: return null
         val plainBytes = metadata.toByteArray(StandardCharsets.UTF_8)
@@ -783,6 +826,14 @@ class ChatViewModel(
         } finally {
             plainBytes.fill(0)
         }
+    }
+
+    private fun wipeEncryptedPayload(payload: EncryptedTransportPayload) {
+        payload.nonce.fill(0)
+        payload.ciphertext.fill(0)
+        payload.signature.fill(0)
+        payload.identityEnvelope.fill(0)
+        payload.envelopes.forEach { it.wrappedKey.fill(0) }
     }
 
     private fun recipientIdentities(chatId: String, includeSelf: Boolean): List<RecipientIdentity>? {
@@ -806,14 +857,14 @@ class ChatViewModel(
         return recipients
     }
 
-    private fun decryptAttachment(chatId: String, message: Message, encrypted: ByteArray): ByteArray? {
+    private suspend fun decryptAttachment(chatId: String, message: Message, encrypted: ByteArray): ByteArray? {
         return try {
             val self = currentUser.value ?: return null
             val senderUsername = if (message.sender == "You") self.username else message.sender
             val senderPublicKey = message.senderPublicKey
                 ?: if (senderUsername.equals(self.username, ignoreCase = true)) self.publicKey else null
                 ?: return null
-            runCatching {
+            val plain = runCatching {
                 val payload = payloadCipher.deserializeForRecipient(
                     chatId = chatId,
                     bytes = encrypted,
@@ -822,7 +873,22 @@ class ChatViewModel(
                     recipientUsername = self.username
                 )
                 payloadCipher.decrypt(payload, self.username)
-            }.getOrNull()
+            }.getOrNull() ?: return null
+            val state = payloadCipher.stateSnapshot() ?: run {
+                plain.fill(0)
+                return null
+            }
+            val synced = try {
+                chatTransport.syncIdentityState(state)
+            } finally {
+                state.envelope.fill(0)
+            }
+            if (!synced) {
+                plain.fill(0)
+                logoutLocal()
+                return null
+            }
+            plain
         } finally {
             encrypted.fill(0)
         }
@@ -1130,7 +1196,7 @@ class ChatViewModel(
         private const val SESSION_WATCHDOG_INTERVAL_MS = 1_000L
         private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
-        private const val IDENTITY_PUBLIC_KEY_BYTES = 64
+        private const val IDENTITY_PUBLIC_KEY_BYTES = 96
         private const val MAX_RECEIVED_FRAME_IDS = 10_000
     }
 }

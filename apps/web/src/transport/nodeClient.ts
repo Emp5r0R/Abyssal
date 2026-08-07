@@ -8,7 +8,11 @@ import type {
   RoomRecord,
   UploadProgress,
 } from "../domain/types";
-import { base64ToBytes, bytesToBase64 } from "../security/crypto";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  type IdentityStateSnapshot,
+} from "../security/crypto";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 
@@ -187,6 +191,30 @@ export class RelaySocket {
 
   activity(): boolean {
     return this.send({ type: "activity" });
+  }
+
+  acknowledge(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    state: IdentityStateSnapshot,
+  ): boolean {
+    return this.send({
+      type: "message_ack",
+      chat_id: chatId,
+      message_id: messageId,
+      sender_username: senderUsername,
+      state_revision: state.revision,
+      identity_envelope_b64: bytesToBase64(state.envelope),
+    });
+  }
+
+  syncIdentityState(state: IdentityStateSnapshot): boolean {
+    return this.send({
+      type: "identity_state",
+      state_revision: state.revision,
+      identity_envelope_b64: bytesToBase64(state.envelope),
+    });
   }
 
   close(): void {

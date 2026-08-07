@@ -207,7 +207,7 @@ class NetworkIdentityService(
         val credential = code.trim().uppercase()
         require(node.isNotEmpty() && node.length <= 128)
         require(credential.isNotEmpty() && credential.length <= 128)
-        return "ABYSSAL_IDENTITY_V1:$node:$credential".toByteArray(StandardCharsets.UTF_8)
+        return "ABYSSAL_IDENTITY_V2:$node:$credential".toByteArray(StandardCharsets.UTF_8)
     }
 
     private companion object {

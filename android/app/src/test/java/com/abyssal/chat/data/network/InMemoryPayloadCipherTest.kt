@@ -21,7 +21,16 @@ class InMemoryPayloadCipherTest {
 
         val plain = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
 
+        assertEquals(4, payload.version)
+        assertEquals(1UL, payload.stateRevision)
+        assertTrue(payload.identityEnvelope.size > 64)
         assertEquals("hello from RAM", plain.decodeToString())
+        val state = receiver.stateSnapshot()
+        val retry = receiver.stateSnapshot()
+        assertEquals(1UL, state?.revision)
+        assertEquals(1UL, retry?.revision)
+        assertTrue(state?.envelope !== retry?.envelope)
+        assertTrue(state!!.envelope.contentEquals(retry!!.envelope))
     }
 
     @Test
@@ -97,7 +106,7 @@ class InMemoryPayloadCipherTest {
 
     private fun identity(fill: Int): InMemoryPayloadCipher = InMemoryPayloadCipher().also {
         val exportKey = ByteArray(64) { fill.toByte() }
-        val context = "ABYSSAL_IDENTITY_V1:node:CODE-12345678".encodeToByteArray()
+        val context = "ABYSSAL_IDENTITY_V2:node:CODE-12345678".encodeToByteArray()
         try {
             it.createIdentity(exportKey, context)
         } finally {

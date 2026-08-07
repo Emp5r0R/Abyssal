@@ -171,7 +171,14 @@ data class EncryptedTransportPayload(
     val nonce: ByteArray,
     val ciphertext: ByteArray,
     val signature: ByteArray,
-    val envelopes: List<RecipientEnvelope>
+    val envelopes: List<RecipientEnvelope>,
+    val stateRevision: ULong,
+    val identityEnvelope: ByteArray
+)
+
+data class IdentityStateSnapshot(
+    val revision: ULong,
+    val envelope: ByteArray
 )
 
 data class RecipientIdentity(

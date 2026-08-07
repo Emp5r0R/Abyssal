@@ -2,6 +2,7 @@ package com.abyssal.chat.data.network
 
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.RecipientEnvelope
 import com.abyssal.chat.domain.model.RecipientIdentity
 import java.nio.charset.StandardCharsets
@@ -13,6 +14,7 @@ import uniffi.abyssal_core.RecipientPublicKey
 
 class InMemoryPayloadCipher {
     private var session: E2eeSession? = null
+    private var pendingState: IdentityStateSnapshot? = null
 
     @Synchronized
     fun createIdentity(exportKey: ByteArray, context: ByteArray): IdentityMaterial {
@@ -45,6 +47,11 @@ class InMemoryPayloadCipher {
     fun publicKey(): ByteArray = requireSession().publicKey()
 
     @Synchronized
+    fun stateSnapshot(): IdentityStateSnapshot? = pendingState?.let {
+        IdentityStateSnapshot(it.revision, it.envelope.clone())
+    }
+
+    @Synchronized
     fun encrypt(
         chatId: String,
         messageId: String,
@@ -62,6 +69,7 @@ class InMemoryPayloadCipher {
             plainBytes,
             uniqueRecipients
         )
+        rememberState(encrypted.stateRevision, encrypted.identityEnvelope)
         return EncryptedTransportPayload(
             version = encrypted.version.toInt(),
             messageId = encrypted.messageId,
@@ -70,13 +78,15 @@ class InMemoryPayloadCipher {
             signature = encrypted.signature,
             envelopes = encrypted.envelopes.map {
                 RecipientEnvelope(it.username, it.wrappedKey)
-            }
+            },
+            stateRevision = encrypted.stateRevision,
+            identityEnvelope = encrypted.identityEnvelope
         )
     }
 
     @Synchronized
     fun decrypt(payload: IncomingTransportPayload, recipientUsername: String): ByteArray {
-        return requireSession().decrypt(
+        val decrypted = requireSession().decrypt(
             payload.chatId,
             payload.messageId,
             payload.senderUsername,
@@ -87,6 +97,9 @@ class InMemoryPayloadCipher {
             payload.wrappedKey,
             recipientUsername
         )
+        rememberState(decrypted.stateRevision, decrypted.identityEnvelope)
+        decrypted.identityEnvelope.fill(0)
+        return decrypted.plaintext
     }
 
     fun serialize(payload: EncryptedTransportPayload): ByteArray {
@@ -139,6 +152,8 @@ class InMemoryPayloadCipher {
 
     @Synchronized
     fun clear() {
+        pendingState?.envelope?.fill(0)
+        pendingState = null
         session?.close()
         session = null
     }
@@ -146,13 +161,18 @@ class InMemoryPayloadCipher {
     private fun requireSession(): E2eeSession =
         session ?: throw IllegalStateException("Identity unavailable")
 
+    private fun rememberState(revision: ULong, envelope: ByteArray) {
+        pendingState?.envelope?.fill(0)
+        pendingState = IdentityStateSnapshot(revision, envelope.clone())
+    }
+
     data class IdentityMaterial(
         val publicKey: ByteArray,
         val envelope: ByteArray
     )
 
     private companion object {
-        const val PROTOCOL_VERSION = 3
+        const val PROTOCOL_VERSION = 4
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
         fun decode(value: String): ByteArray = Base64.getUrlDecoder().decode(value)
