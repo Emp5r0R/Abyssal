@@ -99,6 +99,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
+import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.Message
@@ -333,7 +334,7 @@ private fun ChatContent(
                             onSaveAttachment = {
                                 saveTargetMessage = message
                                 onExternalSystemUiStart()
-                                saveLauncher.launch(encryptedExportName(message.attachmentName ?: "attachment"))
+                                saveLauncher.launch(AttachmentSavePolicy.sanitizedFileName(message.attachmentName))
                             }
                         )
                     }
@@ -1497,9 +1498,9 @@ private fun MediaMessageContent(
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace
                 )
-                if (message.saveAllowed) {
+                if (AttachmentSavePolicy.canSave(message)) {
                     Text(
-                        text = "SAVE ENCRYPTED",
+                        text = "SAVE",
                         color = SteelMuted,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
@@ -1562,9 +1563,9 @@ private fun MediaMessageContent(
                 onClick = onViewAttachment,
                 modifier = Modifier.weight(1f)
             )
-            if (message.saveAllowed) {
+            if (AttachmentSavePolicy.canSave(message)) {
                 MirageSecondaryButton(
-                    text = "Save encrypted",
+                    text = "Save",
                     onClick = onSaveAttachment,
                     modifier = Modifier.weight(1f)
                 )
@@ -1934,11 +1935,6 @@ private fun formatBytes(bytes: Long): String {
     } else {
         "${(bytes / 1024L).coerceAtLeast(0L)} KB"
     }
-}
-
-private fun encryptedExportName(name: String): String {
-    val safeName = name.ifBlank { "attachment" }
-    return if (safeName.endsWith(".abyssal", ignoreCase = true)) safeName else "$safeName.abyssal"
 }
 
 private fun trailingComposerToken(value: String): String? {

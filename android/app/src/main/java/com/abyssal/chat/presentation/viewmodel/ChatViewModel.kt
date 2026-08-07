@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
+import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
@@ -431,52 +432,59 @@ class ChatViewModel(
                 _attachmentError.value = "Wrong information."
                 return@launch
             }
-            _attachmentPreview.value = DecryptedAttachment(
-                messageId = message.id,
-                name = message.attachmentName ?: "attachment",
-                mediaType = message.mediaType ?: "FILE",
-                mimeType = message.attachmentMimeType ?: "application/octet-stream",
-                bytes = bytes,
-                oneTimeView = message.oneTimeView
-            )
-            markMessageAsRead(message.id)
-        }
-    }
-
-    fun saveAttachment(message: Message, outputUri: Uri) {
-        if (!message.saveAllowed || message.oneTimeView) return
-        val chatId = _activeChatId.value ?: return
-        val attachmentId = message.attachmentId ?: return
-        viewModelScope.launch {
-            _attachmentError.value = null
-            val cached = attachmentPreview.value?.takeIf { it.messageId == message.id }
-            val attachment = cached ?: run {
-                val encrypted = attachmentService.downloadEncryptedAttachment(attachmentId)
-                val bytes = encrypted?.let {
-                    decryptAttachment(chatId, message, it)
-                }
-                if (bytes == null) {
-                    _attachmentError.value = "Wrong information."
-                    return@launch
-                }
+            replaceAttachmentPreview(
                 DecryptedAttachment(
                     messageId = message.id,
                     name = message.attachmentName ?: "attachment",
                     mediaType = message.mediaType ?: "FILE",
                     mimeType = message.attachmentMimeType ?: "application/octet-stream",
                     bytes = bytes,
-                    oneTimeView = false
+                    oneTimeView = message.oneTimeView
                 )
-            }
-            if (!attachmentService.saveEncryptedAttachmentExport(attachment, outputUri)) {
-                _attachmentError.value = "Wrong information."
-            }
+            )
             markMessageAsRead(message.id)
         }
     }
 
+    fun saveAttachment(message: Message, outputUri: Uri) {
+        if (!AttachmentSavePolicy.canSave(message)) return
+        val chatId = _activeChatId.value ?: return
+        val attachmentId = message.attachmentId ?: return
+        viewModelScope.launch {
+            _attachmentError.value = null
+            var temporaryBytes: ByteArray? = null
+            try {
+                val attachment = takeAttachmentPreview(message.id) ?: run {
+                    val encrypted = attachmentService.downloadEncryptedAttachment(attachmentId)
+                    val bytes = encrypted?.let {
+                        decryptAttachment(chatId, message, it)
+                    }
+                    if (bytes == null) {
+                        _attachmentError.value = "Wrong information."
+                        return@launch
+                    }
+                    DecryptedAttachment(
+                        messageId = message.id,
+                        name = message.attachmentName ?: "attachment",
+                        mediaType = message.mediaType ?: "FILE",
+                        mimeType = message.attachmentMimeType ?: "application/octet-stream",
+                        bytes = bytes,
+                        oneTimeView = false
+                    )
+                }
+                temporaryBytes = attachment.bytes
+                if (!attachmentService.saveDecryptedAttachment(attachment, outputUri)) {
+                    _attachmentError.value = "Wrong information."
+                }
+                markMessageAsRead(message.id)
+            } finally {
+                temporaryBytes?.fill(0)
+            }
+        }
+    }
+
     fun dismissAttachmentPreview() {
-        _attachmentPreview.value = null
+        replaceAttachmentPreview(null)
     }
 
     fun markMessageAsRead(messageId: String) {
@@ -718,7 +726,7 @@ class ChatViewModel(
         _currentUser.value = null
         _currentScreen.value = Screen.Entrance
         _showCamouflagePinPrompt.value = false
-        _attachmentPreview.value = null
+        replaceAttachmentPreview(null)
         _attachmentError.value = null
         _attachmentUploadProgress.value = AttachmentUploadProgress()
         ownMessageIds.clear()
@@ -799,21 +807,37 @@ class ChatViewModel(
     }
 
     private fun decryptAttachment(chatId: String, message: Message, encrypted: ByteArray): ByteArray? {
-        val self = currentUser.value ?: return null
-        val senderUsername = if (message.sender == "You") self.username else message.sender
-        val senderPublicKey = message.senderPublicKey
-            ?: if (senderUsername.equals(self.username, ignoreCase = true)) self.publicKey else null
-            ?: return null
-        return runCatching {
-            val payload = payloadCipher.deserializeForRecipient(
-                chatId = chatId,
-                bytes = encrypted,
-                senderUsername = senderUsername,
-                senderPublicKey = senderPublicKey,
-                recipientUsername = self.username
-            )
-            payloadCipher.decrypt(payload, self.username)
-        }.getOrNull()
+        return try {
+            val self = currentUser.value ?: return null
+            val senderUsername = if (message.sender == "You") self.username else message.sender
+            val senderPublicKey = message.senderPublicKey
+                ?: if (senderUsername.equals(self.username, ignoreCase = true)) self.publicKey else null
+                ?: return null
+            runCatching {
+                val payload = payloadCipher.deserializeForRecipient(
+                    chatId = chatId,
+                    bytes = encrypted,
+                    senderUsername = senderUsername,
+                    senderPublicKey = senderPublicKey,
+                    recipientUsername = self.username
+                )
+                payloadCipher.decrypt(payload, self.username)
+            }.getOrNull()
+        } finally {
+            encrypted.fill(0)
+        }
+    }
+
+    private fun replaceAttachmentPreview(next: DecryptedAttachment?) {
+        val previous = _attachmentPreview.value
+        if (previous !== next) previous?.bytes?.fill(0)
+        _attachmentPreview.value = next
+    }
+
+    private fun takeAttachmentPreview(messageId: String): DecryptedAttachment? {
+        val current = _attachmentPreview.value?.takeIf { it.messageId == messageId } ?: return null
+        _attachmentPreview.value = null
+        return current
     }
 
     private fun parseIncomingMessage(
