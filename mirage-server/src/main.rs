@@ -46,7 +46,9 @@ const FILE_ATTACHMENT_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 const ENCRYPTION_OVERHEAD_BYTES: usize = 64 * 1024;
 const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
-const WS_MAX_FRAME_BYTES: usize = 64 * 1024;
+const WS_MAX_BYTES_PER_WINDOW: usize = 4 * 1024 * 1024;
+const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const STATE_REVISION_WINDOW_BITS: u32 = u128::BITS;
 const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
 const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const ACCOUNT_BODY_LIMIT_BYTES: usize = 16 * 1024;
@@ -57,11 +59,12 @@ const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
 const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
 const OPAQUE_HANDSHAKE_TTL_MS: u64 = 60_000;
-const IDENTITY_PUBLIC_BYTES: usize = 64;
-const MAX_IDENTITY_ENVELOPE_BYTES: usize = 256;
+const IDENTITY_PUBLIC_BYTES: usize = 96;
+const MAX_IDENTITY_ENVELOPE_BYTES: usize = 512 * 1024;
 const MESSAGE_NONCE_BYTES: usize = 12;
 const MESSAGE_SIGNATURE_BYTES: usize = 64;
-const WRAPPED_KEY_BYTES: usize = 92;
+const MAX_WRAPPED_KEY_BYTES: usize = 4096;
+const E2EE_PROTOCOL_VERSION: u32 = 4;
 const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_REPLAY_IDS: usize = 50_000;
 const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_INVITE_CODE_ID_V1";
@@ -103,6 +106,8 @@ struct Account {
     password_file: Vec<u8>,
     identity_public: Vec<u8>,
     identity_envelope: Vec<u8>,
+    state_revision: u64,
+    state_revision_window: u128,
     connected: bool,
 }
 
@@ -150,6 +155,7 @@ struct DirectEntry {
 struct RateState {
     window_start_ms: u64,
     count: usize,
+    bytes: usize,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -378,6 +384,21 @@ enum InboundFrame {
         ciphertext_b64: String,
         signature_b64: String,
         envelopes: Vec<InboundRecipientEnvelope>,
+        state_revision: u64,
+        identity_envelope_b64: String,
+    },
+    #[serde(rename = "message_ack")]
+    MessageAck {
+        chat_id: String,
+        message_id: String,
+        sender_username: String,
+        state_revision: u64,
+        identity_envelope_b64: String,
+    },
+    #[serde(rename = "identity_state")]
+    IdentityState {
+        state_revision: u64,
+        identity_envelope_b64: String,
     },
     #[serde(rename = "global_wipe")]
     GlobalWipe,
@@ -873,6 +894,7 @@ fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: u
     if now.saturating_sub(state.window_start_ms) >= window_ms {
         state.window_start_ms = now;
         state.count = 0;
+        state.bytes = 0;
     }
     state.count = state.count.saturating_add(1);
     state.count <= limit
@@ -884,6 +906,7 @@ async fn login_attempt_allowed(state: &AppState, code_id: &CodeId) -> bool {
     let rate = limits.entry(*code_id).or_insert(RateState {
         window_start_ms: now,
         count: 0,
+        bytes: 0,
     });
     record_rate_attempt(
         rate,
@@ -1322,6 +1345,8 @@ async fn finish_opaque_account(
                     password_file,
                     identity_public,
                     identity_envelope,
+                    state_revision: 0,
+                    state_revision_window: 1,
                     connected: false,
                 },
             );
@@ -1826,11 +1851,22 @@ async fn check_ws_frame_allowed(
     let state = limits.entry(client_id).or_insert(RateState {
         window_start_ms: now,
         count: 0,
+        bytes: 0,
     });
     if !record_rate_attempt(state, now, WS_RATE_WINDOW_MS, WS_MAX_FRAMES_PER_WINDOW) {
         return Err(format!(
             "rate limit exceeded: count={} window_ms={}",
             state.count, WS_RATE_WINDOW_MS
+        ));
+    }
+    state.bytes = state
+        .bytes
+        .checked_add(frame_bytes)
+        .ok_or_else(|| "frame byte rate rejected".to_string())?;
+    if state.bytes > WS_MAX_BYTES_PER_WINDOW {
+        return Err(format!(
+            "byte rate limit exceeded: bytes={} window_ms={}",
+            state.bytes, WS_RATE_WINDOW_MS
         ));
     }
     Ok(())
@@ -1864,6 +1900,8 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             ciphertext_b64,
             signature_b64,
             envelopes,
+            state_revision,
+            identity_envelope_b64,
         } => {
             touch_activity(state).await;
             route_encrypted_message(
@@ -1876,8 +1914,36 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 ciphertext_b64,
                 signature_b64,
                 envelopes,
+                state_revision,
+                identity_envelope_b64,
             )
             .await
+        }
+        InboundFrame::MessageAck {
+            chat_id,
+            message_id,
+            sender_username,
+            state_revision,
+            identity_envelope_b64,
+        } => {
+            touch_activity(state).await;
+            acknowledge_message(
+                state,
+                sender_id,
+                &chat_id,
+                &message_id,
+                &sender_username,
+                state_revision,
+                &identity_envelope_b64,
+            )
+            .await
+        }
+        InboundFrame::IdentityState {
+            state_revision,
+            identity_envelope_b64,
+        } => {
+            touch_activity(state).await;
+            update_identity_state(state, sender_id, state_revision, &identity_envelope_b64).await
         }
         InboundFrame::GlobalWipe => {
             touch_activity(state).await;
@@ -1918,10 +1984,11 @@ async fn join_room(state: &AppState, client_id: Uuid, chat_id: String) -> Result
         .pending
         .lock()
         .await
-        .remove(&PendingKey {
+        .get(&PendingKey {
             chat_id,
             recipient_username: username,
         })
+        .cloned()
         .unwrap_or_default();
     for frame in pending {
         send_to_client(state, client_id, &frame).await;
@@ -1947,23 +2014,19 @@ async fn route_encrypted_message(
     ciphertext_b64: String,
     signature_b64: String,
     envelopes: Vec<InboundRecipientEnvelope>,
+    state_revision: u64,
+    identity_envelope_b64: String,
 ) -> Result<(), String> {
-    if version != 3 || !valid_chat_id(&chat_id) || !valid_chat_id(&message_id) {
+    if version != E2EE_PROTOCOL_VERSION || !valid_chat_id(&chat_id) || !valid_chat_id(&message_id) {
         return Err("encrypted message rejected".to_string());
     }
     decode_exact(&nonce_b64, MESSAGE_NONCE_BYTES)?;
     decode_exact(&signature_b64, MESSAGE_SIGNATURE_BYTES)?;
     decode_bounded(&ciphertext_b64, WS_MAX_FRAME_BYTES)?;
 
+    decode_bounded(&identity_envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
+
     let (sender_code_id, sender_username) = client_identity(state, sender_id).await?;
-    register_message_id(state, &chat_id, &sender_username, &message_id).await?;
-    let sender_public_key_b64 = state
-        .accounts
-        .lock()
-        .await
-        .get(&sender_code_id)
-        .map(|account| URL_SAFE_NO_PAD.encode(&account.identity_public))
-        .ok_or_else(|| "authenticated identity required".to_string())?;
     let access = conversation_access(state, &sender_username, &chat_id)
         .await
         .ok_or_else(|| "conversation unavailable".to_string())?;
@@ -1998,7 +2061,10 @@ async fn route_encrypted_message(
         {
             return Err("recipient envelope rejected".to_string());
         }
-        decode_exact(&envelope.wrapped_key_b64, WRAPPED_KEY_BYTES)?;
+        let wrapped = decode_bounded(&envelope.wrapped_key_b64, MAX_WRAPPED_KEY_BYTES)?;
+        if wrapped.is_empty() {
+            return Err("recipient envelope rejected".to_string());
+        }
         envelope_map.insert(envelope.recipient_username, envelope.wrapped_key_b64);
     }
     if envelope_map.keys().collect::<HashSet<_>>()
@@ -2006,6 +2072,23 @@ async fn route_encrypted_message(
     {
         return Err("recipient envelope set rejected".to_string());
     }
+
+    apply_identity_state(
+        state,
+        &sender_code_id,
+        state_revision,
+        &identity_envelope_b64,
+        false,
+    )
+    .await?;
+    register_message_id(state, &chat_id, &sender_username, &message_id).await?;
+    let sender_public_key_b64 = state
+        .accounts
+        .lock()
+        .await
+        .get(&sender_code_id)
+        .map(|account| URL_SAFE_NO_PAD.encode(&account.identity_public))
+        .ok_or_else(|| "authenticated identity required".to_string())?;
 
     let joined = state
         .rooms
@@ -2037,9 +2120,8 @@ async fn route_encrypted_message(
                     .then_some(*client_id)
             })
             .collect::<Vec<_>>();
-        if recipient_ids.is_empty() {
-            queue_pending_frame(state, &chat_id, recipient_username, frame).await;
-        } else {
+        queue_pending_frame(state, &chat_id, recipient_username, frame.clone()).await;
+        if !recipient_ids.is_empty() {
             for recipient_id in recipient_ids {
                 send_to_client(state, recipient_id, &frame).await;
             }
@@ -2096,6 +2178,128 @@ async fn queue_pending_frame(
         evicted.zeroize_sensitive();
     }
     queue.push(frame);
+}
+
+async fn update_identity_state(
+    state: &AppState,
+    sender_id: Uuid,
+    revision: u64,
+    envelope_b64: &str,
+) -> Result<(), String> {
+    let (code_id, _) = client_identity(state, sender_id).await?;
+    apply_identity_state(state, &code_id, revision, envelope_b64, true).await
+}
+
+async fn apply_identity_state(
+    state: &AppState,
+    code_id: &CodeId,
+    revision: u64,
+    envelope_b64: &str,
+    allow_reuse: bool,
+) -> Result<(), String> {
+    let mut envelope = decode_bounded(envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
+    if envelope.len() <= 1 + MESSAGE_NONCE_BYTES || envelope.first() != Some(&2) {
+        envelope.zeroize();
+        return Err("identity state rejected".to_string());
+    }
+    let mut accounts = state.accounts.lock().await;
+    let account = accounts
+        .get_mut(code_id)
+        .ok_or_else(|| "authenticated identity required".to_string())?;
+    if revision > account.state_revision {
+        let advance = revision - account.state_revision;
+        account.state_revision_window = if advance >= u64::from(STATE_REVISION_WINDOW_BITS) {
+            1
+        } else {
+            (account.state_revision_window << advance) | 1
+        };
+        let mut previous = std::mem::replace(&mut account.identity_envelope, envelope);
+        previous.zeroize();
+        account.state_revision = revision;
+        return Ok(());
+    }
+
+    let lag = account.state_revision - revision;
+    if lag >= u64::from(STATE_REVISION_WINDOW_BITS) {
+        envelope.zeroize();
+        return if allow_reuse {
+            Ok(())
+        } else {
+            Err("identity state rejected".to_string())
+        };
+    }
+    let revision_bit = 1_u128 << lag;
+    if account.state_revision_window & revision_bit != 0 && !allow_reuse {
+        envelope.zeroize();
+        return Err("identity state rejected".to_string());
+    }
+    account.state_revision_window |= revision_bit;
+    envelope.zeroize();
+    Ok(())
+}
+
+async fn acknowledge_message(
+    state: &AppState,
+    sender_id: Uuid,
+    chat_id: &str,
+    message_id: &str,
+    original_sender: &str,
+    revision: u64,
+    envelope_b64: &str,
+) -> Result<(), String> {
+    if !valid_chat_id(chat_id)
+        || !valid_chat_id(message_id)
+        || original_sender.is_empty()
+        || original_sender.len() > 80
+        || !original_sender.is_ascii()
+    {
+        return Err("message acknowledgement rejected".to_string());
+    }
+    let (code_id, username) = client_identity(state, sender_id).await?;
+    let access = conversation_access(state, &username, chat_id)
+        .await
+        .ok_or_else(|| "conversation unavailable".to_string())?;
+    let valid_sender = match access {
+        ConversationAccess::Room(_) => state
+            .accounts
+            .lock()
+            .await
+            .values()
+            .any(|account| account.username == original_sender),
+        ConversationAccess::Direct => state
+            .direct_catalog
+            .lock()
+            .await
+            .get(chat_id)
+            .and_then(|direct| direct.peer_for(&username))
+            .is_some_and(|peer| peer == original_sender),
+    };
+    if !valid_sender || original_sender == username {
+        return Err("conversation unavailable".to_string());
+    }
+    apply_identity_state(state, &code_id, revision, envelope_b64, true).await?;
+
+    let key = PendingKey {
+        chat_id: chat_id.to_string(),
+        recipient_username: username,
+    };
+    let mut pending = state.pending.lock().await;
+    if let Some(queue) = pending.get_mut(&key) {
+        queue.retain(|frame| {
+            !matches!(
+                frame,
+                OutboundFrame::Message {
+                    message_id: pending_id,
+                    sender_username: pending_sender,
+                    ..
+                } if pending_id == message_id && pending_sender == original_sender
+            )
+        });
+        if queue.is_empty() {
+            pending.remove(&key);
+        }
+    }
+    Ok(())
 }
 
 async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String> {
@@ -2520,12 +2724,14 @@ mod tests {
         let mut state = RateState {
             window_start_ms: 1_000,
             count: 0,
+            bytes: 99,
         };
         assert!(record_rate_attempt(&mut state, 1_001, 100, 2));
         assert!(record_rate_attempt(&mut state, 1_002, 100, 2));
         assert!(!record_rate_attempt(&mut state, 1_003, 100, 2));
         assert!(record_rate_attempt(&mut state, 1_100, 100, 2));
         assert_eq!(state.count, 1);
+        assert_eq!(state.bytes, 0);
     }
 
     #[test]
@@ -2827,11 +3033,28 @@ mod tests {
         assert_eq!(state.pending.lock().await.len(), 1);
 
         let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
-        join_room(&state, bob_id, direct_id)
+        join_room(&state, bob_id, direct_id.clone())
             .await
             .expect("peer can join");
         let delivered = bob_rx.try_recv().expect("peer receives queued frame");
-        assert!(matches!(delivered, Message::Text(text) if text.contains("ciphertext_b64")));
+        let Message::Text(text) = delivered else {
+            panic!("expected text frame")
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("message frame");
+        let message_id = frame["message_id"].as_str().expect("message id");
+        assert!(text.contains("ciphertext_b64"));
+        assert_eq!(state.pending.lock().await.len(), 1);
+        acknowledge_message(
+            &state,
+            bob_id,
+            &direct_id,
+            message_id,
+            "Alice",
+            1,
+            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+        )
+        .await
+        .expect("recipient acknowledgement");
         assert!(state.pending.lock().await.is_empty());
     }
 
@@ -2860,12 +3083,170 @@ mod tests {
         assert!(alice_rx.try_recv().is_err());
         assert!(bob_rx.try_recv().is_err());
 
-        join_room(&state, bob_id, room.id)
+        join_room(&state, bob_id, room.id.clone())
             .await
             .expect("peer joins room");
         let delivered = bob_rx.try_recv().expect("peer receives queued room frame");
-        assert!(matches!(delivered, Message::Text(text) if text.contains("ciphertext_b64")));
+        let Message::Text(text) = delivered else {
+            panic!("expected text frame")
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("message frame");
+        let message_id = frame["message_id"].as_str().expect("message id");
+        assert!(text.contains("ciphertext_b64"));
+        assert_eq!(state.pending.lock().await.len(), 1);
+        acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            message_id,
+            "Alice",
+            1,
+            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+        )
+        .await
+        .expect("recipient acknowledgement");
         assert!(state.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_removes_only_matching_sender_and_message() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        add_test_account(&state, "code-e", "Eve").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, _) = add_test_client(&state, "code-b", "Bob").await;
+        let (eve_id, _) = add_test_client(&state, "code-e", "Eve").await;
+        let room = test_room("forum_ack_binding");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room: room.clone(),
+                owner_code_id: test_code_id("code-a"),
+            },
+        );
+        let shared_message_id = "shared-message-id";
+
+        route_test_message_with_id(
+            &state,
+            alice_id,
+            &room.id,
+            &["Bob", "Eve"],
+            shared_message_id,
+        )
+        .await
+        .expect("Alice message should queue");
+        route_test_message_with_id(
+            &state,
+            eve_id,
+            &room.id,
+            &["Alice", "Bob"],
+            shared_message_id,
+        )
+        .await
+        .expect("Eve message should queue");
+
+        assert!(acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            shared_message_id,
+            "Mallory",
+            1,
+            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+        )
+        .await
+        .is_err());
+
+        acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            shared_message_id,
+            "Alice",
+            1,
+            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+        )
+        .await
+        .expect("Bob should acknowledge Alice only");
+
+        let pending = state.pending.lock().await;
+        let bob_queue = pending
+            .get(&PendingKey {
+                chat_id: room.id.clone(),
+                recipient_username: "Bob".to_string(),
+            })
+            .expect("Eve message must remain queued for Bob");
+        assert_eq!(bob_queue.len(), 1);
+        assert!(matches!(
+            &bob_queue[0],
+            OutboundFrame::Message {
+                sender_username,
+                message_id,
+                ..
+            } if sender_username == "Eve" && message_id == shared_message_id
+        ));
+        drop(pending);
+
+        acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            shared_message_id,
+            "Eve",
+            1,
+            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+        )
+        .await
+        .expect("retry with an older state revision must not roll state backward");
+        assert!(!state.pending.lock().await.contains_key(&PendingKey {
+            chat_id: room.id,
+            recipient_username: "Bob".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn identity_revision_window_accepts_reordering_once_without_rollback() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        let code_id = test_code_id("code-a");
+        let mut revision_two = [2_u8; 256];
+        revision_two[1] = 22;
+        let mut revision_one = [2_u8; 256];
+        revision_one[1] = 11;
+
+        apply_identity_state(
+            &state,
+            &code_id,
+            2,
+            &URL_SAFE_NO_PAD.encode(revision_two),
+            false,
+        )
+        .await
+        .expect("newer revision");
+        apply_identity_state(
+            &state,
+            &code_id,
+            1,
+            &URL_SAFE_NO_PAD.encode(revision_one),
+            false,
+        )
+        .await
+        .expect("bounded out-of-order revision");
+        assert!(apply_identity_state(
+            &state,
+            &code_id,
+            1,
+            &URL_SAFE_NO_PAD.encode(revision_one),
+            false,
+        )
+        .await
+        .is_err());
+
+        let accounts = state.accounts.lock().await;
+        let account = accounts.get(&code_id).expect("Alice account");
+        assert_eq!(account.state_revision, 2);
+        assert_eq!(account.identity_envelope, revision_two);
     }
 
     #[tokio::test]
@@ -2930,7 +3311,9 @@ mod tests {
                 username: username.to_string(),
                 password_file: vec![1; 192],
                 identity_public: vec![username.as_bytes()[0]; IDENTITY_PUBLIC_BYTES],
-                identity_envelope: vec![1; 93],
+                identity_envelope: vec![2; 256],
+                state_revision: 0,
+                state_revision_window: 1,
                 connected: true,
             },
         );
@@ -2942,12 +3325,37 @@ mod tests {
         chat_id: &str,
         recipients: &[&str],
     ) -> Result<(), String> {
+        route_test_message_with_id(
+            state,
+            sender_id,
+            chat_id,
+            recipients,
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    async fn route_test_message_with_id(
+        state: &AppState,
+        sender_id: Uuid,
+        chat_id: &str,
+        recipients: &[&str],
+        message_id: &str,
+    ) -> Result<(), String> {
+        let (code_id, _) = client_identity(state, sender_id).await?;
+        let state_revision = state
+            .accounts
+            .lock()
+            .await
+            .get(&code_id)
+            .map(|account| account.state_revision + 1)
+            .ok_or_else(|| "missing test account".to_string())?;
         route_encrypted_message(
             state,
             sender_id,
             chat_id.to_string(),
-            3,
-            Uuid::new_v4().to_string(),
+            E2EE_PROTOCOL_VERSION,
+            message_id.to_string(),
             URL_SAFE_NO_PAD.encode([2_u8; MESSAGE_NONCE_BYTES]),
             URL_SAFE_NO_PAD.encode(b"ciphertext"),
             URL_SAFE_NO_PAD.encode([3_u8; MESSAGE_SIGNATURE_BYTES]),
@@ -2955,9 +3363,11 @@ mod tests {
                 .iter()
                 .map(|username| InboundRecipientEnvelope {
                     recipient_username: (*username).to_string(),
-                    wrapped_key_b64: URL_SAFE_NO_PAD.encode([4_u8; WRAPPED_KEY_BYTES]),
+                    wrapped_key_b64: URL_SAFE_NO_PAD.encode([4_u8; 256]),
                 })
                 .collect(),
+            state_revision,
+            URL_SAFE_NO_PAD.encode([2_u8; 256]),
         )
         .await
     }

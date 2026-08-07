@@ -119,7 +119,7 @@ Web client behavior:
 - Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
 - Direct composers apply a per-message `Never`, `5s`, `10s`, `30s`, or `1m` timer to text, GIFs, and attachments. Room composers show the creator's locked room timer; room policy can also be configured as no read expiry.
 - The calculator cover PIN and optional duress PIN exist only in the current tab. Reload, tab close, logout, wipe, session expiry, or process termination loses them.
-- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v3 E2EE requires Abyssal `1.7.x` clients; older builds are incompatible.
+- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v4 ratcheted E2EE requires Abyssal `1.8.x` clients; older builds are incompatible.
 
 Run web checks:
 
@@ -135,7 +135,7 @@ Run the complete repository suite from the root:
 ./check.sh all
 ```
 
-Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, `crypto`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, and a live disposable-relay OPAQUE/E2EE DM/offline-replay/access-control integration test. `crypto` regenerates the shared WASM, Kotlin, and four Android ABI libraries.
+Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, `crypto`, `audit`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, a live disposable-relay OPAQUE/ratcheted-E2EE DM/offline-replay/access-control integration test, and npm/RustSec dependency advisory scans. `crypto` regenerates the shared WASM, Kotlin, and four stripped Android ABI libraries, then rejects stale non-v4 artifacts.
 
 ## Rust Server
 
@@ -174,7 +174,7 @@ Security-related relay knobs:
 
 The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
 
-Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Messages, attachment bytes, and read receipts use recipient-specific X25519 key wrapping, ChaCha20-Poly1305, and Ed25519 signatures; the relay routes ciphertext and cannot passively decrypt or forge it. Identity secret keys are recovered from an envelope encrypted by the OPAQUE export key and remain client-side in process memory. This is real baseline E2EE, but it is not Signal-grade: the current protocol has no Double Ratchet/MLS forward secrecy or post-compromise recovery, and safety numbers must be compared out of band to detect an actively malicious relay substituting recipient keys. See [SECURITY.md](SECURITY.md).
+Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v4 encrypts message, attachment, and read-receipt content with ChaCha20-Poly1305; each recipient's content key travels through an authenticated `vodozemac` Olm Double Ratchet session, and Ed25519 signatures bind the outer ciphertext. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender and message ID. This adds pairwise forward secrecy and post-compromise recovery after ratchet-key turnover, but it is not Signal or MLS: initial sessions currently use a reusable fallback prekey, rooms use pairwise fanout, and there is no key transparency, multi-device protocol, or independent Abyssal audit. Compare direct-chat safety numbers out of band. See [SECURITY.md](SECURITY.md).
 
 ## Docker
 
@@ -316,4 +316,4 @@ For production, put Caddy or Nginx in front of port `4020` and use HTTPS/WSS. Th
 
 ## License
 
-Abyssal's original source is licensed under the [Apache License 2.0](LICENSE). Bundled third-party assets retain their own licenses as described in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Abyssal's original source is licensed under the [Mozilla Public License 2.0](LICENSE). Bundled third-party assets retain their own licenses as described in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

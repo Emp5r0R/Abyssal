@@ -17,7 +17,7 @@
         <!-- Main activity (not launcher directly, launcher is delegated to aliases) -->
         <activity
             android:name=".MainActivity"
-            android:exported="true"
+            android:exported="false"
             android:theme="@android:style/Theme.NoTitleBar"
             android:windowSoftInputMode="adjustResize">
         </activity>

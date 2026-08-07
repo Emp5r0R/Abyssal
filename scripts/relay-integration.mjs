@@ -53,7 +53,7 @@ async function register(code, password) {
     decode(start.response_b64),
   ));
   const identity = WasmE2eeSession.create(new Uint8Array(finished.export_key));
-  const context = encoder.encode(`ABYSSAL_IDENTITY_V1:${start.node_id}:${code.toUpperCase()}`);
+  const context = encoder.encode(`ABYSSAL_IDENTITY_V2:${start.node_id}:${code.toUpperCase()}`);
   const identityPublic = identity.publicKey();
   const identityEnvelope = identity.sealIdentity(new Uint8Array(finished.export_key), context);
   const finishResponse = await fetch(`${baseUrl}/v2/account/finish`, {
@@ -162,6 +162,8 @@ function encryptedFrame(sender, recipient, chatId, text) {
     nonce_b64: encode(payload.nonce),
     ciphertext_b64: encode(payload.ciphertext),
     signature_b64: encode(payload.signature),
+    state_revision: payload.state_revision,
+    identity_envelope_b64: encode(payload.identity_envelope),
     envelopes: payload.envelopes.map((envelope) => ({
       recipient_username: envelope.username,
       wrapped_key_b64: encode(envelope.wrapped_key),
@@ -170,7 +172,7 @@ function encryptedFrame(sender, recipient, chatId, text) {
 }
 
 function decryptFrame(recipient, frame) {
-  return decoder.decode(recipient.identity.decrypt(
+  const decrypted = JSON.parse(recipient.identity.decrypt(
     frame.chat_id,
     frame.message_id,
     frame.sender_username,
@@ -181,6 +183,23 @@ function decryptFrame(recipient, frame) {
     decode(frame.wrapped_key_b64),
     recipient.username,
   ));
+  return {
+    text: decoder.decode(new Uint8Array(decrypted.plaintext)),
+    stateRevision: decrypted.state_revision,
+    identityEnvelope: new Uint8Array(decrypted.identity_envelope),
+  };
+}
+
+function acknowledgeFrame(socket, frame, decrypted) {
+  socket.send(JSON.stringify({
+    type: "message_ack",
+    chat_id: frame.chat_id,
+    message_id: frame.message_id,
+    sender_username: frame.sender_username,
+    state_revision: decrypted.stateRevision,
+    identity_envelope_b64: encode(decrypted.identityEnvelope),
+  }));
+  decrypted.identityEnvelope.fill(0);
 }
 
 const alice = await register(aliceCode, "alice-password");
@@ -212,7 +231,10 @@ try {
     (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
   );
   aliceSocket.send(JSON.stringify(encryptedFrame(alice, bob, aliceOpened.direct.id, "live secret")));
-  assert.equal(decryptFrame(bob, await delivered), "live secret");
+  const deliveredFrame = await delivered;
+  const deliveredPlain = decryptFrame(bob, deliveredFrame);
+  assert.equal(deliveredPlain.text, "live secret");
+  acknowledgeFrame(bobSocket, deliveredFrame, deliveredPlain);
 
   const bobDisconnected = waitForFrame(
     aliceSocket,
@@ -230,7 +252,10 @@ try {
     (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
   );
   bobReconnect.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
-  assert.equal(decryptFrame(bob, await replayed), "offline secret");
+  const replayedFrame = await replayed;
+  const replayedPlain = decryptFrame(bob, replayedFrame);
+  assert.equal(replayedPlain.text, "offline secret");
+  acknowledgeFrame(bobReconnect, replayedFrame, replayedPlain);
 
   const unauthorizedUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=dm_guessed&media_type=FILE`, {
     method: "POST",

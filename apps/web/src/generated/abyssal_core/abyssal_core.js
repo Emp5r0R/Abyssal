@@ -40,34 +40,43 @@ export class WasmE2eeSession {
      * @param {Uint8Array} signature
      * @param {Uint8Array} wrapped_key
      * @param {string} recipient_username
-     * @returns {Uint8Array}
+     * @returns {string}
      */
     decrypt(chat_id, message_id, sender_username, sender_public_key, nonce, ciphertext, signature, wrapped_key, recipient_username) {
-        const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len1 = WASM_VECTOR_LEN;
-        const ptr2 = passStringToWasm0(sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len2 = WASM_VECTOR_LEN;
-        const ptr3 = passArray8ToWasm0(sender_public_key, wasm.__wbindgen_malloc);
-        const len3 = WASM_VECTOR_LEN;
-        const ptr4 = passArray8ToWasm0(nonce, wasm.__wbindgen_malloc);
-        const len4 = WASM_VECTOR_LEN;
-        const ptr5 = passArray8ToWasm0(ciphertext, wasm.__wbindgen_malloc);
-        const len5 = WASM_VECTOR_LEN;
-        const ptr6 = passArray8ToWasm0(signature, wasm.__wbindgen_malloc);
-        const len6 = WASM_VECTOR_LEN;
-        const ptr7 = passArray8ToWasm0(wrapped_key, wasm.__wbindgen_malloc);
-        const len7 = WASM_VECTOR_LEN;
-        const ptr8 = passStringToWasm0(recipient_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len8 = WASM_VECTOR_LEN;
-        const ret = wasm.wasme2eesession_decrypt(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8);
-        if (ret[3]) {
-            throw takeFromExternrefTable0(ret[2]);
+        let deferred11_0;
+        let deferred11_1;
+        try {
+            const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len2 = WASM_VECTOR_LEN;
+            const ptr3 = passArray8ToWasm0(sender_public_key, wasm.__wbindgen_malloc);
+            const len3 = WASM_VECTOR_LEN;
+            const ptr4 = passArray8ToWasm0(nonce, wasm.__wbindgen_malloc);
+            const len4 = WASM_VECTOR_LEN;
+            const ptr5 = passArray8ToWasm0(ciphertext, wasm.__wbindgen_malloc);
+            const len5 = WASM_VECTOR_LEN;
+            const ptr6 = passArray8ToWasm0(signature, wasm.__wbindgen_malloc);
+            const len6 = WASM_VECTOR_LEN;
+            const ptr7 = passArray8ToWasm0(wrapped_key, wasm.__wbindgen_malloc);
+            const len7 = WASM_VECTOR_LEN;
+            const ptr8 = passStringToWasm0(recipient_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len8 = WASM_VECTOR_LEN;
+            const ret = wasm.wasme2eesession_decrypt(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8);
+            var ptr10 = ret[0];
+            var len10 = ret[1];
+            if (ret[3]) {
+                ptr10 = 0; len10 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred11_0 = ptr10;
+            deferred11_1 = len10;
+            return getStringFromWasm0(ptr10, len10);
+        } finally {
+            wasm.__wbindgen_free(deferred11_0, deferred11_1, 1);
         }
-        var v10 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-        return v10;
     }
     /**
      * @param {string} chat_id

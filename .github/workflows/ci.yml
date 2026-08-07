@@ -35,3 +35,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: android-actions/setup-android@v4
       - run: ABYSSAL_GRADLE_HOME="$HOME/.gradle" bash ./scripts/test-all.sh android
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: bash ./scripts/test-all.sh audit

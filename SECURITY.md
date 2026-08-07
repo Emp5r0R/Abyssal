@@ -1,14 +1,15 @@
 # Abyssal Security Model
 
-No application has absolute security. Abyssal implements baseline end-to-end encryption and OPAQUE authentication, but it has not received an independent audit and must not be presented as Signal-equivalent.
+No application has absolute security. Abyssal implements ratcheted end-to-end encryption and OPAQUE authentication, but it has not received an independent audit and must not be presented as Signal-equivalent.
 
 ## Current Protections
 
 - Relay state is process memory only: keyed invite-code identifiers, OPAQUE password files, encrypted identity envelopes, sessions, room catalog, presence, recipient-specific pending ciphertext, and attachments have no database or volume. Plaintext invite codes exist only until their one-time startup print, then those buffers are zeroized.
 - Android app-owned account, message, endpoint, PIN, password, token, and key state is process memory only. `FLAG_SECURE` blocks normal Android screenshots and recents snapshots.
 - Web client uses no persistent browser storage, cookies, service worker, source maps, or third-party runtime scripts. Identity keys live in the shared Rust/WASM core; typed password, plaintext, and key buffers are overwritten on a best-effort basis after use.
-- OPAQUE registration and login use the shared Rust `opaque-ke` implementation. Password bytes never appear in relay application requests, and stable identity secret keys are recovered from an envelope encrypted by the OPAQUE export key.
-- Protocol-v3 text, attachment, and read-receipt payloads use a fresh content key, ChaCha20-Poly1305 with conversation/message/sender additional data, recipient-specific ephemeral X25519 key wrapping, and Ed25519 signatures. The relay receives only ciphertext, signatures, public identity keys, and recipient envelopes.
+- OPAQUE registration and login use the shared Rust `opaque-ke` implementation. Password bytes never appear in relay application requests. Identity and ratchet snapshots are encrypted with an OPAQUE export-key-derived key before leaving the client.
+- Protocol-v4 text, attachment, and read-receipt payloads use a fresh content key and ChaCha20-Poly1305 with conversation/message/sender additional data. Each recipient's content key is wrapped through an authenticated `vodozemac` Olm Double Ratchet session configured for a full-length HMAC, and Ed25519 signatures bind the outer ciphertext. The relay receives ciphertext, signatures, public identity bundles, ratchet envelopes, and OPAQUE-encrypted state snapshots, not plaintext or ratchet secrets.
+- Successful encryption and decryption advance a monotonic ratchet-state revision. The relay keeps only the latest encrypted snapshot in RAM, uses a 128-revision replay window to accept bounded network reordering without accepting a message revision twice, and never replaces newer state with an older snapshot. Recipient ciphertext remains queued until a sender-bound acknowledgement follows successful decryption.
 - The relay authoritatively binds delivered sender usernames/public keys to authenticated accounts and rejects missing, duplicate, or unauthorized recipient envelope sets. Clients reject malformed, tampered, wrongly addressed, or misbound payloads before parsing plaintext.
 - Direct conversations display a symmetric safety number derived from both identity public keys. Comparing it through a separate channel detects active relay key substitution for that conversation.
 - TLS/WSS is required for remote web nodes loaded from HTTPS. Loopback HTTP remains available for development.
@@ -16,19 +17,25 @@ No application has absolute security. Abyssal implements baseline end-to-end enc
 - Relay responses set a restrictive CSP, no-store caching, frame denial, no-referrer, MIME sniffing denial, HSTS, permissions restrictions, and cross-origin headers.
 - Account request bodies, WebSocket frame size/rate, attachment type size, total attachment RAM, session inactivity, and per-user room count are bounded.
 - Account-entry attempts are rate-limited per code, and a code cannot create a concurrent bearer session while its existing session remains unexpired.
-- Relay and clients maintain bounded RAM replay windows keyed by conversation, authenticated sender, and message ID. Duplicate ciphertext and receipt frames are rejected without growing unbounded state.
+- Relay and clients maintain bounded RAM replay windows keyed by conversation, authenticated sender, and message ID. Ratchet message keys are consumed after use, so cryptographic replays also fail. Duplicate ciphertext and receipt frames are rejected without growing unbounded state.
 - Clients pin each observed account identity key for the current RAM session and terminate/drop state if that key changes. First-contact authenticity still requires out-of-band safety-number comparison.
 - Sender usernames on delivered frames come from the authenticated relay session, not user-controlled encrypted metadata.
 - Room ownership and media-retention policy are enforced by the relay. Canonical DMs are visible only to their participants, and guessed chat IDs cannot be used to join a DM or transfer its attachments.
-- Android and web attachment saves are explicit user actions. Clients authenticate and decrypt attachment ciphertext in memory, write the original bytes under a sanitized original filename, and best-effort wipe temporary byte arrays. One-time attachments have no save control. Saved files are plaintext by explicit user choice and inherit the destination provider's security. Android `1.7.2` also deletes the obsolete device-bound export key created by older releases.
+- Android and web attachment saves are explicit user actions. Clients authenticate and decrypt attachment ciphertext in memory, write the original bytes under a sanitized original filename, and best-effort wipe temporary byte arrays. One-time attachments have no save control. Saved files are plaintext by explicit user choice and inherit the destination provider's security. Android `1.7.2` and later also delete the obsolete device-bound export key created by older releases.
 
 ## Known High-Risk Gaps
 
-### No Double Ratchet or MLS
+### Initial prekey and group-key limits
 
-Protocol v3 provides authenticated recipient E2EE against passive relay access and forgery, but identity encryption keys are stable for the lifetime of a RAM-only account. Compromise of a recipient identity secret can decrypt previously captured recipient envelopes. There is no Signal Double Ratchet forward secrecy/post-compromise recovery, MLS group epoch management, prekey lifecycle, or multi-device device list. Replay protection is bounded and process-local, not a persistent cross-restart ledger.
+Protocol v4 uses pairwise Olm Double Ratchet sessions. Deleted message keys provide forward secrecy, and a successful reciprocal DH-ratchet step can recover future confidentiality after compromise. Initial asynchronous sessions currently use a reusable fallback prekey included in the verified identity bundle; Abyssal does not yet publish and consume one-time prekey batches. Later compromise of that fallback private key weakens the initial-session guarantee for captured prekey messages.
 
-Required replacement: integrate an audited interoperable pairwise ratchet and group protocol rather than extending the custom envelope protocol. Stable release status describes product/version support, not Signal-grade security assurance.
+Rooms encrypt the same content separately to every account through pairwise sessions. There is no MLS group epoch, membership transcript, efficient group rekey, or multi-device device list. Large rooms therefore have linear envelope cost and weaker membership-change semantics than a reviewed MLS design.
+
+### State rollback and recovery limits
+
+Encrypted ratchet snapshots and pending ciphertext exist only in relay RAM. This permits process-memory-only clients to recover a session after app-process death, but a malicious relay can withhold or replay an older encrypted snapshot. Because clients deliberately keep no persistent state, they have no independent monotonic counter with which to prove rollback after a fresh login. A relay restart destroys accounts, snapshots, pending messages, and replay windows together.
+
+Delivery acknowledgements are authenticated by the WebSocket session and bound to conversation, recipient, original sender, and message ID. They are transport durability signals, not cryptographic proof to the sender that a human read the message.
 
 ### Active relay and web-delivery trust
 
@@ -55,9 +62,9 @@ Required replacement depends on threat model: sealed sender, message padding, ba
 3. Use the supplied Docker read-only runtime, no volumes, non-root UID, dropped capabilities, bounded memory/PIDs, and `no-new-privileges`.
 4. Startup codes appear once in attached process stdout. The supplied Compose deployment disables Docker log persistence and provides no retrieval file, API, fixed-code environment setting, or plaintext-code map. Lost codes require a destructive restart. Do not replace this with a disk-backed log driver.
 5. Restart wipes all relay state. Verify terminal capture, host tracing, crash dumps, and swap are not configured to capture process/container memory.
-6. Rebuild Android clients after protocol changes; protocol-v3 OPAQUE/E2EE requires version `1.7.x` clients.
+6. Rebuild Android clients after protocol changes; protocol-v4 OPAQUE/ratcheted E2EE requires version `1.8.x` clients.
 7. Keep the Android release keystore offline and backed up. Never commit `deploy/release.env`, `.secrets/`, APK signing credentials, or generated access codes.
-8. Commission independent cryptographic and application security review before claiming Signal-grade, audited, or high-assurance security. Stable software releases must continue disclosing ratcheting, group key management, transparency, and audit gaps.
+8. Commission independent cryptographic and application security review before claiming Signal-grade, audited, or high-assurance security. Stable software releases must continue disclosing prekey, group key management, transparency, rollback, multi-device, and audit gaps.
 
 A hostile host administrator can replace or instrument the relay binary, attach before startup output is zeroized, or capture incoming account requests. Software running on an administrator-controlled host cannot prevent that. This design removes recovery paths and plaintext retention after normal startup; it does not claim protection from a malicious root operator.
 

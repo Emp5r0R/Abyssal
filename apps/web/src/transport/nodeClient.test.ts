@@ -22,7 +22,7 @@ const session: AccountSession = {
   sessionInactivitySec: 900,
   endpoint,
   created: false,
-  identityPublicKey: new Uint8Array(64),
+  identityPublicKey: new Uint8Array(96),
 };
 
 afterEach(() => {
@@ -73,7 +73,7 @@ describe("account transport", () => {
   });
 
   it("finishes OPAQUE and validates returned identity material", async () => {
-    const publicKey = new Uint8Array(64).fill(7);
+    const publicKey = new Uint8Array(96).fill(7);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       accepted: true,
       created: true,
@@ -133,7 +133,21 @@ describe("RelaySocket", () => {
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
       expect(relay.openDirect("Bob")).toBe(true);
-      expect(socket.sent).toEqual([JSON.stringify({ type: "open_direct", peer_username: "Bob" })]);
+      expect(relay.acknowledge("dm_123", "message_1", "Alice", {
+        revision: 2,
+        envelope: new Uint8Array([2, 3, 4]),
+      })).toBe(true);
+      expect(socket.sent).toEqual([
+        JSON.stringify({ type: "open_direct", peer_username: "Bob" }),
+        JSON.stringify({
+          type: "message_ack",
+          chat_id: "dm_123",
+          message_id: "message_1",
+          sender_username: "Alice",
+          state_revision: 2,
+          identity_envelope_b64: "AgME",
+        }),
+      ]);
 
       socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
         type: "direct_opened",

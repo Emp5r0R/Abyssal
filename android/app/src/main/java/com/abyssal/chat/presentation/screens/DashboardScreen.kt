@@ -1057,15 +1057,15 @@ private fun DashboardContentPreview() {
         selfDestructDurationSec = 5
     )
     DashboardContent(
-        currentUser = User("SilentVector482", ByteArray(64)),
+        currentUser = User("SilentVector482", ByteArray(96)),
         sessions = listOf(
             ChatSession("room", "operations", true, sampleMessage, 3, 5, ownerUsername = "SilentVector482"),
             ChatSession("dm", "LunarNode231", false, null, 0, 10)
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
         presence = listOf(
-            UserPresence("SilentVector482", true, ByteArray(64)),
-            UserPresence("LunarNode231", false, ByteArray(64))
+            UserPresence("SilentVector482", true, ByteArray(96)),
+            UserPresence("LunarNode231", false, ByteArray(96))
         ),
         sessionSecurity = SessionSecurityState(
             active = true,

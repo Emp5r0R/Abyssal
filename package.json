@@ -1,6 +1,7 @@
 {
   "name": "abyssal-monorepo",
   "private": true,
+  "license": "MPL-2.0",
   "workspaces": [
     "apps/*"
   ],

@@ -6,6 +6,7 @@ import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
@@ -71,6 +72,13 @@ interface IChatTransport {
     suspend fun deleteForum(chatId: String)
     suspend fun openDirect(peerUsername: String)
     suspend fun sendEncryptedPayload(chatId: String, payload: EncryptedTransportPayload): Boolean
+    suspend fun acknowledgeMessage(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        state: IdentityStateSnapshot
+    ): Boolean
+    suspend fun syncIdentityState(state: IdentityStateSnapshot): Boolean
     suspend fun signalUserActivity(): Boolean
     suspend fun broadcastGlobalWipe()
 }

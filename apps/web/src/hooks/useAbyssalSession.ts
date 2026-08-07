@@ -236,18 +236,32 @@ export function useAbyssalSession() {
       socketRef.current?.join(direct.id);
       return;
     }
-    if (frame.type !== "message" || frame.version !== 3) return;
+    if (frame.type !== "message" || frame.version !== 4) return;
 
     try {
       const currentSession = sessionRef.current;
       if (!currentSession) return;
       const replayKey = `${frame.chat_id}\u0000${frame.sender_username}\u0000${frame.message_id}`;
-      if (receivedFrameIdsRef.current.has(replayKey)) return;
+      if (receivedFrameIdsRef.current.has(replayKey)) {
+        const stateSnapshot = cipherRef.current.stateSnapshot();
+        if (!stateSnapshot) {
+          clearMemory();
+          return;
+        }
+        const acknowledged = socketRef.current?.acknowledge(
+          frame.chat_id,
+          frame.message_id,
+          frame.sender_username,
+          stateSnapshot,
+        ) ?? false;
+        wipeBytes(stateSnapshot.envelope);
+        if (!acknowledged) clearMemory();
+        return;
+      }
       if (receivedFrameIdsRef.current.size >= 10_000) {
         const oldest = receivedFrameIdsRef.current.values().next().value;
         if (oldest) receivedFrameIdsRef.current.delete(oldest);
       }
-      receivedFrameIdsRef.current.add(replayKey);
       const senderPublicKey = base64ToBytes(frame.sender_public_key_b64);
       const decrypted = cipherRef.current.decryptText(
         frame.chat_id,
@@ -262,6 +276,20 @@ export function useAbyssalSession() {
         base64ToBytes(frame.wrapped_key_b64),
         currentSession.username,
       );
+      const stateSnapshot = cipherRef.current.stateSnapshot();
+      if (!stateSnapshot) throw new Error("Identity unavailable");
+      const acknowledged = socketRef.current?.acknowledge(
+        frame.chat_id,
+        frame.message_id,
+        frame.sender_username,
+        stateSnapshot,
+      ) ?? false;
+      wipeBytes(stateSnapshot.envelope);
+      if (!acknowledged) {
+        clearMemory();
+        return;
+      }
+      receivedFrameIdsRef.current.add(replayKey);
       const payload = JSON.parse(decrypted) as Record<string, unknown>;
       if (payload.kind === "read_receipt") {
         const targetId = typeof payload.message_id === "string" ? payload.message_id : "";
@@ -660,6 +688,14 @@ export function useAbyssalSession() {
         encrypted,
         currentSession.username,
       );
+      const stateSnapshot = cipherRef.current.stateSnapshot();
+      if (!stateSnapshot) throw new Error("Identity unavailable");
+      const synced = socketRef.current?.syncIdentityState(stateSnapshot) ?? false;
+      wipeBytes(stateSnapshot.envelope);
+      if (!synced) {
+        clearMemory();
+        return;
+      }
       const blob = new Blob([plain.slice().buffer], { type: message.attachment.mimeType });
       setMedia({
         messageId: message.id,
@@ -676,7 +712,7 @@ export function useAbyssalSession() {
       wipeBytes(encrypted);
       wipeBytes(plain);
     }
-  }, [clearMedia, markRoomRead]);
+  }, [clearMedia, clearMemory, markRoomRead]);
 
   const exportAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
@@ -694,6 +730,14 @@ export function useAbyssalSession() {
         encrypted,
         currentSession.username,
       );
+      const stateSnapshot = cipherRef.current.stateSnapshot();
+      if (!stateSnapshot) throw new Error("Identity unavailable");
+      const synced = socketRef.current?.syncIdentityState(stateSnapshot) ?? false;
+      wipeBytes(stateSnapshot.envelope);
+      if (!synced) {
+        clearMemory();
+        return;
+      }
       const url = URL.createObjectURL(attachmentDownloadBlob(plain, message.attachment.mimeType));
       const link = document.createElement("a");
       link.href = url;
@@ -711,7 +755,7 @@ export function useAbyssalSession() {
       wipeBytes(encrypted);
       wipeBytes(plain);
     }
-  }, [markRoomRead]);
+  }, [clearMemory, markRoomRead]);
 
   const createRoom = useCallback((room: RoomRecord): boolean => {
     if (connection !== "connected") return false;
@@ -803,7 +847,7 @@ function validPresence(value: unknown): value is PresenceUser {
     return false;
   }
   try {
-    return base64ToBytes(user.identity_public_b64).byteLength === 64;
+    return base64ToBytes(user.identity_public_b64).byteLength === 96;
   } catch {
     return false;
   }
@@ -1017,4 +1061,5 @@ function wipeEncryptedPayload(payload: EncryptedPayload): void {
   wipeBytes(payload.ciphertext);
   wipeBytes(payload.signature);
   payload.envelopes.forEach((envelope) => wipeBytes(envelope.wrappedKey));
+  wipeBytes(payload.identityEnvelope);
 }
