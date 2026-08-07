@@ -87,7 +87,7 @@ interface IEncryptedAttachmentService {
     ): AttachmentUploadResult
 
     suspend fun downloadEncryptedAttachment(attachmentId: String): ByteArray?
-    suspend fun saveEncryptedAttachmentExport(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
+    suspend fun saveDecryptedAttachment(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
 }
 
 interface IDisguiseManager {
