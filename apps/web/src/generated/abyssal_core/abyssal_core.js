@@ -39,12 +39,14 @@ export class WasmE2eeSession {
      * @param {Uint8Array} ciphertext
      * @param {Uint8Array} signature
      * @param {Uint8Array} wrapped_key
+     * @param {string} recipient_prekey_id
+     * @param {boolean} is_prekey
      * @param {string} recipient_username
      * @returns {string}
      */
-    decrypt(chat_id, message_id, sender_username, sender_public_key, nonce, ciphertext, signature, wrapped_key, recipient_username) {
-        let deferred11_0;
-        let deferred11_1;
+    decrypt(chat_id, message_id, sender_username, sender_public_key, nonce, ciphertext, signature, wrapped_key, recipient_prekey_id, is_prekey, recipient_username) {
+        let deferred12_0;
+        let deferred12_1;
         try {
             const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len0 = WASM_VECTOR_LEN;
@@ -62,20 +64,22 @@ export class WasmE2eeSession {
             const len6 = WASM_VECTOR_LEN;
             const ptr7 = passArray8ToWasm0(wrapped_key, wasm.__wbindgen_malloc);
             const len7 = WASM_VECTOR_LEN;
-            const ptr8 = passStringToWasm0(recipient_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const ptr8 = passStringToWasm0(recipient_prekey_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len8 = WASM_VECTOR_LEN;
-            const ret = wasm.wasme2eesession_decrypt(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8);
-            var ptr10 = ret[0];
-            var len10 = ret[1];
+            const ptr9 = passStringToWasm0(recipient_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len9 = WASM_VECTOR_LEN;
+            const ret = wasm.wasme2eesession_decrypt(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8, is_prekey, ptr9, len9);
+            var ptr11 = ret[0];
+            var len11 = ret[1];
             if (ret[3]) {
-                ptr10 = 0; len10 = 0;
+                ptr11 = 0; len11 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred11_0 = ptr10;
-            deferred11_1 = len10;
-            return getStringFromWasm0(ptr10, len10);
+            deferred12_0 = ptr11;
+            deferred12_1 = len11;
+            return getStringFromWasm0(ptr11, len11);
         } finally {
-            wasm.__wbindgen_free(deferred11_0, deferred11_1, 1);
+            wasm.__wbindgen_free(deferred12_0, deferred12_1, 1);
         }
     }
     /**
@@ -112,6 +116,21 @@ export class WasmE2eeSession {
             return getStringFromWasm0(ptr6, len6);
         } finally {
             wasm.__wbindgen_free(deferred7_0, deferred7_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    prekeyId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasme2eesession_prekeyId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
     /**

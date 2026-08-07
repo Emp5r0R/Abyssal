@@ -294,6 +294,7 @@ private fun DashboardContent(
             SettingsDialog(
                 initialSettings = disguiseSettings,
                 sessionSecurity = sessionSecurity,
+                directoryCheckpoint = presence.firstOrNull()?.directoryDigest,
                 onDismiss = { showSettingsDialog = false },
                 onSave = { enabled, pin, duressPin ->
                     onUpdateDisguise(enabled, pin, duressPin)
@@ -477,6 +478,7 @@ private fun PresenceStrip(
 private fun SettingsDialog(
     initialSettings: DisguiseSettings,
     sessionSecurity: SessionSecurityState,
+    directoryCheckpoint: String?,
     onDismiss: () -> Unit,
     onSave: (Boolean, String, String) -> Unit,
     onLock: () -> Unit,
@@ -523,6 +525,24 @@ private fun SettingsDialog(
                 onClick = onEndSession,
                 danger = true,
                 modifier = Modifier.weight(1f)
+            )
+        }
+
+        if (!directoryCheckpoint.isNullOrBlank()) {
+            SectionLabel(
+                text = "DIRECTORY CHECKPOINT",
+                modifier = Modifier.fillMaxWidth(),
+                color = NeonCyan
+            )
+            Text(
+                text = directoryCheckpoint.chunked(4).joinToString(" "),
+                color = PureWhite,
+                fontSize = 11.sp,
+                lineHeight = 17.sp,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp, bottom = 22.dp)
             )
         }
 
@@ -1057,15 +1077,15 @@ private fun DashboardContentPreview() {
         selfDestructDurationSec = 5
     )
     DashboardContent(
-        currentUser = User("SilentVector482", ByteArray(96)),
+        currentUser = User("SilentVector482", ByteArray(128)),
         sessions = listOf(
             ChatSession("room", "operations", true, sampleMessage, 3, 5, ownerUsername = "SilentVector482"),
             ChatSession("dm", "LunarNode231", false, null, 0, 10)
         ),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
         presence = listOf(
-            UserPresence("SilentVector482", true, ByteArray(96)),
-            UserPresence("LunarNode231", false, ByteArray(96))
+            UserPresence("SilentVector482", true, ByteArray(128)),
+            UserPresence("LunarNode231", false, ByteArray(128))
         ),
         sessionSecurity = SessionSecurityState(
             active = true,

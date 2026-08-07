@@ -54,6 +54,7 @@ interface FinishOpaqueAccountInput {
   registrationUpload?: Uint8Array;
   credentialFinalization?: Uint8Array;
   identityPublicKey?: Uint8Array;
+  identityPrekeyId?: string;
   identityEnvelope?: Uint8Array;
 }
 
@@ -79,6 +80,7 @@ export async function finishOpaqueAccount(
       identity_public_b64: input.identityPublicKey
         ? bytesToBase64(input.identityPublicKey)
         : undefined,
+      identity_prekey_id: input.identityPrekeyId,
       identity_envelope_b64: input.identityEnvelope
         ? bytesToBase64(input.identityEnvelope)
         : undefined,
@@ -92,8 +94,14 @@ export async function finishOpaqueAccount(
     !payload.token ||
     !payload.username ||
     !payload.identity_public_b64 ||
+    !payload.identity_prekey_id ||
     !payload.identity_envelope_b64
   ) {
+    throw new Error("Wrong information");
+  }
+  const identityPublicKey = base64ToBytes(payload.identity_public_b64);
+  if (identityPublicKey.byteLength !== 128 || !/^[A-Za-z0-9_-]{1,32}$/.test(payload.identity_prekey_id)) {
+    identityPublicKey.fill(0);
     throw new Error("Wrong information");
   }
   return {
@@ -104,7 +112,8 @@ export async function finishOpaqueAccount(
     sessionInactivitySec: payload.session_inactivity_sec,
     endpoint,
     created: payload.created,
-    identityPublicKey: base64ToBytes(payload.identity_public_b64),
+    identityPublicKey,
+    identityPrekeyId: payload.identity_prekey_id,
   };
 }
 
@@ -198,6 +207,7 @@ export class RelaySocket {
     messageId: string,
     senderUsername: string,
     state: IdentityStateSnapshot,
+    usedPrekeyId: string,
   ): boolean {
     return this.send({
       type: "message_ack",
@@ -206,6 +216,9 @@ export class RelaySocket {
       sender_username: senderUsername,
       state_revision: state.revision,
       identity_envelope_b64: bytesToBase64(state.envelope),
+      identity_public_b64: bytesToBase64(state.identityPublicKey),
+      prekey_id: state.prekeyId,
+      used_prekey_id: usedPrekeyId,
     });
   }
 
@@ -214,6 +227,8 @@ export class RelaySocket {
       type: "identity_state",
       state_revision: state.revision,
       identity_envelope_b64: bytesToBase64(state.envelope),
+      identity_public_b64: bytesToBase64(state.identityPublicKey),
+      prekey_id: state.prekeyId,
     });
   }
 

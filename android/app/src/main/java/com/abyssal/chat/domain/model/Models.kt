@@ -2,17 +2,21 @@ package com.abyssal.chat.domain.model
 
 data class User(
     val username: String,
-    val publicKey: ByteArray
+    val publicKey: ByteArray,
+    val prekeyId: String = ""
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is User) return false
-        return username == other.username && publicKey.contentEquals(other.publicKey)
+        return username == other.username &&
+            prekeyId == other.prekeyId &&
+            publicKey.contentEquals(other.publicKey)
     }
 
     override fun hashCode(): Int {
         var result = username.hashCode()
         result = 31 * result + publicKey.contentHashCode()
+        result = 31 * result + prekeyId.hashCode()
         return result
     }
 }
@@ -114,6 +118,7 @@ data class IdentityValidationResult(
     val maxRoomsPerUser: Int = 5,
     val sessionInactivitySec: Int = 15 * 60,
     val publicKey: ByteArray? = null,
+    val prekeyId: String? = null,
     val error: String? = null
 )
 
@@ -138,7 +143,9 @@ data class IncomingTransportPayload(
     val signature: ByteArray,
     val wrappedKey: ByteArray,
     val senderUsername: String,
-    val senderPublicKey: ByteArray
+    val senderPublicKey: ByteArray,
+    val prekeyId: String = "",
+    val isPrekey: Boolean = false
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -150,7 +157,9 @@ data class IncomingTransportPayload(
             ciphertext.contentEquals(other.ciphertext) &&
             signature.contentEquals(other.signature) &&
             wrappedKey.contentEquals(other.wrappedKey) &&
-            senderPublicKey.contentEquals(other.senderPublicKey)
+            senderPublicKey.contentEquals(other.senderPublicKey) &&
+            prekeyId == other.prekeyId &&
+            isPrekey == other.isPrekey
     }
 
     override fun hashCode(): Int {
@@ -162,13 +171,17 @@ data class IncomingTransportPayload(
         result = 31 * result + wrappedKey.contentHashCode()
         result = 31 * result + senderUsername.hashCode()
         result = 31 * result + senderPublicKey.contentHashCode()
+        result = 31 * result + prekeyId.hashCode()
+        result = 31 * result + isPrekey.hashCode()
         return result
     }
 }
 
 data class RecipientEnvelope(
     val recipientUsername: String,
-    val wrappedKey: ByteArray
+    val wrappedKey: ByteArray,
+    val prekeyId: String = "",
+    val isPrekey: Boolean = false
 )
 
 data class EncryptedTransportPayload(
@@ -179,17 +192,22 @@ data class EncryptedTransportPayload(
     val signature: ByteArray,
     val envelopes: List<RecipientEnvelope>,
     val stateRevision: ULong,
-    val identityEnvelope: ByteArray
+    val identityEnvelope: ByteArray,
+    val identityPublicKey: ByteArray = ByteArray(0),
+    val prekeyId: String = ""
 )
 
 data class IdentityStateSnapshot(
     val revision: ULong,
-    val envelope: ByteArray
+    val envelope: ByteArray,
+    val identityPublicKey: ByteArray = ByteArray(0),
+    val prekeyId: String = ""
 )
 
 data class RecipientIdentity(
     val username: String,
-    val publicKey: ByteArray
+    val publicKey: ByteArray,
+    val prekeyId: String = ""
 )
 
 data class RoomChange(
@@ -207,7 +225,9 @@ data class DisguiseSettings(
 data class UserPresence(
     val username: String,
     val connected: Boolean,
-    val publicKey: ByteArray
+    val publicKey: ByteArray,
+    val prekeyId: String = "",
+    val directoryDigest: String = ""
 )
 
 data class AttachmentUploadResult(

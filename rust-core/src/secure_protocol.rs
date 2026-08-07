@@ -27,7 +27,10 @@ use zeroize::{Zeroize, Zeroizing};
 use wasm_bindgen::prelude::*;
 
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
-const IDENTITY_PUBLIC_BYTES: usize = IDENTITY_FINGERPRINT_BYTES + 32;
+const ONE_TIME_KEY_BYTES: usize = 32;
+const ONE_TIME_KEY_OFFSET: usize = IDENTITY_FINGERPRINT_BYTES;
+const FALLBACK_KEY_OFFSET: usize = ONE_TIME_KEY_OFFSET + ONE_TIME_KEY_BYTES;
+const IDENTITY_PUBLIC_BYTES: usize = FALLBACK_KEY_OFFSET + 32;
 const NONCE_BYTES: usize = 12;
 const MAX_CONTEXT_BYTES: usize = 512;
 const MAX_PAYLOAD_BYTES: usize = 220 * 1024 * 1024;
@@ -35,8 +38,8 @@ const MAX_IDENTITY_STATE_BYTES: usize = 512 * 1024;
 const MAX_RATCHET_ENVELOPE_BYTES: usize = 4096;
 const MAX_PEERS: usize = 256;
 const MAX_SESSIONS_PER_PEER: usize = 4;
-const PROTOCOL_VERSION: u32 = 4;
-const IDENTITY_ENVELOPE_VERSION: u8 = 2;
+const PROTOCOL_VERSION: u32 = 5;
+const IDENTITY_ENVELOPE_VERSION: u8 = 4;
 
 pub struct AbyssalOpaqueSuite;
 
@@ -71,12 +74,15 @@ pub struct OpaqueLoginFinish {
 pub struct RecipientPublicKey {
     pub username: String,
     pub public_key: Vec<u8>,
+    pub prekey_id: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, uniffi::Record)]
 pub struct RecipientEnvelope {
     pub username: String,
     pub wrapped_key: Vec<u8>,
+    pub prekey_id: String,
+    pub is_prekey: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, uniffi::Record)]
@@ -89,6 +95,8 @@ pub struct E2eePayload {
     pub envelopes: Vec<RecipientEnvelope>,
     pub state_revision: u64,
     pub identity_envelope: Vec<u8>,
+    pub identity_public: Vec<u8>,
+    pub prekey_id: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, uniffi::Record)]
@@ -96,6 +104,8 @@ pub struct E2eeDecryption {
     pub plaintext: Vec<u8>,
     pub state_revision: u64,
     pub identity_envelope: Vec<u8>,
+    pub identity_public: Vec<u8>,
+    pub prekey_id: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -108,15 +118,21 @@ struct StoredPeerSessions {
 struct StoredE2eeState {
     revision: u64,
     fallback_public: [u8; 32],
+    one_time_public: [u8; ONE_TIME_KEY_BYTES],
+    one_time_key_id: String,
     account: AccountPickle,
     peers: Vec<StoredPeerSessions>,
+    session_prekeys: HashMap<String, String>,
 }
 
 struct E2eeState {
     revision: u64,
     fallback_public: [u8; 32],
+    one_time_public: [u8; ONE_TIME_KEY_BYTES],
+    one_time_key_id: String,
     account: Account,
     sessions: HashMap<String, Vec<Session>>,
+    session_prekeys: HashMap<String, String>,
 }
 
 struct SealingMaterial {
@@ -221,10 +237,12 @@ pub fn conversation_safety_number(
     {
         return Err("Identity unavailable".to_string().into());
     }
-    let (first, second) = if first_public_key <= second_public_key {
-        (&first_public_key, &second_public_key)
+    let first_identity = &first_public_key[..IDENTITY_FINGERPRINT_BYTES];
+    let second_identity = &second_public_key[..IDENTITY_FINGERPRINT_BYTES];
+    let (first, second) = if first_identity <= second_identity {
+        (first_identity, second_identity)
     } else {
-        (&second_public_key, &first_public_key)
+        (second_identity, first_identity)
     };
     let mut hasher = Sha256::new();
     hasher.update(b"ABYSSAL_SAFETY_NUMBER_V2");
@@ -317,6 +335,14 @@ impl E2eeSession {
         validate_export_key(&export_key)?;
         let mut account = Account::new();
         account.generate_fallback_key();
+        account.generate_one_time_keys(1);
+        let one_time_public = account
+            .one_time_keys()
+            .into_iter()
+            .next()
+            .map(|(_, public)| public.to_bytes())
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        let one_time_key_id = prekey_id_for_public(&one_time_public);
         let fallback_public = account
             .fallback_key()
             .into_values()
@@ -328,8 +354,11 @@ impl E2eeSession {
             state: Mutex::new(E2eeState {
                 revision: 0,
                 fallback_public,
+                one_time_public,
+                one_time_key_id,
                 account,
                 sessions: HashMap::new(),
+                session_prekeys: HashMap::new(),
             }),
             sealing: Mutex::new(None),
         }))
@@ -373,32 +402,53 @@ impl E2eeSession {
         if stored.peers.len() > MAX_PEERS {
             return Err("Identity unavailable".to_string().into());
         }
+        validate_prekey_bundle(&stored.one_time_key_id, &stored.one_time_public)?;
         let mut sessions = HashMap::with_capacity(stored.peers.len());
+        let mut session_ids = HashSet::new();
         for peer in stored.peers {
             validate_username(&peer.peer)?;
             if peer.sessions.is_empty() || peer.sessions.len() > MAX_SESSIONS_PER_PEER {
                 return Err("Identity unavailable".to_string().into());
             }
             let peer_key = peer_key(&peer.peer);
-            if sessions
-                .insert(
-                    peer_key,
-                    peer.sessions
-                        .into_iter()
-                        .map(Session::from_pickle)
-                        .collect(),
-                )
-                .is_some()
+            let peer_sessions = peer
+                .sessions
+                .into_iter()
+                .map(Session::from_pickle)
+                .collect::<Vec<_>>();
+            if peer_sessions
+                .iter()
+                .any(|session| !session_ids.insert(session.session_id()))
+                || sessions.insert(peer_key, peer_sessions).is_some()
             {
                 return Err("Identity unavailable".to_string().into());
             }
+        }
+        if stored.session_prekeys.len() != session_ids.len()
+            || stored
+                .session_prekeys
+                .iter()
+                .any(|(session_id, prekey_id)| {
+                    !session_ids.contains(session_id)
+                        || prekey_id.is_empty()
+                        || prekey_id.len() > 32
+                        || !prekey_id.is_ascii()
+                        || !prekey_id.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                        })
+                })
+        {
+            return Err("Identity unavailable".to_string().into());
         }
         let session = Arc::new(Self {
             state: Mutex::new(E2eeState {
                 revision: stored.revision,
                 fallback_public: stored.fallback_public,
+                one_time_public: stored.one_time_public,
+                one_time_key_id: stored.one_time_key_id,
                 account: Account::from_pickle(stored.account),
                 sessions,
+                session_prekeys: stored.session_prekeys,
             }),
             sealing: Mutex::new(Some(SealingMaterial { key: *key, context })),
         });
@@ -416,8 +466,16 @@ impl E2eeSession {
         let mut result = Vec::with_capacity(IDENTITY_PUBLIC_BYTES);
         result.extend_from_slice(identity.curve25519.as_bytes());
         result.extend_from_slice(identity.ed25519.as_bytes());
+        result.extend_from_slice(&state.one_time_public);
         result.extend_from_slice(&state.fallback_public);
         result
+    }
+
+    pub fn prekey_id(&self) -> String {
+        let Ok(state) = self.state.lock() else {
+            return String::new();
+        };
+        state.one_time_key_id.clone()
     }
 
     pub fn seal_identity(
@@ -457,6 +515,12 @@ impl E2eeSession {
         for recipient in &recipients {
             validate_username(&recipient.username)?;
             if recipient.public_key.len() != IDENTITY_PUBLIC_BYTES
+                || recipient.prekey_id.is_empty()
+                || validate_prekey_bundle(
+                    &recipient.prekey_id,
+                    &recipient.public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET],
+                )
+                .is_err()
                 || !seen.insert(peer_key(&recipient.username))
             {
                 return Err("Recipient unavailable".to_string().into());
@@ -492,11 +556,14 @@ impl E2eeSession {
                 &recipient.public_key,
                 &aad,
                 &recipient.username,
+                &recipient.prekey_id,
             )
             .map_err(AbyssalError::from)?;
             envelopes.push(RecipientEnvelope {
                 username: recipient.username,
-                wrapped_key,
+                wrapped_key: wrapped_key.bytes,
+                prekey_id: wrapped_key.prekey_id,
+                is_prekey: wrapped_key.is_prekey,
             });
         }
         let signature_input = signature_input(&aad, &nonce, &ciphertext);
@@ -515,6 +582,8 @@ impl E2eeSession {
             envelopes,
             state_revision: state.revision,
             identity_envelope,
+            identity_public: public_key_from_state(&state),
+            prekey_id: state.one_time_key_id.clone(),
         })
     }
 
@@ -529,6 +598,8 @@ impl E2eeSession {
         ciphertext: Vec<u8>,
         signature: Vec<u8>,
         wrapped_key: Vec<u8>,
+        recipient_prekey_id: String,
+        is_prekey: bool,
         recipient_username: String,
     ) -> Result<E2eeDecryption, AbyssalError> {
         validate_message_context(&chat_id, &message_id, &sender_username)?;
@@ -557,14 +628,19 @@ impl E2eeSession {
             .as_ref()
             .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
         let mut state = lock(&self.state, "Identity unavailable")?;
-        let content_key = Zeroizing::new(ratchet_unwrap_content_key(
+        let (content_key, used_prekey) = ratchet_unwrap_content_key(
             &mut state,
             &sender_username,
             &sender_public_key,
             &wrapped_key,
             &aad,
-            &recipient_username,
-        )?);
+            RecipientEnvelopeContext {
+                prekey_id: &recipient_prekey_id,
+                is_prekey,
+                username: &recipient_username,
+            },
+        )?;
+        let content_key = Zeroizing::new(content_key);
         let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
             .map_err(|_| "Payload unavailable".to_string())?;
         let plaintext = cipher
@@ -576,6 +652,9 @@ impl E2eeSession {
                 },
             )
             .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+        if used_prekey {
+            rotate_one_time_key(&mut state)?;
+        }
         state.revision = state
             .revision
             .checked_add(1)
@@ -585,8 +664,22 @@ impl E2eeSession {
             plaintext,
             state_revision: state.revision,
             identity_envelope,
+            identity_public: public_key_from_state(&state),
+            prekey_id: state.one_time_key_id.clone(),
         })
     }
+}
+
+struct WrappedContentKey {
+    bytes: Vec<u8>,
+    prekey_id: String,
+    is_prekey: bool,
+}
+
+struct RecipientEnvelopeContext<'a> {
+    prekey_id: &'a str,
+    is_prekey: bool,
+    username: &'a str,
 }
 
 fn ratchet_wrap_content_key(
@@ -595,40 +688,83 @@ fn ratchet_wrap_content_key(
     recipient_public: &[u8],
     aad: &[u8],
     recipient_username: &str,
-) -> Result<Vec<u8>, String> {
+    recipient_prekey_id: &str,
+) -> Result<WrappedContentKey, String> {
     let key = peer_key(recipient_username);
-    if !state.sessions.contains_key(&key) {
-        if state.sessions.len() >= MAX_PEERS {
+    let needs_new_session = match state
+        .sessions
+        .get(&key)
+        .and_then(|sessions| sessions.last())
+    {
+        Some(session) if session.has_received_message() => false,
+        Some(session) => state
+            .session_prekeys
+            .get(&session.session_id())
+            .is_none_or(|prekey_id| prekey_id != recipient_prekey_id),
+        None => true,
+    };
+    if needs_new_session {
+        if !state.sessions.contains_key(&key) && state.sessions.len() >= MAX_PEERS {
             return Err("Recipient unavailable".to_string());
         }
         let identity_key = Curve25519PublicKey::from_slice(&recipient_public[..32])
             .map_err(|_| "Recipient unavailable".to_string())?;
-        let fallback_key = Curve25519PublicKey::from_slice(
-            &recipient_public[IDENTITY_FINGERPRINT_BYTES..IDENTITY_PUBLIC_BYTES],
+        let one_time_key = Curve25519PublicKey::from_slice(
+            &recipient_public[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET],
         )
         .map_err(|_| "Recipient unavailable".to_string())?;
         let session = state
             .account
-            .create_outbound_session(SessionConfig::version_2(), identity_key, fallback_key)
+            .create_outbound_session(SessionConfig::version_2(), identity_key, one_time_key)
             .map_err(|_| "Recipient unavailable".to_string())?;
-        state.sessions.insert(key.clone(), vec![session]);
+        let session_id = session.session_id();
+        let sessions = state.sessions.entry(key.clone()).or_default();
+        let evicted = if sessions.len() >= MAX_SESSIONS_PER_PEER {
+            Some(sessions.remove(0).session_id())
+        } else {
+            None
+        };
+        sessions.push(session);
+        if let Some(evicted) = evicted {
+            state.session_prekeys.remove(&evicted);
+        }
+        state
+            .session_prekeys
+            .insert(session_id, recipient_prekey_id.to_string());
     }
-    let sessions = state
+    let session_id = state
         .sessions
-        .get_mut(&key)
+        .get(&key)
+        .and_then(|sessions| sessions.last())
+        .map(Session::session_id)
         .ok_or_else(|| "Recipient unavailable".to_string())?;
-    let session = sessions
-        .last_mut()
+    let session_prekey_id = state
+        .session_prekeys
+        .get(&session_id)
+        .cloned()
         .ok_or_else(|| "Recipient unavailable".to_string())?;
     let bound_key = Zeroizing::new(bound_content_key(content_key, aad, recipient_username));
-    let message = session
+    let message = state
+        .sessions
+        .get_mut(&key)
+        .and_then(|sessions| sessions.last_mut())
+        .ok_or_else(|| "Recipient unavailable".to_string())?
         .encrypt(bound_key.as_slice())
         .map_err(|_| "Recipient unavailable".to_string())?;
     let encoded = serde_json::to_vec(&message).map_err(|_| "Recipient unavailable".to_string())?;
     if encoded.len() > MAX_RATCHET_ENVELOPE_BYTES {
         return Err("Recipient unavailable".to_string());
     }
-    Ok(encoded)
+    let is_prekey = matches!(&message, OlmMessage::PreKey(_));
+    Ok(WrappedContentKey {
+        bytes: encoded,
+        prekey_id: if is_prekey {
+            session_prekey_id
+        } else {
+            String::new()
+        },
+        is_prekey,
+    })
 }
 
 fn ratchet_unwrap_content_key(
@@ -637,18 +773,37 @@ fn ratchet_unwrap_content_key(
     sender_public: &[u8],
     wrapped: &[u8],
     aad: &[u8],
-    recipient_username: &str,
-) -> Result<[u8; 32], String> {
+    recipient: RecipientEnvelopeContext<'_>,
+) -> Result<([u8; 32], bool), String> {
     if wrapped.is_empty() || wrapped.len() > MAX_RATCHET_ENVELOPE_BYTES {
         return Err("Payload unavailable".to_string());
     }
     let message: OlmMessage =
         serde_json::from_slice(wrapped).map_err(|_| "Payload unavailable".to_string())?;
+    let actual_is_prekey = matches!(&message, OlmMessage::PreKey(_));
+    let valid_prekey_id = recipient.prekey_id.len() <= 32
+        && recipient.prekey_id.is_ascii()
+        && recipient
+            .prekey_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    if !valid_prekey_id
+        || actual_is_prekey != recipient.is_prekey
+        || recipient.is_prekey == recipient.prekey_id.is_empty()
+        || match &message {
+            OlmMessage::PreKey(prekey) => {
+                prekey_id_for_public(&prekey.one_time_key().to_bytes()) != recipient.prekey_id
+            }
+            OlmMessage::Normal(_) => false,
+        }
+    {
+        return Err("Payload unavailable".to_string());
+    }
     let sender_identity = Curve25519PublicKey::from_slice(&sender_public[..32])
         .map_err(|_| "Sender unavailable".to_string())?;
     let key = peer_key(sender_username);
 
-    let plain = Zeroizing::new(match &message {
+    let (plain, used_prekey) = match &message {
         OlmMessage::PreKey(prekey) => {
             let existing = state.sessions.get_mut(&key).and_then(|sessions| {
                 sessions
@@ -656,9 +811,10 @@ fn ratchet_unwrap_content_key(
                     .find(|session| session.session_id() == prekey.session_id())
             });
             if let Some(session) = existing {
-                session
+                let plain = session
                     .decrypt(&message)
-                    .map_err(|_| "Payload unavailable".to_string())?
+                    .map_err(|_| "Payload unavailable".to_string())?;
+                (plain, false)
             } else {
                 if !state.sessions.contains_key(&key) && state.sessions.len() >= MAX_PEERS {
                     return Err("Payload unavailable".to_string());
@@ -668,12 +824,21 @@ fn ratchet_unwrap_content_key(
                     .create_inbound_session(SessionConfig::version_2(), sender_identity, prekey)
                     .map_err(|_| "Payload unavailable".to_string())?;
                 let plain = created.plaintext;
+                let session_id = created.session.session_id();
                 let sessions = state.sessions.entry(key).or_default();
-                if sessions.len() >= MAX_SESSIONS_PER_PEER {
-                    sessions.remove(0);
-                }
+                let evicted = if sessions.len() >= MAX_SESSIONS_PER_PEER {
+                    Some(sessions.remove(0).session_id())
+                } else {
+                    None
+                };
                 sessions.push(created.session);
-                plain
+                if let Some(evicted) = evicted {
+                    state.session_prekeys.remove(&evicted);
+                }
+                state
+                    .session_prekeys
+                    .insert(session_id, recipient.prekey_id.to_string());
+                (plain, true)
             }
         }
         OlmMessage::Normal(_) => {
@@ -688,19 +853,26 @@ fn ratchet_unwrap_content_key(
                     break;
                 }
             }
-            decrypted.ok_or_else(|| "Payload unavailable".to_string())?
+            (
+                decrypted.ok_or_else(|| "Payload unavailable".to_string())?,
+                false,
+            )
         }
-    });
+    };
+    let plain = Zeroizing::new(plain);
     if plain.len() != 64 {
         return Err("Payload unavailable".to_string());
     }
-    let expected_binding = content_key_binding(aad, recipient_username);
+    let expected_binding = content_key_binding(aad, recipient.username);
     if plain[32..] != expected_binding {
         return Err("Payload unavailable".to_string());
     }
-    plain[..32]
-        .try_into()
-        .map_err(|_| "Payload unavailable".to_string())
+    Ok((
+        plain[..32]
+            .try_into()
+            .map_err(|_| "Payload unavailable".to_string())?,
+        used_prekey,
+    ))
 }
 
 fn bound_content_key(content_key: &[u8; 32], aad: &[u8], recipient_username: &str) -> Vec<u8> {
@@ -724,7 +896,10 @@ fn seal_state(state: &E2eeState, sealing: &SealingMaterial) -> Result<Vec<u8>, S
     let stored = StoredE2eeState {
         revision: state.revision,
         fallback_public: state.fallback_public,
+        one_time_public: state.one_time_public,
+        one_time_key_id: state.one_time_key_id.clone(),
         account: state.account.pickle(),
+        session_prekeys: state.session_prekeys.clone(),
         peers: state
             .sessions
             .iter()
@@ -760,6 +935,42 @@ fn seal_state(state: &E2eeState, sealing: &SealingMaterial) -> Result<Vec<u8>, S
     Ok(result)
 }
 
+fn public_key_from_state(state: &E2eeState) -> Vec<u8> {
+    let identity = state.account.identity_keys();
+    let mut result = Vec::with_capacity(IDENTITY_PUBLIC_BYTES);
+    result.extend_from_slice(identity.curve25519.as_bytes());
+    result.extend_from_slice(identity.ed25519.as_bytes());
+    result.extend_from_slice(&state.one_time_public);
+    result.extend_from_slice(&state.fallback_public);
+    result
+}
+
+fn rotate_one_time_key(state: &mut E2eeState) -> Result<(), String> {
+    state.account.generate_one_time_keys(1);
+    let public = state
+        .account
+        .one_time_keys()
+        .into_iter()
+        .next()
+        .map(|(_, public)| public.to_bytes())
+        .ok_or_else(|| "Identity unavailable".to_string())?;
+    state.account.mark_keys_as_published();
+    state.one_time_key_id = prekey_id_for_public(&public);
+    state.one_time_public = public;
+    Ok(())
+}
+
+pub fn prekey_id_for_public(public_key: &[u8; ONE_TIME_KEY_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(canonical_parts(&[b"ABYSSAL_PREKEY_ID_V1", public_key]));
+    let mut result = String::with_capacity(32);
+    for byte in &digest[..16] {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
 fn peer_key(username: &str) -> String {
     username.to_ascii_lowercase()
 }
@@ -773,14 +984,14 @@ fn lock<'a, T>(mutex: &'a Mutex<T>, message: &str) -> Result<MutexGuard<'a, T>, 
 fn identity_wrap_key(export_key: &[u8], context: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
     Hkdf::<Sha256>::new(Some(context), export_key)
-        .expand(b"ABYSSAL_IDENTITY_WRAP_V2", &mut key)
+        .expand(b"ABYSSAL_IDENTITY_WRAP_V3", &mut key)
         .map_err(|_| "Identity unavailable".to_string())?;
     Ok(key)
 }
 
 fn message_aad(chat_id: &str, message_id: &str, sender_username: &str) -> Vec<u8> {
     canonical_parts(&[
-        b"ABYSSAL_E2EE_PAYLOAD_V4",
+        b"ABYSSAL_E2EE_PAYLOAD_V5",
         chat_id.as_bytes(),
         message_id.as_bytes(),
         sender_username.as_bytes(),
@@ -823,6 +1034,33 @@ fn validate_context(context: &[u8]) -> Result<(), String> {
     } else {
         Err("Identity unavailable".to_string())
     }
+}
+
+fn validate_prekey_bundle(prekey_id: &str, public_key: &[u8]) -> Result<(), String> {
+    if public_key.len() != ONE_TIME_KEY_BYTES
+        || prekey_id.len() > 32
+        || !prekey_id.is_ascii()
+        || !prekey_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Identity unavailable".to_string());
+    }
+    if prekey_id.is_empty() {
+        if public_key.iter().any(|byte| *byte != 0) {
+            return Err("Identity unavailable".to_string());
+        }
+    } else if public_key.iter().all(|byte| *byte == 0)
+        || prekey_id
+            != prekey_id_for_public(
+                public_key
+                    .try_into()
+                    .map_err(|_| "Identity unavailable".to_string())?,
+            )
+    {
+        return Err("Identity unavailable".to_string());
+    }
+    Ok(())
 }
 
 fn validate_identifier(identifier: &[u8]) -> Result<(), String> {
@@ -933,6 +1171,11 @@ impl WasmE2eeSession {
         self.inner.public_key()
     }
 
+    #[wasm_bindgen(js_name = prekeyId)]
+    pub fn wasm_prekey_id(&self) -> String {
+        self.inner.prekey_id()
+    }
+
     #[wasm_bindgen(js_name = sealIdentity)]
     pub fn wasm_seal_identity(
         &self,
@@ -972,6 +1215,8 @@ impl WasmE2eeSession {
         ciphertext: Vec<u8>,
         signature: Vec<u8>,
         wrapped_key: Vec<u8>,
+        recipient_prekey_id: String,
+        is_prekey: bool,
         recipient_username: String,
     ) -> Result<String, JsValue> {
         let result = self
@@ -985,6 +1230,8 @@ impl WasmE2eeSession {
                 ciphertext,
                 signature,
                 wrapped_key,
+                recipient_prekey_id,
+                is_prekey,
                 recipient_username,
             )
             .map_err(js_error)?;
@@ -1114,6 +1361,9 @@ mod tests {
         assert_eq!(alice.public_key(), recovered.public_key());
 
         let bob = sealed_session(7);
+        let bob_initial_prekey = bob.prekey_id();
+        let safety_before = conversation_safety_number(alice.public_key(), bob.public_key())
+            .expect("safety number");
         let payload = alice
             .encrypt(
                 "dm_alice_bob".to_string(),
@@ -1123,9 +1373,12 @@ mod tests {
                 vec![RecipientPublicKey {
                     username: "Bob".to_string(),
                     public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
                 }],
             )
             .expect("encrypt");
+        assert!(payload.envelopes[0].is_prekey);
+        assert_eq!(payload.envelopes[0].prekey_id, bob_initial_prekey);
         assert!(!payload
             .ciphertext
             .windows(b"relay cannot read this".len())
@@ -1140,10 +1393,50 @@ mod tests {
                 payload.ciphertext,
                 payload.signature,
                 payload.envelopes[0].wrapped_key.clone(),
+                payload.envelopes[0].prekey_id.clone(),
+                payload.envelopes[0].is_prekey,
                 "Bob".to_string(),
             )
             .expect("decrypt");
         assert_eq!(plain.plaintext, b"relay cannot read this");
+        assert_ne!(bob.prekey_id(), bob_initial_prekey);
+        let bob_rotated_prekey = bob.prekey_id();
+        let follow_up = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "message-2".to_string(),
+                "Alice".to_string(),
+                b"new prekey session".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Bob".to_string(),
+                    public_key: bob.public_key(),
+                    prekey_id: bob_rotated_prekey.clone(),
+                }],
+            )
+            .expect("encrypt after recipient prekey rotation");
+        assert!(follow_up.envelopes[0].is_prekey);
+        assert_eq!(follow_up.envelopes[0].prekey_id, bob_rotated_prekey);
+        let follow_up_plain = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                follow_up.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                follow_up.nonce,
+                follow_up.ciphertext,
+                follow_up.signature,
+                follow_up.envelopes[0].wrapped_key.clone(),
+                follow_up.envelopes[0].prekey_id.clone(),
+                follow_up.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .expect("decrypt after recipient prekey rotation");
+        assert_eq!(follow_up_plain.plaintext, b"new prekey session");
+        assert_eq!(
+            safety_before,
+            conversation_safety_number(alice.public_key(), bob.public_key())
+                .expect("stable safety number")
+        );
     }
 
     #[test]
@@ -1157,6 +1450,7 @@ mod tests {
         let recipient = RecipientPublicKey {
             username: "Bob".to_string(),
             public_key: bob.public_key(),
+            prekey_id: bob.prekey_id(),
         };
         let first = alice
             .encrypt(
@@ -1200,6 +1494,8 @@ mod tests {
                 second.ciphertext,
                 second.signature,
                 second.envelopes[0].wrapped_key.clone(),
+                second.envelopes[0].prekey_id.clone(),
+                second.envelopes[0].is_prekey,
                 "Bob".to_string(),
             )
             .expect("late decrypt");
@@ -1214,6 +1510,8 @@ mod tests {
                 first.ciphertext.clone(),
                 first.signature.clone(),
                 first.envelopes[0].wrapped_key.clone(),
+                first.envelopes[0].prekey_id.clone(),
+                first.envelopes[0].is_prekey,
                 "Bob".to_string(),
             )
             .expect("early decrypt");
@@ -1230,6 +1528,8 @@ mod tests {
                 first.ciphertext,
                 first.signature,
                 first.envelopes[0].wrapped_key.clone(),
+                first.envelopes[0].prekey_id.clone(),
+                first.envelopes[0].is_prekey,
                 "Bob".to_string(),
             )
             .is_err());
@@ -1243,6 +1543,7 @@ mod tests {
                 vec![RecipientPublicKey {
                     username: "Alice".to_string(),
                     public_key: alice.public_key(),
+                    prekey_id: alice.prekey_id(),
                 }],
             )
             .expect("reply encrypt");
@@ -1259,6 +1560,8 @@ mod tests {
                 reply.ciphertext,
                 reply.signature,
                 reply.envelopes[0].wrapped_key.clone(),
+                reply.envelopes[0].prekey_id.clone(),
+                reply.envelopes[0].is_prekey,
                 "Alice".to_string(),
             )
             .expect("reply decrypt");
@@ -1293,6 +1596,8 @@ mod tests {
                 third.ciphertext,
                 third.signature,
                 third.envelopes[0].wrapped_key.clone(),
+                third.envelopes[0].prekey_id.clone(),
+                third.envelopes[0].is_prekey,
                 "Bob".to_string(),
             )
             .expect("decrypt after state restore");
@@ -1314,6 +1619,7 @@ mod tests {
                 vec![RecipientPublicKey {
                     username: "Bob".to_string(),
                     public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
                 }],
             )
             .expect("encrypt");
@@ -1327,6 +1633,38 @@ mod tests {
                 payload.ciphertext.clone(),
                 payload.signature.clone(),
                 payload.envelopes[0].wrapped_key.clone(),
+                payload.envelopes[0].prekey_id.clone(),
+                payload.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .is_err());
+        assert!(bob
+            .decrypt(
+                "forum_one".to_string(),
+                payload.message_id.clone(),
+                "Alice".to_string(),
+                alice.public_key(),
+                payload.nonce.clone(),
+                payload.ciphertext.clone(),
+                payload.signature.clone(),
+                payload.envelopes[0].wrapped_key.clone(),
+                "wrong-prekey".to_string(),
+                true,
+                "Bob".to_string(),
+            )
+            .is_err());
+        assert!(bob
+            .decrypt(
+                "forum_one".to_string(),
+                payload.message_id.clone(),
+                "Alice".to_string(),
+                alice.public_key(),
+                payload.nonce.clone(),
+                payload.ciphertext.clone(),
+                payload.signature.clone(),
+                payload.envelopes[0].wrapped_key.clone(),
+                String::new(),
+                false,
                 "Bob".to_string(),
             )
             .is_err());
@@ -1341,6 +1679,8 @@ mod tests {
                 payload.ciphertext,
                 payload.signature,
                 payload.envelopes[0].wrapped_key.clone(),
+                payload.envelopes[0].prekey_id.clone(),
+                payload.envelopes[0].is_prekey,
                 "Bob".to_string(),
             )
             .is_err());

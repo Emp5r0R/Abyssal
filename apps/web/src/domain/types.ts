@@ -16,6 +16,7 @@ export interface AccountSession {
   endpoint: NodeEndpoint;
   created: boolean;
   identityPublicKey: Uint8Array;
+  identityPrekeyId: string;
 }
 
 export interface AccountResponse {
@@ -27,6 +28,7 @@ export interface AccountResponse {
   max_rooms_per_user: number;
   session_inactivity_sec: number;
   identity_public_b64?: string | null;
+  identity_prekey_id?: string | null;
   identity_envelope_b64?: string | null;
   error?: string | null;
 }
@@ -38,6 +40,7 @@ export interface OpaqueAccountStartResponse {
   response_b64?: string | null;
   node_id: string;
   identity_public_b64?: string | null;
+  identity_prekey_id?: string | null;
   identity_envelope_b64?: string | null;
   error?: string | null;
 }
@@ -46,6 +49,8 @@ export interface PresenceUser {
   username: string;
   connected: boolean;
   identity_public_b64: string;
+  identity_prekey_id: string;
+  directory_digest: string;
 }
 
 export interface RoomRecord {
@@ -125,6 +130,8 @@ export type IncomingFrame =
       wrapped_key_b64: string;
       sender_username: string;
       sender_public_key_b64: string;
+      prekey_id: string;
+      is_prekey: boolean;
     }
   | { type: "presence"; users: PresenceUser[] }
   | { type: "GLOBAL_WIPE" | "global_wipe" }

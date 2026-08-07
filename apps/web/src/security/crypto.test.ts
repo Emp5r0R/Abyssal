@@ -65,11 +65,11 @@ describe("recipient E2EE", () => {
     const bob = identity(2);
     const eve = identity(3);
     const payload = alice.encryptText(CHAT_ID, MESSAGE_ID, "Alice", "classified", [
-      { username: "Bob", publicKey: bob.publicKey() },
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
     const envelope = payload.envelopes[0];
 
-    expect(payload.version).toBe(4);
+    expect(payload.version).toBe(5);
     expect(payload.stateRevision).toBe(1);
     expect(payload.identityEnvelope.byteLength).toBeGreaterThan(64);
     expect(payload.ciphertext).not.toEqual(new TextEncoder().encode("classified"));
@@ -81,6 +81,8 @@ describe("recipient E2EE", () => {
         alice.publicKey(),
         payload,
         envelope.wrappedKey,
+        envelope.prekeyId,
+        envelope.isPrekey,
         "Bob",
       ),
     ).toBe("classified");
@@ -99,6 +101,8 @@ describe("recipient E2EE", () => {
         alice.publicKey(),
         payload,
         envelope.wrappedKey,
+        envelope.prekeyId,
+        envelope.isPrekey,
         "Bob",
       ),
     ).toThrow();
@@ -109,7 +113,7 @@ describe("recipient E2EE", () => {
     const bobExport = new Uint8Array(64).fill(12);
     const bob = new InMemoryPayloadCipher();
     bob.createIdentity(bobExport, CONTEXT);
-    const recipients = [{ username: "Bob", publicKey: bob.publicKey() }];
+    const recipients = [{ username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() }];
     const first = alice.encryptText(CHAT_ID, "message_early", "Alice", "early", recipients);
     const second = alice.encryptText(CHAT_ID, "message_late", "Alice", "late", recipients);
 
@@ -120,6 +124,8 @@ describe("recipient E2EE", () => {
       alice.publicKey(),
       second,
       second.envelopes[0].wrappedKey,
+      second.envelopes[0].prekeyId,
+      second.envelopes[0].isPrekey,
       "Bob",
     )).toBe("late");
     expect(bob.decryptText(
@@ -129,6 +135,8 @@ describe("recipient E2EE", () => {
       alice.publicKey(),
       first,
       first.envelopes[0].wrappedKey,
+      first.envelopes[0].prekeyId,
+      first.envelopes[0].isPrekey,
       "Bob",
     )).toBe("early");
     const latest = bob.stateSnapshot();
@@ -140,6 +148,8 @@ describe("recipient E2EE", () => {
       alice.publicKey(),
       first,
       first.envelopes[0].wrappedKey,
+      first.envelopes[0].prekeyId,
+      first.envelopes[0].isPrekey,
       "Bob",
     )).toThrow();
 
@@ -153,6 +163,8 @@ describe("recipient E2EE", () => {
       alice.publicKey(),
       third,
       third.envelopes[0].wrappedKey,
+      third.envelopes[0].prekeyId,
+      third.envelopes[0].isPrekey,
       "Bob",
     )).toBe("restored");
   });
@@ -161,7 +173,7 @@ describe("recipient E2EE", () => {
     const alice = identity(4);
     const bob = identity(5);
     const payload = alice.encryptText(CHAT_ID, MESSAGE_ID, "Alice", "secret", [
-      { username: "Bob", publicKey: bob.publicKey() },
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
     const decrypt = () => bob.decryptText(
       CHAT_ID,
@@ -170,8 +182,32 @@ describe("recipient E2EE", () => {
       alice.publicKey(),
       payload,
       payload.envelopes[0].wrappedKey,
+      payload.envelopes[0].prekeyId,
+      payload.envelopes[0].isPrekey,
       "Bob",
     );
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      MESSAGE_ID,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      payload.envelopes[0].wrappedKey,
+      "wrong-prekey",
+      true,
+      "Bob",
+    )).toThrow();
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      MESSAGE_ID,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      payload.envelopes[0].wrappedKey,
+      "",
+      false,
+      "Bob",
+    )).toThrow();
     payload.ciphertext[0] ^= 1;
     expect(decrypt).toThrow();
     payload.ciphertext[0] ^= 1;
@@ -185,6 +221,8 @@ describe("recipient E2EE", () => {
       alice.publicKey(),
       payload,
       payload.envelopes[0].wrappedKey,
+      payload.envelopes[0].prekeyId,
+      payload.envelopes[0].isPrekey,
       "Bob",
     )).toThrow();
     expect(() => bob.decryptText(
@@ -194,6 +232,8 @@ describe("recipient E2EE", () => {
       bob.publicKey(),
       payload,
       payload.envelopes[0].wrappedKey,
+      payload.envelopes[0].prekeyId,
+      payload.envelopes[0].isPrekey,
       "Bob",
     )).toThrow();
   });
@@ -204,7 +244,7 @@ describe("recipient E2EE", () => {
     const eve = identity(8);
     const plain = new Uint8Array([0, 255, 1, 128, 64]);
     const encrypted = alice.encryptBytes(CHAT_ID, "attachment_1", "Alice", plain, [
-      { username: "Bob", publicKey: bob.publicKey() },
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
     expect(encrypted).not.toEqual(plain);
     expect(bob.decryptBytes(CHAT_ID, "Alice", alice.publicKey(), encrypted, "Bob")).toEqual(plain);

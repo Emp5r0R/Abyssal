@@ -8,6 +8,7 @@ import {
   Plus,
   Radio,
   ShieldAlert,
+  ShieldCheck,
   Trash2,
   UserRound,
   UsersRound,
@@ -64,6 +65,7 @@ export function AppShell({
   const [confirmWipe, setConfirmWipe] = useState(false);
   const ownedRooms = rooms.filter((room) => room.owner_username === username).length;
   const activeUsers = presence.filter((user) => user.connected);
+  const directoryCheckpoint = presence[0]?.directory_digest;
 
   return (
     <main className={`app-shell ${activeRoomId ? "has-active-room" : ""}`}>
@@ -152,6 +154,11 @@ export function AppShell({
         <div className="sidebar-session">
           <div><Activity size={15} /><span>SESSION</span><strong>{formatDuration(remainingSessionSec)}</strong></div>
           <progress className="session-meter" max={sessionTimeoutSec} value={remainingSessionSec} aria-label="Session time remaining" />
+          {directoryCheckpoint ? (
+            <div className="directory-checkpoint" title={`Directory checkpoint ${directoryCheckpoint}`}>
+              <ShieldCheck size={14} /><span>DIRECTORY</span><strong>{shortCheckpoint(directoryCheckpoint)}</strong>
+            </div>
+          ) : null}
         </div>
 
         <div className="sidebar-actions">
@@ -308,4 +315,8 @@ function formatDuration(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;
   return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
+function shortCheckpoint(value: string): string {
+  return `${value.slice(0, 8)}...${value.slice(-4)}`;
 }

@@ -11,6 +11,8 @@ const DECODER = new TextDecoder("utf-8", { fatal: true });
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const USERNAME_PATTERN = /^[\x20-\x7e]{1,80}$/;
 const MAX_PAYLOAD_BYTES = 220 * 1024 * 1024;
+const IDENTITY_PUBLIC_KEY_BYTES = 128;
+const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 
 let wasmReady: Promise<unknown> | null = null;
 
@@ -35,15 +37,18 @@ export interface OpaqueLoginResult {
 export interface RecipientKey {
   username: string;
   publicKey: Uint8Array;
+  prekeyId: string;
 }
 
 export interface RecipientEnvelope {
   username: string;
   wrappedKey: Uint8Array;
+  prekeyId: string;
+  isPrekey: boolean;
 }
 
 export interface EncryptedPayload {
-  version: 4;
+  version: 5;
   messageId: string;
   nonce: Uint8Array;
   ciphertext: Uint8Array;
@@ -51,11 +56,15 @@ export interface EncryptedPayload {
   envelopes: RecipientEnvelope[];
   stateRevision: number;
   identityEnvelope: Uint8Array;
+  identityPublicKey: Uint8Array;
+  prekeyId: string;
 }
 
 export interface IdentityStateSnapshot {
   revision: number;
   envelope: Uint8Array;
+  identityPublicKey: Uint8Array;
+  prekeyId: string;
 }
 
 interface RustOpaqueStart {
@@ -82,15 +91,24 @@ interface RustEncryptedPayload {
   nonce: number[];
   ciphertext: number[];
   signature: number[];
-  envelopes: Array<{ username: string; wrapped_key: number[] }>;
+  envelopes: Array<{
+    username: string;
+    wrapped_key: number[];
+    prekey_id: string;
+    is_prekey: boolean;
+  }>;
   state_revision: number;
   identity_envelope: number[];
+  identity_public: number[];
+  prekey_id: string;
 }
 
 interface RustE2eeDecryption {
   plaintext: number[];
   state_revision: number;
   identity_envelope: number[];
+  identity_public: number[];
+  prekey_id: string;
 }
 
 export async function initializeCrypto(): Promise<void> {
@@ -176,6 +194,7 @@ export class InMemoryPayloadCipher {
 
   createIdentity(exportKey: Uint8Array, context: Uint8Array): {
     publicKey: Uint8Array;
+    prekeyId: string;
     envelope: Uint8Array;
   } {
     this.clear();
@@ -183,6 +202,7 @@ export class InMemoryPayloadCipher {
     this.#session = session;
     return {
       publicKey: session.publicKey(),
+      prekeyId: session.prekeyId(),
       envelope: session.sealIdentity(exportKey, context),
     };
   }
@@ -202,11 +222,18 @@ export class InMemoryPayloadCipher {
     return this.#session.publicKey();
   }
 
+  prekeyId(): string {
+    if (!this.#session) throw new Error("Identity unavailable");
+    return this.#session.prekeyId();
+  }
+
   stateSnapshot(): IdentityStateSnapshot | null {
     if (!this.#pendingState) return null;
     return {
       revision: this.#pendingState.revision,
       envelope: this.#pendingState.envelope.slice(),
+      identityPublicKey: this.#pendingState.identityPublicKey.slice(),
+      prekeyId: this.#pendingState.prekeyId,
     };
   }
 
@@ -232,6 +259,8 @@ export class InMemoryPayloadCipher {
     senderPublicKey: Uint8Array,
     payload: Pick<EncryptedPayload, "nonce" | "ciphertext" | "signature">,
     wrappedKey: Uint8Array,
+    recipientPrekeyId: string,
+    isPrekey: boolean,
     recipientUsername: string,
   ): string {
     const plain = this.decryptPayload(
@@ -241,6 +270,8 @@ export class InMemoryPayloadCipher {
       senderPublicKey,
       payload,
       wrappedKey,
+      recipientPrekeyId,
+      isPrekey,
       recipientUsername,
     );
     try {
@@ -286,12 +317,17 @@ export class InMemoryPayloadCipher {
       senderPublicKey,
       payload,
       envelope.wrappedKey,
+      envelope.prekeyId,
+      envelope.isPrekey,
       recipientUsername,
     );
   }
 
   clear(): void {
-    if (this.#pendingState) wipeBytes(this.#pendingState.envelope);
+    if (this.#pendingState) {
+      wipeBytes(this.#pendingState.envelope);
+      wipeBytes(this.#pendingState.identityPublicKey);
+    }
     this.#pendingState = null;
     this.#session?.free();
     this.#session = null;
@@ -310,13 +346,18 @@ export class InMemoryPayloadCipher {
     const rustRecipients = recipients.map((recipient) => {
       if (
         !USERNAME_PATTERN.test(recipient.username) ||
-        recipient.publicKey.byteLength !== 96 ||
+        recipient.publicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+        !PREKEY_ID_PATTERN.test(recipient.prekeyId) ||
         seen.has(recipient.username)
       ) {
         throw new Error("Recipient unavailable");
       }
       seen.add(recipient.username);
-      return { username: recipient.username, public_key: [...recipient.publicKey] };
+      return {
+        username: recipient.username,
+        public_key: [...recipient.publicKey],
+        prekey_id: recipient.prekeyId,
+      };
     });
     const result = parseJson<RustEncryptedPayload>(
       this.#session.encrypt(
@@ -328,7 +369,7 @@ export class InMemoryPayloadCipher {
       ),
     );
     if (
-      result.version !== 4 ||
+      result.version !== 5 ||
       result.message_id !== messageId ||
       !Number.isSafeInteger(result.state_revision) ||
       result.state_revision <= 0
@@ -336,9 +377,15 @@ export class InMemoryPayloadCipher {
       throw new Error("Payload unavailable");
     }
     const identityEnvelope = bytes(result.identity_envelope);
-    this.rememberState(result.state_revision, identityEnvelope);
+    const identityPublicKey = bytes(result.identity_public);
+    if (identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || !PREKEY_ID_PATTERN.test(result.prekey_id)) {
+      identityEnvelope.fill(0);
+      identityPublicKey.fill(0);
+      throw new Error("Payload unavailable");
+    }
+    this.rememberState(result.state_revision, identityEnvelope, identityPublicKey, result.prekey_id);
     return {
-      version: 4,
+      version: 5,
       messageId: result.message_id,
       nonce: bytes(result.nonce),
       ciphertext: bytes(result.ciphertext),
@@ -346,9 +393,13 @@ export class InMemoryPayloadCipher {
       envelopes: result.envelopes.map((envelope) => ({
         username: envelope.username,
         wrappedKey: bytes(envelope.wrapped_key),
+        prekeyId: envelope.prekey_id,
+        isPrekey: envelope.is_prekey,
       })),
       stateRevision: result.state_revision,
       identityEnvelope,
+      identityPublicKey,
+      prekeyId: result.prekey_id,
     };
   }
 
@@ -359,6 +410,8 @@ export class InMemoryPayloadCipher {
     senderPublicKey: Uint8Array,
     payload: Pick<EncryptedPayload, "nonce" | "ciphertext" | "signature">,
     wrappedKey: Uint8Array,
+    recipientPrekeyId: string,
+    isPrekey: boolean,
     recipientUsername: string,
   ): Uint8Array {
     if (!this.#session) throw new Error("Payload cipher unavailable");
@@ -373,6 +426,8 @@ export class InMemoryPayloadCipher {
         payload.ciphertext,
         payload.signature,
         wrappedKey,
+        recipientPrekeyId,
+        isPrekey,
         recipientUsername,
       ),
     );
@@ -380,14 +435,32 @@ export class InMemoryPayloadCipher {
       throw new Error("Payload unavailable");
     }
     const identityEnvelope = bytes(result.identity_envelope);
-    this.rememberState(result.state_revision, identityEnvelope);
+    const identityPublicKey = bytes(result.identity_public);
+    if (identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || !PREKEY_ID_PATTERN.test(result.prekey_id)) {
+      identityEnvelope.fill(0);
+      identityPublicKey.fill(0);
+      throw new Error("Payload unavailable");
+    }
+    this.rememberState(result.state_revision, identityEnvelope, identityPublicKey, result.prekey_id);
     wipeBytes(identityEnvelope);
+    identityPublicKey.fill(0);
     return bytes(result.plaintext);
   }
 
-  private rememberState(revision: number, envelope: Uint8Array): void {
+  private rememberState(
+    revision: number,
+    envelope: Uint8Array,
+    identityPublicKey: Uint8Array,
+    prekeyId: string,
+  ): void {
     if (this.#pendingState) wipeBytes(this.#pendingState.envelope);
-    this.#pendingState = { revision, envelope: envelope.slice() };
+    if (this.#pendingState) wipeBytes(this.#pendingState.identityPublicKey);
+    this.#pendingState = {
+      revision,
+      envelope: envelope.slice(),
+      identityPublicKey: identityPublicKey.slice(),
+      prekeyId,
+    };
   }
 }
 
@@ -400,9 +473,13 @@ export function payloadToFrame(payload: EncryptedPayload): Record<string, unknow
     signature_b64: bytesToBase64(payload.signature),
     state_revision: payload.stateRevision,
     identity_envelope_b64: bytesToBase64(payload.identityEnvelope),
+    identity_public_b64: bytesToBase64(payload.identityPublicKey),
+    prekey_id: payload.prekeyId,
     envelopes: payload.envelopes.map((envelope) => ({
       recipient_username: envelope.username,
       wrapped_key_b64: bytesToBase64(envelope.wrappedKey),
+      prekey_id: envelope.prekeyId,
+      is_prekey: envelope.isPrekey,
     })),
   };
 }
@@ -466,16 +543,18 @@ function serializePayload(payload: EncryptedPayload) {
     envelopes: payload.envelopes.map((envelope) => ({
       username: envelope.username,
       wrapped_key_b64: bytesToBase64(envelope.wrappedKey),
+      prekey_id: envelope.prekeyId,
+      is_prekey: envelope.isPrekey,
     })),
   };
 }
 
 function deserializePayload(value: ReturnType<typeof serializePayload>): EncryptedPayload {
-  if (value.version !== 4 || !CHAT_ID_PATTERN.test(value.message_id) || !Array.isArray(value.envelopes)) {
+  if (value.version !== 5 || !CHAT_ID_PATTERN.test(value.message_id) || !Array.isArray(value.envelopes)) {
     throw new Error("Payload unavailable");
   }
   return {
-    version: 4,
+    version: 5,
     messageId: value.message_id,
     nonce: base64ToBytes(value.nonce_b64),
     ciphertext: base64ToBytes(value.ciphertext_b64),
@@ -483,9 +562,13 @@ function deserializePayload(value: ReturnType<typeof serializePayload>): Encrypt
     envelopes: value.envelopes.map((envelope) => ({
       username: envelope.username,
       wrappedKey: base64ToBytes(envelope.wrapped_key_b64),
+      prekeyId: envelope.prekey_id,
+      isPrekey: envelope.is_prekey,
     })),
     stateRevision: 0,
     identityEnvelope: new Uint8Array(0),
+    identityPublicKey: new Uint8Array(0),
+    prekeyId: "",
   };
 }
 
@@ -494,5 +577,6 @@ function wipePayloadBytes(payload: EncryptedPayload): void {
   payload.ciphertext.fill(0);
   payload.signature.fill(0);
   payload.identityEnvelope.fill(0);
+  payload.identityPublicKey.fill(0);
   payload.envelopes.forEach((envelope) => envelope.wrappedKey.fill(0));
 }

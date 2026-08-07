@@ -131,12 +131,16 @@ class RealChatTransport(
             .put("signature_b64", encode(payload.signature))
             .put("state_revision", payload.stateRevision.toLong())
             .put("identity_envelope_b64", encode(payload.identityEnvelope))
+            .put("identity_public_b64", encode(payload.identityPublicKey))
+            .put("prekey_id", payload.prekeyId)
             .put("envelopes", JSONArray().apply {
                 payload.envelopes.forEach { envelope ->
                     put(
                         JSONObject()
                             .put("recipient_username", envelope.recipientUsername)
                             .put("wrapped_key_b64", encode(envelope.wrappedKey))
+                            .put("prekey_id", envelope.prekeyId)
+                            .put("is_prekey", envelope.isPrekey)
                     )
                 }
             })
@@ -150,6 +154,7 @@ class RealChatTransport(
         payload.ciphertext.fill(0)
         payload.signature.fill(0)
         payload.identityEnvelope.fill(0)
+        payload.identityPublicKey.fill(0)
         payload.envelopes.forEach { it.wrappedKey.fill(0) }
         return accepted
     }
@@ -158,7 +163,8 @@ class RealChatTransport(
         chatId: String,
         messageId: String,
         senderUsername: String,
-        state: IdentityStateSnapshot
+        state: IdentityStateSnapshot,
+        usedPrekeyId: String
     ): Boolean {
         val accepted = webSocket?.send(
             JSONObject()
@@ -168,6 +174,9 @@ class RealChatTransport(
                 .put("sender_username", senderUsername)
                 .put("state_revision", state.revision.toLong())
                 .put("identity_envelope_b64", encode(state.envelope))
+                .put("identity_public_b64", encode(state.identityPublicKey))
+                .put("prekey_id", state.prekeyId)
+                .put("used_prekey_id", usedPrekeyId)
                 .toString()
         ) == true
         if (!accepted) _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
@@ -180,6 +189,8 @@ class RealChatTransport(
                 .put("type", "identity_state")
                 .put("state_revision", state.revision.toLong())
                 .put("identity_envelope_b64", encode(state.envelope))
+                .put("identity_public_b64", encode(state.identityPublicKey))
+                .put("prekey_id", state.prekeyId)
                 .toString()
         ) == true
         if (!accepted) _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
@@ -233,7 +244,9 @@ class RealChatTransport(
                                     signature = decode(json.getString("signature_b64")),
                                     wrappedKey = decode(json.getString("wrapped_key_b64")),
                                     senderUsername = senderUsername,
-                                    senderPublicKey = decode(json.getString("sender_public_key_b64"))
+                                    senderPublicKey = decode(json.getString("sender_public_key_b64")),
+                                    prekeyId = json.optString("prekey_id"),
+                                    isPrekey = json.optBoolean("is_prekey", false)
                                 )
                             )
                         }
@@ -244,20 +257,45 @@ class RealChatTransport(
                                 val username = user.optString("username").takeIf { it.isNotBlank() }
                                     ?: return@mapNotNull null
                                 val publicKeyB64 = user.getString("identity_public_b64")
+                                val publicKey = decode(publicKeyB64)
+                                if (publicKey.size != IDENTITY_PUBLIC_KEY_BYTES) {
+                                    publicKey.fill(0)
+                                    return@mapNotNull null
+                                }
+                                val prekeyId = user.optString("identity_prekey_id")
+                                if (!PREKEY_ID_REGEX.matches(prekeyId)) {
+                                    publicKey.fill(0)
+                                    return@mapNotNull null
+                                }
+                                val fingerprint = encode(publicKey.copyOfRange(0, 64))
                                 val pinKey = username.lowercase()
                                 val pinned = identityPins[pinKey]
-                                if (pinned != null && pinned != publicKeyB64) {
+                                if (pinned != null && pinned != fingerprint) {
+                                    publicKey.fill(0)
                                     webSocket.close(1008, "identity changed")
                                     this@RealChatTransport.webSocket = null
                                     _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
                                     return
                                 }
-                                identityPins[pinKey] = publicKeyB64
+                                identityPins[pinKey] = fingerprint
+                                val directoryDigest = user.optString("directory_digest")
+                                if (!DIRECTORY_DIGEST_REGEX.matches(directoryDigest)) {
+                                    publicKey.fill(0)
+                                    return@mapNotNull null
+                                }
                                 UserPresence(
                                     username = username,
                                     connected = user.optBoolean("connected", false),
-                                    publicKey = decode(publicKeyB64)
+                                    publicKey = publicKey,
+                                    prekeyId = prekeyId,
+                                    directoryDigest = directoryDigest
                                 )
+                            }
+                            if (nextPresence.map { user -> user.directoryDigest }.distinct().size > 1) {
+                                webSocket.close(1008, "directory changed")
+                                this@RealChatTransport.webSocket = null
+                                _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+                                return
                             }
                             _presence.value = nextPresence
                         }
@@ -389,7 +427,10 @@ class RealChatTransport(
     }
 
     private companion object {
-        const val PROTOCOL_VERSION = 4
+        const val PROTOCOL_VERSION = 5
+        const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
+        val DIRECTORY_DIGEST_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
         val DIRECT_ID_REGEX = Regex("^dm_[A-Za-z0-9_-]{1,125}$")
 
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)

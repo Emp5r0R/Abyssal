@@ -22,7 +22,8 @@ const session: AccountSession = {
   sessionInactivitySec: 900,
   endpoint,
   created: false,
-  identityPublicKey: new Uint8Array(96),
+  identityPublicKey: new Uint8Array(128),
+  identityPrekeyId: "test-prekey",
 };
 
 afterEach(() => {
@@ -73,7 +74,7 @@ describe("account transport", () => {
   });
 
   it("finishes OPAQUE and validates returned identity material", async () => {
-    const publicKey = new Uint8Array(96).fill(7);
+    const publicKey = new Uint8Array(128).fill(7);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       accepted: true,
       created: true,
@@ -83,6 +84,7 @@ describe("account transport", () => {
       max_rooms_per_user: 3,
       session_inactivity_sec: 900,
       identity_public_b64: bytesToBase64(publicKey),
+      identity_prekey_id: "test-prekey",
       identity_envelope_b64: "AQID",
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
 
@@ -136,7 +138,9 @@ describe("RelaySocket", () => {
       expect(relay.acknowledge("dm_123", "message_1", "Alice", {
         revision: 2,
         envelope: new Uint8Array([2, 3, 4]),
-      })).toBe(true);
+        identityPublicKey: new Uint8Array(128).fill(7),
+        prekeyId: "test-prekey",
+      }, "used-prekey")).toBe(true);
       expect(socket.sent).toEqual([
         JSON.stringify({ type: "open_direct", peer_username: "Bob" }),
         JSON.stringify({
@@ -146,6 +150,9 @@ describe("RelaySocket", () => {
           sender_username: "Alice",
           state_revision: 2,
           identity_envelope_b64: "AgME",
+          identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
+          prekey_id: "test-prekey",
+          used_prekey_id: "used-prekey",
         }),
       ]);
 

@@ -178,11 +178,16 @@ export function useAbyssalSession() {
     }
     if (frame.type === "presence") {
       const next = frame.users.filter(validPresence);
+      if (new Set(next.map((user) => user.directory_digest)).size > 1) {
+        clearMemory();
+        return;
+      }
       const identityChanged = next.some((user) => {
         const key = user.username.toLowerCase();
         const pinned = identityPinsRef.current.get(key);
-        if (pinned && pinned !== user.identity_public_b64) return true;
-        identityPinsRef.current.set(key, user.identity_public_b64);
+        const fingerprint = stableIdentityFingerprint(user.identity_public_b64);
+        if (pinned && pinned !== fingerprint) return true;
+        identityPinsRef.current.set(key, fingerprint);
         return false;
       });
       if (identityChanged) {
@@ -236,7 +241,7 @@ export function useAbyssalSession() {
       socketRef.current?.join(direct.id);
       return;
     }
-    if (frame.type !== "message" || frame.version !== 4) return;
+    if (frame.type !== "message" || frame.version !== 5) return;
 
     try {
       const currentSession = sessionRef.current;
@@ -253,6 +258,7 @@ export function useAbyssalSession() {
           frame.message_id,
           frame.sender_username,
           stateSnapshot,
+          frame.prekey_id,
         ) ?? false;
         wipeBytes(stateSnapshot.envelope);
         if (!acknowledged) clearMemory();
@@ -274,6 +280,8 @@ export function useAbyssalSession() {
           signature: base64ToBytes(frame.signature_b64),
         },
         base64ToBytes(frame.wrapped_key_b64),
+        frame.prekey_id,
+        frame.is_prekey,
         currentSession.username,
       );
       const stateSnapshot = cipherRef.current.stateSnapshot();
@@ -283,6 +291,7 @@ export function useAbyssalSession() {
         frame.message_id,
         frame.sender_username,
         stateSnapshot,
+        frame.prekey_id,
       ) ?? false;
       wipeBytes(stateSnapshot.envelope);
       if (!acknowledged) {
@@ -352,6 +361,7 @@ export function useAbyssalSession() {
             handshakeId: start.handshake_id!,
             registrationUpload: result.registrationUpload,
             identityPublicKey: identity.publicKey,
+            identityPrekeyId: identity.prekeyId,
             identityEnvelope: identity.envelope,
           });
           wipeBytes(result.registrationUpload);
@@ -387,7 +397,8 @@ export function useAbyssalSession() {
       cipherRef.current.clear();
       throw error;
     }
-    if (!equalBytes(cipherRef.current.publicKey(), nextSession.identityPublicKey)) {
+    if (!equalBytes(cipherRef.current.publicKey(), nextSession.identityPublicKey) ||
+      cipherRef.current.prekeyId() !== nextSession.identityPrekeyId) {
       cipherRef.current.clear();
       throw new Error("Wrong information");
     }
@@ -493,11 +504,13 @@ export function useAbyssalSession() {
       .map((user) => ({
         username: user.username,
         publicKey: base64ToBytes(user.identity_public_b64),
+        prekeyId: user.identity_prekey_id,
       }));
     if (includeSelf) {
       recipients.push({
         username: currentSession.username,
         publicKey: currentSession.identityPublicKey.slice(),
+        prekeyId: currentSession.identityPrekeyId,
       });
     }
     return recipients;
@@ -842,15 +855,23 @@ function validPresence(value: unknown): value is PresenceUser {
     user.username.length === 0 ||
     user.username.length > 80 ||
     typeof user.connected !== "boolean" ||
-    typeof user.identity_public_b64 !== "string"
+    typeof user.identity_public_b64 !== "string" ||
+    typeof user.directory_digest !== "string"
   ) {
     return false;
   }
   try {
-    return base64ToBytes(user.identity_public_b64).byteLength === 96;
+    return base64ToBytes(user.identity_public_b64).byteLength === 128 &&
+      typeof user.identity_prekey_id === "string" &&
+      /^[A-Za-z0-9_-]{1,32}$/.test(user.identity_prekey_id) &&
+      /^[A-Za-z0-9_-]{43}$/.test(user.directory_digest);
   } catch {
     return false;
   }
+}
+
+function stableIdentityFingerprint(publicKeyB64: string): string {
+  return bytesToBase64(base64ToBytes(publicKeyB64).subarray(0, 64));
 }
 
 function conversationForId(
@@ -1062,4 +1083,5 @@ function wipeEncryptedPayload(payload: EncryptedPayload): void {
   wipeBytes(payload.signature);
   payload.envelopes.forEach((envelope) => wipeBytes(envelope.wrappedKey));
   wipeBytes(payload.identityEnvelope);
+  wipeBytes(payload.identityPublicKey);
 }

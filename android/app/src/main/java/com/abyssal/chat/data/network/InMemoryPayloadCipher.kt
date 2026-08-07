@@ -24,6 +24,7 @@ class InMemoryPayloadCipher {
             session = next
             IdentityMaterial(
                 publicKey = next.publicKey(),
+                prekeyId = next.prekeyId(),
                 envelope = next.sealIdentity(exportKey, context)
             )
         } catch (error: Exception) {
@@ -47,8 +48,16 @@ class InMemoryPayloadCipher {
     fun publicKey(): ByteArray = requireSession().publicKey()
 
     @Synchronized
+    fun prekeyId(): String = requireSession().prekeyId()
+
+    @Synchronized
     fun stateSnapshot(): IdentityStateSnapshot? = pendingState?.let {
-        IdentityStateSnapshot(it.revision, it.envelope.clone())
+        IdentityStateSnapshot(
+            revision = it.revision,
+            envelope = it.envelope.clone(),
+            identityPublicKey = it.identityPublicKey.clone(),
+            prekeyId = it.prekeyId
+        )
     }
 
     @Synchronized
@@ -61,7 +70,7 @@ class InMemoryPayloadCipher {
     ): EncryptedTransportPayload {
         val uniqueRecipients = recipients
             .distinctBy { it.username.lowercase() }
-            .map { RecipientPublicKey(it.username, it.publicKey) }
+            .map { RecipientPublicKey(it.username, it.publicKey, it.prekeyId) }
         val encrypted = requireSession().encrypt(
             chatId,
             messageId,
@@ -69,7 +78,12 @@ class InMemoryPayloadCipher {
             plainBytes,
             uniqueRecipients
         )
-        rememberState(encrypted.stateRevision, encrypted.identityEnvelope)
+        rememberState(
+            encrypted.stateRevision,
+            encrypted.identityEnvelope,
+            encrypted.identityPublic,
+            encrypted.prekeyId
+        )
         return EncryptedTransportPayload(
             version = encrypted.version.toInt(),
             messageId = encrypted.messageId,
@@ -77,10 +91,12 @@ class InMemoryPayloadCipher {
             ciphertext = encrypted.ciphertext,
             signature = encrypted.signature,
             envelopes = encrypted.envelopes.map {
-                RecipientEnvelope(it.username, it.wrappedKey)
+                RecipientEnvelope(it.username, it.wrappedKey, it.prekeyId, it.isPrekey)
             },
             stateRevision = encrypted.stateRevision,
-            identityEnvelope = encrypted.identityEnvelope
+            identityEnvelope = encrypted.identityEnvelope,
+            identityPublicKey = encrypted.identityPublic,
+            prekeyId = encrypted.prekeyId
         )
     }
 
@@ -95,9 +111,16 @@ class InMemoryPayloadCipher {
             payload.ciphertext,
             payload.signature,
             payload.wrappedKey,
+            payload.prekeyId,
+            payload.isPrekey,
             recipientUsername
         )
-        rememberState(decrypted.stateRevision, decrypted.identityEnvelope)
+        rememberState(
+            decrypted.stateRevision,
+            decrypted.identityEnvelope,
+            decrypted.identityPublic,
+            decrypted.prekeyId
+        )
         decrypted.identityEnvelope.fill(0)
         return decrypted.plaintext
     }
@@ -115,6 +138,8 @@ class InMemoryPayloadCipher {
                         JSONObject()
                             .put("recipient_username", envelope.recipientUsername)
                             .put("wrapped_key_b64", encode(envelope.wrappedKey))
+                            .put("prekey_id", envelope.prekeyId)
+                            .put("is_prekey", envelope.isPrekey)
                     )
                 }
             })
@@ -131,13 +156,12 @@ class InMemoryPayloadCipher {
         val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
         require(json.optInt("version") == PROTOCOL_VERSION)
         val envelopes = json.getJSONArray("envelopes")
-        val wrappedKey = (0 until envelopes.length())
+        val envelope = (0 until envelopes.length())
             .asSequence()
             .map { envelopes.getJSONObject(it) }
             .firstOrNull { it.getString("recipient_username") == recipientUsername }
-            ?.getString("wrapped_key_b64")
-            ?.let(::decode)
             ?: throw IllegalArgumentException("Recipient unavailable")
+        val wrappedKey = envelope.getString("wrapped_key_b64").let(::decode)
         return IncomingTransportPayload(
             chatId = chatId,
             messageId = json.getString("message_id"),
@@ -146,13 +170,16 @@ class InMemoryPayloadCipher {
             signature = decode(json.getString("signature_b64")),
             wrappedKey = wrappedKey,
             senderUsername = senderUsername,
-            senderPublicKey = senderPublicKey
+            senderPublicKey = senderPublicKey,
+            prekeyId = envelope.optString("prekey_id"),
+            isPrekey = envelope.optBoolean("is_prekey", false)
         )
     }
 
     @Synchronized
     fun clear() {
         pendingState?.envelope?.fill(0)
+        pendingState?.identityPublicKey?.fill(0)
         pendingState = null
         session?.close()
         session = null
@@ -161,18 +188,30 @@ class InMemoryPayloadCipher {
     private fun requireSession(): E2eeSession =
         session ?: throw IllegalStateException("Identity unavailable")
 
-    private fun rememberState(revision: ULong, envelope: ByteArray) {
+    private fun rememberState(
+        revision: ULong,
+        envelope: ByteArray,
+        identityPublicKey: ByteArray,
+        prekeyId: String
+    ) {
         pendingState?.envelope?.fill(0)
-        pendingState = IdentityStateSnapshot(revision, envelope.clone())
+        pendingState?.identityPublicKey?.fill(0)
+        pendingState = IdentityStateSnapshot(
+            revision = revision,
+            envelope = envelope.clone(),
+            identityPublicKey = identityPublicKey.clone(),
+            prekeyId = prekeyId
+        )
     }
 
     data class IdentityMaterial(
         val publicKey: ByteArray,
+        val prekeyId: String,
         val envelope: ByteArray
     )
 
     private companion object {
-        const val PROTOCOL_VERSION = 4
+        const val PROTOCOL_VERSION = 5
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
         fun decode(value: String): ByteArray = Base64.getUrlDecoder().decode(value)
