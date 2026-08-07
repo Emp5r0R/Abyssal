@@ -1,5 +1,7 @@
 package com.abyssal.chat
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.view.MotionEvent
 import android.view.WindowManager
@@ -20,6 +22,7 @@ import com.abyssal.chat.presentation.screens.ChatScreen
 import com.abyssal.chat.presentation.screens.DashboardScreen
 import com.abyssal.chat.presentation.screens.EntranceScreen
 import com.abyssal.chat.presentation.screens.CalculatorScreen
+import com.abyssal.chat.presentation.screens.UpdateAvailableDialog
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.AbyssalTheme
@@ -51,6 +54,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val currentScreen by viewModel.currentScreen.collectAsState()
                     val isLocked by viewModel.isLocked.collectAsState()
+                    val availableUpdate by viewModel.availableUpdate.collectAsState()
 
                     // If disguised, intercept routing to display Calculator Cover
                     if (isLocked) {
@@ -68,6 +72,27 @@ class MainActivity : ComponentActivity() {
                                 is Screen.Dashboard -> DashboardScreen(viewModel)
                                 is Screen.Chat -> ChatScreen(viewModel, screen.sessionId)
                             }
+                        }
+                    }
+
+                    if (!isLocked) {
+                        availableUpdate?.let { update ->
+                            UpdateAvailableDialog(
+                                update = update,
+                                currentVersionName = BuildConfig.VERSION_NAME,
+                                onUpdate = {
+                                    val intent = Intent(
+                                        Intent.ACTION_VIEW,
+                                        Uri.parse(update.apkDownloadUrl)
+                                    ).addCategory(Intent.CATEGORY_BROWSABLE)
+                                    runCatching {
+                                        startActivity(intent)
+                                        viewModel.acceptAvailableUpdate()
+                                    }
+                                },
+                                onRemindLater = viewModel::remindAvailableUpdateLater,
+                                onCancel = viewModel::cancelAvailableUpdate
+                            )
                         }
                     }
                 }

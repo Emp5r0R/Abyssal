@@ -117,6 +117,12 @@ data class IdentityValidationResult(
     val error: String? = null
 )
 
+data class AvailableAppUpdate(
+    val versionName: String,
+    val apkDownloadUrl: String,
+    val releasePageUrl: String
+)
+
 data class SessionSecurityState(
     val active: Boolean = false,
     val retainedInBackground: Boolean = false,

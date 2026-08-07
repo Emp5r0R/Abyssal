@@ -31,7 +31,7 @@ The script requires `deploy/release.env`, verifies the APK signature with `apksi
 1. Review `git diff`, `SECURITY.md`, version code, and version name.
 2. Commit and push `main`.
 3. Create a signed Git tag matching the Android version.
-4. Upload only the release APK, AAB, and checksum manifest from `build-outputs/`.
+4. Upload only the release APK, AAB, and checksum manifest from `build-outputs/`. Keep the build script's exact `abyssal-android-VERSION-universal-release.apk` name: Android update discovery intentionally rejects alternate filenames, hosts, repository paths, prereleases, and drafts.
 5. Publish stable product releases only with the known cryptographic limits copied into release notes. Never describe Abyssal as Signal-grade, independently audited, or high-assurance until that work exists.
 
 ## Deploy relay

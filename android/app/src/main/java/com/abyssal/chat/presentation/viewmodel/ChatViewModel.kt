@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.AttachmentSavePolicy
+import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
@@ -22,6 +23,8 @@ import com.abyssal.chat.domain.model.SessionInactivityPolicy
 import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
+import com.abyssal.chat.domain.model.UpdatePromptPolicy
+import com.abyssal.chat.domain.repository.IAppUpdateService
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
 import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
@@ -59,6 +62,7 @@ class ChatViewModel(
     private val chatTransport: IChatTransport,
     private val attachmentService: IEncryptedAttachmentService,
     private val disguiseManager: IDisguiseManager,
+    private val appUpdateService: IAppUpdateService,
     private val payloadCipher: InMemoryPayloadCipher = InMemoryPayloadCipher()
 ) : ViewModel() {
 
@@ -100,6 +104,11 @@ class ChatViewModel(
 
     private val _calculatorDisplay = MutableStateFlow("0")
     val calculatorDisplay: StateFlow<String> = _calculatorDisplay.asStateFlow()
+
+    private val _availableUpdate = MutableStateFlow<AvailableAppUpdate?>(null)
+    val availableUpdate: StateFlow<AvailableAppUpdate?> = _availableUpdate.asStateFlow()
+    private val updatePromptPolicy = UpdatePromptPolicy()
+    private var updateCheckInFlight = false
 
     private val sessionInactivityPolicy = SessionInactivityPolicy()
     private val _sessionSecurity = MutableStateFlow(SessionSecurityState())
@@ -255,6 +264,48 @@ class ChatViewModel(
         } else {
             _activeChatId.value = null
         }
+    }
+
+    fun checkForAppUpdate() {
+        val now = elapsedRealtimeMs()
+        if (
+            _isLocked.value ||
+            _availableUpdate.value != null ||
+            updateCheckInFlight ||
+            !updatePromptPolicy.shouldCheck(now)
+        ) {
+            return
+        }
+        updateCheckInFlight = true
+        viewModelScope.launch {
+            try {
+                val result = runCatching { appUpdateService.findAvailableUpdate() }
+                val completedAt = elapsedRealtimeMs()
+                result.onSuccess { update ->
+                    updatePromptPolicy.markChecked(completedAt)
+                    _availableUpdate.value = update
+                }.onFailure {
+                    updatePromptPolicy.markFailed(completedAt)
+                }
+            } finally {
+                updateCheckInFlight = false
+            }
+        }
+    }
+
+    fun cancelAvailableUpdate() {
+        updatePromptPolicy.cancelForProcess()
+        _availableUpdate.value = null
+    }
+
+    fun remindAvailableUpdateLater() {
+        updatePromptPolicy.remindLater(elapsedRealtimeMs())
+        _availableUpdate.value = null
+    }
+
+    fun acceptAvailableUpdate() {
+        updatePromptPolicy.cancelForProcess()
+        _availableUpdate.value = null
     }
 
     fun clearAccountError() {
@@ -666,6 +717,7 @@ class ChatViewModel(
     fun onHostResumed() {
         if (expireSessionIfNeeded()) return
         if (sessionInactivityPolicy.isActive()) chatTransport.connect()
+        checkForAppUpdate()
     }
 
     fun recordUserActivity() {
@@ -726,6 +778,7 @@ class ChatViewModel(
         if (disguiseManager.verifyPin(cleanExpr)) {
             if (expireSessionIfNeeded()) return "0"
             _isLocked.value = false
+            checkForAppUpdate()
             if (sessionInactivityPolicy.isActive()) {
                 sessionInactivityPolicy.touch()
                 updateSessionSecurityState()

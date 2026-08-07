@@ -2,6 +2,7 @@ package com.abyssal.chat.domain.repository
 
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.AttachmentUploadResult
+import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
@@ -107,4 +108,8 @@ interface IDisguiseManager {
     fun verifyDuressPin(pin: String): Boolean
     fun getPin(): String
     fun getDuressPin(): String
+}
+
+interface IAppUpdateService {
+    suspend fun findAvailableUpdate(): AvailableAppUpdate?
 }

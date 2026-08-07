@@ -76,6 +76,7 @@ For an Android emulator talking to a server on the development machine, use `htt
 - Direct headers display a symmetric safety number derived from both identity keys. Both participants see the same number and can compare it through a separate channel to detect relay key substitution.
 - Direct composers choose retention for each text, GIF, or attachment: `Never`, `5s`, `10s`, `30s`, or `1m`. `Never` means retained only for the current client/relay RAM lifetime; restart, wipe, logout, or process loss still removes it.
 - Room creators may set any after-read timer to `0` for no read-triggered expiry. Room policy is locked for participants, including text and media-specific timers; a sender cannot extend it from the composer.
+- Android checks the latest stable GitHub release after launch without caching metadata to disk. A newer signed universal APK opens in the system browser only after explicit confirmation; users can cancel for the process lifetime or request an in-memory reminder two hours later. The prompt never appears over the calculator cover.
 
 ### Signed release build
 
