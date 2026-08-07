@@ -55,6 +55,7 @@ async function register(code, password) {
   const identity = WasmE2eeSession.create(new Uint8Array(finished.export_key));
   const context = encoder.encode(`ABYSSAL_IDENTITY_V2:${start.node_id}:${code.toUpperCase()}`);
   const identityPublic = identity.publicKey();
+  const identityPrekeyId = identity.prekeyId();
   const identityEnvelope = identity.sealIdentity(new Uint8Array(finished.export_key), context);
   const finishResponse = await fetch(`${baseUrl}/v2/account/finish`, {
     method: "POST",
@@ -64,6 +65,7 @@ async function register(code, password) {
       handshake_id: start.handshake_id,
       registration_upload_b64: encode(finished.registration_upload),
       identity_public_b64: encode(identityPublic),
+      identity_prekey_id: identityPrekeyId,
       identity_envelope_b64: encode(identityEnvelope),
     }),
   });
@@ -73,6 +75,7 @@ async function register(code, password) {
   assert.ok(account.token);
   assert.ok(account.username);
   assert.equal(account.identity_public_b64, encode(identityPublic));
+  assert.equal(account.identity_prekey_id, identityPrekeyId);
 
   passwordBytes.fill(0);
   context.fill(0);
@@ -152,6 +155,7 @@ function encryptedFrame(sender, recipient, chatId, text) {
     JSON.stringify([{
       username: recipient.username,
       public_key: [...recipient.identity.publicKey()],
+      prekey_id: recipient.identity.prekeyId(),
     }]),
   ));
   return {
@@ -164,9 +168,13 @@ function encryptedFrame(sender, recipient, chatId, text) {
     signature_b64: encode(payload.signature),
     state_revision: payload.state_revision,
     identity_envelope_b64: encode(payload.identity_envelope),
+    identity_public_b64: encode(payload.identity_public),
+    prekey_id: payload.prekey_id,
     envelopes: payload.envelopes.map((envelope) => ({
       recipient_username: envelope.username,
       wrapped_key_b64: encode(envelope.wrapped_key),
+      prekey_id: envelope.prekey_id,
+      is_prekey: envelope.is_prekey,
     })),
   };
 }
@@ -181,12 +189,16 @@ function decryptFrame(recipient, frame) {
     decode(frame.ciphertext_b64),
     decode(frame.signature_b64),
     decode(frame.wrapped_key_b64),
+    frame.prekey_id,
+    frame.is_prekey,
     recipient.username,
   ));
   return {
     text: decoder.decode(new Uint8Array(decrypted.plaintext)),
     stateRevision: decrypted.state_revision,
     identityEnvelope: new Uint8Array(decrypted.identity_envelope),
+    identityPublic: new Uint8Array(decrypted.identity_public),
+    prekeyId: decrypted.prekey_id,
   };
 }
 
@@ -198,8 +210,12 @@ function acknowledgeFrame(socket, frame, decrypted) {
     sender_username: frame.sender_username,
     state_revision: decrypted.stateRevision,
     identity_envelope_b64: encode(decrypted.identityEnvelope),
+    identity_public_b64: encode(decrypted.identityPublic),
+    prekey_id: decrypted.prekeyId,
+    used_prekey_id: frame.prekey_id,
   }));
   decrypted.identityEnvelope.fill(0);
+  decrypted.identityPublic.fill(0);
 }
 
 const alice = await register(aliceCode, "alice-password");

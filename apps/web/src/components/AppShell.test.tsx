@@ -48,9 +48,9 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> =
     directs: [{ id: "dm_random", peer_username: "Bob" }],
     messages: {},
     presence: [
-      { username: "Alice", connected: true, identity_public_b64: "AA" },
-      { username: "Bob", connected: true, identity_public_b64: "AA" },
-      { username: "Carol", connected: false, identity_public_b64: "AA" },
+      { username: "Alice", connected: true, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43) },
+      { username: "Bob", connected: true, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43) },
+      { username: "Carol", connected: false, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43) },
     ],
     activeRoomId: null,
     maxRooms: 2,
@@ -89,6 +89,11 @@ describe("AppShell direct-message navigation", () => {
   it("does not allow messaging the current account", () => {
     renderShell();
     expect(screen.getByTitle("Current account")).toBeDisabled();
+  });
+
+  it("exposes the full directory checkpoint for out-of-band comparison", () => {
+    renderShell();
+    expect(screen.getByTitle(`Directory checkpoint ${"A".repeat(43)}`)).toBeInTheDocument();
   });
 
   it("requires explicit confirmation before wiping relay RAM", () => {

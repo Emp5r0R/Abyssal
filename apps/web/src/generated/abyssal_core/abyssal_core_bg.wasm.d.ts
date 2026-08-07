@@ -14,6 +14,7 @@ export const uniffi_abyssal_core_checksum_func_opaque_client_finish_registration
 export const uniffi_abyssal_core_checksum_func_opaque_client_start: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_decrypt: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_encrypt: () => number;
+export const uniffi_abyssal_core_checksum_method_e2eesession_prekey_id: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_public_key: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_seal_identity: () => number;
 export const uniffi_abyssal_core_fn_clone_e2eesession: (a: bigint, b: number) => bigint;
@@ -24,13 +25,15 @@ export const uniffi_abyssal_core_fn_func_conversation_safety_number: (a: number,
 export const uniffi_abyssal_core_fn_func_opaque_client_finish_login: (a: number, b: number, c: number, d: number, e: number) => void;
 export const uniffi_abyssal_core_fn_func_opaque_client_finish_registration: (a: number, b: number, c: number, d: number, e: number) => void;
 export const uniffi_abyssal_core_fn_func_opaque_client_start: (a: number, b: number, c: number) => void;
-export const uniffi_abyssal_core_fn_method_e2eesession_decrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
+export const uniffi_abyssal_core_fn_method_e2eesession_decrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_encrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+export const uniffi_abyssal_core_fn_method_e2eesession_prekey_id: (a: number, b: bigint, c: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_public_key: (a: number, b: bigint, c: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_seal_identity: (a: number, b: bigint, c: number, d: number, e: number) => void;
 export const wasme2eesession_create: (a: number, b: number) => [number, number, number];
-export const wasme2eesession_decrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number) => [number, number, number, number];
+export const wasme2eesession_decrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number) => [number, number, number, number];
 export const wasme2eesession_encrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
+export const wasme2eesession_prekeyId: (a: number) => [number, number];
 export const wasme2eesession_publicKey: (a: number) => [number, number];
 export const wasme2eesession_recover: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
 export const wasme2eesession_sealIdentity: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];

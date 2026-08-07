@@ -68,6 +68,7 @@ class NetworkIdentityService(
                             finishBody
                                 .put("registration_upload_b64", encode(result.registrationUpload))
                                 .put("identity_public_b64", encode(identity.publicKey))
+                                .put("identity_prekey_id", identity.prekeyId)
                                 .put("identity_envelope_b64", encode(identity.envelope))
                         } finally {
                             identity.publicKey.fill(0)
@@ -79,7 +80,14 @@ class NetworkIdentityService(
                     }
                 }
                 "login" -> {
+                    val serverPrekeyId = start.optString("identity_prekey_id")
+                        .takeIf { it.matches(PREKEY_ID_REGEX) }
+                        ?: return@withContext rejectedAndClear()
                     val identityPublic = decode(start.optString("identity_public_b64"))
+                    if (identityPublic.size != IDENTITY_PUBLIC_KEY_BYTES) {
+                        identityPublic.fill(0)
+                        return@withContext rejectedAndClear()
+                    }
                     val identityEnvelope = decode(start.optString("identity_envelope_b64"))
                     val result = opaqueClientFinishLogin(
                         passwordBytes,
@@ -93,6 +101,9 @@ class NetworkIdentityService(
                             identityEnvelope,
                             identityPublic
                         )
+                        if (payloadCipher.prekeyId() != serverPrekeyId) {
+                            return@withContext rejectedAndClear()
+                        }
                         finishBody.put(
                             "credential_finalization_b64",
                             encode(result.credentialFinalization)
@@ -119,7 +130,12 @@ class NetworkIdentityService(
                 return@withContext rejectedAndClear()
             }
             serverPublicKey.fill(0)
-            parseAccepted(finish, publicKey)
+            try {
+                parseAccepted(finish, publicKey)
+            } catch (_: Exception) {
+                publicKey.fill(0)
+                throw IllegalArgumentException("Identity unavailable")
+            }
         } catch (_: Exception) {
             rejectedAndClear()
         } finally {
@@ -190,7 +206,10 @@ class NetworkIdentityService(
             sessionInactivitySec = json
                 .optInt("session_inactivity_sec", DEFAULT_SESSION_INACTIVITY_SEC)
                 .coerceIn(MIN_SESSION_INACTIVITY_SEC, MAX_SESSION_INACTIVITY_SEC),
-            publicKey = publicKey
+            publicKey = publicKey,
+            prekeyId = json.optString("identity_prekey_id")
+                .takeIf { it.matches(PREKEY_ID_REGEX) }
+                ?: throw IllegalArgumentException("Identity unavailable")
         )
     }
 
@@ -217,6 +236,8 @@ class NetworkIdentityService(
         const val MIN_MAX_ROOMS_PER_USER = 1
         const val MAX_MAX_ROOMS_PER_USER = 100
         const val DEFAULT_MAX_ROOMS_PER_USER = 5
+        const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)

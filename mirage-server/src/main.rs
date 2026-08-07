@@ -10,6 +10,7 @@ use std::{
 use abyssal_core::secure_protocol::{
     opaque_server_finish_login, opaque_server_finish_registration,
     opaque_server_registration_response, opaque_server_setup, opaque_server_start_login,
+    prekey_id_for_public,
 };
 use axum::{
     body::Bytes,
@@ -29,7 +30,7 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 use tower_http::{
     cors::CorsLayer,
@@ -59,14 +60,21 @@ const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
 const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
 const OPAQUE_HANDSHAKE_TTL_MS: u64 = 60_000;
-const IDENTITY_PUBLIC_BYTES: usize = 96;
+const IDENTITY_FINGERPRINT_BYTES: usize = 64;
+const ONE_TIME_KEY_BYTES: usize = 32;
+const ONE_TIME_KEY_OFFSET: usize = IDENTITY_FINGERPRINT_BYTES;
+const FALLBACK_KEY_OFFSET: usize = ONE_TIME_KEY_OFFSET + ONE_TIME_KEY_BYTES;
+const IDENTITY_PUBLIC_BYTES: usize = FALLBACK_KEY_OFFSET + 32;
 const MAX_IDENTITY_ENVELOPE_BYTES: usize = 512 * 1024;
 const MESSAGE_NONCE_BYTES: usize = 12;
 const MESSAGE_SIGNATURE_BYTES: usize = 64;
 const MAX_WRAPPED_KEY_BYTES: usize = 4096;
-const E2EE_PROTOCOL_VERSION: u32 = 4;
+const E2EE_PROTOCOL_VERSION: u32 = 5;
+const IDENTITY_ENVELOPE_VERSION: u8 = 4;
 const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_REPLAY_IDS: usize = 50_000;
+const PREKEY_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
+const MAX_PREKEY_ID_BYTES: usize = 32;
 const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_INVITE_CODE_ID_V1";
 
 type CodeId = [u8; 32];
@@ -89,10 +97,12 @@ struct AppState {
     available_codes: Arc<Mutex<HashSet<CodeId>>>,
     accounts: Arc<Mutex<HashMap<CodeId, Account>>>,
     sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
+    active_connections: Arc<Mutex<HashMap<CodeId, Uuid>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
     login_limits: Arc<Mutex<HashMap<CodeId, RateState>>>,
     replay_ids: Arc<Mutex<HashMap<ReplayKey, u64>>>,
+    prekey_claims: Arc<Mutex<HashMap<PrekeyClaimKey, PrekeyClaim>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     room_catalog: Arc<Mutex<HashMap<String, RoomEntry>>>,
     direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
@@ -106,6 +116,7 @@ struct Account {
     password_file: Vec<u8>,
     identity_public: Vec<u8>,
     identity_envelope: Vec<u8>,
+    prekey_id: String,
     state_revision: u64,
     state_revision_window: u128,
     connected: bool,
@@ -179,6 +190,34 @@ impl Drop for ReplayKey {
     }
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct PrekeyClaimKey {
+    code_id: CodeId,
+    prekey_id: String,
+}
+
+struct PrekeyClaim {
+    chat_id: String,
+    message_id: String,
+    sender_username: String,
+    created_at_ms: u64,
+}
+
+impl Drop for PrekeyClaimKey {
+    fn drop(&mut self) {
+        self.code_id.zeroize();
+        self.prekey_id.zeroize();
+    }
+}
+
+impl Drop for PrekeyClaim {
+    fn drop(&mut self) {
+        self.chat_id.zeroize();
+        self.message_id.zeroize();
+        self.sender_username.zeroize();
+    }
+}
+
 impl Drop for PendingKey {
     fn drop(&mut self) {
         self.chat_id.zeroize();
@@ -209,6 +248,7 @@ impl Drop for Account {
         self.password_file.zeroize();
         self.identity_public.zeroize();
         self.identity_envelope.zeroize();
+        self.prekey_id.zeroize();
     }
 }
 
@@ -308,6 +348,7 @@ struct OpaqueAccountFinishRequest {
     registration_upload_b64: Option<String>,
     credential_finalization_b64: Option<String>,
     identity_public_b64: Option<String>,
+    identity_prekey_id: Option<String>,
     identity_envelope_b64: Option<String>,
 }
 
@@ -316,6 +357,7 @@ impl Drop for OpaqueAccountFinishRequest {
         self.registration_upload_b64.zeroize();
         self.credential_finalization_b64.zeroize();
         self.identity_public_b64.zeroize();
+        self.identity_prekey_id.zeroize();
         self.identity_envelope_b64.zeroize();
     }
 }
@@ -339,6 +381,7 @@ struct AccountResponse {
     max_rooms_per_user: usize,
     session_inactivity_sec: u64,
     identity_public_b64: Option<String>,
+    identity_prekey_id: Option<String>,
     identity_envelope_b64: Option<String>,
     error: Option<String>,
 }
@@ -351,6 +394,7 @@ struct OpaqueAccountStartResponse {
     response_b64: Option<String>,
     node_id: String,
     identity_public_b64: Option<String>,
+    identity_prekey_id: Option<String>,
     identity_envelope_b64: Option<String>,
     error: Option<&'static str>,
 }
@@ -386,6 +430,8 @@ enum InboundFrame {
         envelopes: Vec<InboundRecipientEnvelope>,
         state_revision: u64,
         identity_envelope_b64: String,
+        identity_public_b64: String,
+        prekey_id: String,
     },
     #[serde(rename = "message_ack")]
     MessageAck {
@@ -394,11 +440,16 @@ enum InboundFrame {
         sender_username: String,
         state_revision: u64,
         identity_envelope_b64: String,
+        identity_public_b64: String,
+        prekey_id: String,
+        used_prekey_id: String,
     },
     #[serde(rename = "identity_state")]
     IdentityState {
         state_revision: u64,
         identity_envelope_b64: String,
+        identity_public_b64: String,
+        prekey_id: String,
     },
     #[serde(rename = "global_wipe")]
     GlobalWipe,
@@ -419,6 +470,8 @@ enum InboundFrame {
 struct InboundRecipientEnvelope {
     recipient_username: String,
     wrapped_key_b64: String,
+    prekey_id: String,
+    is_prekey: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -433,6 +486,8 @@ enum OutboundFrame {
         ciphertext_b64: String,
         signature_b64: String,
         wrapped_key_b64: String,
+        prekey_id: String,
+        is_prekey: bool,
         sender_username: String,
         sender_public_key_b64: String,
     },
@@ -489,6 +544,8 @@ struct PresenceUser {
     username: String,
     connected: bool,
     identity_public_b64: String,
+    identity_prekey_id: String,
+    directory_digest: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -636,10 +693,12 @@ impl AppState {
             available_codes: Arc::new(Mutex::new(available_codes)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
+            prekey_claims: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
@@ -1015,6 +1074,11 @@ async fn session_sweeper(state: AppState) {
         if removed > 0 {
             info!("expired_sessions_removed count={removed}");
         }
+        state
+            .prekey_claims
+            .lock()
+            .await
+            .retain(|_, claim| now.saturating_sub(claim.created_at_ms) < PREKEY_CLAIM_TTL_MS);
     }
 }
 
@@ -1230,6 +1294,7 @@ async fn start_opaque_account(
                 response_b64: Some(URL_SAFE_NO_PAD.encode(response)),
                 node_id: state.node_id.clone(),
                 identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&account.identity_public)),
+                identity_prekey_id: Some(account.prekey_id.clone()),
                 identity_envelope_b64: Some(URL_SAFE_NO_PAD.encode(&account.identity_envelope)),
                 error: None,
             }),
@@ -1268,6 +1333,7 @@ async fn start_opaque_account(
             response_b64: Some(URL_SAFE_NO_PAD.encode(response)),
             node_id: state.node_id.clone(),
             identity_public_b64: None,
+            identity_prekey_id: None,
             identity_envelope_b64: None,
             error: None,
         }),
@@ -1319,6 +1385,13 @@ async fn finish_opaque_account(
                     return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
                 }
             };
+            let prekey_id = match request.identity_prekey_id.as_deref() {
+                Some(value) if valid_prekey_id(value) => value.to_string(),
+                _ => return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await,
+            };
+            if !valid_identity_public_bundle(&identity_public, &prekey_id) {
+                return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await;
+            }
             let identity_envelope = match request
                 .identity_envelope_b64
                 .as_deref()
@@ -1345,6 +1418,7 @@ async fn finish_opaque_account(
                     password_file,
                     identity_public,
                     identity_envelope,
+                    prekey_id,
                     state_revision: 0,
                     state_revision_window: 1,
                     connected: false,
@@ -1398,6 +1472,7 @@ fn opaque_start_error(
             response_b64: None,
             node_id: state.node_id.clone(),
             identity_public_b64: None,
+            identity_prekey_id: None,
             identity_envelope_b64: None,
             error: Some("Wrong information."),
         }),
@@ -1435,6 +1510,34 @@ fn decode_exact(value: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "Wrong information".to_string())
 }
 
+fn valid_prekey_id(value: &str) -> bool {
+    value.len() <= MAX_PREKEY_ID_BYTES
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_identity_public_bundle(public_key: &[u8], prekey_id: &str) -> bool {
+    if public_key.len() != IDENTITY_PUBLIC_BYTES || !valid_prekey_id(prekey_id) {
+        return false;
+    }
+    let long_term = &public_key[..IDENTITY_FINGERPRINT_BYTES];
+    if long_term.iter().all(|byte| *byte == 0) {
+        return false;
+    }
+    let one_time = &public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET];
+    if prekey_id.is_empty() {
+        one_time.iter().all(|byte| *byte == 0)
+    } else {
+        one_time.iter().any(|byte| *byte != 0)
+            && one_time
+                .try_into()
+                .map(|public| prekey_id_for_public(public) == prekey_id)
+                .unwrap_or(false)
+    }
+}
+
 async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) {
     let old_clients = state
         .clients
@@ -1467,12 +1570,18 @@ async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) 
         .lock()
         .await
         .retain(|client_id, _| !old_ids.contains(client_id));
+    state
+        .frame_limits
+        .lock()
+        .await
+        .retain(|client_id, _| !old_ids.contains(client_id));
     for members in state.rooms.lock().await.values_mut() {
         members.retain(|client_id| !old_ids.contains(client_id));
     }
     if let Some(account) = state.accounts.lock().await.get_mut(code_id) {
         account.connected = false;
     }
+    state.active_connections.lock().await.remove(code_id);
     broadcast_presence(state).await;
 }
 
@@ -1657,6 +1766,7 @@ async fn account_error(
             max_rooms_per_user: state.max_rooms_per_user,
             session_inactivity_sec: state.session_inactivity_ms / 1000,
             identity_public_b64: None,
+            identity_prekey_id: None,
             identity_envelope_b64: None,
             error: Some("Wrong information.".to_string()),
         }),
@@ -1672,10 +1782,12 @@ async fn issue_session(
     let account_identity = state.accounts.lock().await.get(&code_id).map(|account| {
         (
             URL_SAFE_NO_PAD.encode(&account.identity_public),
+            account.prekey_id.clone(),
             URL_SAFE_NO_PAD.encode(&account.identity_envelope),
         )
     });
-    let Some((identity_public_b64, identity_envelope_b64)) = account_identity else {
+    let Some((identity_public_b64, identity_prekey_id, identity_envelope_b64)) = account_identity
+    else {
         return account_error(StatusCode::UNAUTHORIZED, state, String::new()).await;
     };
     let token = Uuid::new_v4().to_string();
@@ -1703,6 +1815,7 @@ async fn issue_session(
             max_rooms_per_user: state.max_rooms_per_user,
             session_inactivity_sec: state.session_inactivity_ms / 1000,
             identity_public_b64: Some(identity_public_b64),
+            identity_prekey_id: Some(identity_prekey_id),
             identity_envelope_b64: Some(identity_envelope_b64),
             error: None,
         }),
@@ -1723,10 +1836,28 @@ async fn ws_handler(
     let auth = active_session(&state, &token, true).await;
 
     match auth {
-        Some(session) => ws
-            .protocols([WEB_SOCKET_PROTOCOL])
-            .on_upgrade(move |socket| socket_loop(state, token, session, socket))
-            .into_response(),
+        Some(session) => {
+            let client_id = Uuid::new_v4();
+            let code_id = session.code_id;
+            if state
+                .active_connections
+                .lock()
+                .await
+                .insert(code_id, client_id)
+                .is_some()
+            {
+                return StatusCode::CONFLICT.into_response();
+            }
+            let failed_state = state.clone();
+            ws.protocols([WEB_SOCKET_PROTOCOL])
+                .on_failed_upgrade(move |_| {
+                    tokio::spawn(async move {
+                        release_connection_reservation(&failed_state, &code_id, client_id).await;
+                    });
+                })
+                .on_upgrade(move |socket| socket_loop(state, token, session, client_id, socket))
+                .into_response()
+        }
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
@@ -1766,8 +1897,13 @@ fn websocket_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> 
             .any(|allowed| allowed == origin.trim_end_matches('/'))
 }
 
-async fn socket_loop(state: AppState, session_token: String, auth: AuthSession, socket: WebSocket) {
-    let client_id = Uuid::new_v4();
+async fn socket_loop(
+    state: AppState,
+    session_token: String,
+    auth: AuthSession,
+    client_id: Uuid,
+    socket: WebSocket,
+) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Message>(CLIENT_OUTBOUND_QUEUE_CAPACITY);
 
@@ -1902,6 +2038,8 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             envelopes,
             state_revision,
             identity_envelope_b64,
+            identity_public_b64,
+            prekey_id,
         } => {
             touch_activity(state).await;
             route_encrypted_message(
@@ -1916,6 +2054,8 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 envelopes,
                 state_revision,
                 identity_envelope_b64,
+                identity_public_b64,
+                prekey_id,
             )
             .await
         }
@@ -1925,6 +2065,9 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             sender_username,
             state_revision,
             identity_envelope_b64,
+            identity_public_b64,
+            prekey_id,
+            used_prekey_id,
         } => {
             touch_activity(state).await;
             acknowledge_message(
@@ -1935,15 +2078,28 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 &sender_username,
                 state_revision,
                 &identity_envelope_b64,
+                &identity_public_b64,
+                &prekey_id,
+                &used_prekey_id,
             )
             .await
         }
         InboundFrame::IdentityState {
             state_revision,
             identity_envelope_b64,
+            identity_public_b64,
+            prekey_id,
         } => {
             touch_activity(state).await;
-            update_identity_state(state, sender_id, state_revision, &identity_envelope_b64).await
+            update_identity_state(
+                state,
+                sender_id,
+                state_revision,
+                &identity_envelope_b64,
+                &identity_public_b64,
+                &prekey_id,
+            )
+            .await
         }
         InboundFrame::GlobalWipe => {
             touch_activity(state).await;
@@ -2016,6 +2172,8 @@ async fn route_encrypted_message(
     envelopes: Vec<InboundRecipientEnvelope>,
     state_revision: u64,
     identity_envelope_b64: String,
+    identity_public_b64: String,
+    prekey_id: String,
 ) -> Result<(), String> {
     if version != E2EE_PROTOCOL_VERSION || !valid_chat_id(&chat_id) || !valid_chat_id(&message_id) {
         return Err("encrypted message rejected".to_string());
@@ -2061,11 +2219,18 @@ async fn route_encrypted_message(
         {
             return Err("recipient envelope rejected".to_string());
         }
+        if !valid_prekey_id(&envelope.prekey_id) {
+            return Err("recipient envelope rejected".to_string());
+        }
+        if envelope.is_prekey == envelope.prekey_id.is_empty() {
+            return Err("recipient envelope rejected".to_string());
+        }
         let wrapped = decode_bounded(&envelope.wrapped_key_b64, MAX_WRAPPED_KEY_BYTES)?;
         if wrapped.is_empty() {
             return Err("recipient envelope rejected".to_string());
         }
-        envelope_map.insert(envelope.recipient_username, envelope.wrapped_key_b64);
+        let recipient_username = envelope.recipient_username.clone();
+        envelope_map.insert(recipient_username, envelope);
     }
     if envelope_map.keys().collect::<HashSet<_>>()
         != expected_recipients.iter().collect::<HashSet<_>>()
@@ -2078,10 +2243,24 @@ async fn route_encrypted_message(
         &sender_code_id,
         state_revision,
         &identity_envelope_b64,
+        &identity_public_b64,
+        &prekey_id,
         false,
     )
     .await?;
-    register_message_id(state, &chat_id, &sender_username, &message_id).await?;
+    claim_prekeys(
+        state,
+        &expected_recipients,
+        &envelope_map,
+        &chat_id,
+        &message_id,
+        &sender_username,
+    )
+    .await?;
+    if let Err(error) = register_message_id(state, &chat_id, &sender_username, &message_id).await {
+        release_prekey_claims(state, &chat_id, &message_id, &sender_username).await;
+        return Err(error);
+    }
     let sender_public_key_b64 = state
         .accounts
         .lock()
@@ -2099,7 +2278,7 @@ async fn route_encrypted_message(
         .unwrap_or_default();
     let clients = state.clients.lock().await.clone();
     for recipient_username in expected_recipients {
-        let wrapped_key_b64 = envelope_map
+        let envelope = envelope_map
             .remove(&recipient_username)
             .ok_or_else(|| "recipient envelope rejected".to_string())?;
         let frame = OutboundFrame::Message {
@@ -2109,7 +2288,9 @@ async fn route_encrypted_message(
             nonce_b64: nonce_b64.clone(),
             ciphertext_b64: ciphertext_b64.clone(),
             signature_b64: signature_b64.clone(),
-            wrapped_key_b64,
+            wrapped_key_b64: envelope.wrapped_key_b64,
+            prekey_id: envelope.prekey_id,
+            is_prekey: envelope.is_prekey,
             sender_username: sender_username.clone(),
             sender_public_key_b64: sender_public_key_b64.clone(),
         };
@@ -2160,6 +2341,75 @@ async fn register_message_id(
     Ok(())
 }
 
+async fn claim_prekeys(
+    state: &AppState,
+    expected_recipients: &HashSet<String>,
+    envelopes: &HashMap<String, InboundRecipientEnvelope>,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+) -> Result<(), String> {
+    let accounts = state.accounts.lock().await;
+    let mut claims_to_add = Vec::new();
+    for username in expected_recipients {
+        let Some(envelope) = envelopes.get(username) else {
+            return Err("recipient envelope rejected".to_string());
+        };
+        if !envelope.is_prekey || envelope.prekey_id.is_empty() {
+            continue;
+        }
+        let Some((code_id, account)) = accounts
+            .iter()
+            .find(|(_, account)| account.username == *username)
+        else {
+            return Err("recipient envelope rejected".to_string());
+        };
+        if account.prekey_id != envelope.prekey_id {
+            return Err("recipient prekey unavailable".to_string());
+        }
+        claims_to_add.push((
+            PrekeyClaimKey {
+                code_id: *code_id,
+                prekey_id: envelope.prekey_id.clone(),
+            },
+            PrekeyClaim {
+                chat_id: chat_id.to_string(),
+                message_id: message_id.to_string(),
+                sender_username: sender_username.to_string(),
+                created_at_ms: now_ms(),
+            },
+        ));
+    }
+    drop(accounts);
+
+    let now = now_ms();
+    let mut claims = state.prekey_claims.lock().await;
+    claims.retain(|_, claim| now.saturating_sub(claim.created_at_ms) < PREKEY_CLAIM_TTL_MS);
+    if claims_to_add
+        .iter()
+        .any(|(key, _)| claims.contains_key(key))
+    {
+        return Err("recipient prekey unavailable".to_string());
+    }
+    for (key, claim) in claims_to_add {
+        claims.insert(key, claim);
+    }
+    Ok(())
+}
+
+async fn release_prekey_claims(
+    state: &AppState,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+) {
+    state.prekey_claims.lock().await.retain(|_, claim| {
+        claim.chat_id != chat_id
+            || claim.message_id != message_id
+            || claim.sender_username != sender_username
+    });
+}
+
 async fn queue_pending_frame(
     state: &AppState,
     chat_id: &str,
@@ -2185,9 +2435,20 @@ async fn update_identity_state(
     sender_id: Uuid,
     revision: u64,
     envelope_b64: &str,
+    identity_public_b64: &str,
+    prekey_id: &str,
 ) -> Result<(), String> {
     let (code_id, _) = client_identity(state, sender_id).await?;
-    apply_identity_state(state, &code_id, revision, envelope_b64, true).await
+    apply_identity_state(
+        state,
+        &code_id,
+        revision,
+        envelope_b64,
+        identity_public_b64,
+        prekey_id,
+        true,
+    )
+    .await
 }
 
 async fn apply_identity_state(
@@ -2195,17 +2456,34 @@ async fn apply_identity_state(
     code_id: &CodeId,
     revision: u64,
     envelope_b64: &str,
+    identity_public_b64: &str,
+    prekey_id: &str,
     allow_reuse: bool,
 ) -> Result<(), String> {
     let mut envelope = decode_bounded(envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
-    if envelope.len() <= 1 + MESSAGE_NONCE_BYTES || envelope.first() != Some(&2) {
+    let mut identity_public = decode_exact(identity_public_b64, IDENTITY_PUBLIC_BYTES)?;
+    if envelope.len() <= 1 + MESSAGE_NONCE_BYTES
+        || envelope.first() != Some(&IDENTITY_ENVELOPE_VERSION)
+        || !valid_identity_public_bundle(&identity_public, prekey_id)
+    {
         envelope.zeroize();
+        identity_public.zeroize();
         return Err("identity state rejected".to_string());
     }
     let mut accounts = state.accounts.lock().await;
-    let account = accounts
-        .get_mut(code_id)
-        .ok_or_else(|| "authenticated identity required".to_string())?;
+    let account = accounts.get_mut(code_id).ok_or_else(|| {
+        envelope.zeroize();
+        identity_public.zeroize();
+        "authenticated identity required".to_string()
+    })?;
+    if account.identity_public.len() != IDENTITY_PUBLIC_BYTES
+        || account.identity_public[..IDENTITY_FINGERPRINT_BYTES]
+            != identity_public[..IDENTITY_FINGERPRINT_BYTES]
+    {
+        envelope.zeroize();
+        identity_public.zeroize();
+        return Err("identity state rejected".to_string());
+    }
     if revision > account.state_revision {
         let advance = revision - account.state_revision;
         account.state_revision_window = if advance >= u64::from(STATE_REVISION_WINDOW_BITS) {
@@ -2215,6 +2493,9 @@ async fn apply_identity_state(
         };
         let mut previous = std::mem::replace(&mut account.identity_envelope, envelope);
         previous.zeroize();
+        let mut previous_public = std::mem::replace(&mut account.identity_public, identity_public);
+        previous_public.zeroize();
+        account.prekey_id = prekey_id.to_string();
         account.state_revision = revision;
         return Ok(());
     }
@@ -2222,6 +2503,7 @@ async fn apply_identity_state(
     let lag = account.state_revision - revision;
     if lag >= u64::from(STATE_REVISION_WINDOW_BITS) {
         envelope.zeroize();
+        identity_public.zeroize();
         return if allow_reuse {
             Ok(())
         } else {
@@ -2231,13 +2513,21 @@ async fn apply_identity_state(
     let revision_bit = 1_u128 << lag;
     if account.state_revision_window & revision_bit != 0 && !allow_reuse {
         envelope.zeroize();
+        identity_public.zeroize();
+        return Err("identity state rejected".to_string());
+    }
+    if account.identity_public != identity_public || account.prekey_id != prekey_id {
+        envelope.zeroize();
+        identity_public.zeroize();
         return Err("identity state rejected".to_string());
     }
     account.state_revision_window |= revision_bit;
     envelope.zeroize();
+    identity_public.zeroize();
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn acknowledge_message(
     state: &AppState,
     sender_id: Uuid,
@@ -2246,6 +2536,9 @@ async fn acknowledge_message(
     original_sender: &str,
     revision: u64,
     envelope_b64: &str,
+    identity_public_b64: &str,
+    current_prekey_id: &str,
+    used_prekey_id: &str,
 ) -> Result<(), String> {
     if !valid_chat_id(chat_id)
         || !valid_chat_id(message_id)
@@ -2277,7 +2570,33 @@ async fn acknowledge_message(
     if !valid_sender || original_sender == username {
         return Err("conversation unavailable".to_string());
     }
-    apply_identity_state(state, &code_id, revision, envelope_b64, true).await?;
+    apply_identity_state(
+        state,
+        &code_id,
+        revision,
+        envelope_b64,
+        identity_public_b64,
+        current_prekey_id,
+        true,
+    )
+    .await?;
+
+    if !used_prekey_id.is_empty() {
+        let key = PrekeyClaimKey {
+            code_id,
+            prekey_id: used_prekey_id.to_string(),
+        };
+        let mut claims = state.prekey_claims.lock().await;
+        if let Some(claim) = claims.get(&key) {
+            if claim.chat_id != chat_id
+                || claim.message_id != message_id
+                || claim.sender_username != original_sender
+            {
+                return Err("message acknowledgement rejected".to_string());
+            }
+        }
+        claims.remove(&key);
+    }
 
     let key = PendingKey {
         chat_id: chat_id.to_string(),
@@ -2350,9 +2669,11 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     }
     state.frame_limits.lock().await.clear();
     state.replay_ids.lock().await.clear();
+    state.prekey_claims.lock().await.clear();
     state.opaque_handshakes.lock().await.clear();
     state.login_limits.lock().await.clear();
     state.clients.lock().await.clear();
+    state.active_connections.lock().await.clear();
 }
 
 async fn create_room(
@@ -2578,17 +2899,19 @@ fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
 }
 
 async fn broadcast_presence(state: &AppState) {
-    let users = state
-        .accounts
-        .lock()
-        .await
+    let accounts = state.accounts.lock().await;
+    let directory_digest = identity_directory_digest(&accounts);
+    let users = accounts
         .values()
         .map(|account| PresenceUser {
             username: account.username.clone(),
             connected: account.connected,
             identity_public_b64: URL_SAFE_NO_PAD.encode(&account.identity_public),
+            identity_prekey_id: account.prekey_id.clone(),
+            directory_digest: directory_digest.clone(),
         })
         .collect::<Vec<_>>();
+    drop(accounts);
     let frame = OutboundFrame::Presence { users };
     let clients = state
         .clients
@@ -2600,6 +2923,28 @@ async fn broadcast_presence(state: &AppState) {
     for client_id in clients {
         send_to_client(state, client_id, &frame).await;
     }
+}
+
+fn identity_directory_digest(accounts: &HashMap<CodeId, Account>) -> String {
+    let mut entries = accounts
+        .values()
+        .filter(|account| account.identity_public.len() >= IDENTITY_FINGERPRINT_BYTES)
+        .map(|account| {
+            (
+                account.username.clone(),
+                account.identity_public[..IDENTITY_FINGERPRINT_BYTES].to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    digest.update(b"ABYSSAL_DIRECTORY_CHECKPOINT_V1");
+    for (username, identity_public) in entries {
+        digest.update((username.len() as u32).to_be_bytes());
+        digest.update(username.as_bytes());
+        digest.update(&identity_public);
+    }
+    URL_SAFE_NO_PAD.encode(digest.finalize())
 }
 
 async fn broadcast_to_all(state: &AppState, frame: &OutboundFrame) {
@@ -2649,6 +2994,7 @@ async fn cleanup_client(state: &AppState, client_id: Uuid) {
         members.remove(&client_id);
     }
     if let Some(code_id) = code_id {
+        release_connection_reservation(state, &code_id, client_id).await;
         let still_connected = state
             .clients
             .lock()
@@ -2662,6 +3008,13 @@ async fn cleanup_client(state: &AppState, client_id: Uuid) {
         }
     }
     broadcast_presence(state).await;
+}
+
+async fn release_connection_reservation(state: &AppState, code_id: &CodeId, client_id: Uuid) {
+    let mut active_connections = state.active_connections.lock().await;
+    if active_connections.get(code_id) == Some(&client_id) {
+        active_connections.remove(code_id);
+    }
 }
 
 #[cfg(test)]
@@ -2869,6 +3222,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn one_time_prekey_claims_are_single_use_and_bound_to_recipient_state() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let expected = HashSet::from(["Bob".to_string()]);
+        let envelope = InboundRecipientEnvelope {
+            recipient_username: "Bob".to_string(),
+            wrapped_key_b64: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            prekey_id: test_prekey_id(b'B'),
+            is_prekey: true,
+        };
+        let envelopes = HashMap::from([("Bob".to_string(), envelope)]);
+
+        claim_prekeys(
+            &state,
+            &expected,
+            &envelopes,
+            "dm_alice_bob",
+            "message-1",
+            "Alice",
+        )
+        .await
+        .expect("first claim");
+        assert!(claim_prekeys(
+            &state,
+            &expected,
+            &envelopes,
+            "dm_alice_bob",
+            "message-2",
+            "Alice",
+        )
+        .await
+        .is_err());
+
+        let mut mismatched = envelopes;
+        mismatched.get_mut("Bob").expect("Bob envelope").prekey_id = "other-key".to_string();
+        state.prekey_claims.lock().await.clear();
+        assert!(claim_prekeys(
+            &state,
+            &expected,
+            &mismatched,
+            "dm_alice_bob",
+            "message-3",
+            "Alice",
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn identity_directory_checkpoint_is_order_independent_and_long_term_bound() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let first = {
+            let accounts = state.accounts.lock().await;
+            identity_directory_digest(&accounts)
+        };
+        {
+            let mut accounts = state.accounts.lock().await;
+            let bob_id = test_code_id("code-b");
+            accounts.get_mut(&bob_id).expect("Bob").prekey_id = "rotated-key".to_string();
+        }
+        let after_prekey_rotation = {
+            let accounts = state.accounts.lock().await;
+            identity_directory_digest(&accounts)
+        };
+        assert_eq!(first, after_prekey_rotation);
+        {
+            let mut accounts = state.accounts.lock().await;
+            let bob_id = test_code_id("code-b");
+            accounts.get_mut(&bob_id).expect("Bob").identity_public[0] ^= 1;
+        }
+        let after_identity_change = {
+            let accounts = state.accounts.lock().await;
+            identity_directory_digest(&accounts)
+        };
+        assert_ne!(first, after_identity_change);
+    }
+
     #[test]
     fn attachment_ttl_cannot_exceed_enforced_room_policy() {
         let mut room = test_room("forum_policy");
@@ -3051,7 +3485,14 @@ mod tests {
             message_id,
             "Alice",
             1,
-            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+            &URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            &test_identity_public_b64(b'B'),
+            &test_prekey_id(b'B'),
+            "",
         )
         .await
         .expect("recipient acknowledgement");
@@ -3101,7 +3542,14 @@ mod tests {
             message_id,
             "Alice",
             1,
-            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+            &URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            &test_identity_public_b64(b'B'),
+            &test_prekey_id(b'B'),
+            "",
         )
         .await
         .expect("recipient acknowledgement");
@@ -3153,7 +3601,14 @@ mod tests {
             shared_message_id,
             "Mallory",
             1,
-            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+            &URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            &test_identity_public_b64(b'B'),
+            &test_prekey_id(b'B'),
+            "",
         )
         .await
         .is_err());
@@ -3165,7 +3620,14 @@ mod tests {
             shared_message_id,
             "Alice",
             1,
-            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+            &URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            &test_identity_public_b64(b'B'),
+            &test_prekey_id(b'B'),
+            "",
         )
         .await
         .expect("Bob should acknowledge Alice only");
@@ -3195,7 +3657,14 @@ mod tests {
             shared_message_id,
             "Eve",
             1,
-            &URL_SAFE_NO_PAD.encode([2_u8; 256]),
+            &URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            &test_identity_public_b64(b'B'),
+            &test_prekey_id(b'B'),
+            "",
         )
         .await
         .expect("retry with an older state revision must not roll state backward");
@@ -3211,8 +3680,10 @@ mod tests {
         add_test_account(&state, "code-a", "Alice").await;
         let code_id = test_code_id("code-a");
         let mut revision_two = [2_u8; 256];
+        revision_two[0] = IDENTITY_ENVELOPE_VERSION;
         revision_two[1] = 22;
         let mut revision_one = [2_u8; 256];
+        revision_one[0] = IDENTITY_ENVELOPE_VERSION;
         revision_one[1] = 11;
 
         apply_identity_state(
@@ -3220,6 +3691,8 @@ mod tests {
             &code_id,
             2,
             &URL_SAFE_NO_PAD.encode(revision_two),
+            &test_identity_public_b64(b'A'),
+            &test_prekey_id(b'A'),
             false,
         )
         .await
@@ -3229,6 +3702,8 @@ mod tests {
             &code_id,
             1,
             &URL_SAFE_NO_PAD.encode(revision_one),
+            &test_identity_public_b64(b'A'),
+            &test_prekey_id(b'A'),
             false,
         )
         .await
@@ -3238,6 +3713,8 @@ mod tests {
             &code_id,
             1,
             &URL_SAFE_NO_PAD.encode(revision_one),
+            &test_identity_public_b64(b'A'),
+            &test_prekey_id(b'A'),
             false,
         )
         .await
@@ -3275,6 +3752,34 @@ mod tests {
         assert!(state.sessions.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn stale_socket_cleanup_cannot_release_new_active_connection() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        let (old_client, _) = add_test_client(&state, "code-a", "Alice").await;
+        let code_id = test_code_id("code-a");
+        state
+            .active_connections
+            .lock()
+            .await
+            .insert(code_id, old_client);
+
+        replace_connected_clients_for_code(&state, &code_id).await;
+        let (new_client, _) = add_test_client(&state, "code-a", "Alice").await;
+        state
+            .active_connections
+            .lock()
+            .await
+            .insert(code_id, new_client);
+
+        cleanup_client(&state, old_client).await;
+
+        assert_eq!(
+            state.active_connections.lock().await.get(&code_id).copied(),
+            Some(new_client)
+        );
+    }
+
     fn test_state() -> AppState {
         AppState {
             node_id: "test-node".to_string(),
@@ -3293,6 +3798,7 @@ mod tests {
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -3301,17 +3807,22 @@ mod tests {
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
+            prekey_claims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     async fn add_test_account(state: &AppState, code: &str, username: &str) {
+        let identity_fill = username.as_bytes()[0];
+        let mut identity_envelope = vec![0; 256];
+        identity_envelope[0] = IDENTITY_ENVELOPE_VERSION;
         state.accounts.lock().await.insert(
             test_code_id(code),
             Account {
                 username: username.to_string(),
                 password_file: vec![1; 192],
-                identity_public: vec![username.as_bytes()[0]; IDENTITY_PUBLIC_BYTES],
-                identity_envelope: vec![2; 256],
+                identity_public: vec![identity_fill; IDENTITY_PUBLIC_BYTES],
+                prekey_id: test_prekey_id(identity_fill),
+                identity_envelope,
                 state_revision: 0,
                 state_revision_window: 1,
                 connected: true,
@@ -3350,6 +3861,18 @@ mod tests {
             .get(&code_id)
             .map(|account| account.state_revision + 1)
             .ok_or_else(|| "missing test account".to_string())?;
+        let (identity_public_b64, prekey_id) = state
+            .accounts
+            .lock()
+            .await
+            .get(&code_id)
+            .map(|account| {
+                (
+                    URL_SAFE_NO_PAD.encode(&account.identity_public),
+                    account.prekey_id.clone(),
+                )
+            })
+            .ok_or_else(|| "missing test account".to_string())?;
         route_encrypted_message(
             state,
             sender_id,
@@ -3364,10 +3887,18 @@ mod tests {
                 .map(|username| InboundRecipientEnvelope {
                     recipient_username: (*username).to_string(),
                     wrapped_key_b64: URL_SAFE_NO_PAD.encode([4_u8; 256]),
+                    prekey_id: String::new(),
+                    is_prekey: false,
                 })
                 .collect(),
             state_revision,
-            URL_SAFE_NO_PAD.encode([2_u8; 256]),
+            URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            identity_public_b64,
+            prekey_id,
         )
         .await
     }
@@ -3392,6 +3923,14 @@ mod tests {
 
     fn test_code_id(code: &str) -> CodeId {
         derive_code_id(&[7_u8; 32], code)
+    }
+
+    fn test_identity_public_b64(fill: u8) -> String {
+        URL_SAFE_NO_PAD.encode(vec![fill; IDENTITY_PUBLIC_BYTES])
+    }
+
+    fn test_prekey_id(fill: u8) -> String {
+        prekey_id_for_public(&[fill; ONE_TIME_KEY_BYTES])
     }
 
     fn test_room(id: &str) -> RoomRecord {

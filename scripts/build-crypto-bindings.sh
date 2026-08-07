@@ -80,8 +80,8 @@ chmod 0644 "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so
 for artifact in \
   "$ROOT_DIR"/apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
   "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
-  if ! grep -aFq "ABYSSAL_E2EE_PAYLOAD_V4" "$artifact"; then
-    echo "Generated crypto artifact does not contain protocol v4: $artifact" >&2
+  if ! grep -aFq "ABYSSAL_E2EE_PAYLOAD_V5" "$artifact"; then
+    echo "Generated crypto artifact does not contain protocol v5: $artifact" >&2
     exit 1
   fi
 done

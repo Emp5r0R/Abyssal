@@ -155,7 +155,7 @@ describe("Abyssal System Security & Feature Suite", () => {
         "message_1",
         "Alice",
         plainText,
-        [{ username: "Bob", publicKey: receiverCipher.publicKey() }],
+        [{ username: "Bob", publicKey: receiverCipher.publicKey(), prekeyId: receiverCipher.prekeyId() }],
       );
       expect(encrypted.ciphertext).not.toEqual(new TextEncoder().encode(plainText));
 
@@ -166,6 +166,8 @@ describe("Abyssal System Security & Feature Suite", () => {
         senderCipher.publicKey(),
         encrypted,
         encrypted.envelopes[0].wrappedKey,
+        encrypted.envelopes[0].prekeyId,
+        encrypted.envelopes[0].isPrekey,
         "Bob",
       );
       expect(decrypted).toBe(plainText);
@@ -176,6 +178,8 @@ describe("Abyssal System Security & Feature Suite", () => {
         senderCipher.publicKey(),
         encrypted,
         encrypted.envelopes[0].wrappedKey,
+        encrypted.envelopes[0].prekeyId,
+        encrypted.envelopes[0].isPrekey,
         "Bob",
       )).toThrow();
     });
@@ -193,7 +197,7 @@ describe("Abyssal System Security & Feature Suite", () => {
         "attachment_1",
         "Alice",
         attachmentBytes,
-        [{ username: "Bob", publicKey: recipient.publicKey() }],
+        [{ username: "Bob", publicKey: recipient.publicKey(), prekeyId: recipient.prekeyId() }],
       );
       expect(encrypted).not.toEqual(attachmentBytes);
       const decrypted = recipient.decryptBytes(

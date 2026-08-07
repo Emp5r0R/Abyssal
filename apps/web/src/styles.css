@@ -893,6 +893,22 @@ button:disabled {
   background: var(--green);
 }
 
+.directory-checkpoint {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  margin-top: 11px;
+  color: var(--cyan);
+  font-size: 9px;
+}
+
+.directory-checkpoint strong {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sidebar-actions {
   display: flex;
   height: 57px;

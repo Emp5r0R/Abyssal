@@ -3,6 +3,7 @@ package com.abyssal.chat.data.network
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.RecipientIdentity
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -11,24 +12,29 @@ class InMemoryPayloadCipherTest {
     fun listedRecipientDecryptsAuthenticatedPayload() {
         val sender = identity(1)
         val receiver = identity(2)
+        val initialPrekey = receiver.prekeyId()
         val payload = sender.encrypt(
             CHAT_ID,
             MESSAGE_ID,
             "Alice",
             "hello from RAM".encodeToByteArray(),
-            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
         )
 
         val plain = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
 
-        assertEquals(4, payload.version)
+        assertEquals(5, payload.version)
+        assertTrue(payload.envelopes.single().isPrekey)
+        assertEquals(initialPrekey, payload.envelopes.single().prekeyId)
         assertEquals(1UL, payload.stateRevision)
         assertTrue(payload.identityEnvelope.size > 64)
         assertEquals("hello from RAM", plain.decodeToString())
+        assertNotEquals(initialPrekey, receiver.prekeyId())
         val state = receiver.stateSnapshot()
         val retry = receiver.stateSnapshot()
         assertEquals(1UL, state?.revision)
         assertEquals(1UL, retry?.revision)
+        assertEquals(128, state?.identityPublicKey?.size)
         assertTrue(state?.envelope !== retry?.envelope)
         assertTrue(state!!.envelope.contentEquals(retry!!.envelope))
     }
@@ -43,7 +49,7 @@ class InMemoryPayloadCipherTest {
             MESSAGE_ID,
             "Alice",
             "secret".encodeToByteArray(),
-            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
         )
         val incoming = incoming(payload, sender.publicKey(), "Alice", "Mallory", wrappedFor = "Bob")
 
@@ -59,13 +65,19 @@ class InMemoryPayloadCipherTest {
             MESSAGE_ID,
             "Alice",
             byteArrayOf(1, 2, 3, 4),
-            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
         )
         val original = incoming(payload, sender.publicKey(), "Alice", "Bob")
         val tampered = original.copy(ciphertext = original.ciphertext.clone().also {
             it[it.lastIndex] = (it.last() + 1).toByte()
         })
 
+        assertTrue(runCatching {
+            receiver.decrypt(original.copy(prekeyId = "wrong-prekey"), "Bob")
+        }.isFailure)
+        assertTrue(runCatching {
+            receiver.decrypt(original.copy(prekeyId = "", isPrekey = false), "Bob")
+        }.isFailure)
         assertTrue(runCatching { receiver.decrypt(tampered, "Bob") }.isFailure)
         assertTrue(runCatching { receiver.decrypt(original.copy(chatId = "forum_other"), "Bob") }.isFailure)
         assertTrue(runCatching {
@@ -82,7 +94,7 @@ class InMemoryPayloadCipherTest {
             "${MESSAGE_ID}_attachment",
             "Alice",
             byteArrayOf(9, 8, 7),
-            listOf(RecipientIdentity("Bob", receiver.publicKey()))
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
         )
         val serialized = sender.serialize(payload)
         val incoming = receiver.deserializeForRecipient(
@@ -121,16 +133,21 @@ class InMemoryPayloadCipherTest {
         sender: String,
         recipient: String,
         wrappedFor: String = recipient
-    ): IncomingTransportPayload = IncomingTransportPayload(
-        chatId = CHAT_ID,
-        messageId = payload.messageId,
-        nonce = payload.nonce,
-        ciphertext = payload.ciphertext,
-        signature = payload.signature,
-        wrappedKey = payload.envelopes.single { it.recipientUsername == wrappedFor }.wrappedKey,
-        senderUsername = sender,
-        senderPublicKey = senderPublicKey
-    )
+    ): IncomingTransportPayload {
+        val envelope = payload.envelopes.single { it.recipientUsername == wrappedFor }
+        return IncomingTransportPayload(
+            chatId = CHAT_ID,
+            messageId = payload.messageId,
+            nonce = payload.nonce,
+            ciphertext = payload.ciphertext,
+            signature = payload.signature,
+            wrappedKey = envelope.wrappedKey,
+            senderUsername = sender,
+            senderPublicKey = senderPublicKey,
+            prekeyId = envelope.prekeyId,
+            isPrekey = envelope.isPrekey
+        )
+    }
 
     private companion object {
         const val CHAT_ID = "forum_general"

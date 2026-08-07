@@ -161,10 +161,12 @@ class ChatViewModel(
                             incoming.chatId,
                             incoming.messageId,
                             incoming.senderUsername,
-                            state
+                            state,
+                            incoming.prekeyId
                         )
                     } finally {
                         state.envelope.fill(0)
+                        state.identityPublicKey.fill(0)
                     }
                     if (!acknowledged) logoutLocal()
                     return@collect
@@ -181,10 +183,12 @@ class ChatViewModel(
                         incoming.chatId,
                         incoming.messageId,
                         incoming.senderUsername,
-                        state
+                        state,
+                        incoming.prekeyId
                     )
                 } finally {
                     state.envelope.fill(0)
+                    state.identityPublicKey.fill(0)
                 }
                 if (!acknowledged) {
                     plainBytes.fill(0)
@@ -334,6 +338,12 @@ class ChatViewModel(
                 val identity = User(
                     username = validation.username ?: "AbyssalUser",
                     publicKey = validation.publicKey ?: run {
+                        _inviteCodeError.value = "Wrong information."
+                        payloadCipher.clear()
+                        _isVerifyingCode.value = false
+                        return@launch
+                    },
+                    prekeyId = validation.prekeyId ?: run {
                         _inviteCodeError.value = "Wrong information."
                         payloadCipher.clear()
                         _isVerifyingCode.value = false
@@ -886,6 +896,7 @@ class ChatViewModel(
         payload.ciphertext.fill(0)
         payload.signature.fill(0)
         payload.identityEnvelope.fill(0)
+        payload.identityPublicKey.fill(0)
         payload.envelopes.forEach { it.wrappedKey.fill(0) }
     }
 
@@ -902,10 +913,10 @@ class ChatViewModel(
                 ?: return null
         } else {
             known.values.filterNot { it.username.equals(self.username, ignoreCase = true) }
-        }.map { RecipientIdentity(it.username, it.publicKey) }.toMutableList()
+        }.map { RecipientIdentity(it.username, it.publicKey, it.prekeyId) }.toMutableList()
 
         if (includeSelf && recipients.none { it.username.equals(self.username, ignoreCase = true) }) {
-            recipients += RecipientIdentity(self.username, self.publicKey)
+            recipients += RecipientIdentity(self.username, self.publicKey, self.prekeyId)
         }
         return recipients
     }
@@ -935,6 +946,7 @@ class ChatViewModel(
                 chatTransport.syncIdentityState(state)
             } finally {
                 state.envelope.fill(0)
+                state.identityPublicKey.fill(0)
             }
             if (!synced) {
                 plain.fill(0)
@@ -1249,7 +1261,7 @@ class ChatViewModel(
         private const val SESSION_WATCHDOG_INTERVAL_MS = 1_000L
         private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
-        private const val IDENTITY_PUBLIC_KEY_BYTES = 96
+        private const val IDENTITY_PUBLIC_KEY_BYTES = 128
         private const val MAX_RECEIVED_FRAME_IDS = 10_000
     }
 }
