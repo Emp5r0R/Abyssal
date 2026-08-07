@@ -66,6 +66,8 @@ Required replacement depends on threat model: sealed sender, message padding, ba
 7. Keep the Android release keystore offline and backed up. Never commit `deploy/release.env`, `.secrets/`, APK signing credentials, or generated access codes.
 8. Commission independent cryptographic and application security review before claiming Signal-grade, audited, or high-assurance security. Stable software releases must continue disclosing prekey, group key management, transparency, rollback, multi-device, and audit gaps.
 
+Android update discovery requests only the configured official GitHub `releases/latest` API endpoint over HTTPS. The client disables redirects and caching for this request, accepts only stable semantic versions, and requires the APK asset name, repository path, HTTPS host, media type, and bounded size to match the expected release. Release metadata and reminder state remain in RAM. Pressing Update opens the official APK URL in the system browser; Android still requires normal user confirmation and a matching application signature before replacement.
+
 A hostile host administrator can replace or instrument the relay binary, attach before startup output is zeroized, or capture incoming account requests. Software running on an administrator-controlled host cannot prevent that. This design removes recovery paths and plaintext retention after normal startup; it does not claim protection from a malicious root operator.
 
 ## Reporting

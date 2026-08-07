@@ -25,6 +25,12 @@ android {
         versionCode = 13
         versionName = "1.8.0"
 
+        buildConfigField(
+            "String",
+            "UPDATE_API_URL",
+            "\"https://api.github.com/repos/Emp5r0R/Abyssal/releases/latest\""
+        )
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
@@ -71,6 +77,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.11"

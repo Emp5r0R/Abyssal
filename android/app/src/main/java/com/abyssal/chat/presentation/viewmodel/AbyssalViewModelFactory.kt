@@ -3,8 +3,10 @@ package com.abyssal.chat.presentation.viewmodel
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import com.abyssal.chat.BuildConfig
 import com.abyssal.chat.data.network.CloudflareFallbackDns
 import com.abyssal.chat.data.network.EncryptedAttachmentService
+import com.abyssal.chat.data.network.GitHubReleaseUpdateService
 import com.abyssal.chat.data.network.InMemoryNodeConfigService
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.data.network.NetworkIdentityService
@@ -35,6 +37,19 @@ class AbyssalViewModelFactory(
         val chatTransport = RealChatTransport(nodeConfigService, httpClient)
         val attachmentService = EncryptedAttachmentService(appContext, nodeConfigService, httpClient)
         val disguiseManager = AndroidDisguiseManager(appContext)
+        val appUpdateService = GitHubReleaseUpdateService(
+            client = httpClient.newBuilder()
+                .callTimeout(12, TimeUnit.SECONDS)
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .cache(null)
+                .build(),
+            currentVersionName = BuildConfig.VERSION_NAME,
+            apiUrl = BuildConfig.UPDATE_API_URL
+        )
 
         @Suppress("UNCHECKED_CAST")
         return ChatViewModel(
@@ -45,6 +60,7 @@ class AbyssalViewModelFactory(
             chatTransport = chatTransport,
             attachmentService = attachmentService,
             disguiseManager = disguiseManager,
+            appUpdateService = appUpdateService,
             payloadCipher = payloadCipher
         ) as T
     }
