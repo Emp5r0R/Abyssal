@@ -18,10 +18,9 @@ describe("attachmentDownloadBlob", () => {
     expect(new Uint8Array(await blob.arrayBuffer())).toEqual(new Uint8Array([137, 80, 78, 71]));
   });
 
-  it("handles empty Uint8Array", async () => {
-    const blob = attachmentDownloadBlob(new Uint8Array(0), "application/octet-stream");
-    expect(blob.type).toBe("application/octet-stream");
-    expect((await blob.arrayBuffer()).byteLength).toBe(0);
+  it("rejects an empty plaintext export", () => {
+    expect(() => attachmentDownloadBlob(new Uint8Array(0), "application/octet-stream"))
+      .toThrow("Attachment unavailable");
   });
 
   it("creates independent copies from the same source buffer", async () => {
@@ -45,7 +44,8 @@ describe("attachmentDownloadBlob", () => {
   });
 
   it("falls back to a non-executable type for malformed media types", () => {
-    expect(attachmentDownloadBlob(new Uint8Array(), "text/html; charset=utf-8").type).toBe("application/octet-stream");
+    expect(attachmentDownloadBlob(new Uint8Array([1]), "text/html; charset=utf-8").type)
+      .toBe("application/octet-stream");
   });
 
   it("keeps the original extension without adding an Abyssal suffix", () => {

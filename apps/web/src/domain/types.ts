@@ -99,6 +99,8 @@ export interface ChatMessage {
   senderPublicKeyB64?: string;
   attachment?: {
     id: string;
+    encryptionVersion: number;
+    encryptionKey: Uint8Array;
     name: string;
     mediaType: MediaType;
     mimeType: string;
@@ -130,6 +132,7 @@ export type IncomingFrame =
       wrapped_key_b64: string;
       sender_username: string;
       sender_public_key_b64: string;
+      identity_public_b64?: string;
       prekey_id: string;
       is_prekey: boolean;
     }

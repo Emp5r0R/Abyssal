@@ -4,7 +4,6 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.abyssal.chat.BuildConfig
-import com.abyssal.chat.data.network.CloudflareFallbackDns
 import com.abyssal.chat.data.network.EncryptedAttachmentService
 import com.abyssal.chat.data.network.GitHubReleaseUpdateService
 import com.abyssal.chat.data.network.InMemoryNodeConfigService
@@ -14,6 +13,7 @@ import com.abyssal.chat.data.network.RealChatTransport
 import com.abyssal.chat.data.repository.AndroidDisguiseManager
 import com.abyssal.chat.data.repository.InMemoryMessageRepository
 import java.util.concurrent.TimeUnit
+import okhttp3.Dns
 import okhttp3.OkHttpClient
 
 class AbyssalViewModelFactory(
@@ -24,27 +24,50 @@ class AbyssalViewModelFactory(
             error("Unsupported ViewModel: ${modelClass.name}")
         }
 
-        val httpClient = OkHttpClient.Builder()
-            .dns(CloudflareFallbackDns())
+        val nodeHttpClient = OkHttpClient.Builder()
+            .dns(Dns.SYSTEM)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
+            .callTimeout(180, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .retryOnConnectionFailure(false)
+            .cache(null)
+            .build()
+        val nodeWebSocketClient = OkHttpClient.Builder()
+            .dns(Dns.SYSTEM)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
+            .callTimeout(0, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .retryOnConnectionFailure(false)
+            .cache(null)
+            .build()
+        val attachmentHttpClient = nodeHttpClient.newBuilder()
+            .readTimeout(2, TimeUnit.MINUTES)
+            .writeTimeout(2, TimeUnit.MINUTES)
+            .callTimeout(11, TimeUnit.MINUTES)
             .build()
         val nodeConfigService = InMemoryNodeConfigService()
         val payloadCipher = InMemoryPayloadCipher()
-        val identityService = NetworkIdentityService(httpClient, payloadCipher)
+        val identityService = NetworkIdentityService(nodeHttpClient, payloadCipher)
         val messageRepository = InMemoryMessageRepository()
-        val chatTransport = RealChatTransport(nodeConfigService, httpClient)
-        val attachmentService = EncryptedAttachmentService(appContext, nodeConfigService, httpClient)
+        val chatTransport = RealChatTransport(nodeConfigService, nodeWebSocketClient)
+        val attachmentService = EncryptedAttachmentService(appContext, nodeConfigService, attachmentHttpClient)
         val disguiseManager = AndroidDisguiseManager(appContext)
         val appUpdateService = GitHubReleaseUpdateService(
-            client = httpClient.newBuilder()
+            client = OkHttpClient.Builder()
+                .dns(Dns.SYSTEM)
                 .callTimeout(12, TimeUnit.SECONDS)
                 .connectTimeout(8, TimeUnit.SECONDS)
                 .readTimeout(10, TimeUnit.SECONDS)
                 .writeTimeout(10, TimeUnit.SECONDS)
                 .followRedirects(false)
                 .followSslRedirects(false)
+                .retryOnConnectionFailure(false)
                 .cache(null)
                 .build(),
             currentVersionName = BuildConfig.VERSION_NAME,

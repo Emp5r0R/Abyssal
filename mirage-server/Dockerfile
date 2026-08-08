@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-bookworm-slim AS web-builder
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS web-builder
 
 WORKDIR /repo
 COPY package.json package-lock.json ./
@@ -9,7 +9,7 @@ RUN npm ci --workspace @abyssal/web
 COPY apps/web ./apps/web
 RUN npm run build --workspace @abyssal/web
 
-FROM rust:1-bookworm AS rust-builder
+FROM rust:1-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS rust-builder
 
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock ./
@@ -22,7 +22,7 @@ RUN --mount=type=cache,id=abyssal-cargo-registry,target=/usr/local/cargo/registr
     && mkdir -p /out \
     && cp /repo/target/release/mirage-server /out/mirage-server
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
 
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin mirage \
     && apt-get update \

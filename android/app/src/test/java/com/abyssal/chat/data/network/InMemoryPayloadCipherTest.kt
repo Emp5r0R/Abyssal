@@ -3,9 +3,11 @@ package com.abyssal.chat.data.network
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.RecipientIdentity
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 
 class InMemoryPayloadCipherTest {
     @Test
@@ -23,9 +25,10 @@ class InMemoryPayloadCipherTest {
 
         val plain = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
 
-        assertEquals(5, payload.version)
+        assertEquals(6, payload.version)
         assertTrue(payload.envelopes.single().isPrekey)
         assertEquals(initialPrekey, payload.envelopes.single().prekeyId)
+        assertEquals(64, payload.envelopes.single().signature.size)
         assertEquals(1UL, payload.stateRevision)
         assertTrue(payload.identityEnvelope.size > 64)
         assertEquals("hello from RAM", plain.decodeToString())
@@ -71,6 +74,9 @@ class InMemoryPayloadCipherTest {
         val tampered = original.copy(ciphertext = original.ciphertext.clone().also {
             it[it.lastIndex] = (it.last() + 1).toByte()
         })
+        val tamperedSignature = original.copy(signature = original.signature.clone().also {
+            it[it.lastIndex] = (it.last() + 1).toByte()
+        })
 
         assertTrue(runCatching {
             receiver.decrypt(original.copy(prekeyId = "wrong-prekey"), "Bob")
@@ -79,6 +85,7 @@ class InMemoryPayloadCipherTest {
             receiver.decrypt(original.copy(prekeyId = "", isPrekey = false), "Bob")
         }.isFailure)
         assertTrue(runCatching { receiver.decrypt(tampered, "Bob") }.isFailure)
+        assertTrue(runCatching { receiver.decrypt(tamperedSignature, "Bob") }.isFailure)
         assertTrue(runCatching { receiver.decrypt(original.copy(chatId = "forum_other"), "Bob") }.isFailure)
         assertTrue(runCatching {
             receiver.decrypt(original.copy(senderPublicKey = ByteArray(64)), "Bob")
@@ -97,6 +104,13 @@ class InMemoryPayloadCipherTest {
             listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
         )
         val serialized = sender.serialize(payload)
+        val serializedJson = JSONObject(serialized.decodeToString())
+        assertEquals(6, serializedJson.optInt("version"))
+        assertTrue(serializedJson.optString("identity_public_b64").isNotEmpty())
+        val serializedEnvelope = serializedJson.getJSONArray("envelopes").getJSONObject(0)
+        assertTrue(serializedEnvelope.optString("signature_b64").isNotEmpty())
+        assertFalse(serializedJson.has("state_revision"))
+        assertFalse(serializedJson.has("identity_envelope_b64"))
         val incoming = receiver.deserializeForRecipient(
             CHAT_ID,
             serialized,
@@ -106,6 +120,26 @@ class InMemoryPayloadCipherTest {
         )
 
         assertTrue(byteArrayOf(9, 8, 7).contentEquals(receiver.decrypt(incoming, "Bob")))
+    }
+
+    @Test
+    fun emptyRecipientListIsRejectedWithoutAdvancingIdentity() {
+        val sender = identity(1)
+        val initialPrekey = sender.prekeyId()
+
+        assertTrue(
+            runCatching {
+                sender.encrypt(
+                    CHAT_ID,
+                    MESSAGE_ID,
+                    "Alice",
+                    byteArrayOf(1, 2, 3),
+                    emptyList()
+                )
+            }.isFailure
+        )
+        assertEquals(initialPrekey, sender.prekeyId())
+        assertTrue(sender.stateSnapshot() == null)
     }
 
     @Test
@@ -138,9 +172,11 @@ class InMemoryPayloadCipherTest {
         return IncomingTransportPayload(
             chatId = CHAT_ID,
             messageId = payload.messageId,
+            version = payload.version,
+            identityPublicKey = payload.identityPublicKey,
             nonce = payload.nonce,
             ciphertext = payload.ciphertext,
-            signature = payload.signature,
+            signature = envelope.signature,
             wrappedKey = envelope.wrappedKey,
             senderUsername = sender,
             senderPublicKey = senderPublicKey,

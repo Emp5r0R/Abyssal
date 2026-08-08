@@ -11,6 +11,7 @@ import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.INodeConfigService
 import java.util.Collections
 import java.util.Base64
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -74,7 +75,7 @@ class RealChatTransport(
             val payload = _incomingPayloads.tryReceive().getOrNull() ?: break
             wipeIncomingPayload(payload)
         }
-        _presence.value = emptyList()
+        clearPresence()
         _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
     }
 
@@ -130,42 +131,44 @@ class RealChatTransport(
         chatId: String,
         payload: EncryptedTransportPayload
     ): Boolean {
-        val frame = JSONObject()
-            .put("type", "message")
-            .put("chat_id", chatId)
-            .put("version", payload.version)
-            .put("message_id", payload.messageId)
-            .put("nonce_b64", encode(payload.nonce))
-            .put("ciphertext_b64", encode(payload.ciphertext))
-            .put("signature_b64", encode(payload.signature))
-            .put("state_revision", payload.stateRevision.toLong())
-            .put("identity_envelope_b64", encode(payload.identityEnvelope))
-            .put("identity_public_b64", encode(payload.identityPublicKey))
-            .put("prekey_id", payload.prekeyId)
-            .put("envelopes", JSONArray().apply {
-                payload.envelopes.forEach { envelope ->
-                    put(
-                        JSONObject()
-                            .put("recipient_username", envelope.recipientUsername)
-                            .put("wrapped_key_b64", encode(envelope.wrappedKey))
-                            .put("prekey_id", envelope.prekeyId)
-                            .put("is_prekey", envelope.isPrekey)
-                    )
+        return try {
+            val frame = JSONObject()
+                .put("type", "message")
+                .put("chat_id", chatId)
+                .put("version", payload.version)
+                .put("message_id", payload.messageId)
+                .put("nonce_b64", encode(payload.nonce))
+                .put("ciphertext_b64", encode(payload.ciphertext))
+                .put("state_revision", payload.stateRevision.toLong())
+                .put("identity_envelope_b64", encode(payload.identityEnvelope))
+                .put("identity_public_b64", encode(payload.identityPublicKey))
+                .put("prekey_id", payload.prekeyId)
+                .put("envelopes", JSONArray().apply {
+                    payload.envelopes.forEach { envelope ->
+                        put(
+                            JSONObject()
+                                .put("recipient_username", envelope.recipientUsername)
+                                .put("wrapped_key_b64", encode(envelope.wrappedKey))
+                                .put("prekey_id", envelope.prekeyId)
+                                .put("is_prekey", envelope.isPrekey)
+                                .put("signature_b64", encode(envelope.signature))
+                        )
+                    }
+                })
+                .toString()
+            if (frame.length > MAX_WEBSOCKET_FRAME_CHARS) {
+                _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+                false
+            } else {
+                val accepted = webSocket?.send(frame) == true
+                if (!accepted) {
+                    _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
                 }
-            })
-            .toString()
-
-        val accepted = webSocket?.send(frame) == true
-        if (!accepted) {
-            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+                accepted
+            }
+        } finally {
+            wipeEncryptedPayload(payload)
         }
-        payload.nonce.fill(0)
-        payload.ciphertext.fill(0)
-        payload.signature.fill(0)
-        payload.identityEnvelope.fill(0)
-        payload.identityPublicKey.fill(0)
-        payload.envelopes.forEach { it.wrappedKey.fill(0) }
-        return accepted
     }
 
     override suspend fun acknowledgeMessage(
@@ -235,81 +238,87 @@ class RealChatTransport(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (text.length > MAX_WEBSOCKET_FRAME_CHARS) return
                 runCatching {
                     val json = JSONObject(text)
                     when (json.optString("type")) {
                         "GLOBAL_WIPE", "global_wipe" -> _wipeCommands.tryEmit(Unit)
                         "message" -> {
                             if (json.optInt("version") != PROTOCOL_VERSION) return
-                            val chatId = json.optString("chat_id").takeIf { it.isNotBlank() } ?: return
-                            val messageId = json.optString("message_id").takeIf { it.isNotBlank() } ?: return
-                            val senderUsername = json.optString("sender_username").takeIf { it.isNotBlank() } ?: return
-                            val payload = IncomingTransportPayload(
-                                chatId = chatId,
-                                messageId = messageId,
-                                nonce = decode(json.getString("nonce_b64")),
-                                ciphertext = decode(json.getString("ciphertext_b64")),
-                                signature = decode(json.getString("signature_b64")),
-                                wrappedKey = decode(json.getString("wrapped_key_b64")),
-                                senderUsername = senderUsername,
-                                senderPublicKey = decode(json.getString("sender_public_key_b64")),
-                                prekeyId = json.optString("prekey_id"),
-                                isPrekey = json.optBoolean("is_prekey", false)
-                            )
-                            if (!_incomingPayloads.trySend(payload).isSuccess) wipeIncomingPayload(payload)
-                            Unit
+                            json.toIncomingPayload()?.let { payload ->
+                                if (!_incomingPayloads.trySend(payload).isSuccess) wipeIncomingPayload(payload)
+                            }
                         }
                         "presence" -> {
                             val users = json.optJSONArray("users") ?: return
+                            if (users.length() > MAX_DIRECTORY_ENTRIES) return
+                            var identityChanged = false
                             val nextPresence = (0 until users.length()).mapNotNull { index ->
-                                val user = users.optJSONObject(index) ?: return@mapNotNull null
-                                val username = user.optString("username").takeIf { it.isNotBlank() }
-                                    ?: return@mapNotNull null
-                                val publicKeyB64 = user.getString("identity_public_b64")
-                                val publicKey = decode(publicKeyB64)
-                                if (publicKey.size != IDENTITY_PUBLIC_KEY_BYTES) {
-                                    publicKey.fill(0)
-                                    return@mapNotNull null
+                                var publicKey: ByteArray? = null
+                                var ownershipTransferred = false
+                                try {
+                                    val user = users.optJSONObject(index) ?: return@mapNotNull null
+                                    val username = user.optString("username").takeIf { isSafeUsername(it) }
+                                        ?: return@mapNotNull null
+                                    val publicKeyB64 = user.getString("identity_public_b64")
+                                    val decodedPublicKey = decode(publicKeyB64)
+                                    if (decodedPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES) {
+                                        return@mapNotNull null
+                                    }
+                                    publicKey = decodedPublicKey
+                                    val prekeyId = user.optString("identity_prekey_id")
+                                    if (!PREKEY_ID_REGEX.matches(prekeyId)) {
+                                        return@mapNotNull null
+                                    }
+                                    val fingerprint = encode(decodedPublicKey.copyOfRange(0, 64))
+                                    val pinKey = username.lowercase(Locale.ROOT)
+                                    val pinned = identityPins[pinKey]
+                                    if (pinned != null && pinned != fingerprint) {
+                                        webSocket.close(1008, "identity changed")
+                                        this@RealChatTransport.webSocket = null
+                                        _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+                                        identityChanged = true
+                                        return@mapNotNull null
+                                    }
+                                    identityPins[pinKey] = fingerprint
+                                    val directoryDigest = user.optString("directory_digest")
+                                    if (!DIRECTORY_DIGEST_REGEX.matches(directoryDigest)) {
+                                        return@mapNotNull null
+                                    }
+                                    val presence = UserPresence(
+                                        username = username,
+                                        connected = user.optBoolean("connected", false),
+                                        publicKey = decodedPublicKey,
+                                        prekeyId = prekeyId,
+                                        directoryDigest = directoryDigest
+                                    )
+                                    ownershipTransferred = true
+                                    presence
+                                } catch (_: Exception) {
+                                    null
+                                } finally {
+                                    if (!ownershipTransferred) publicKey?.fill(0)
                                 }
-                                val prekeyId = user.optString("identity_prekey_id")
-                                if (!PREKEY_ID_REGEX.matches(prekeyId)) {
-                                    publicKey.fill(0)
-                                    return@mapNotNull null
-                                }
-                                val fingerprint = encode(publicKey.copyOfRange(0, 64))
-                                val pinKey = username.lowercase()
-                                val pinned = identityPins[pinKey]
-                                if (pinned != null && pinned != fingerprint) {
-                                    publicKey.fill(0)
-                                    webSocket.close(1008, "identity changed")
-                                    this@RealChatTransport.webSocket = null
-                                    _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
-                                    return
-                                }
-                                identityPins[pinKey] = fingerprint
-                                val directoryDigest = user.optString("directory_digest")
-                                if (!DIRECTORY_DIGEST_REGEX.matches(directoryDigest)) {
-                                    publicKey.fill(0)
-                                    return@mapNotNull null
-                                }
-                                UserPresence(
-                                    username = username,
-                                    connected = user.optBoolean("connected", false),
-                                    publicKey = publicKey,
-                                    prekeyId = prekeyId,
-                                    directoryDigest = directoryDigest
-                                )
+                            }
+                            if (identityChanged) {
+                                wipePresence(nextPresence)
+                                _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+                                return
                             }
                             if (nextPresence.map { user -> user.directoryDigest }.distinct().size > 1) {
+                                wipePresence(nextPresence)
                                 webSocket.close(1008, "directory changed")
                                 this@RealChatTransport.webSocket = null
                                 _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
                                 return
                             }
+                            val previousPresence = _presence.value
                             _presence.value = nextPresence
+                            wipePresence(previousPresence)
                         }
                         "rooms" -> {
                             val rooms = json.optJSONArray("rooms") ?: JSONArray()
+                            if (rooms.length() > MAX_DIRECTORY_ENTRIES) return
                             (0 until rooms.length()).forEach { index ->
                                 rooms.optJSONObject(index)?.toChatSession()?.let { session ->
                                     joinedChatIds.add(session.id)
@@ -330,6 +339,7 @@ class RealChatTransport(
                         }
                         "directs" -> {
                             val directs = json.optJSONArray("directs") ?: JSONArray()
+                            if (directs.length() > MAX_DIRECTORY_ENTRIES) return
                             (0 until directs.length()).forEach { index ->
                                 directs.optJSONObject(index)?.toDirectSession()?.let { session ->
                                     joinedChatIds.add(session.id)
@@ -351,12 +361,14 @@ class RealChatTransport(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 connecting.set(false)
                 this@RealChatTransport.webSocket = null
+                clearPresence()
                 _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 connecting.set(false)
                 this@RealChatTransport.webSocket = null
+                clearPresence()
                 _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
             }
         }
@@ -377,6 +389,100 @@ class RealChatTransport(
         payload.signature.fill(0)
         payload.wrappedKey.fill(0)
         payload.senderPublicKey.fill(0)
+        payload.identityPublicKey.fill(0)
+    }
+
+    private fun wipeEncryptedPayload(payload: EncryptedTransportPayload) {
+        payload.nonce.fill(0)
+        payload.ciphertext.fill(0)
+        payload.identityEnvelope.fill(0)
+        payload.identityPublicKey.fill(0)
+        payload.envelopes.forEach {
+            it.wrappedKey.fill(0)
+            it.signature.fill(0)
+        }
+    }
+
+    private fun clearPresence() {
+        val previous = _presence.value
+        _presence.value = emptyList()
+        wipePresence(previous)
+    }
+
+    private fun wipePresence(presence: List<UserPresence>) {
+        presence.forEach { it.publicKey.fill(0) }
+    }
+
+    private fun JSONObject.toIncomingPayload(): IncomingTransportPayload? {
+        var nonce: ByteArray? = null
+        var ciphertext: ByteArray? = null
+        var signature: ByteArray? = null
+        var wrappedKey: ByteArray? = null
+        var senderPublicKey: ByteArray? = null
+        var identityPublicKey: ByteArray? = null
+        var ownershipTransferred = false
+        return try {
+            val chatId = optString("chat_id").takeIf { isSafeIdentifier(it) } ?: return null
+            val messageId = optString("message_id").takeIf { isSafeIdentifier(it) } ?: return null
+            val version = optInt("version")
+            if (version != PROTOCOL_VERSION) return null
+            val senderUsername = optString("sender_username")
+                .takeIf { isSafeUsername(it) } ?: return null
+            val prekeyId = optString("prekey_id")
+            val isPrekey = optBoolean("is_prekey", false)
+            if (isPrekey != prekeyId.isNotEmpty() ||
+                (prekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(prekeyId))
+            ) return null
+
+            val decodedNonce = decode(getString("nonce_b64"))
+            val decodedCiphertext = decode(getString("ciphertext_b64"))
+            val decodedSignature = decode(getString("signature_b64"))
+            val decodedWrappedKey = decode(getString("wrapped_key_b64"))
+            val decodedSenderPublicKey = decode(getString("sender_public_key_b64"))
+            val decodedIdentityPublicKey = decode(getString("identity_public_b64"))
+            nonce = decodedNonce
+            ciphertext = decodedCiphertext
+            signature = decodedSignature
+            wrappedKey = decodedWrappedKey
+            senderPublicKey = decodedSenderPublicKey
+            identityPublicKey = decodedIdentityPublicKey
+            if (
+                decodedNonce.size != MESSAGE_NONCE_BYTES ||
+                decodedCiphertext.isEmpty() || decodedCiphertext.size > MAX_CIPHERTEXT_BYTES ||
+                decodedSignature.size != MESSAGE_SIGNATURE_BYTES ||
+                decodedWrappedKey.isEmpty() || decodedWrappedKey.size > MAX_WRAPPED_KEY_BYTES ||
+                decodedSenderPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
+                decodedIdentityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES
+            ) return null
+
+            val payload = IncomingTransportPayload(
+                chatId = chatId,
+                messageId = messageId,
+                version = version,
+                identityPublicKey = decodedIdentityPublicKey,
+                nonce = decodedNonce,
+                ciphertext = decodedCiphertext,
+                signature = decodedSignature,
+                wrappedKey = decodedWrappedKey,
+                senderUsername = senderUsername,
+                senderPublicKey = decodedSenderPublicKey,
+                prekeyId = prekeyId,
+                isPrekey = isPrekey
+            )
+            ownershipTransferred = true
+            payload
+        } catch (_: Exception) {
+            null
+        } finally {
+            if (!ownershipTransferred) {
+                nonce?.fill(0)
+                ciphertext?.fill(0)
+                signature?.fill(0)
+                wrappedKey?.fill(0)
+                senderPublicKey?.fill(0)
+                identityPublicKey?.fill(0)
+            }
+        }
     }
 
     private fun ChatSession.toRoomJson(): JSONObject {
@@ -401,27 +507,31 @@ class RealChatTransport(
     }
 
     private fun JSONObject.toChatSession(): ChatSession? {
-        val chatId = optString("id").takeIf { it.isNotBlank() } ?: return null
+        val chatId = optString("id").takeIf { it.startsWith("forum_") && isSafeIdentifier(it) } ?: return null
+        val name = optString("name", chatId.removePrefix("forum_")
+            .takeIf { it.isNotBlank() } ?: chatId)
+            .takeIf { it.isNotBlank() && it.length <= MAX_ROOM_NAME_CHARS }
+            ?: return null
         return ChatSession(
             id = chatId,
-            name = optString("name", chatId.removePrefix("forum_")),
+            name = name,
             isForum = true,
             lastMessage = null,
             unreadCount = 0,
             selfDestructTimerSec = optInt("self_destruct_timer_sec", 5).coerceIn(0, 86_400),
-            overallExpirySec = optInt("overall_expiry_sec", 0).coerceAtLeast(0),
+            overallExpirySec = optInt("overall_expiry_sec", 0).coerceIn(0, MAX_RETENTION_SEC),
             allowImages = optBoolean("allow_images", true),
             allowVideos = optBoolean("allow_videos", true),
             allowFiles = optBoolean("allow_files", true),
             enforceTextAbsoluteExpiry = optBoolean("enforce_text_absolute_expiry", false),
             imageReadTimerSec = optInt("image_read_timer_sec", 5).coerceIn(0, 86_400),
-            imageOverallExpirySec = optInt("image_overall_expiry_sec", 0).coerceAtLeast(0),
+            imageOverallExpirySec = optInt("image_overall_expiry_sec", 0).coerceIn(0, MAX_RETENTION_SEC),
             enforceImageAbsoluteExpiry = optBoolean("enforce_image_absolute_expiry", false),
             videoReadTimerSec = optInt("video_read_timer_sec", 5).coerceIn(0, 86_400),
-            videoOverallExpirySec = optInt("video_overall_expiry_sec", 0).coerceAtLeast(0),
+            videoOverallExpirySec = optInt("video_overall_expiry_sec", 0).coerceIn(0, MAX_RETENTION_SEC),
             enforceVideoAbsoluteExpiry = optBoolean("enforce_video_absolute_expiry", false),
             fileReadTimerSec = optInt("file_read_timer_sec", 5).coerceIn(0, 86_400),
-            fileOverallExpirySec = optInt("file_overall_expiry_sec", 0).coerceAtLeast(0),
+            fileOverallExpirySec = optInt("file_overall_expiry_sec", 0).coerceIn(0, MAX_RETENTION_SEC),
             enforceFileAbsoluteExpiry = optBoolean("enforce_file_absolute_expiry", false),
             ownerUsername = optString("owner_username").takeIf { it.isNotBlank() }
         )
@@ -431,7 +541,7 @@ class RealChatTransport(
         val chatId = optString("id").takeIf { it.matches(DIRECT_ID_REGEX) } ?: return null
         val peerUsername = optString("peer_username")
             .trim()
-            .takeIf { it.isNotEmpty() && it.length <= 80 }
+            .takeIf { isSafeUsername(it) }
             ?: return null
         return ChatSession(
             id = chatId,
@@ -444,11 +554,37 @@ class RealChatTransport(
     }
 
     private companion object {
-        const val PROTOCOL_VERSION = 5
+        const val PROTOCOL_VERSION = 6
+        const val MAX_WEBSOCKET_FRAME_CHARS = 1 * 1024 * 1024
+        const val MAX_CIPHERTEXT_BYTES = 1 * 1024 * 1024
+        const val MAX_WRAPPED_KEY_BYTES = 4096
+        const val MESSAGE_NONCE_BYTES = 12
+        const val MESSAGE_SIGNATURE_BYTES = 64
         const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        const val MAX_USERNAME_CHARS = 80
+        const val MAX_ROOM_NAME_CHARS = 128
+        const val MAX_RETENTION_SEC = 86_400
+        // The relay's room quota can reach 100 rooms per account. The inbound
+        // WebSocket frame is capped at 1 MiB, so this bounds JSON work without
+        // rejecting a valid catalog before the frame-size guard does.
+        const val MAX_DIRECTORY_ENTRIES = 4096
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
         val DIRECTORY_DIGEST_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
         val DIRECT_ID_REGEX = Regex("^dm_[A-Za-z0-9_-]{1,125}$")
+
+        fun isSafeIdentifier(value: String): Boolean =
+            value.isNotEmpty() && value.length <= 128 &&
+                value.all { character ->
+                    character in 'A'..'Z' || character in 'a'..'z' || character in '0'..'9' ||
+                        character == '_' || character == '-'
+                }
+
+        fun isSafeUsername(value: String): Boolean =
+            value.length in 1..MAX_USERNAME_CHARS &&
+                value.all { character ->
+                    character in 'A'..'Z' || character in 'a'..'z' || character in '0'..'9' ||
+                        character == '_' || character == '-'
+                }
 
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 

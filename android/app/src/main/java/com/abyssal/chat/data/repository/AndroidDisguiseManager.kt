@@ -5,6 +5,25 @@ import android.content.Context
 import android.content.pm.PackageManager
 import com.abyssal.chat.domain.repository.IDisguiseManager
 
+internal fun applyLauncherAliasTransition(
+    enableTarget: () -> Unit,
+    disableOpposite: () -> Unit,
+    rollbackTarget: () -> Unit
+): Boolean {
+    return try {
+        enableTarget()
+        try {
+            disableOpposite()
+        } catch (error: RuntimeException) {
+            runCatching(rollbackTarget)
+            throw error
+        }
+        true
+    } catch (_: RuntimeException) {
+        false
+    }
+}
+
 class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
 
     // Secrets intentionally live only for the lifetime of the application process. If
@@ -58,12 +77,19 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         val calculator = ComponentName(context, "${context.packageName}.LauncherCalculator")
         val enable = PackageManager.COMPONENT_ENABLED_STATE_ENABLED
         val disable = PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-        return runCatching {
-            val first = if (enabled) calculator else abyssal
-            val second = if (enabled) abyssal else calculator
-            packageManager.setComponentEnabledSetting(first, enable, PackageManager.DONT_KILL_APP)
-            packageManager.setComponentEnabledSetting(second, disable, PackageManager.DONT_KILL_APP)
-        }.isSuccess
+        val first = if (enabled) calculator else abyssal
+        val second = if (enabled) abyssal else calculator
+        return applyLauncherAliasTransition(
+            enableTarget = {
+                packageManager.setComponentEnabledSetting(first, enable, PackageManager.DONT_KILL_APP)
+            },
+            disableOpposite = {
+                packageManager.setComponentEnabledSetting(second, disable, PackageManager.DONT_KILL_APP)
+            },
+            rollbackTarget = {
+                packageManager.setComponentEnabledSetting(first, disable, PackageManager.DONT_KILL_APP)
+            }
+        )
     }
 
     private fun resetStaleCamouflage() {

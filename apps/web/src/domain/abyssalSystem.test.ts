@@ -3,7 +3,7 @@ import { normalizeNodeUrl } from "../security/nodeUrl";
 import { classifyMedia, mediaAllowed, MEDIA_LIMIT_BYTES, clampRoom } from "./messagePolicy";
 import { mentionsUsername, splitMentionText } from "./messageAttention";
 import { reactionByShortcode, exactReactionShortcut } from "./reactions";
-import { InMemoryPayloadCipher } from "../security/crypto";
+import { base64ToBytes, bytesToBase64, InMemoryPayloadCipher } from "../security/crypto";
 
 describe("Abyssal System Security & Feature Suite", () => {
   describe("1. Login & Connection Normalization", () => {
@@ -165,6 +165,7 @@ describe("Abyssal System Security & Feature Suite", () => {
         "Alice",
         senderCipher.publicKey(),
         encrypted,
+        encrypted.envelopes[0].signature,
         encrypted.envelopes[0].wrappedKey,
         encrypted.envelopes[0].prekeyId,
         encrypted.envelopes[0].isPrekey,
@@ -177,6 +178,7 @@ describe("Abyssal System Security & Feature Suite", () => {
         "Alice",
         senderCipher.publicKey(),
         encrypted,
+        encrypted.envelopes[0].signature,
         encrypted.envelopes[0].wrappedKey,
         encrypted.envelopes[0].prekeyId,
         encrypted.envelopes[0].isPrekey,
@@ -192,22 +194,61 @@ describe("Abyssal System Security & Feature Suite", () => {
       recipient.createIdentity(new Uint8Array(64).fill(4), context);
 
       const attachmentBytes = new Uint8Array([12, 34, 56, 78]);
-      const encrypted = sender.encryptBytes(
+      const encrypted = sender.encryptAttachment(
         "forum_media",
-        "attachment_1",
+        "message_media",
         "Alice",
+        "FILE",
         attachmentBytes,
-        [{ username: "Bob", publicKey: recipient.publicKey(), prekeyId: recipient.prekeyId() }],
       );
-      expect(encrypted).not.toEqual(attachmentBytes);
-      const decrypted = recipient.decryptBytes(
+      expect(encrypted.blob).not.toEqual(attachmentBytes);
+      const decrypted = recipient.decryptAttachment(
         "forum_media",
+        "message_media",
         "Alice",
-        sender.publicKey(),
-        encrypted,
-        "Bob",
+        "FILE",
+        encrypted.key,
+        encrypted.blob,
       );
       expect(decrypted).toEqual(attachmentBytes);
+
+      // The bulk cipher is stateless: the first ratcheted payload is metadata,
+      // so a new recipient can establish its session before fetching bytes.
+      const metadata = sender.encryptText(
+        "forum_media",
+        "message_media",
+        "Alice",
+        JSON.stringify({
+          kind: "attachment",
+          attachment_cipher_version: encrypted.version,
+          attachment_key_b64: bytesToBase64(encrypted.key),
+        }),
+        [{ username: "Bob", publicKey: recipient.publicKey(), prekeyId: recipient.prekeyId() }],
+      );
+      const metadataPlaintext = recipient.decryptText(
+        "forum_media",
+        "message_media",
+        "Alice",
+        sender.publicKey(),
+        metadata,
+        metadata.envelopes[0].signature,
+        metadata.envelopes[0].wrappedKey,
+        metadata.envelopes[0].prekeyId,
+        metadata.envelopes[0].isPrekey,
+        "Bob",
+      );
+      const metadataRecord = JSON.parse(metadataPlaintext) as {
+        attachment_cipher_version: number;
+        attachment_key_b64: string;
+      };
+      expect(recipient.decryptAttachment(
+        "forum_media",
+        "message_media",
+        "Alice",
+        "FILE",
+        base64ToBytes(metadataRecord.attachment_key_b64),
+        encrypted.blob,
+      )).toEqual(attachmentBytes);
     });
   });
 });

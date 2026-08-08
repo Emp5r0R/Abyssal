@@ -1,5 +1,7 @@
 import initWasm, {
   conversationSafetyNumber as rustConversationSafetyNumber,
+  decryptAttachment as rustDecryptAttachment,
+  encryptAttachment as rustEncryptAttachment,
   opaqueClientFinishLogin,
   opaqueClientFinishRegistration,
   opaqueClientStart,
@@ -11,14 +13,15 @@ const DECODER = new TextDecoder("utf-8", { fatal: true });
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const USERNAME_PATTERN = /^[\x20-\x7e]{1,80}$/;
 const CHACHA20_POLY1305_TAG_BYTES = 16;
-const SERIALIZED_ATTACHMENT_FIXED_BYTES = 16 * 1024;
-// Keep the serialized envelope budget aligned with the relay and Android
-// client. Recipient-specific wrapped keys are included in the JSON payload.
-const MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES = 4 * 1024 * 1024;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES = 200 * 1024 * 1024;
-const MAX_SERIALIZED_ATTACHMENT_BYTES = maxSerializedAttachmentBytes("FILE");
 const IDENTITY_PUBLIC_KEY_BYTES = 128;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
+export const PROTOCOL_VERSION = 6;
+export const ATTACHMENT_CIPHER_VERSION = 1;
+const ATTACHMENT_KEY_BYTES = 32;
+const ATTACHMENT_NONCE_BYTES = 24;
+const ATTACHMENT_BLOB_MIN_BYTES = 1 + ATTACHMENT_NONCE_BYTES + CHACHA20_POLY1305_TAG_BYTES;
+const MAX_ATTACHMENT_BLOB_BYTES = ATTACHMENT_BLOB_MIN_BYTES + MAX_ATTACHMENT_PLAINTEXT_BYTES;
 
 let wasmReady: Promise<unknown> | null = null;
 
@@ -37,7 +40,6 @@ export interface OpaqueRegistrationResult {
 export interface OpaqueLoginResult {
   credentialFinalization: Uint8Array;
   exportKey: Uint8Array;
-  sessionKey: Uint8Array;
 }
 
 export interface RecipientKey {
@@ -51,19 +53,25 @@ export interface RecipientEnvelope {
   wrappedKey: Uint8Array;
   prekeyId: string;
   isPrekey: boolean;
+  signature: Uint8Array;
 }
 
 export interface EncryptedPayload {
-  version: 5;
+  version: number;
   messageId: string;
   nonce: Uint8Array;
   ciphertext: Uint8Array;
-  signature: Uint8Array;
   envelopes: RecipientEnvelope[];
   stateRevision: number;
   identityEnvelope: Uint8Array;
   identityPublicKey: Uint8Array;
   prekeyId: string;
+}
+
+export interface EncryptedAttachment {
+  version: number;
+  key: Uint8Array;
+  blob: Uint8Array;
 }
 
 export interface IdentityStateSnapshot {
@@ -88,7 +96,12 @@ interface RustRegistrationFinish {
 interface RustLoginFinish {
   credential_finalization: number[];
   export_key: number[];
-  session_key: number[];
+}
+
+interface RustAttachmentCiphertext {
+  version: number;
+  key: number[];
+  blob: number[];
 }
 
 interface RustEncryptedPayload {
@@ -96,12 +109,12 @@ interface RustEncryptedPayload {
   message_id: string;
   nonce: number[];
   ciphertext: number[];
-  signature: number[];
   envelopes: Array<{
     username: string;
     wrapped_key: number[];
     prekey_id: string;
     is_prekey: boolean;
+    signature: number[];
   }>;
   state_revision: number;
   identity_envelope: number[];
@@ -173,7 +186,6 @@ export async function finishOpaqueLogin(
     return {
       credentialFinalization: bytes(result.credential_finalization),
       exportKey: bytes(result.export_key),
-      sessionKey: bytes(result.session_key),
     };
   } finally {
     passwordBytes.fill(0);
@@ -263,7 +275,8 @@ export class InMemoryPayloadCipher {
     messageId: string,
     senderUsername: string,
     senderPublicKey: Uint8Array,
-    payload: Pick<EncryptedPayload, "nonce" | "ciphertext" | "signature">,
+    payload: Pick<EncryptedPayload, "version" | "identityPublicKey" | "nonce" | "ciphertext">,
+    signature: Uint8Array,
     wrappedKey: Uint8Array,
     recipientPrekeyId: string,
     isPrekey: boolean,
@@ -275,6 +288,7 @@ export class InMemoryPayloadCipher {
       senderUsername,
       senderPublicKey,
       payload,
+      signature,
       wrappedKey,
       recipientPrekeyId,
       isPrekey,
@@ -287,46 +301,51 @@ export class InMemoryPayloadCipher {
     }
   }
 
-  encryptBytes(
+  encryptAttachment(
     chatId: string,
     messageId: string,
     senderUsername: string,
+    mediaType: string,
     value: Uint8Array,
-    recipients: RecipientKey[],
-  ): Uint8Array {
-    const encrypted = this.encryptPayload(chatId, messageId, senderUsername, value, recipients);
-    try {
-      return ENCODER.encode(JSON.stringify(serializePayload(encrypted)));
-    } finally {
-      wipePayloadBytes(encrypted);
-    }
-  }
-
-  decryptBytes(
-    chatId: string,
-    senderUsername: string,
-    senderPublicKey: Uint8Array,
-    serialized: Uint8Array,
-    recipientUsername: string,
-  ): Uint8Array {
-    if (serialized.byteLength <= 0 || serialized.byteLength > MAX_SERIALIZED_ATTACHMENT_BYTES) {
+  ): EncryptedAttachment {
+    if (!this.#session) throw new Error("Payload cipher unavailable");
+    const result = parseJson<RustAttachmentCiphertext>(
+      rustEncryptAttachment(chatId, messageId, senderUsername, mediaType, value),
+    );
+    const key = bytes(result.key);
+    const blob = bytes(result.blob);
+    if (
+      result.version !== ATTACHMENT_CIPHER_VERSION ||
+      key.byteLength !== ATTACHMENT_KEY_BYTES ||
+      blob.byteLength < ATTACHMENT_BLOB_MIN_BYTES ||
+      blob.byteLength > MAX_ATTACHMENT_BLOB_BYTES ||
+      blob[0] !== ATTACHMENT_CIPHER_VERSION
+    ) {
+      key.fill(0);
+      blob.fill(0);
       throw new Error("Payload unavailable");
     }
-    const parsed = parseJson<ReturnType<typeof serializePayload>>(DECODER.decode(serialized));
-    const payload = deserializePayload(parsed);
-    const envelope = payload.envelopes.find((item) => item.username === recipientUsername);
-    if (!envelope) throw new Error("Payload unavailable");
-    return this.decryptPayload(
-      chatId,
-      payload.messageId,
-      senderUsername,
-      senderPublicKey,
-      payload,
-      envelope.wrappedKey,
-      envelope.prekeyId,
-      envelope.isPrekey,
-      recipientUsername,
-    );
+    return { version: result.version, key, blob };
+  }
+
+  decryptAttachment(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    mediaType: string,
+    key: Uint8Array,
+    blob: Uint8Array,
+  ): Uint8Array {
+    if (
+      !this.#session ||
+      key.byteLength !== ATTACHMENT_KEY_BYTES ||
+      blob.byteLength < ATTACHMENT_BLOB_MIN_BYTES ||
+      blob.byteLength > MAX_ATTACHMENT_BLOB_BYTES ||
+      blob[0] !== ATTACHMENT_CIPHER_VERSION
+    ) {
+      throw new Error("Payload unavailable");
+    }
+    return rustDecryptAttachment(chatId, messageId, senderUsername, mediaType, key, blob);
   }
 
   clear(): void {
@@ -365,6 +384,7 @@ export class InMemoryPayloadCipher {
         prekey_id: recipient.prekeyId,
       };
     });
+    if (rustRecipients.length === 0) throw new Error("Recipient unavailable");
     const result = parseJson<RustEncryptedPayload>(
       this.#session.encrypt(
         chatId,
@@ -375,7 +395,7 @@ export class InMemoryPayloadCipher {
       ),
     );
     if (
-      result.version !== 5 ||
+      result.version !== PROTOCOL_VERSION ||
       result.message_id !== messageId ||
       !Number.isSafeInteger(result.state_revision) ||
       result.state_revision <= 0
@@ -391,16 +411,16 @@ export class InMemoryPayloadCipher {
     }
     this.rememberState(result.state_revision, identityEnvelope, identityPublicKey, result.prekey_id);
     return {
-      version: 5,
+      version: PROTOCOL_VERSION,
       messageId: result.message_id,
       nonce: bytes(result.nonce),
       ciphertext: bytes(result.ciphertext),
-      signature: bytes(result.signature),
       envelopes: result.envelopes.map((envelope) => ({
         username: envelope.username,
         wrappedKey: bytes(envelope.wrapped_key),
         prekeyId: envelope.prekey_id,
         isPrekey: envelope.is_prekey,
+        signature: bytes(envelope.signature),
       })),
       stateRevision: result.state_revision,
       identityEnvelope,
@@ -414,7 +434,8 @@ export class InMemoryPayloadCipher {
     messageId: string,
     senderUsername: string,
     senderPublicKey: Uint8Array,
-    payload: Pick<EncryptedPayload, "nonce" | "ciphertext" | "signature">,
+    payload: Pick<EncryptedPayload, "version" | "identityPublicKey" | "nonce" | "ciphertext">,
+    signature: Uint8Array,
     wrappedKey: Uint8Array,
     recipientPrekeyId: string,
     isPrekey: boolean,
@@ -428,9 +449,11 @@ export class InMemoryPayloadCipher {
         messageId,
         senderUsername,
         senderPublicKey,
+        payload.version,
+        payload.identityPublicKey,
         payload.nonce,
         payload.ciphertext,
-        payload.signature,
+        signature,
         wrappedKey,
         recipientPrekeyId,
         isPrekey,
@@ -482,9 +505,7 @@ export function maxSerializedAttachmentBytes(mediaType: string): number {
     : mediaType.toUpperCase() === "VIDEO"
       ? 100 * 1024 * 1024
       : MAX_ATTACHMENT_PLAINTEXT_BYTES;
-  return SERIALIZED_ATTACHMENT_FIXED_BYTES
-    + base64NoPaddingLength(plainLimit + CHACHA20_POLY1305_TAG_BYTES)
-    + MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES;
+  return plainLimit + ATTACHMENT_BLOB_MIN_BYTES;
 }
 
 export function payloadToFrame(payload: EncryptedPayload): Record<string, unknown> {
@@ -493,7 +514,6 @@ export function payloadToFrame(payload: EncryptedPayload): Record<string, unknow
     message_id: payload.messageId,
     nonce_b64: bytesToBase64(payload.nonce),
     ciphertext_b64: bytesToBase64(payload.ciphertext),
-    signature_b64: bytesToBase64(payload.signature),
     state_revision: payload.stateRevision,
     identity_envelope_b64: bytesToBase64(payload.identityEnvelope),
     identity_public_b64: bytesToBase64(payload.identityPublicKey),
@@ -503,6 +523,7 @@ export function payloadToFrame(payload: EncryptedPayload): Record<string, unknow
       wrapped_key_b64: bytesToBase64(envelope.wrappedKey),
       prekey_id: envelope.prekeyId,
       is_prekey: envelope.isPrekey,
+      signature_b64: bytesToBase64(envelope.signature),
     })),
   };
 }
@@ -554,52 +575,4 @@ function parseJson<T>(value: string): T {
   } catch {
     throw new Error("Payload unavailable");
   }
-}
-
-function serializePayload(payload: EncryptedPayload) {
-  return {
-    version: payload.version,
-    message_id: payload.messageId,
-    nonce_b64: bytesToBase64(payload.nonce),
-    ciphertext_b64: bytesToBase64(payload.ciphertext),
-    signature_b64: bytesToBase64(payload.signature),
-    envelopes: payload.envelopes.map((envelope) => ({
-      username: envelope.username,
-      wrapped_key_b64: bytesToBase64(envelope.wrappedKey),
-      prekey_id: envelope.prekeyId,
-      is_prekey: envelope.isPrekey,
-    })),
-  };
-}
-
-function deserializePayload(value: ReturnType<typeof serializePayload>): EncryptedPayload {
-  if (value.version !== 5 || !CHAT_ID_PATTERN.test(value.message_id) || !Array.isArray(value.envelopes)) {
-    throw new Error("Payload unavailable");
-  }
-  return {
-    version: 5,
-    messageId: value.message_id,
-    nonce: base64ToBytes(value.nonce_b64),
-    ciphertext: base64ToBytes(value.ciphertext_b64),
-    signature: base64ToBytes(value.signature_b64),
-    envelopes: value.envelopes.map((envelope) => ({
-      username: envelope.username,
-      wrappedKey: base64ToBytes(envelope.wrapped_key_b64),
-      prekeyId: envelope.prekey_id,
-      isPrekey: envelope.is_prekey,
-    })),
-    stateRevision: 0,
-    identityEnvelope: new Uint8Array(0),
-    identityPublicKey: new Uint8Array(0),
-    prekeyId: "",
-  };
-}
-
-function wipePayloadBytes(payload: EncryptedPayload): void {
-  payload.nonce.fill(0);
-  payload.ciphertext.fill(0);
-  payload.signature.fill(0);
-  payload.identityEnvelope.fill(0);
-  payload.identityPublicKey.fill(0);
-  payload.envelopes.forEach((envelope) => envelope.wrappedKey.fill(0));
 }

@@ -1,6 +1,5 @@
 package com.abyssal.chat
 
-import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -102,32 +101,31 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        if (!isChangingConfigurations) viewModel.lockForLifecycleExit()
+        if (::viewModel.isInitialized && !isChangingConfigurations) {
+            viewModel.lockForLifecycleExit()
+        }
         super.onPause()
     }
 
     override fun onStop() {
-        if (!isChangingConfigurations) viewModel.lockForLifecycleExit()
+        if (::viewModel.isInitialized && !isChangingConfigurations) {
+            viewModel.lockForLifecycleExit()
+        }
         super.onStop()
     }
 
     override fun onResume() {
         super.onResume()
-        viewModel.onHostResumed()
+        if (::viewModel.isInitialized) viewModel.onHostResumed()
     }
 
     override fun onTrimMemory(level: Int) {
-        if (
-            ::viewModel.isInitialized &&
-            level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
-        ) {
-            viewModel.lockForLifecycleExit()
-        }
+        if (::viewModel.isInitialized) viewModel.onHostTrimMemory(level)
         super.onTrimMemory(level)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+        if (::viewModel.isInitialized && event.actionMasked == MotionEvent.ACTION_DOWN) {
             viewModel.recordUserActivity()
         }
         return super.dispatchTouchEvent(event)

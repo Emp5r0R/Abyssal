@@ -28,6 +28,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     private fun resetToEmpty() {
+        _sessions.value.forEach { it.lastMessage?.let(::wipeMessageKeys) }
         _sessions.value = emptyList()
         _messages.value = emptyMap()
     }
@@ -41,9 +42,13 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             // Mask actual message content in personal DM previews
             val previewMsg = last?.let { msg ->
                 if (!session.isForum) {
-                    msg.copy(content = "Message received")
+                    msg.copy(
+                        content = "Message received",
+                        senderPublicKey = null,
+                        attachmentKey = null
+                    )
                 } else {
-                    msg
+                    msg.copy(senderPublicKey = null, attachmentKey = null)
                 }
             }
             
@@ -66,7 +71,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                             val elapsed = now - msg.timestampMs
                             if (elapsed >= overallLimit * 1000L) {
                                 updated = true
-                                wipeMessageKey(msg)
+                                wipeMessageKeys(msg)
                                 return@filter false
                             }
                         }
@@ -78,7 +83,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                             val keep = elapsed < msg.selfDestructDurationSec * 1000L
                             if (!keep) {
                                 updated = true
-                                wipeMessageKey(msg)
+                                wipeMessageKeys(msg)
                             }
                             keep
                         } else {
@@ -107,11 +112,14 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
         val existing = currentChatMsgs.firstOrNull { it.id == message.id }
         if (existing != null) {
-            if (existing !== message) wipeMessageKey(message)
+            if (existing !== message) wipeMessageKeys(message)
             return
         }
-        val storedMessage = message.copy(senderPublicKey = message.senderPublicKey?.copyOf())
-        wipeMessageKey(message)
+        val storedMessage = message.copy(
+            senderPublicKey = message.senderPublicKey?.copyOf(),
+            attachmentKey = message.attachmentKey?.copyOf()
+        )
+        wipeMessageKeys(message)
         currentChatMsgs.add(storedMessage)
         _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
         updateLastMessages()
@@ -134,9 +142,11 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun deleteChatSession(chatId: String) {
+        val removedSession = _sessions.value.firstOrNull { it.id == chatId }
         _sessions.value = _sessions.value.filterNot { it.id == chatId }
         val removed = _messages.value[chatId].orEmpty()
-        removed.forEach(::wipeMessageKey)
+        removed.forEach(::wipeMessageKeys)
+        removedSession?.lastMessage?.let(::wipeMessageKeys)
         _messages.value = _messages.value.toMutableMap().apply { remove(chatId) }
     }
 
@@ -204,12 +214,31 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         }
     }
 
+    override suspend fun forgetAttachmentKey(chatId: String, messageId: String) {
+        val current = _messages.value[chatId] ?: return
+        var changed = false
+        val updated = current.map { message ->
+            if (message.id == messageId && message.attachmentKey != null) {
+                changed = true
+                message.attachmentKey.fill(0)
+                message.copy(attachmentKey = null)
+            } else {
+                message
+            }
+        }
+        if (changed) {
+            _messages.value = _messages.value.toMutableMap().apply { put(chatId, updated) }
+            updateLastMessages()
+        }
+    }
+
     override suspend fun clearAllData() {
-        _messages.value.values.flatten().forEach(::wipeMessageKey)
+        _messages.value.values.flatten().forEach(::wipeMessageKeys)
         resetToEmpty()
     }
 
-    private fun wipeMessageKey(message: Message) {
+    private fun wipeMessageKeys(message: Message) {
         message.senderPublicKey?.fill(0)
+        message.attachmentKey?.fill(0)
     }
 }

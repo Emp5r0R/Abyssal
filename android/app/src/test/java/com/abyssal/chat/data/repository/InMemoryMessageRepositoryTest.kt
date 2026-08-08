@@ -104,6 +104,43 @@ class InMemoryMessageRepositoryTest {
         assertArrayEquals(ByteArray(32), stored.senderPublicKey)
     }
 
+    @Test
+    fun attachmentKeysAreOwnedWipedAndNeverReachDashboardPreview() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val senderKey = ByteArray(128) { 3 }
+        val attachmentKey = ByteArray(32) { 7 }
+        val message = testMessage("attachment-keyed").copy(
+            isMedia = true,
+            attachmentId = "123e4567-e89b-12d3-a456-426614174000",
+            attachmentCipherVersion = 1,
+            attachmentKey = attachmentKey,
+            senderPublicKey = senderKey
+        )
+
+        repository.saveMessage("forum_keys", message)
+
+        val stored = repository.getMessages("forum_keys").first().single()
+        assertArrayEquals(ByteArray(32), attachmentKey)
+        assertArrayEquals(ByteArray(128), senderKey)
+        assertArrayEquals(ByteArray(32) { 7 }, stored.attachmentKey)
+        assertArrayEquals(ByteArray(128) { 3 }, stored.senderPublicKey)
+        val preview = repository.getChatSessions().first().single().lastMessage
+        assertEquals(null, preview?.attachmentKey)
+        assertEquals(null, preview?.senderPublicKey)
+
+        repository.markAsRead("forum_keys", stored.id)
+        val marked = repository.getMessages("forum_keys").first().single()
+        assertArrayEquals(ByteArray(32) { 7 }, marked.attachmentKey)
+
+        repository.forgetAttachmentKey("forum_keys", stored.id)
+        assertEquals(null, repository.getMessages("forum_keys").first().single().attachmentKey)
+        assertArrayEquals(ByteArray(32), marked.attachmentKey)
+
+        repository.clearAllData()
+        assertArrayEquals(ByteArray(32), stored.attachmentKey)
+        assertArrayEquals(ByteArray(128), stored.senderPublicKey)
+    }
+
     private fun testMessage(id: String) = Message(
         id = id,
         sender = "Alice",
