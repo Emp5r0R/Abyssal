@@ -39,6 +39,20 @@ class BoundedInputReaderTest {
         )
     }
 
+    @Test
+    fun exactReaderRequiresPositiveLengthAndRejectsTruncatedOrExtraData() {
+        val source = byteArrayOf(1, 2, 3)
+
+        assertNull(BoundedInputReader.readExact(ByteArrayInputStream(source), 0L, 3L))
+        assertNull(BoundedInputReader.readExact(ByteArrayInputStream(source), -1L, 3L))
+        assertNull(BoundedInputReader.readExact(ByteArrayInputStream(source), 4L, 4L))
+        assertNull(BoundedInputReader.readExact(ByteArrayInputStream(source + byteArrayOf(4)), 3L, 3L))
+        assertArrayEquals(
+            source,
+            BoundedInputReader.readExact(ByteArrayInputStream(source), source.size.toLong(), 3L)
+        )
+    }
+
     private class UnknownLengthInputStream(private val bytes: ByteArray) : InputStream() {
         private var offset = 0
 

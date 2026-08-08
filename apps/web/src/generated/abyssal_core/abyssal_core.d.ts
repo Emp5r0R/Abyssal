@@ -6,7 +6,7 @@ export class WasmE2eeSession {
     free(): void;
     [Symbol.dispose](): void;
     static create(export_key: Uint8Array): WasmE2eeSession;
-    decrypt(chat_id: string, message_id: string, sender_username: string, sender_public_key: Uint8Array, nonce: Uint8Array, ciphertext: Uint8Array, signature: Uint8Array, wrapped_key: Uint8Array, recipient_prekey_id: string, is_prekey: boolean, recipient_username: string): string;
+    decrypt(chat_id: string, message_id: string, sender_username: string, sender_public_key: Uint8Array, version: number, identity_public: Uint8Array, nonce: Uint8Array, ciphertext: Uint8Array, signature: Uint8Array, wrapped_key: Uint8Array, recipient_prekey_id: string, is_prekey: boolean, recipient_username: string): string;
     encrypt(chat_id: string, message_id: string, sender_username: string, plaintext: Uint8Array, recipients_json: string): string;
     prekeyId(): string;
     publicKey(): Uint8Array;
@@ -15,6 +15,10 @@ export class WasmE2eeSession {
 }
 
 export function conversationSafetyNumber(first_public_key: Uint8Array, second_public_key: Uint8Array): string;
+
+export function decryptAttachment(chat_id: string, message_id: string, sender_username: string, media_type: string, key: Uint8Array, blob: Uint8Array): Uint8Array;
+
+export function encryptAttachment(chat_id: string, message_id: string, sender_username: string, media_type: string, plaintext: Uint8Array): string;
 
 export function opaqueClientFinishLogin(password: Uint8Array, login_state: Uint8Array, credential_response: Uint8Array): string;
 
@@ -28,12 +32,16 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_wasme2eesession_free: (a: number, b: number) => void;
     readonly conversationSafetyNumber: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly decryptAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
+    readonly encryptAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly opaqueClientFinishLogin: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly opaqueClientFinishRegistration: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly opaqueClientStart: (a: number, b: number) => [number, number, number, number];
     readonly uniffi_abyssal_core_checksum_constructor_e2eesession_create: () => number;
     readonly uniffi_abyssal_core_checksum_constructor_e2eesession_recover: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_safety_number: () => number;
+    readonly uniffi_abyssal_core_checksum_func_decrypt_attachment: () => number;
+    readonly uniffi_abyssal_core_checksum_func_encrypt_attachment: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_finish_login: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_finish_registration: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_start: () => number;
@@ -47,16 +55,18 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_constructor_e2eesession_recover: (a: number, b: number, c: number, d: number, e: number) => bigint;
     readonly uniffi_abyssal_core_fn_free_e2eesession: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_func_conversation_safety_number: (a: number, b: number, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_func_decrypt_attachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly uniffi_abyssal_core_fn_func_encrypt_attachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_finish_login: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_finish_registration: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_start: (a: number, b: number, c: number) => void;
-    readonly uniffi_abyssal_core_fn_method_e2eesession_decrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => void;
+    readonly uniffi_abyssal_core_fn_method_e2eesession_decrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_encrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_prekey_id: (a: number, b: bigint, c: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_public_key: (a: number, b: bigint, c: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_seal_identity: (a: number, b: bigint, c: number, d: number, e: number) => void;
     readonly wasme2eesession_create: (a: number, b: number) => [number, number, number];
-    readonly wasme2eesession_decrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number) => [number, number, number, number];
+    readonly wasme2eesession_decrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => [number, number, number, number];
     readonly wasme2eesession_encrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => [number, number, number, number];
     readonly wasme2eesession_prekeyId: (a: number) => [number, number];
     readonly wasme2eesession_publicKey: (a: number) => [number, number];

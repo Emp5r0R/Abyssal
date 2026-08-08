@@ -11,10 +11,27 @@ import type {
 import {
   base64ToBytes,
   bytesToBase64,
+  maxSerializedAttachmentBytes,
   type IdentityStateSnapshot,
 } from "../security/crypto";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
+const ATTACHMENT_CLAIM_HEADER = "X-Abyssal-Attachment-Claim";
+const ATTACHMENT_CLAIM_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ATTACHMENT_BLOB_OVERHEAD_BYTES = 41;
+const MAX_ATTACHMENT_PLAINTEXT_BYTES =
+  maxSerializedAttachmentBytes("FILE") - ATTACHMENT_BLOB_OVERHEAD_BYTES;
+
+export interface DownloadedEncryptedAttachment {
+  bytes: Uint8Array;
+  claim?: string;
+}
+
+export interface AttachmentPlaintextPolicy {
+  expectedBytes: number;
+  maxBytes: number;
+}
 
 export async function startOpaqueAccount(
   endpoint: NodeEndpoint,
@@ -279,20 +296,170 @@ export function uploadEncryptedAttachment(
         resolve(id);
       }
     };
-    request.send(encrypted.slice().buffer);
+    // XMLHttpRequest accepts ArrayBufferView at runtime. TypeScript's DOM
+    // declaration does not model the generic Uint8Array used here, so keep
+    // the view intact through the boundary instead of copying 200 MiB.
+    request.send(encrypted as unknown as ArrayBuffer);
   });
 }
 
 export async function downloadEncryptedAttachment(
   session: AccountSession,
   attachmentId: string,
-): Promise<Uint8Array> {
-  const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}`, {
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    headers: { Authorization: `Bearer ${session.token}` },
-  });
+): Promise<DownloadedEncryptedAttachment> {
+  let claim: string | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let encrypted: Uint8Array | undefined;
+  try {
+    const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}`, {
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers: { Authorization: `Bearer ${session.token}` },
+    });
+    claim = readAttachmentClaim(response.headers);
+    if (!response.ok) throw new Error("Attachment unavailable");
+    const maxBytes = maxSerializedAttachmentBytes("FILE");
+    const contentLength = response.headers.get("content-length");
+    const advertisedLength = parseAttachmentContentLength(contentLength, maxBytes);
+    encrypted = new Uint8Array(advertisedLength);
+    reader = response.body?.getReader();
+    if (!reader) throw new Error("Attachment unavailable");
+    let offset = 0;
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      try {
+        if (offset > advertisedLength - chunk.byteLength) {
+          throw new Error("Attachment unavailable");
+        }
+        encrypted.set(chunk, offset);
+        offset += chunk.byteLength;
+      } finally {
+        chunk.fill(0);
+      }
+    }
+    if (offset !== advertisedLength) {
+      throw new Error("Attachment unavailable");
+    }
+    return claim ? { bytes: encrypted, claim } : { bytes: encrypted };
+  } catch (error) {
+    encrypted?.fill(0);
+    if (reader) await reader.cancel().catch(() => undefined);
+    if (claim) await releaseAttachmentDownloadClaim(session, attachmentId, claim).catch(() => undefined);
+    throw error;
+  } finally {
+    reader?.releaseLock();
+  }
+}
+
+export async function completeAttachmentDownload(
+  session: AccountSession,
+  attachmentId: string,
+  claim: string,
+): Promise<void> {
+  const validatedClaim = validateAttachmentClaim(claim);
+  const response = await fetch(
+    `${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}/complete`,
+    {
+      method: "POST",
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers: attachmentClaimHeaders(session, validatedClaim),
+    },
+  );
   if (!response.ok) throw new Error("Attachment unavailable");
-  return new Uint8Array(await response.arrayBuffer());
+}
+
+export async function releaseAttachmentDownloadClaim(
+  session: AccountSession,
+  attachmentId: string,
+  claim: string,
+): Promise<void> {
+  const validatedClaim = validateAttachmentClaim(claim);
+  const response = await fetch(
+    `${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}/claim`,
+    {
+      method: "DELETE",
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers: attachmentClaimHeaders(session, validatedClaim),
+    },
+  );
+  if (!response.ok) throw new Error("Attachment unavailable");
+}
+
+export async function decryptAndCompleteAttachment(
+  session: AccountSession,
+  attachmentId: string,
+  downloaded: DownloadedEncryptedAttachment,
+  decrypt: () => Uint8Array | Promise<Uint8Array>,
+  policy?: AttachmentPlaintextPolicy,
+): Promise<Uint8Array> {
+  let plaintext: Uint8Array | undefined;
+  let claimCompleted = false;
+  try {
+    plaintext = await decrypt();
+    const maxBytes = policy?.maxBytes ?? MAX_ATTACHMENT_PLAINTEXT_BYTES;
+    if (
+      !Number.isSafeInteger(maxBytes) ||
+      maxBytes <= 0 ||
+      plaintext.byteLength === 0 ||
+      plaintext.byteLength > maxBytes ||
+      (policy !== undefined && (
+        !Number.isSafeInteger(policy.expectedBytes) ||
+        policy.expectedBytes <= 0 ||
+        policy.expectedBytes > maxBytes ||
+        plaintext.byteLength !== policy.expectedBytes
+      ))
+    ) {
+      throw new Error("Attachment unavailable");
+    }
+    if (downloaded.claim) {
+      await completeAttachmentDownload(session, attachmentId, downloaded.claim);
+      claimCompleted = true;
+    }
+    return plaintext;
+  } catch (error) {
+    if (plaintext) plaintext.fill(0);
+    if (downloaded.claim && !claimCompleted) {
+      await releaseAttachmentDownloadClaim(session, attachmentId, downloaded.claim).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+function readAttachmentClaim(headers: Headers): string | undefined {
+  const value = headers.get(ATTACHMENT_CLAIM_HEADER);
+  if (value === null) return undefined;
+  return validateAttachmentClaim(value);
+}
+
+function parseAttachmentContentLength(value: string | null, maxBytes: number): number {
+  const normalized = value?.trim() ?? "";
+  if (!/^\d+$/.test(normalized)) throw new Error("Attachment unavailable");
+  const length = Number(normalized);
+  if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
+    throw new Error("Attachment unavailable");
+  }
+  return length;
+}
+
+function validateAttachmentClaim(claim: string): string {
+  // Keep the length check alongside the regex: JavaScript's `$` can match
+  // immediately before a trailing line terminator.
+  if (claim.length !== 36 || !ATTACHMENT_CLAIM_PATTERN.test(claim)) {
+    throw new Error("Attachment unavailable");
+  }
+  return claim;
+}
+
+function attachmentClaimHeaders(session: AccountSession, claim: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${session.token}`,
+    [ATTACHMENT_CLAIM_HEADER]: claim,
+  };
 }

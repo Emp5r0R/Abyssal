@@ -7,9 +7,12 @@ import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.repository.IIdentityService
 import java.nio.charset.StandardCharsets
 import java.util.Base64
+import java.util.Locale
+import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -20,8 +23,9 @@ import uniffi.abyssal_core.opaqueClientFinishRegistration
 import uniffi.abyssal_core.opaqueClientStart
 
 class NetworkIdentityService(
-    private val client: OkHttpClient,
-    private val payloadCipher: InMemoryPayloadCipher
+    client: OkHttpClient,
+    private val payloadCipher: InMemoryPayloadCipher,
+    private val callFactory: Call.Factory = client
 ) : IIdentityService {
     private var currentUser: User? = null
 
@@ -30,6 +34,10 @@ class NetworkIdentityService(
         password: String,
         endpoint: NodeEndpoint
     ): IdentityValidationResult = withContext(Dispatchers.IO) {
+        if (
+            code.trim().length !in 1..MAX_CODE_CHARS ||
+            password.length !in MIN_PASSWORD_CHARS..MAX_PASSWORD_CHARS
+        ) return@withContext rejected()
         val passwordBytes = password.toByteArray(StandardCharsets.UTF_8)
         var opaque: OpaqueClientStart? = null
         var responseBytes: ByteArray? = null
@@ -46,12 +54,16 @@ class NetworkIdentityService(
             ) ?: return@withContext rejected()
             if (!start.optBoolean("accepted", false)) return@withContext rejected()
 
-            val handshakeId = start.optString("handshake_id").takeIf { it.isNotBlank() }
+            val handshakeId = start.optString("handshake_id")
+                .takeIf { HANDSHAKE_ID_REGEX.matches(it) }
                 ?: return@withContext rejected()
             val mode = start.optString("mode")
-            val nodeId = start.optString("node_id").takeIf { it.isNotBlank() }
+            val nodeId = start.optString("node_id")
+                .takeIf { isBoundedAscii(it, MAX_NODE_ID_CHARS) }
                 ?: return@withContext rejected()
-            responseBytes = decode(start.optString("response_b64"))
+            responseBytes = decode(start.optString("response_b64")).also {
+                require(it.isNotEmpty() && it.size <= MAX_OPAQUE_RESPONSE_BYTES)
+            }
             context = identityContext(nodeId, code)
 
             val finishBody = JSONObject().put("handshake_id", handshakeId)
@@ -83,37 +95,45 @@ class NetworkIdentityService(
                     val serverPrekeyId = start.optString("identity_prekey_id")
                         .takeIf { it.matches(PREKEY_ID_REGEX) }
                         ?: return@withContext rejectedAndClear()
-                    val identityPublic = decode(start.optString("identity_public_b64"))
-                    if (identityPublic.size != IDENTITY_PUBLIC_KEY_BYTES) {
-                        identityPublic.fill(0)
-                        return@withContext rejectedAndClear()
-                    }
-                    val identityEnvelope = decode(start.optString("identity_envelope_b64"))
-                    val result = opaqueClientFinishLogin(
-                        passwordBytes,
-                        opaque.loginState,
-                        responseBytes
-                    )
+                    var identityPublic: ByteArray? = null
+                    var identityEnvelope: ByteArray? = null
                     try {
-                        payloadCipher.recoverIdentity(
-                            result.exportKey,
-                            context,
-                            identityEnvelope,
-                            identityPublic
-                        )
-                        if (payloadCipher.prekeyId() != serverPrekeyId) {
+                        val identityPublicBytes = decode(start.optString("identity_public_b64"))
+                        if (identityPublicBytes.size != IDENTITY_PUBLIC_KEY_BYTES) {
                             return@withContext rejectedAndClear()
                         }
-                        finishBody.put(
-                            "credential_finalization_b64",
-                            encode(result.credentialFinalization)
+                        identityPublic = identityPublicBytes
+                        val identityEnvelopeBytes = decode(start.optString("identity_envelope_b64"))
+                        if (identityEnvelopeBytes.isEmpty() || identityEnvelopeBytes.size > MAX_IDENTITY_ENVELOPE_BYTES) {
+                            return@withContext rejectedAndClear()
+                        }
+                        identityEnvelope = identityEnvelopeBytes
+                        val result = opaqueClientFinishLogin(
+                            passwordBytes,
+                            opaque.loginState,
+                            responseBytes
                         )
+                        try {
+                            payloadCipher.recoverIdentity(
+                                result.exportKey,
+                                context,
+                                identityEnvelopeBytes,
+                                identityPublicBytes
+                            )
+                            if (payloadCipher.prekeyId() != serverPrekeyId) {
+                                return@withContext rejectedAndClear()
+                            }
+                            finishBody.put(
+                                "credential_finalization_b64",
+                                encode(result.credentialFinalization)
+                            )
+                        } finally {
+                            result.credentialFinalization.fill(0)
+                            result.exportKey.fill(0)
+                        }
                     } finally {
-                        result.credentialFinalization.fill(0)
-                        result.exportKey.fill(0)
-                        result.sessionKey.fill(0)
-                        identityPublic.fill(0)
-                        identityEnvelope.fill(0)
+                        identityPublic?.fill(0)
+                        identityEnvelope?.fill(0)
                     }
                 }
                 else -> return@withContext rejected()
@@ -136,6 +156,9 @@ class NetworkIdentityService(
                 publicKey.fill(0)
                 throw IllegalArgumentException("Identity unavailable")
             }
+        } catch (error: CancellationException) {
+            payloadCipher.clear()
+            throw error
         } catch (_: Exception) {
             rejectedAndClear()
         } finally {
@@ -173,43 +196,58 @@ class NetworkIdentityService(
             .header("Authorization", "Bearer ${session.token}")
             .post(ByteArray(0).toRequestBody(null))
             .build()
-        runCatching {
-            client.newCall(request).execute().use { response -> response.isSuccessful }
-        }.getOrDefault(false)
+        try {
+            awaitHttpResponse(callFactory.newCall(request)) { response -> response.isSuccessful }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        }
     }
 
     override fun logout() {
         currentUser = null
     }
 
-    private fun postJson(endpoint: NodeEndpoint, path: String, json: JSONObject): JSONObject? {
+    private suspend fun postJson(endpoint: NodeEndpoint, path: String, json: JSONObject): JSONObject? {
+        val requestBytes = json.toString().toByteArray(StandardCharsets.UTF_8)
         val request = Request.Builder()
             .url("${endpoint.apiBaseUrl}$path")
-            .post(json.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .post(requestBytes.toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        return client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) return@use null
-            val body = response.body ?: return@use null
-            if (body.contentLength() > MAX_ACCOUNT_RESPONSE_BYTES) return@use null
-            val raw = BoundedInputReader.read(body.byteStream(), MAX_ACCOUNT_RESPONSE_BYTES)
-                ?: return@use null
-            try {
-                raw.takeIf { it.isNotEmpty() }?.let {
-                    JSONObject(String(it, StandardCharsets.UTF_8))
+        return try {
+            awaitHttpResponse(callFactory.newCall(request)) { response ->
+                if (!response.isSuccessful) return@awaitHttpResponse null
+                val body = response.body ?: return@awaitHttpResponse null
+                if (body.contentLength() > MAX_ACCOUNT_RESPONSE_BYTES) return@awaitHttpResponse null
+                val raw = BoundedInputReader.read(body.byteStream(), MAX_ACCOUNT_RESPONSE_BYTES)
+                    ?: return@awaitHttpResponse null
+                try {
+                    raw.takeIf { it.isNotEmpty() }?.let {
+                        JSONObject(String(it, StandardCharsets.UTF_8))
+                    }
+                } finally {
+                    raw.fill(0)
                 }
-            } finally {
-                raw.fill(0)
             }
+        } finally {
+            requestBytes.fill(0)
         }
     }
 
     private fun parseAccepted(json: JSONObject, publicKey: ByteArray): IdentityValidationResult {
+        val token = json.optString("token").takeIf { isBoundedAscii(it, MAX_TOKEN_CHARS) }
+            ?: throw IllegalArgumentException("Identity unavailable")
+        val nodeId = json.optString("node_id").takeIf { isBoundedAscii(it, MAX_NODE_ID_CHARS) }
+            ?: throw IllegalArgumentException("Identity unavailable")
+        val username = json.optString("username").takeIf { isBoundedAscii(it, MAX_USERNAME_CHARS) }
+            ?: throw IllegalArgumentException("Identity unavailable")
         return IdentityValidationResult(
             accepted = true,
             created = json.optBoolean("created", false),
-            token = json.optString("token").takeIf { it.isNotBlank() },
-            nodeId = json.optString("node_id").takeIf { it.isNotBlank() },
-            username = json.optString("username").takeIf { it.isNotBlank() },
+            token = token,
+            nodeId = nodeId,
+            username = username,
             maxRoomsPerUser = json
                 .optInt("max_rooms_per_user", DEFAULT_MAX_ROOMS_PER_USER)
                 .coerceIn(MIN_MAX_ROOMS_PER_USER, MAX_MAX_ROOMS_PER_USER),
@@ -233,7 +271,7 @@ class NetworkIdentityService(
 
     private fun identityContext(nodeId: String, code: String): ByteArray {
         val node = nodeId.trim()
-        val credential = code.trim().uppercase()
+        val credential = code.trim().uppercase(Locale.ROOT)
         require(node.isNotEmpty() && node.length <= 128)
         require(credential.isNotEmpty() && credential.length <= 128)
         return "ABYSSAL_IDENTITY_V2:$node:$credential".toByteArray(StandardCharsets.UTF_8)
@@ -246,10 +284,22 @@ class NetworkIdentityService(
         const val MIN_MAX_ROOMS_PER_USER = 1
         const val MAX_MAX_ROOMS_PER_USER = 100
         const val DEFAULT_MAX_ROOMS_PER_USER = 5
+        const val MIN_PASSWORD_CHARS = 8
+        const val MAX_PASSWORD_CHARS = 512
+        const val MAX_CODE_CHARS = 128
+        const val MAX_NODE_ID_CHARS = 128
+        const val MAX_USERNAME_CHARS = 80
+        const val MAX_TOKEN_CHARS = 128
         const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
+        const val MAX_OPAQUE_RESPONSE_BYTES = 64 * 1024
         const val MAX_ACCOUNT_RESPONSE_BYTES = 1 * 1024 * 1024L
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
+        val HANDSHAKE_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,128}$")
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        fun isBoundedAscii(value: String, maxLength: Int): Boolean =
+            value.length in 1..maxLength && value.all { it.code in 0x20..0x7e }
 
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 

@@ -45,7 +45,7 @@ class GitHubReleaseUpdateService(
             .get()
             .build()
 
-        client.newCall(request).execute().use { response ->
+        awaitHttpResponse(client.newCall(request)) { response ->
             check(response.request.url == apiEndpoint && response.isSuccessful)
             val body = requireNotNull(response.body)
             val reportedLength = body.contentLength()

@@ -677,6 +677,10 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_abyssal_core_checksum_func_conversation_safety_number(
     ): Int
+    external fun uniffi_abyssal_core_checksum_func_decrypt_attachment(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_encrypt_attachment(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_opaque_client_finish_login(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_opaque_client_finish_registration(
@@ -723,7 +727,7 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_abyssal_core_fn_constructor_e2eesession_recover(`exportKey`: RustBuffer.ByValue,`context`: RustBuffer.ByValue,`envelope`: RustBuffer.ByValue,`expectedPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Long
-    external fun uniffi_abyssal_core_fn_method_e2eesession_decrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`senderPublicKey`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,`wrappedKey`: RustBuffer.ByValue,`recipientPrekeyId`: RustBuffer.ByValue,`isPrekey`: Byte,`recipientUsername`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    external fun uniffi_abyssal_core_fn_method_e2eesession_decrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`senderPublicKey`: RustBuffer.ByValue,`version`: Int,`identityPublic`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,`wrappedKey`: RustBuffer.ByValue,`recipientPrekeyId`: RustBuffer.ByValue,`isPrekey`: Byte,`recipientUsername`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_encrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`recipients`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -734,6 +738,10 @@ internal object UniffiLib {
     external fun uniffi_abyssal_core_fn_method_e2eesession_seal_identity(`ptr`: Long,`exportKey`: RustBuffer.ByValue,`context`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_conversation_safety_number(`firstPublicKey`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_decrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`blob`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_encrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_opaque_client_finish_login(`password`: RustBuffer.ByValue,`loginState`: RustBuffer.ByValue,`credentialResponse`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -863,6 +871,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_conversation_safety_number() != 24566) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_func_decrypt_attachment() != 57237) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_encrypt_attachment() != 28381) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_func_opaque_client_finish_login() != 16464) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -872,7 +886,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_opaque_client_start() != 26876) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_decrypt() != 38130) {
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_decrypt() != 7898) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_encrypt() != 11964) {
@@ -1293,7 +1307,7 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 
 public interface E2eeSessionInterface {
 
-    fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption
+    fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `version`: kotlin.UInt, `identityPublic`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption
 
     fun `encrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `plaintext`: kotlin.ByteArray, `recipients`: List<RecipientPublicKey>): E2eePayload
 
@@ -1408,7 +1422,7 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
     }
 
 
-    @Throws(AbyssalException::class)override fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption {
+    @Throws(AbyssalException::class)override fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `version`: kotlin.UInt, `identityPublic`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption {
             return FfiConverterTypeE2eeDecryption.lift(
     callWithHandle {
     uniffiRustCallWithError(AbyssalException) { _status ->
@@ -1419,6 +1433,8 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
         FfiConverterString.lower(`messageId`),
         FfiConverterString.lower(`senderUsername`),
         FfiConverterByteArray.lower(`senderPublicKey`),
+        FfiConverterUInt.lower(`version`),
+        FfiConverterByteArray.lower(`identityPublic`),
         FfiConverterByteArray.lower(`nonce`),
         FfiConverterByteArray.lower(`ciphertext`),
         FfiConverterByteArray.lower(`signature`),
@@ -1560,6 +1576,49 @@ public object FfiConverterTypeE2eeSession: FfiConverter<E2eeSession, Long> {
 
 
 
+data class AttachmentCiphertext (
+    var `version`: kotlin.UInt
+    ,
+    var `key`: kotlin.ByteArray
+    ,
+    var `blob`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAttachmentCiphertext: FfiConverterRustBuffer<AttachmentCiphertext> {
+    override fun read(buf: ByteBuffer): AttachmentCiphertext {
+        return AttachmentCiphertext(
+            FfiConverterUInt.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: AttachmentCiphertext) = (
+            FfiConverterUInt.allocationSize(value.`version`) +
+            FfiConverterByteArray.allocationSize(value.`key`) +
+            FfiConverterByteArray.allocationSize(value.`blob`)
+    )
+
+    override fun write(value: AttachmentCiphertext, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`version`, buf)
+            FfiConverterByteArray.write(value.`key`, buf)
+            FfiConverterByteArray.write(value.`blob`, buf)
+    }
+}
+
+
+
 data class E2eeDecryption (
     var `plaintext`: kotlin.ByteArray
     ,
@@ -1622,8 +1681,6 @@ data class E2eePayload (
     ,
     var `ciphertext`: kotlin.ByteArray
     ,
-    var `signature`: kotlin.ByteArray
-    ,
     var `envelopes`: List<RecipientEnvelope>
     ,
     var `stateRevision`: kotlin.ULong
@@ -1653,7 +1710,6 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterString.read(buf),
             FfiConverterByteArray.read(buf),
             FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
             FfiConverterSequenceTypeRecipientEnvelope.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterByteArray.read(buf),
@@ -1667,7 +1723,6 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterString.allocationSize(value.`messageId`) +
             FfiConverterByteArray.allocationSize(value.`nonce`) +
             FfiConverterByteArray.allocationSize(value.`ciphertext`) +
-            FfiConverterByteArray.allocationSize(value.`signature`) +
             FfiConverterSequenceTypeRecipientEnvelope.allocationSize(value.`envelopes`) +
             FfiConverterULong.allocationSize(value.`stateRevision`) +
             FfiConverterByteArray.allocationSize(value.`identityEnvelope`) +
@@ -1680,7 +1735,6 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterString.write(value.`messageId`, buf)
             FfiConverterByteArray.write(value.`nonce`, buf)
             FfiConverterByteArray.write(value.`ciphertext`, buf)
-            FfiConverterByteArray.write(value.`signature`, buf)
             FfiConverterSequenceTypeRecipientEnvelope.write(value.`envelopes`, buf)
             FfiConverterULong.write(value.`stateRevision`, buf)
             FfiConverterByteArray.write(value.`identityEnvelope`, buf)
@@ -1743,8 +1797,6 @@ data class OpaqueLoginFinish (
     var `credentialFinalization`: kotlin.ByteArray
     ,
     var `exportKey`: kotlin.ByteArray
-    ,
-    var `sessionKey`: kotlin.ByteArray
 
 ){
 
@@ -1763,20 +1815,17 @@ public object FfiConverterTypeOpaqueLoginFinish: FfiConverterRustBuffer<OpaqueLo
         return OpaqueLoginFinish(
             FfiConverterByteArray.read(buf),
             FfiConverterByteArray.read(buf),
-            FfiConverterByteArray.read(buf),
         )
     }
 
     override fun allocationSize(value: OpaqueLoginFinish) = (
             FfiConverterByteArray.allocationSize(value.`credentialFinalization`) +
-            FfiConverterByteArray.allocationSize(value.`exportKey`) +
-            FfiConverterByteArray.allocationSize(value.`sessionKey`)
+            FfiConverterByteArray.allocationSize(value.`exportKey`)
     )
 
     override fun write(value: OpaqueLoginFinish, buf: ByteBuffer) {
             FfiConverterByteArray.write(value.`credentialFinalization`, buf)
             FfiConverterByteArray.write(value.`exportKey`, buf)
-            FfiConverterByteArray.write(value.`sessionKey`, buf)
     }
 }
 
@@ -1828,6 +1877,8 @@ data class RecipientEnvelope (
     var `prekeyId`: kotlin.String
     ,
     var `isPrekey`: kotlin.Boolean
+    ,
+    var `signature`: kotlin.ByteArray
 
 ){
 
@@ -1848,6 +1899,7 @@ public object FfiConverterTypeRecipientEnvelope: FfiConverterRustBuffer<Recipien
             FfiConverterByteArray.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterByteArray.read(buf),
         )
     }
 
@@ -1855,7 +1907,8 @@ public object FfiConverterTypeRecipientEnvelope: FfiConverterRustBuffer<Recipien
             FfiConverterString.allocationSize(value.`username`) +
             FfiConverterByteArray.allocationSize(value.`wrappedKey`) +
             FfiConverterString.allocationSize(value.`prekeyId`) +
-            FfiConverterBoolean.allocationSize(value.`isPrekey`)
+            FfiConverterBoolean.allocationSize(value.`isPrekey`) +
+            FfiConverterByteArray.allocationSize(value.`signature`)
     )
 
     override fun write(value: RecipientEnvelope, buf: ByteBuffer) {
@@ -1863,6 +1916,7 @@ public object FfiConverterTypeRecipientEnvelope: FfiConverterRustBuffer<Recipien
             FfiConverterByteArray.write(value.`wrappedKey`, buf)
             FfiConverterString.write(value.`prekeyId`, buf)
             FfiConverterBoolean.write(value.`isPrekey`, buf)
+            FfiConverterByteArray.write(value.`signature`, buf)
     }
 }
 
@@ -2034,6 +2088,39 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
 
         FfiConverterByteArray.lower(`firstPublicKey`),
         FfiConverterByteArray.lower(`secondPublicKey`),_status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `decryptAttachment`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `mediaType`: kotlin.String, `key`: kotlin.ByteArray, `blob`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_decrypt_attachment(
+
+
+        FfiConverterString.lower(`chatId`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterString.lower(`senderUsername`),
+        FfiConverterString.lower(`mediaType`),
+        FfiConverterByteArray.lower(`key`),
+        FfiConverterByteArray.lower(`blob`),_status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `encryptAttachment`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `mediaType`: kotlin.String, `plaintext`: kotlin.ByteArray): AttachmentCiphertext {
+            return FfiConverterTypeAttachmentCiphertext.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_encrypt_attachment(
+
+
+        FfiConverterString.lower(`chatId`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterString.lower(`senderUsername`),
+        FfiConverterString.lower(`mediaType`),
+        FfiConverterByteArray.lower(`plaintext`),_status)
 }
     )
     }

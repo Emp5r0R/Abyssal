@@ -22,6 +22,15 @@ export ABYSSAL_KEYSTORE_PATH ABYSSAL_KEYSTORE_PASSWORD ABYSSAL_KEY_ALIAS ABYSSAL
 
 [[ -f "$ABYSSAL_KEYSTORE_PATH" ]] || { printf 'Keystore not found: %s\n' "$ABYSSAL_KEYSTORE_PATH" >&2; exit 1; }
 
+RECORDED_CRYPTO_DIGEST="$(tr -d '[:space:]' < "$ROOT_DIR/rust-core/generated-bindings.sha256")"
+CURRENT_CRYPTO_DIGEST="$("$ROOT_DIR/scripts/crypto-source-digest.sh")"
+if [[ ! "$RECORDED_CRYPTO_DIGEST" =~ ^[0-9a-f]{64}$ ]] || \
+  [[ "$RECORDED_CRYPTO_DIGEST" != "$CURRENT_CRYPTO_DIGEST" ]]; then
+  printf 'Generated crypto bindings are stale; run ./scripts/test-all.sh crypto first.\n' >&2
+  exit 1
+fi
+unset RECORDED_CRYPTO_DIGEST CURRENT_CRYPTO_DIGEST
+
 VERSION="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$ROOT_DIR/android/app/build.gradle.kts" | head -1)"
 [[ -n "$VERSION" ]] || { printf 'Unable to read Android versionName.\n' >&2; exit 1; }
 
@@ -47,8 +56,8 @@ for abi in arm64-v8a armeabi-v7a x86 x86_64; do
     printf 'Missing native crypto library for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
     exit 1
   }
-  grep -aFq 'ABYSSAL_E2EE_PAYLOAD_V5' "$NATIVE_LIBRARY" || {
-    printf 'Native crypto library is not protocol v5 for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
+  grep -aFq 'ABYSSAL_E2EE_PAYLOAD_V6' "$NATIVE_LIBRARY" || {
+    printf 'Native crypto library is not protocol v6 for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
     exit 1
   }
 done

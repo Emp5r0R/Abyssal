@@ -937,7 +937,7 @@ private fun AttachmentDialog(
         )
         AttachmentOptionToggle(
             label = "Delete after download",
-            detail = "Server removes encrypted bytes after first fetch.",
+            detail = "Server removes encrypted bytes after authenticated completion.",
             checked = deleteAfterDownload,
             onCheckedChange = { deleteAfterDownload = it },
             modifier = Modifier.padding(top = 8.dp)
@@ -1195,7 +1195,10 @@ private fun BundledEmojiPreview(
                     val drawable = runCatching {
                         ImageDecoder.decodeDrawable(
                             ImageDecoder.createSource(viewContext.assets, assetPath)
-                        )
+                        ) { decoder, info, _ ->
+                            decoder.setTargetSampleSize(previewSampleSize(info.size.width, info.size.height))
+                            decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM)
+                        }
                     }.getOrNull()
                     setImageDrawable(drawable)
                     (drawable as? AnimatedImageDrawable)?.start()
@@ -1209,7 +1212,7 @@ private fun BundledEmojiPreview(
     val bytes = remember(assetPath) {
         runCatching { context.assets.open(assetPath).use { it.readBytes() } }.getOrNull()
     }
-    val bitmap = remember(bytes) { bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
+    val bitmap = remember(bytes) { bytes?.let(::decodeBoundedPreviewBitmap) }
     if (bitmap != null) {
         Image(
             bitmap = bitmap.asImageBitmap(),
@@ -1688,7 +1691,10 @@ private fun RamImagePreview(bytes: ByteArray, mimeType: String) {
                     scaleType = ImageView.ScaleType.FIT_CENTER
                     setBackgroundColor(android.graphics.Color.BLACK)
                     val drawable = runCatching {
-                        ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(bytes)))
+                        ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(bytes))) { decoder, info, _ ->
+                            decoder.setTargetSampleSize(previewSampleSize(info.size.width, info.size.height))
+                            decoder.setMemorySizePolicy(ImageDecoder.MEMORY_POLICY_LOW_RAM)
+                        }
                     }.getOrNull()
                     setImageDrawable(drawable)
                     (drawable as? AnimatedImageDrawable)?.start()
@@ -1703,7 +1709,7 @@ private fun RamImagePreview(bytes: ByteArray, mimeType: String) {
         return
     }
 
-    val bitmap = remember(bytes) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+    val bitmap = remember(bytes) { decodeBoundedPreviewBitmap(bytes) }
     if (bitmap != null) {
         Image(
             bitmap = bitmap.asImageBitmap(),
@@ -1726,18 +1732,30 @@ private fun RamVideoPreview(bytes: ByteArray) {
     var playbackFailed by remember(bytes) { mutableStateOf(false) }
     val prepareStarted = remember(bytes) { AtomicBoolean(false) }
     val mediaPlayer = remember(bytes) {
-        MediaPlayer().apply {
-            setDataSource(ByteArrayMediaDataSource(bytes))
-            isLooping = true
-            setOnPreparedListener { player ->
+        val player = runCatching { MediaPlayer() }.getOrNull() ?: return@remember null
+        runCatching {
+            player.setDataSource(ByteArrayMediaDataSource(bytes))
+            player.isLooping = true
+            player.setOnPreparedListener { preparedPlayer ->
                 prepared = true
-                runCatching { player.start() }.onFailure { playbackFailed = true }
+                runCatching { preparedPlayer.start() }.onFailure { playbackFailed = true }
             }
-            setOnErrorListener { _, _, _ ->
+            player.setOnErrorListener { _, _, _ ->
                 playbackFailed = true
                 true
             }
+            player
+        }.getOrElse {
+            runCatching { player.release() }
+            null
         }
+    }
+
+    if (mediaPlayer == null) {
+        AttachmentLoadedPanel(
+            DecryptedAttachment("", "video", "VIDEO", "video/*", bytes, oneTimeView = false)
+        )
+        return
     }
 
     DisposableEffect(mediaPlayer) {
@@ -1872,9 +1890,16 @@ private data class BundledEmojiPayload(
 
 private class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
-        if (position < 0 || position >= bytes.size) return -1
-        val length = minOf(size, bytes.size - position.toInt())
-        bytes.copyInto(buffer, destinationOffset = offset, startIndex = position.toInt(), endIndex = position.toInt() + length)
+        if (
+            position < 0L ||
+            position >= bytes.size.toLong() ||
+            offset < 0 ||
+            size < 0 ||
+            offset > buffer.size - size
+        ) return -1
+        val start = position.toInt()
+        val length = minOf(size, bytes.size - start)
+        bytes.copyInto(buffer, destinationOffset = offset, startIndex = start, endIndex = start + length)
         return length
     }
 
@@ -1934,6 +1959,34 @@ private fun attachmentLimitBytes(mediaType: String): Long {
         "VIDEO" -> 100L * 1024L * 1024L
         else -> 200L * 1024L * 1024L
     }
+}
+
+private const val MAX_PREVIEW_DIMENSION = 4096
+private const val MAX_PREVIEW_PIXELS = 16_000_000L
+
+private fun previewSampleSize(width: Int, height: Int): Int {
+    if (width <= 0 || height <= 0) return 1
+    var sample = 1
+    while (
+        width / sample > MAX_PREVIEW_DIMENSION ||
+        height / sample > MAX_PREVIEW_DIMENSION ||
+        (width.toLong() / sample.toLong()) * (height.toLong() / sample.toLong()) > MAX_PREVIEW_PIXELS
+    ) {
+        sample = sample shl 1
+    }
+    return sample
+}
+
+private fun decodeBoundedPreviewBitmap(bytes: ByteArray): android.graphics.Bitmap? {
+    if (bytes.isEmpty()) return null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = previewSampleSize(bounds.outWidth, bounds.outHeight)
+        inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+    }
+    return runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) }.getOrNull()
 }
 
 private fun roomMediaRuleDetail(session: ChatSession?, mediaType: String, fallback: String): String {

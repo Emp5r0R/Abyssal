@@ -33,6 +33,8 @@ data class Message(
     val mediaType: String? = null, // "IMAGE", "VIDEO", "FILE"
     val mediaSizeMb: Int = 0,
     val attachmentId: String? = null,
+    val attachmentCipherVersion: Int = 0,
+    val attachmentKey: ByteArray? = null,
     val attachmentName: String? = null,
     val attachmentMimeType: String? = null,
     val attachmentSizeBytes: Long = 0L,
@@ -138,6 +140,8 @@ data class SessionSecurityState(
 data class IncomingTransportPayload(
     val chatId: String,
     val messageId: String,
+    val version: Int,
+    val identityPublicKey: ByteArray,
     val nonce: ByteArray,
     val ciphertext: ByteArray,
     val signature: ByteArray,
@@ -153,6 +157,8 @@ data class IncomingTransportPayload(
         return chatId == other.chatId &&
             messageId == other.messageId &&
             senderUsername == other.senderUsername &&
+            version == other.version &&
+            identityPublicKey.contentEquals(other.identityPublicKey) &&
             nonce.contentEquals(other.nonce) &&
             ciphertext.contentEquals(other.ciphertext) &&
             signature.contentEquals(other.signature) &&
@@ -165,6 +171,8 @@ data class IncomingTransportPayload(
     override fun hashCode(): Int {
         var result = chatId.hashCode()
         result = 31 * result + messageId.hashCode()
+        result = 31 * result + version
+        result = 31 * result + identityPublicKey.contentHashCode()
         result = 31 * result + nonce.contentHashCode()
         result = 31 * result + ciphertext.contentHashCode()
         result = 31 * result + signature.contentHashCode()
@@ -181,7 +189,8 @@ data class RecipientEnvelope(
     val recipientUsername: String,
     val wrappedKey: ByteArray,
     val prekeyId: String = "",
-    val isPrekey: Boolean = false
+    val isPrekey: Boolean = false,
+    val signature: ByteArray = ByteArray(0)
 )
 
 data class EncryptedTransportPayload(
@@ -189,7 +198,6 @@ data class EncryptedTransportPayload(
     val messageId: String,
     val nonce: ByteArray,
     val ciphertext: ByteArray,
-    val signature: ByteArray,
     val envelopes: List<RecipientEnvelope>,
     val stateRevision: ULong,
     val identityEnvelope: ByteArray,
@@ -233,6 +241,11 @@ data class UserPresence(
 data class AttachmentUploadResult(
     val accepted: Boolean,
     val attachmentId: String? = null
+)
+
+data class EncryptedAttachmentDownload(
+    val bytes: ByteArray,
+    val claim: String? = null
 )
 
 data class AttachmentUploadProgress(

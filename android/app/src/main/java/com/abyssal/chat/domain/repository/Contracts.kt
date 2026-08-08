@@ -6,6 +6,7 @@ import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
+import com.abyssal.chat.domain.model.EncryptedAttachmentDownload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
@@ -49,15 +50,10 @@ interface IMessageRepository {
     fun getMessages(chatId: String): Flow<List<Message>>
     suspend fun saveMessage(chatId: String, message: Message)
     suspend fun markAsRead(chatId: String, messageId: String)
+    suspend fun forgetAttachmentKey(chatId: String, messageId: String)
     suspend fun createForumSession(session: ChatSession)
     suspend fun deleteChatSession(chatId: String)
     suspend fun clearAllData()
-}
-
-interface ICryptoService {
-    suspend fun generateKeyPair(): Pair<ByteArray, ByteArray>
-    suspend fun encryptMessage(plainText: String, sessionKey: ByteArray): Pair<ByteArray, ByteArray>
-    suspend fun decryptMessage(cipherText: ByteArray, nonce: ByteArray, sessionKey: ByteArray): String
 }
 
 interface IChatTransport {
@@ -96,7 +92,9 @@ interface IEncryptedAttachmentService {
         onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult
 
-    suspend fun downloadEncryptedAttachment(attachmentId: String): ByteArray?
+    suspend fun downloadEncryptedAttachment(attachmentId: String): EncryptedAttachmentDownload?
+    suspend fun completeAttachmentDownload(attachmentId: String, claim: String): Boolean
+    suspend fun releaseAttachmentDownloadClaim(attachmentId: String, claim: String): Boolean
     suspend fun saveDecryptedAttachment(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
 }
 

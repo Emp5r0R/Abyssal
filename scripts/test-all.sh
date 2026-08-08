@@ -25,13 +25,22 @@ run_shell() {
   echo "==> Repository and shell checks"
   git -C "$ROOT_DIR" diff --check
   while IFS= read -r script; do
-    bash -n "$script"
-  done < <(find "$ROOT_DIR" -path "$ROOT_DIR/.git" -prune -o -type f -name '*.sh' -print | sort)
+    bash -n "$ROOT_DIR/$script"
+  done < <(git -C "$ROOT_DIR" ls-files '*.sh' | sort)
+
+  local recorded_crypto_digest current_crypto_digest
+  recorded_crypto_digest="$(tr -d '[:space:]' < "$ROOT_DIR/rust-core/generated-bindings.sha256")"
+  current_crypto_digest="$("$ROOT_DIR/scripts/crypto-source-digest.sh")"
+  if [[ ! "$recorded_crypto_digest" =~ ^[0-9a-f]{64}$ ]] || \
+    [[ "$recorded_crypto_digest" != "$current_crypto_digest" ]]; then
+    echo "Stale generated crypto bindings; run ./scripts/test-all.sh crypto." >&2
+    exit 1
+  fi
 
   for artifact in \
     "$ROOT_DIR"/apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
     "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
-    if ! grep -aFq "ABYSSAL_E2EE_PAYLOAD_V5" "$artifact"; then
+    if ! grep -aFq "ABYSSAL_E2EE_PAYLOAD_V6" "$artifact"; then
       echo "Stale crypto artifact: $artifact" >&2
       exit 1
     fi

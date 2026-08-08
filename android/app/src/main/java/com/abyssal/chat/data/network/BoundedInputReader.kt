@@ -7,6 +7,40 @@ import java.io.InputStream
 internal object BoundedInputReader {
     private const val CHUNK_BYTES = 64 * 1024
 
+    /** Reads an exact positive-length body into one destination allocation. */
+    fun readExact(input: InputStream, expectedBytes: Long, maxBytes: Long): ByteArray? {
+        if (
+            expectedBytes <= 0L ||
+            expectedBytes > maxBytes ||
+            expectedBytes > Int.MAX_VALUE.toLong()
+        ) return null
+        val output = ByteArray(expectedBytes.toInt())
+        var offset = 0
+        var complete = false
+        return try {
+            while (offset < output.size) {
+                val count = input.read(output, offset, output.size - offset)
+                when {
+                    count < 0 -> return null
+                    count == 0 -> {
+                        val next = input.read()
+                        if (next < 0) return null
+                        output[offset++] = next.toByte()
+                    }
+                    count > output.size - offset -> return null
+                    else -> offset += count
+                }
+            }
+            if (input.read() >= 0) return null
+            complete = true
+            output
+        } catch (_: Exception) {
+            null
+        } finally {
+            if (!complete) output.fill(0)
+        }
+    }
+
     fun read(input: InputStream, maxBytes: Long): ByteArray? {
         require(maxBytes in 0L..Int.MAX_VALUE.toLong())
         val output = WipingByteArrayOutputStream(minOf(maxBytes, CHUNK_BYTES.toLong()).toInt())

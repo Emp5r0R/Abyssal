@@ -35,6 +35,8 @@ export class WasmE2eeSession {
      * @param {string} message_id
      * @param {string} sender_username
      * @param {Uint8Array} sender_public_key
+     * @param {number} version
+     * @param {Uint8Array} identity_public
      * @param {Uint8Array} nonce
      * @param {Uint8Array} ciphertext
      * @param {Uint8Array} signature
@@ -44,9 +46,9 @@ export class WasmE2eeSession {
      * @param {string} recipient_username
      * @returns {string}
      */
-    decrypt(chat_id, message_id, sender_username, sender_public_key, nonce, ciphertext, signature, wrapped_key, recipient_prekey_id, is_prekey, recipient_username) {
-        let deferred12_0;
-        let deferred12_1;
+    decrypt(chat_id, message_id, sender_username, sender_public_key, version, identity_public, nonce, ciphertext, signature, wrapped_key, recipient_prekey_id, is_prekey, recipient_username) {
+        let deferred13_0;
+        let deferred13_1;
         try {
             const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len0 = WASM_VECTOR_LEN;
@@ -56,30 +58,32 @@ export class WasmE2eeSession {
             const len2 = WASM_VECTOR_LEN;
             const ptr3 = passArray8ToWasm0(sender_public_key, wasm.__wbindgen_malloc);
             const len3 = WASM_VECTOR_LEN;
-            const ptr4 = passArray8ToWasm0(nonce, wasm.__wbindgen_malloc);
+            const ptr4 = passArray8ToWasm0(identity_public, wasm.__wbindgen_malloc);
             const len4 = WASM_VECTOR_LEN;
-            const ptr5 = passArray8ToWasm0(ciphertext, wasm.__wbindgen_malloc);
+            const ptr5 = passArray8ToWasm0(nonce, wasm.__wbindgen_malloc);
             const len5 = WASM_VECTOR_LEN;
-            const ptr6 = passArray8ToWasm0(signature, wasm.__wbindgen_malloc);
+            const ptr6 = passArray8ToWasm0(ciphertext, wasm.__wbindgen_malloc);
             const len6 = WASM_VECTOR_LEN;
-            const ptr7 = passArray8ToWasm0(wrapped_key, wasm.__wbindgen_malloc);
+            const ptr7 = passArray8ToWasm0(signature, wasm.__wbindgen_malloc);
             const len7 = WASM_VECTOR_LEN;
-            const ptr8 = passStringToWasm0(recipient_prekey_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const ptr8 = passArray8ToWasm0(wrapped_key, wasm.__wbindgen_malloc);
             const len8 = WASM_VECTOR_LEN;
-            const ptr9 = passStringToWasm0(recipient_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const ptr9 = passStringToWasm0(recipient_prekey_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len9 = WASM_VECTOR_LEN;
-            const ret = wasm.wasme2eesession_decrypt(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8, is_prekey, ptr9, len9);
-            var ptr11 = ret[0];
-            var len11 = ret[1];
+            const ptr10 = passStringToWasm0(recipient_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len10 = WASM_VECTOR_LEN;
+            const ret = wasm.wasme2eesession_decrypt(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, version, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8, ptr9, len9, is_prekey, ptr10, len10);
+            var ptr12 = ret[0];
+            var len12 = ret[1];
             if (ret[3]) {
-                ptr11 = 0; len11 = 0;
+                ptr12 = 0; len12 = 0;
                 throw takeFromExternrefTable0(ret[2]);
             }
-            deferred12_0 = ptr11;
-            deferred12_1 = len11;
-            return getStringFromWasm0(ptr11, len11);
+            deferred13_0 = ptr12;
+            deferred13_1 = len12;
+            return getStringFromWasm0(ptr12, len12);
         } finally {
-            wasm.__wbindgen_free(deferred12_0, deferred12_1, 1);
+            wasm.__wbindgen_free(deferred13_0, deferred13_1, 1);
         }
     }
     /**
@@ -210,6 +214,74 @@ export function conversationSafetyNumber(first_public_key, second_public_key) {
         return getStringFromWasm0(ptr3, len3);
     } finally {
         wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+    }
+}
+
+/**
+ * @param {string} chat_id
+ * @param {string} message_id
+ * @param {string} sender_username
+ * @param {string} media_type
+ * @param {Uint8Array} key
+ * @param {Uint8Array} blob
+ * @returns {Uint8Array}
+ */
+export function decryptAttachment(chat_id, message_id, sender_username, media_type, key, blob) {
+    const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(media_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray8ToWasm0(key, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passArray8ToWasm0(blob, wasm.__wbindgen_malloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.decryptAttachment(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * @param {string} chat_id
+ * @param {string} message_id
+ * @param {string} sender_username
+ * @param {string} media_type
+ * @param {Uint8Array} plaintext
+ * @returns {string}
+ */
+export function encryptAttachment(chat_id, message_id, sender_username, media_type, plaintext) {
+    let deferred7_0;
+    let deferred7_1;
+    try {
+        const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(media_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passArray8ToWasm0(plaintext, wasm.__wbindgen_malloc);
+        const len4 = WASM_VECTOR_LEN;
+        const ret = wasm.encryptAttachment(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+        var ptr6 = ret[0];
+        var len6 = ret[1];
+        if (ret[3]) {
+            ptr6 = 0; len6 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred7_0 = ptr6;
+        deferred7_1 = len6;
+        return getStringFromWasm0(ptr6, len6);
+    } finally {
+        wasm.__wbindgen_free(deferred7_0, deferred7_1, 1);
     }
 }
 

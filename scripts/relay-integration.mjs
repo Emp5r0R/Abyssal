@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
+  decryptAttachment,
+  encryptAttachment,
   initSync,
   opaqueClientFinishRegistration,
   opaqueClientStart,
@@ -165,7 +167,6 @@ function encryptedFrame(sender, recipient, chatId, text) {
     message_id: payload.message_id,
     nonce_b64: encode(payload.nonce),
     ciphertext_b64: encode(payload.ciphertext),
-    signature_b64: encode(payload.signature),
     state_revision: payload.state_revision,
     identity_envelope_b64: encode(payload.identity_envelope),
     identity_public_b64: encode(payload.identity_public),
@@ -175,6 +176,7 @@ function encryptedFrame(sender, recipient, chatId, text) {
       wrapped_key_b64: encode(envelope.wrapped_key),
       prekey_id: envelope.prekey_id,
       is_prekey: envelope.is_prekey,
+      signature_b64: encode(envelope.signature),
     })),
   };
 }
@@ -185,6 +187,8 @@ function decryptFrame(recipient, frame) {
     frame.message_id,
     frame.sender_username,
     decode(frame.sender_public_key_b64),
+    frame.version,
+    decode(frame.identity_public_b64),
     decode(frame.nonce_b64),
     decode(frame.ciphertext_b64),
     decode(frame.signature_b64),
@@ -242,6 +246,187 @@ try {
 
   aliceSocket.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
   bobSocket.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
+
+  // Exercise the attachment relay before the first E2EE message on this direct
+  // with the same stateless XChaCha blob and context-bound decrypt path used by
+  // the web client, rather than a hand-built ciphertext fixture.
+  const attachmentMessageId = randomUUID();
+  const attachmentPlaintext = new Uint8Array([1, 2, 3, 4]);
+  const encryptedAttachment = JSON.parse(encryptAttachment(
+    aliceOpened.direct.id,
+    attachmentMessageId,
+    alice.username,
+    "FILE",
+    attachmentPlaintext,
+  ));
+  const attachmentKey = new Uint8Array(encryptedAttachment.key);
+  const attachmentBytes = new Uint8Array(encryptedAttachment.blob);
+  assert.ok(attachmentBytes.byteLength > attachmentPlaintext.byteLength);
+  const uploadResponse = await fetch(
+    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}` },
+      body: attachmentBytes,
+    },
+  );
+  assert.equal(uploadResponse.status, 200);
+  const upload = await uploadResponse.json();
+  assert.equal(upload.accepted, true);
+  assert.match(String(upload.attachment_id), /^[0-9a-f-]{36}$/);
+
+  const downloadResponse = await fetch(
+    `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
+    { headers: { authorization: `Bearer ${bob.token}` } },
+  );
+  assert.equal(downloadResponse.status, 200);
+  assert.equal(downloadResponse.headers.get("x-abyssal-attachment-claim"), null);
+  assert.equal(downloadResponse.headers.get("content-length"), String(attachmentBytes.byteLength));
+  assert.ok(Number(downloadResponse.headers.get("content-length")) > 0);
+  const downloadedAttachmentBytes = new Uint8Array(await downloadResponse.arrayBuffer());
+  assert.ok(downloadedAttachmentBytes.byteLength > 0);
+  assert.deepEqual(downloadedAttachmentBytes, attachmentBytes);
+  assert.deepEqual(
+    decryptAttachment(
+      aliceOpened.direct.id,
+      attachmentMessageId,
+      alice.username,
+      "FILE",
+      attachmentKey,
+      downloadedAttachmentBytes,
+    ),
+    attachmentPlaintext,
+  );
+  downloadedAttachmentBytes.fill(0);
+
+  const oneTimeUploadResponse = await fetch(
+    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE&one_time=true&delete_after_download=true`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}` },
+      body: attachmentBytes,
+    },
+  );
+  assert.equal(oneTimeUploadResponse.status, 200);
+  const oneTimeUpload = await oneTimeUploadResponse.json();
+  assert.equal(oneTimeUpload.accepted, true);
+  const oneTimeDownloadUrl = `${baseUrl}/v1/attachment/${encodeURIComponent(oneTimeUpload.attachment_id)}`;
+  const firstOneTimeDownload = await fetch(oneTimeDownloadUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(firstOneTimeDownload.status, 200);
+  assert.equal(firstOneTimeDownload.headers.get("content-length"), String(attachmentBytes.byteLength));
+  assert.ok(Number(firstOneTimeDownload.headers.get("content-length")) > 0);
+  const attachmentClaim = firstOneTimeDownload.headers.get("x-abyssal-attachment-claim");
+  assert.match(attachmentClaim ?? "", /^[0-9a-f-]{36}$/);
+  const firstOneTimeBytes = new Uint8Array(await firstOneTimeDownload.arrayBuffer());
+  assert.ok(firstOneTimeBytes.byteLength > 0);
+  assert.deepEqual(firstOneTimeBytes, attachmentBytes);
+  assert.deepEqual(
+    decryptAttachment(
+      aliceOpened.direct.id,
+      attachmentMessageId,
+      alice.username,
+      "FILE",
+      attachmentKey,
+      firstOneTimeBytes,
+    ),
+    attachmentPlaintext,
+  );
+  firstOneTimeBytes.fill(0);
+  const invalidClaimCompletion = await fetch(`${oneTimeDownloadUrl}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bob.token}`,
+      "x-abyssal-attachment-claim": randomUUID(),
+    },
+  });
+  assert.equal(invalidClaimCompletion.status, 404);
+  const invalidTokenCompletion = await fetch(`${oneTimeDownloadUrl}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer invalid-token",
+      "x-abyssal-attachment-claim": attachmentClaim,
+    },
+  });
+  assert.equal(invalidTokenCompletion.status, 401);
+  const wrongUserCompletion = await fetch(`${oneTimeDownloadUrl}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${alice.token}`,
+      "x-abyssal-attachment-claim": attachmentClaim,
+    },
+  });
+  assert.equal(wrongUserCompletion.status, 403);
+  const completeOneTime = await fetch(`${oneTimeDownloadUrl}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bob.token}`,
+      "x-abyssal-attachment-claim": attachmentClaim,
+    },
+  });
+  assert.equal(completeOneTime.status, 204);
+  const secondOneTimeDownload = await fetch(oneTimeDownloadUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(secondOneTimeDownload.status, 404);
+
+  const releasableUploadResponse = await fetch(
+    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE&one_time=true&delete_after_download=true`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}` },
+      body: attachmentBytes,
+    },
+  );
+  assert.equal(releasableUploadResponse.status, 200);
+  const releasableUpload = await releasableUploadResponse.json();
+  const releasableUrl = `${baseUrl}/v1/attachment/${encodeURIComponent(releasableUpload.attachment_id)}`;
+  const interruptedDownload = await fetch(releasableUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(interruptedDownload.status, 200);
+  const interruptedClaim = interruptedDownload.headers.get("x-abyssal-attachment-claim");
+  assert.match(interruptedClaim ?? "", /^[0-9a-f-]{36}$/);
+  assert.ok(interruptedDownload.body);
+  const interruptedReader = interruptedDownload.body.getReader();
+  const interruptedChunk = await interruptedReader.read();
+  assert.ok(interruptedChunk.value?.byteLength);
+  await interruptedReader.cancel();
+  const releaseResponse = await fetch(`${releasableUrl}/claim`, {
+    method: "DELETE",
+    headers: {
+      authorization: `Bearer ${bob.token}`,
+      "x-abyssal-attachment-claim": interruptedClaim,
+    },
+  });
+  assert.equal(releaseResponse.status, 204);
+  const retryDownload = await fetch(releasableUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(retryDownload.status, 200);
+  assert.equal(retryDownload.headers.get("content-length"), String(attachmentBytes.byteLength));
+  assert.ok(Number(retryDownload.headers.get("content-length")) > 0);
+  const retryClaim = retryDownload.headers.get("x-abyssal-attachment-claim");
+  assert.match(retryClaim ?? "", /^[0-9a-f-]{36}$/);
+  assert.deepEqual(new Uint8Array(await retryDownload.arrayBuffer()), attachmentBytes);
+  const completeRetry = await fetch(`${releasableUrl}/complete`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bob.token}`,
+      "x-abyssal-attachment-claim": retryClaim,
+    },
+  });
+  assert.equal(completeRetry.status, 204);
+  const retryGone = await fetch(releasableUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(retryGone.status, 404);
+
+  attachmentPlaintext.fill(0);
+  attachmentKey.fill(0);
+  attachmentBytes.fill(0);
+
   const delivered = waitForFrame(
     bobSocket,
     (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
@@ -272,49 +457,6 @@ try {
   const replayedPlain = decryptFrame(bob, replayedFrame);
   assert.equal(replayedPlain.text, "offline secret");
   acknowledgeFrame(bobReconnect, replayedFrame, replayedPlain);
-
-  const attachmentBytes = new Uint8Array([1, 2, 3, 4]);
-  const uploadResponse = await fetch(
-    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${alice.token}` },
-      body: attachmentBytes,
-    },
-  );
-  assert.equal(uploadResponse.status, 200);
-  const upload = await uploadResponse.json();
-  assert.equal(upload.accepted, true);
-  assert.match(String(upload.attachment_id), /^[0-9a-f-]{36}$/);
-
-  const downloadResponse = await fetch(
-    `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
-    { headers: { authorization: `Bearer ${bob.token}` } },
-  );
-  assert.equal(downloadResponse.status, 200);
-  assert.deepEqual(new Uint8Array(await downloadResponse.arrayBuffer()), attachmentBytes);
-
-  const oneTimeUploadResponse = await fetch(
-    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE&one_time=true&delete_after_download=true`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${alice.token}` },
-      body: attachmentBytes,
-    },
-  );
-  assert.equal(oneTimeUploadResponse.status, 200);
-  const oneTimeUpload = await oneTimeUploadResponse.json();
-  assert.equal(oneTimeUpload.accepted, true);
-  const oneTimeDownloadUrl = `${baseUrl}/v1/attachment/${encodeURIComponent(oneTimeUpload.attachment_id)}`;
-  const firstOneTimeDownload = await fetch(oneTimeDownloadUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(firstOneTimeDownload.status, 200);
-  assert.deepEqual(new Uint8Array(await firstOneTimeDownload.arrayBuffer()), attachmentBytes);
-  const secondOneTimeDownload = await fetch(oneTimeDownloadUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(secondOneTimeDownload.status, 404);
 
   const unauthorizedUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=dm_guessed&media_type=FILE`, {
     method: "POST",

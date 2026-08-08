@@ -30,9 +30,10 @@ Root `package.json` owns the npm workspace. Root `Cargo.toml` and `Cargo.lock` o
 - Explicit logout and client-side expiry also make a best-effort relay call to revoke the bearer token immediately. The relay independently rejects expired tokens and closes idle WebSockets, so client enforcement is not the only boundary.
 - The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe.
 - Camouflage has no default PIN and is never recoverable from disk. Android resets the stale calculator launcher alias and the RAM-only PIN after process death; configure a new camouflage PIN after signing in to a fresh process.
-- The relay stores generated codes, OPAQUE password records, encrypted identity envelopes, sessions, rooms, clients, presence, and pending recipient-specific ciphertext in RAM only. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
+- The relay stores generated codes, OPAQUE password records, encrypted identity envelopes, sessions, rooms, clients, presence, and pending recipient-specific ciphertext in RAM only. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Pending frames expire after a bounded configurable lifetime (default 24 hours, accepted range 1-168 hours; `0` is clamped, never unbounded), and expiration also releases any matching one-time-prekey claim. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
 - Files, images, and videos may only be written to disk through an explicit user save flow. Android and web authenticate and decrypt attachments in memory, then save the original bytes under a sanitized original filename. One-time attachments remain view-only and expose no save control.
-- Attachment plaintext limits are 20 MiB for images, 100 MiB for videos, and 200 MiB for other files. Relay upload limits include the encrypted envelope: the 16-byte AEAD tag is expanded by unpadded base64, then the serialized body reserves a 16 KiB fixed budget plus up to 4 MiB for recipient-specific envelopes. A default 320 MiB encrypted-RAM quota applies per account in addition to the global RAM limit, and at most two attachment downloads run concurrently by default.
+- Attachment plaintext limits are 20 MiB for images, 100 MiB for videos, and 200 MiB for other files. Protocol-v6 attachments are stateless binary XChaCha20-Poly1305 blobs: one version byte, a 24-byte nonce, ciphertext, and a 16-byte tag, so the wire body is the plaintext size plus exactly 41 bytes. The bulk key is delivered inside the encrypted, ratcheted message metadata; the relay stores and streams only the opaque blob. A default 320 MiB encrypted-RAM quota applies per account in addition to the global RAM limit, with bounded upload and download concurrency.
+- `Delete after download` and one-time attachments are destructive only after the client receives the exact non-empty ciphertext, authenticates and decrypts it, then explicitly completes its recipient-bound claim. In a DM each intended recipient gets one completion; in a room the eligible recipients are snapshotted at upload and each can complete once. Failed, truncated, interrupted, cancelled, or unauthenticated transfers release the claim for retry; concurrent claims by the same recipient are rejected; and the owner can preview their upload without consuming a recipient claim. The relay removes the encrypted blob and releases quota only after every eligible recipient completes, or when the configured retention policy expires it.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
 - Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
 - The web client never calls `localStorage`, `sessionStorage`, IndexedDB, Cache Storage, cookies, or a service worker. Account state, messages, PINs, decrypted media URLs, and crypto keys live in the current JavaScript process only. Relay responses use `Cache-Control: no-store`.
@@ -122,7 +123,7 @@ Web client behavior:
 - Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
 - Direct composers apply a per-message `Never`, `5s`, `10s`, `30s`, or `1m` timer to text, GIFs, and attachments. Room composers show the creator's locked room timer; room policy can also be configured as no read expiry.
 - The calculator cover PIN and optional duress PIN exist only in the current tab. Reload, tab close, logout, wipe, session expiry, or process termination loses them.
-- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v5 E2EE with one-time prekey claims requires Abyssal `1.9.x` clients; older builds are incompatible.
+- WebSocket bearer tokens use a negotiated subprotocol instead of a URL query string. Protocol-v6 E2EE with per-recipient signatures, one-time prekey claims, and ratcheted metadata requires Abyssal `2.0.0` clients; older protocol-v5/1.9.x builds are wire-incompatible.
 
 Run web checks:
 
@@ -138,7 +139,7 @@ Run the complete repository suite from the root:
 ./check.sh all
 ```
 
-Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, `crypto`, `audit`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, a live disposable-relay OPAQUE/ratcheted-E2EE DM/offline-replay/access-control integration test, and npm/RustSec dependency advisory scans. `crypto` regenerates the shared WASM, Kotlin, and four stripped Android ABI libraries, then rejects stale non-v5 artifacts.
+Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, `crypto`, `audit`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, a live disposable-relay OPAQUE/ratcheted-E2EE DM/offline-replay/access-control integration test, and npm/RustSec dependency advisory scans. `crypto` regenerates the shared WASM, Kotlin, and four stripped Android ABI libraries, then records a deterministic digest of their Rust inputs. Normal, full, and signed-release checks reject non-v6 or stale generated artifacts.
 
 ## Rust Server
 
@@ -154,6 +155,7 @@ ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB=320 \
 ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY=2 \
 ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY=2 \
 ABYSSAL_MAX_ROOMS_PER_USER=5 \
+ABYSSAL_PENDING_MESSAGE_TTL_HOURS=24 \
 ABYSSAL_SESSION_INACTIVITY_MINUTES=15 \
 ABYSSAL_INACTIVITY_LIMIT_HOURS=0 \
 cargo run --release
@@ -169,6 +171,8 @@ The server prints generated access codes once to attached stdout during boot. Ea
 
 Every authenticated user can create rooms and trigger a relay RAM wipe. Rooms are owned by their creator: only that account can update or delete them. `ABYSSAL_MAX_ROOMS_PER_USER` limits each account's active rooms, and deleting an owned room releases one slot.
 
+This is an intentional availability tradeoff: a compromised account can wipe the relay and force destructive restart/code rotation. Keep active account sessions and the wipe confirmation protected.
+
 Security-related relay knobs:
 
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
@@ -176,6 +180,7 @@ Security-related relay knobs:
 - `ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY`: maximum concurrent attachment responses across the relay. Default: `2`; accepted range: `1` to `16`.
 - `ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY`: maximum concurrent attachment request-body reads. Default: `2`; accepted range: `1` to `4`. This bounds large encrypted request allocations before the RAM quota check.
 - `ABYSSAL_MAX_ROOMS_PER_USER`: active room quota for each account. Default: `5`; accepted range: `1` to `100`.
+- `ABYSSAL_PENDING_MESSAGE_TTL_HOURS`: maximum RAM lifetime for an undelivered encrypted pending frame. Default: `24`; accepted range: `1` to `168` hours. `0` is clamped to the one-hour minimum and never means unbounded. Expired frames are removed, their byte budget is returned, and matching prekey claims are released together.
 - `ABYSSAL_SESSION_INACTIVITY_MINUTES`: strict bearer-token and WebSocket inactivity limit. Default: `15`; accepted range: `1` to `1440`. The Android client displays the node policy and enforces the same deadline locally.
 - `ABYSSAL_INACTIVITY_LIMIT_HOURS`: dead-man switch. `0` disables it. A positive value wipes relay RAM state and broadcasts `GLOBAL_WIPE` after that many idle hours.
 - `ABYSSAL_WEB_ORIGINS`: comma-separated exact browser origins allowed to call the relay cross-origin and open WebSockets. Leave empty when web and relay share one origin.
@@ -183,18 +188,22 @@ Security-related relay knobs:
 
 The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
 
-Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v5 encrypts message, attachment, and read-receipt content with ChaCha20-Poly1305; each recipient's content key travels through an authenticated `vodozemac` Olm Double Ratchet session, and Ed25519 signatures bind the outer ciphertext. Initial asynchronous messages use a recipient-specific one-time prekey; its public key deterministically commits to the advertised prekey ID, and recipients verify that ID against the key embedded in the Olm envelope before decrypting. The recipient rotates that prekey after successful use. A relay prekey claim lasts 10 minutes when idle, but a matching queued ciphertext keeps the claim until acknowledgement, eviction, or queue removal, so a delayed frame cannot race a later sender for the same prekey. Client decryption checkpoints ratchet/account/prekey metadata before processing and restores it when Olm succeeds but outer AEAD or content binding fails. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender, message ID, and consumed prekey. Presence also carries a stable long-term identity directory checkpoint, while clients pin the long-term identity portion across prekey rotation. This is still not Signal or MLS: rooms use pairwise fanout, there is no signed key-transparency log or multi-device protocol, and no independent Abyssal audit. Compare direct-chat safety numbers and directory checkpoints out of band. See [SECURITY.md](SECURITY.md).
+Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v6 encrypts text, read receipts, and control metadata with ChaCha20-Poly1305 and carries each recipient's content key through an authenticated `vodozemac` Olm Double Ratchet session. Every recipient envelope contains exactly one Ed25519 signature over the v6 version, authenticated context, common ciphertext, sender identity key, intended username, prekey metadata, and recipient-specific ratchet envelope; the relay validates envelope shape and forwards only the envelope selected for that recipient, while clients verify the signature before accepting plaintext. Initial asynchronous messages use a recipient-specific one-time prekey; its public key deterministically commits to the advertised prekey ID, and recipients verify that ID against the key embedded in the Olm envelope before decrypting. The recipient rotates that prekey after successful use. Attachment bulk data is separate stateless XChaCha20-Poly1305: a version byte, 24-byte nonce, ciphertext, and 16-byte tag. Its 32-byte key is delivered in encrypted ratcheted message metadata, so the relay never receives the attachment key or plaintext. A relay prekey claim lasts 10 minutes when idle, but a matching queued ciphertext keeps the claim until acknowledgement, eviction, or queue removal, so a delayed frame cannot race a later sender for the same prekey. Client decryption checkpoints ratchet/account/prekey metadata before processing and restores it when Olm succeeds but outer AEAD, signature, or content binding fails. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender, message ID, and consumed prekey. Presence also carries a stable long-term identity directory checkpoint, while clients pin the long-term identity portion across prekey rotation. This is not Signal or MLS: rooms use pairwise fanout, there is no key-transparency witness, multi-device protocol, persistent rollback anchor, or independent Abyssal audit. Compare direct-chat safety numbers and directory checkpoints out of band. See [SECURITY.md](SECURITY.md).
 
 ## Docker
 
-The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, two roughly 271 MiB serialized upload bodies, two downloads, and runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host.
+The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, disabled core dumps, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, two roughly 200 MiB encrypted upload bodies, two downloads, and runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host. Attachment uploads have a 30-second idle deadline and a 10-minute total deadline, while stalled download producers release their buffers and permits after 30 seconds. Automatic restart is deliberately disabled: a crash must remain visible, because restarting creates a new invite-code set that is only recoverable from the operator's attached stdout.
+
+Docker is the supported launcher. A systemd unit is intentionally not shipped: journald would persist one-time startup codes and relay metadata, while a hidden restart could generate an unrecoverable fresh code set. Keep Docker's `none` log driver and disabled automatic restart unchanged.
 
 ```bash
 cp mirage-server/.env.example mirage-server/.env
 $EDITOR mirage-server/.env
-docker compose -f deploy/docker-compose.yml up -d --build
+./deploy/server-start.sh
 curl http://127.0.0.1:4020/health
 ```
+
+The public health response contains only liveness, node identity, and the RAM-only storage label; invite and account counts are not exposed.
 
 Stop it:
 
@@ -202,7 +211,7 @@ Stop it:
 docker compose -f deploy/docker-compose.yml down
 ```
 
-Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env`, systemd environment entries, or your server secret manager. The process prints codes once to attached stdout. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs. Terminal scrollback is the operator's only copy and must be protected or cleared after distribution.
+Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env` or your server secret manager. The process prints codes once to attached stdout. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs. Terminal scrollback is the operator's only copy and must be protected or cleared after distribution.
 
 ## Remote Docker Deploy
 
@@ -313,15 +322,7 @@ npm run web:build
 cargo build --release --package mirage-server
 ```
 
-Copy `deploy/mirage-server.service` to `/etc/systemd/system/mirage-server.service`, edit the environment values, then:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now mirage-server
-sudo systemctl status mirage-server
-```
-
-For production, put Caddy or Nginx in front of port `4020` and use HTTPS/WSS. The Android app will derive `wss://.../v1/ws` from a `https://...` node URL entered by the user.
+For production, use the supplied Docker launcher and put Caddy or Nginx in front of port `4020` with HTTPS/WSS. The Android app will derive `wss://.../v1/ws` from a `https://...` node URL entered by the user.
 
 ## License
 

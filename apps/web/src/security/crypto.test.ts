@@ -9,6 +9,7 @@ import {
   identityContext,
   InMemoryPayloadCipher,
   maxSerializedAttachmentBytes,
+  payloadToFrame,
   startOpaque,
   wipeBytes,
 } from "./crypto";
@@ -49,8 +50,8 @@ describe("OPAQUE client bindings", () => {
   });
 });
 
-describe("serialized attachment bounds", () => {
-  it("accounts for base64 expansion and recipient envelope budget", () => {
+describe("stateless attachment bounds", () => {
+  it("accounts for the fixed binary XChaCha envelope overhead", () => {
     expect(base64NoPaddingLength(0)).toBe(0);
     expect(base64NoPaddingLength(1)).toBe(2);
     expect(base64NoPaddingLength(2)).toBe(3);
@@ -61,8 +62,7 @@ describe("serialized attachment bounds", () => {
     const fileLimit = maxSerializedAttachmentBytes("FILE");
     expect(imageLimit).toBeLessThan(videoLimit);
     expect(videoLimit).toBeLessThan(fileLimit);
-    expect(fileLimit).toBeGreaterThan(200 * 1024 * 1024);
-    expect(fileLimit).toBeLessThanOrEqual(320 * 1024 * 1024);
+    expect(fileLimit).toBe(200 * 1024 * 1024 + 41);
   });
 });
 
@@ -88,7 +88,7 @@ describe("recipient E2EE", () => {
     ]);
     const envelope = payload.envelopes[0];
 
-    expect(payload.version).toBe(5);
+    expect(payload.version).toBe(6);
     expect(payload.stateRevision).toBe(1);
     expect(payload.identityEnvelope.byteLength).toBeGreaterThan(64);
     expect(payload.ciphertext).not.toEqual(new TextEncoder().encode("classified"));
@@ -99,6 +99,7 @@ describe("recipient E2EE", () => {
         "Alice",
         alice.publicKey(),
         payload,
+        envelope.signature,
         envelope.wrappedKey,
         envelope.prekeyId,
         envelope.isPrekey,
@@ -119,6 +120,7 @@ describe("recipient E2EE", () => {
         "Alice",
         alice.publicKey(),
         payload,
+        envelope.signature,
         envelope.wrappedKey,
         envelope.prekeyId,
         envelope.isPrekey,
@@ -142,6 +144,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       second,
+      second.envelopes[0].signature,
       second.envelopes[0].wrappedKey,
       second.envelopes[0].prekeyId,
       second.envelopes[0].isPrekey,
@@ -153,6 +156,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       first,
+      first.envelopes[0].signature,
       first.envelopes[0].wrappedKey,
       first.envelopes[0].prekeyId,
       first.envelopes[0].isPrekey,
@@ -166,6 +170,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       first,
+      first.envelopes[0].signature,
       first.envelopes[0].wrappedKey,
       first.envelopes[0].prekeyId,
       first.envelopes[0].isPrekey,
@@ -181,6 +186,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       third,
+      third.envelopes[0].signature,
       third.envelopes[0].wrappedKey,
       third.envelopes[0].prekeyId,
       third.envelopes[0].isPrekey,
@@ -200,6 +206,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       payload,
+      payload.envelopes[0].signature,
       payload.envelopes[0].wrappedKey,
       payload.envelopes[0].prekeyId,
       payload.envelopes[0].isPrekey,
@@ -211,6 +218,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       payload,
+      payload.envelopes[0].signature,
       payload.envelopes[0].wrappedKey,
       "wrong-prekey",
       true,
@@ -222,6 +230,7 @@ describe("recipient E2EE", () => {
       "Alice",
       alice.publicKey(),
       payload,
+      payload.envelopes[0].signature,
       payload.envelopes[0].wrappedKey,
       "",
       false,
@@ -230,15 +239,43 @@ describe("recipient E2EE", () => {
     payload.ciphertext[0] ^= 1;
     expect(decrypt).toThrow();
     payload.ciphertext[0] ^= 1;
-    payload.signature[0] ^= 1;
+    payload.envelopes[0].signature[0] ^= 1;
     expect(decrypt).toThrow();
-    payload.signature[0] ^= 1;
+    payload.envelopes[0].signature[0] ^= 1;
+    const legacy = { ...payload, version: 5 as const };
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      MESSAGE_ID,
+      "Alice",
+      alice.publicKey(),
+      legacy,
+      payload.envelopes[0].signature,
+      payload.envelopes[0].wrappedKey,
+      payload.envelopes[0].prekeyId,
+      payload.envelopes[0].isPrekey,
+      "Bob",
+    )).toThrow();
+    const mismatchedIdentity = payload.identityPublicKey.slice();
+    mismatchedIdentity[0] ^= 1;
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      MESSAGE_ID,
+      "Alice",
+      alice.publicKey(),
+      { ...payload, identityPublicKey: mismatchedIdentity },
+      payload.envelopes[0].signature,
+      payload.envelopes[0].wrappedKey,
+      payload.envelopes[0].prekeyId,
+      payload.envelopes[0].isPrekey,
+      "Bob",
+    )).toThrow();
     expect(() => bob.decryptText(
       "forum_other",
       MESSAGE_ID,
       "Alice",
       alice.publicKey(),
       payload,
+      payload.envelopes[0].signature,
       payload.envelopes[0].wrappedKey,
       payload.envelopes[0].prekeyId,
       payload.envelopes[0].isPrekey,
@@ -250,6 +287,7 @@ describe("recipient E2EE", () => {
       "Alice",
       bob.publicKey(),
       payload,
+      payload.envelopes[0].signature,
       payload.envelopes[0].wrappedKey,
       payload.envelopes[0].prekeyId,
       payload.envelopes[0].isPrekey,
@@ -257,17 +295,83 @@ describe("recipient E2EE", () => {
     )).toThrow();
   });
 
-  it("round-trips signed binary attachments and rejects another recipient", () => {
+  it("round-trips stateless attachments and binds blob context", () => {
     const alice = identity(6);
     const bob = identity(7);
-    const eve = identity(8);
     const plain = new Uint8Array([0, 255, 1, 128, 64]);
-    const encrypted = alice.encryptBytes(CHAT_ID, "attachment_1", "Alice", plain, [
+    const encrypted = alice.encryptAttachment(CHAT_ID, "attachment_1", "Alice", "FILE", plain);
+    expect(encrypted.blob).not.toEqual(plain);
+    expect(encrypted.key.byteLength).toBe(32);
+    expect(encrypted.blob[0]).toBe(1);
+    expect(bob.decryptAttachment(
+      CHAT_ID,
+      "attachment_1",
+      "Alice",
+      "FILE",
+      encrypted.key,
+      encrypted.blob,
+    )).toEqual(plain);
+    const tampered = encrypted.blob.slice();
+    tampered[tampered.length - 1] ^= 1;
+    expect(() => bob.decryptAttachment(
+      CHAT_ID,
+      "attachment_1",
+      "Alice",
+      "FILE",
+      encrypted.key,
+      tampered,
+    )).toThrow();
+    expect(() => bob.decryptAttachment(
+      "other_chat",
+      "attachment_1",
+      "Alice",
+      "FILE",
+      encrypted.key,
+      encrypted.blob,
+    )).toThrow();
+    expect(() => bob.decryptAttachment(
+      CHAT_ID,
+      "attachment_other",
+      "Alice",
+      "FILE",
+      encrypted.key,
+      encrypted.blob,
+    )).toThrow();
+    expect(() => bob.decryptAttachment(
+      CHAT_ID,
+      "attachment_1",
+      "Alice",
+      "IMAGE",
+      encrypted.key,
+      encrypted.blob,
+    )).toThrow();
+    const legacy = encrypted.blob.slice();
+    legacy[0] = 0;
+    expect(() => bob.decryptAttachment(
+      CHAT_ID,
+      "attachment_1",
+      "Alice",
+      "FILE",
+      encrypted.key,
+      legacy,
+    )).toThrow();
+    wipeBytes(encrypted.key);
+    wipeBytes(encrypted.blob);
+    const framePayload = alice.encryptText(CHAT_ID, "frame_1", "Alice", "frame", [
       { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
-    expect(encrypted).not.toEqual(plain);
-    expect(bob.decryptBytes(CHAT_ID, "Alice", alice.publicKey(), encrypted, "Bob")).toEqual(plain);
-    expect(() => eve.decryptBytes(CHAT_ID, "Alice", alice.publicKey(), encrypted, "Eve")).toThrow();
+    const frame = payloadToFrame(framePayload);
+    framePayload.nonce.fill(0);
+    framePayload.ciphertext.fill(0);
+    framePayload.identityEnvelope.fill(0);
+    framePayload.identityPublicKey.fill(0);
+    framePayload.envelopes.forEach((envelope) => {
+      envelope.wrappedKey.fill(0);
+      envelope.signature.fill(0);
+    });
+    expect(frame.version).toBe(6);
+    expect(frame).not.toHaveProperty("signature_b64");
+    expect((frame.envelopes as Array<{ signature_b64: string }>)[0].signature_b64).toBeTruthy();
   });
 
   it("recovers stable identity only with correct OPAQUE export key and context", () => {
