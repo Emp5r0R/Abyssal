@@ -628,45 +628,56 @@ impl E2eeSession {
             .as_ref()
             .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
         let mut state = lock(&self.state, "Identity unavailable")?;
-        let (content_key, used_prekey) = ratchet_unwrap_content_key(
-            &mut state,
-            &sender_username,
-            &sender_public_key,
-            &wrapped_key,
-            &aad,
-            RecipientEnvelopeContext {
-                prekey_id: &recipient_prekey_id,
-                is_prekey,
-                username: &recipient_username,
-            },
-        )?;
-        let content_key = Zeroizing::new(content_key);
-        let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
-            .map_err(|_| "Payload unavailable".to_string())?;
-        let plaintext = cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &ciphertext,
-                    aad: &aad,
+        let checkpoint = checkpoint_state(&state);
+        let result = (|| -> Result<E2eeDecryption, AbyssalError> {
+            let (content_key, used_prekey) = ratchet_unwrap_content_key(
+                &mut state,
+                &sender_username,
+                &sender_public_key,
+                &wrapped_key,
+                &aad,
+                RecipientEnvelopeContext {
+                    prekey_id: &recipient_prekey_id,
+                    is_prekey,
+                    username: &recipient_username,
                 },
             )
-            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
-        if used_prekey {
-            rotate_one_time_key(&mut state)?;
+            .map_err(AbyssalError::from)?;
+            let content_key = Zeroizing::new(content_key);
+            let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
+                .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+            let mut plaintext = Zeroizing::new(
+                cipher
+                    .decrypt(
+                        Nonce::from_slice(&nonce),
+                        Payload {
+                            msg: &ciphertext,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+            );
+            if used_prekey {
+                rotate_one_time_key(&mut state).map_err(AbyssalError::from)?;
+            }
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+            let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
+            let plaintext = std::mem::take(&mut *plaintext);
+            Ok(E2eeDecryption {
+                plaintext,
+                state_revision: state.revision,
+                identity_envelope,
+                identity_public: public_key_from_state(&state),
+                prekey_id: state.one_time_key_id.clone(),
+            })
+        })();
+        if result.is_err() {
+            restore_state(&mut state, checkpoint);
         }
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
-        let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
-        Ok(E2eeDecryption {
-            plaintext,
-            state_revision: state.revision,
-            identity_envelope,
-            identity_public: public_key_from_state(&state),
-            prekey_id: state.one_time_key_id.clone(),
-        })
+        result
     }
 }
 
@@ -893,22 +904,7 @@ fn content_key_binding(aad: &[u8], recipient_username: &str) -> [u8; 32] {
 }
 
 fn seal_state(state: &E2eeState, sealing: &SealingMaterial) -> Result<Vec<u8>, String> {
-    let stored = StoredE2eeState {
-        revision: state.revision,
-        fallback_public: state.fallback_public,
-        one_time_public: state.one_time_public,
-        one_time_key_id: state.one_time_key_id.clone(),
-        account: state.account.pickle(),
-        session_prekeys: state.session_prekeys.clone(),
-        peers: state
-            .sessions
-            .iter()
-            .map(|(peer, sessions)| StoredPeerSessions {
-                peer: peer.clone(),
-                sessions: sessions.iter().map(Session::pickle).collect(),
-            })
-            .collect(),
-    };
+    let stored = checkpoint_state(state);
     let plain = Zeroizing::new(
         serde_json::to_vec(&stored).map_err(|_| "Identity unavailable".to_string())?,
     );
@@ -933,6 +929,47 @@ fn seal_state(state: &E2eeState, sealing: &SealingMaterial) -> Result<Vec<u8>, S
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&encrypted);
     Ok(result)
+}
+
+fn checkpoint_state(state: &E2eeState) -> StoredE2eeState {
+    StoredE2eeState {
+        revision: state.revision,
+        fallback_public: state.fallback_public,
+        one_time_public: state.one_time_public,
+        one_time_key_id: state.one_time_key_id.clone(),
+        account: state.account.pickle(),
+        session_prekeys: state.session_prekeys.clone(),
+        peers: state
+            .sessions
+            .iter()
+            .map(|(peer, sessions)| StoredPeerSessions {
+                peer: peer.clone(),
+                sessions: sessions.iter().map(Session::pickle).collect(),
+            })
+            .collect(),
+    }
+}
+
+fn restore_state(state: &mut E2eeState, stored: StoredE2eeState) {
+    state.revision = stored.revision;
+    state.fallback_public = stored.fallback_public;
+    state.one_time_public = stored.one_time_public;
+    state.one_time_key_id = stored.one_time_key_id;
+    state.account = Account::from_pickle(stored.account);
+    state.sessions = stored
+        .peers
+        .into_iter()
+        .map(|peer| {
+            (
+                peer.peer,
+                peer.sessions
+                    .into_iter()
+                    .map(Session::from_pickle)
+                    .collect(),
+            )
+        })
+        .collect();
+    state.session_prekeys = stored.session_prekeys;
 }
 
 fn public_key_from_state(state: &E2eeState) -> Vec<u8> {
@@ -1038,6 +1075,7 @@ fn validate_context(context: &[u8]) -> Result<(), String> {
 
 fn validate_prekey_bundle(prekey_id: &str, public_key: &[u8]) -> Result<(), String> {
     if public_key.len() != ONE_TIME_KEY_BYTES
+        || prekey_id.is_empty()
         || prekey_id.len() > 32
         || !prekey_id.is_ascii()
         || !prekey_id
@@ -1046,11 +1084,7 @@ fn validate_prekey_bundle(prekey_id: &str, public_key: &[u8]) -> Result<(), Stri
     {
         return Err("Identity unavailable".to_string());
     }
-    if prekey_id.is_empty() {
-        if public_key.iter().any(|byte| *byte != 0) {
-            return Err("Identity unavailable".to_string());
-        }
-    } else if public_key.iter().all(|byte| *byte == 0)
+    if public_key.iter().all(|byte| *byte == 0)
         || prekey_id
             != prekey_id_for_public(
                 public_key
@@ -1349,6 +1383,16 @@ mod tests {
     }
 
     #[test]
+    fn stored_prekey_bundle_requires_a_nonempty_commitment() {
+        let public_key = [7_u8; ONE_TIME_KEY_BYTES];
+        let prekey_id = prekey_id_for_public(&public_key);
+        assert!(validate_prekey_bundle(&prekey_id, &public_key).is_ok());
+        assert!(validate_prekey_bundle("", &[0_u8; ONE_TIME_KEY_BYTES]).is_err());
+        assert!(validate_prekey_bundle("", &public_key).is_err());
+        assert!(validate_prekey_bundle("not-the-commitment", &public_key).is_err());
+    }
+
+    #[test]
     fn identity_recovery_and_recipient_e2ee_round_trip() {
         let export_key = vec![42; 64];
         let context = b"node:INVITE-CODE-1234".to_vec();
@@ -1603,6 +1647,182 @@ mod tests {
             .expect("decrypt after state restore");
         assert_eq!(plain.plaintext, b"restored");
         assert_eq!(plain.state_revision, 4);
+    }
+
+    #[test]
+    fn decrypt_restores_state_after_outer_aead_failure() {
+        let alice = sealed_session(31);
+        let bob = sealed_session(32);
+        let initial_prekey = bob.prekey_id();
+        let initial_public_key = bob.public_key();
+        let recipient = RecipientPublicKey {
+            username: "Bob".to_string(),
+            public_key: initial_public_key.clone(),
+            prekey_id: initial_prekey.clone(),
+        };
+        let first = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "same-message-context".to_string(),
+                "Alice".to_string(),
+                b"first content key".to_vec(),
+                vec![recipient.clone()],
+            )
+            .expect("first encrypt");
+        let second = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "same-message-context".to_string(),
+                "Alice".to_string(),
+                b"second content key".to_vec(),
+                vec![recipient],
+            )
+            .expect("second encrypt");
+
+        assert!(bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                first.message_id.clone(),
+                "Alice".to_string(),
+                alice.public_key(),
+                first.nonce.clone(),
+                first.ciphertext.clone(),
+                first.signature.clone(),
+                second.envelopes[0].wrapped_key.clone(),
+                second.envelopes[0].prekey_id.clone(),
+                second.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .is_err());
+        assert_eq!(bob.prekey_id(), initial_prekey);
+        assert_eq!(bob.public_key(), initial_public_key);
+        {
+            let state = bob.state.lock().expect("Bob ratchet state");
+            assert_eq!(state.revision, 0);
+            assert!(state.sessions.is_empty());
+            assert!(state.session_prekeys.is_empty());
+        }
+
+        let first_plain = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                first.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                first.nonce,
+                first.ciphertext,
+                first.signature,
+                first.envelopes[0].wrapped_key.clone(),
+                first.envelopes[0].prekey_id.clone(),
+                first.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .expect("first legitimate payload");
+        assert_eq!(first_plain.plaintext, b"first content key");
+        let second_plain = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                second.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                second.nonce,
+                second.ciphertext,
+                second.signature,
+                second.envelopes[0].wrapped_key.clone(),
+                second.envelopes[0].prekey_id.clone(),
+                second.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .expect("second legitimate payload");
+        assert_eq!(second_plain.plaintext, b"second content key");
+    }
+
+    #[test]
+    fn decrypt_restores_state_after_content_binding_failure() {
+        let alice = sealed_session(41);
+        let bob = sealed_session(42);
+        let initial_prekey = bob.prekey_id();
+        let initial_public_key = bob.public_key();
+        let recipient = RecipientPublicKey {
+            username: "Bob".to_string(),
+            public_key: initial_public_key.clone(),
+            prekey_id: initial_prekey.clone(),
+        };
+        let first = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "binding-first".to_string(),
+                "Alice".to_string(),
+                b"binding first".to_vec(),
+                vec![recipient.clone()],
+            )
+            .expect("first encrypt");
+        let second = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "binding-second".to_string(),
+                "Alice".to_string(),
+                b"binding second".to_vec(),
+                vec![recipient],
+            )
+            .expect("second encrypt");
+
+        assert!(bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                first.message_id.clone(),
+                "Alice".to_string(),
+                alice.public_key(),
+                first.nonce.clone(),
+                first.ciphertext.clone(),
+                first.signature.clone(),
+                second.envelopes[0].wrapped_key.clone(),
+                second.envelopes[0].prekey_id.clone(),
+                second.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .is_err());
+        assert_eq!(bob.prekey_id(), initial_prekey);
+        assert_eq!(bob.public_key(), initial_public_key);
+        {
+            let state = bob.state.lock().expect("Bob ratchet state");
+            assert_eq!(state.revision, 0);
+            assert!(state.sessions.is_empty());
+            assert!(state.session_prekeys.is_empty());
+        }
+
+        let first_plain = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                first.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                first.nonce,
+                first.ciphertext,
+                first.signature,
+                first.envelopes[0].wrapped_key.clone(),
+                first.envelopes[0].prekey_id.clone(),
+                first.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .expect("first legitimate payload");
+        assert_eq!(first_plain.plaintext, b"binding first");
+        let second_plain = bob
+            .decrypt(
+                "dm_alice_bob".to_string(),
+                second.message_id,
+                "Alice".to_string(),
+                alice.public_key(),
+                second.nonce,
+                second.ciphertext,
+                second.signature,
+                second.envelopes[0].wrapped_key.clone(),
+                second.envelopes[0].prekey_id.clone(),
+                second.envelopes[0].is_prekey,
+                "Bob".to_string(),
+            )
+            .expect("second legitimate payload");
+        assert_eq!(second_plain.plaintext, b"binding second");
     }
 
     #[test]

@@ -20,6 +20,57 @@ import okhttp3.RequestBody
 import okio.BufferedSink
 import org.json.JSONObject
 
+private const val CHACHA20_POLY1305_TAG_BYTES = 16L
+private const val SERIALIZED_ATTACHMENT_FIXED_BYTES = 16L * 1024L
+
+// The attachment ciphertext is base64 encoded inside the encrypted JSON payload.
+// Keep a deterministic envelope budget for recipient-specific wrapped keys rather
+// than pretending JSON adds only the AEAD tag size.
+internal const val MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES = 4L * 1024L * 1024L
+
+internal fun base64NoPaddingLength(rawBytes: Long): Long {
+    require(rawBytes >= 0L)
+    val groups = rawBytes / 3L
+    return groups * 4L + when (rawBytes % 3L) {
+        0L -> 0L
+        1L -> 2L
+        else -> 3L
+    }
+}
+
+internal fun maxSerializedAttachmentBytes(mediaType: String): Long {
+    val plainLimit = when (mediaType.uppercase()) {
+        "IMAGE" -> 20L * 1024L * 1024L
+        "VIDEO" -> 100L * 1024L * 1024L
+        else -> 200L * 1024L * 1024L
+    }
+    val ciphertextB64Bytes = base64NoPaddingLength(plainLimit + CHACHA20_POLY1305_TAG_BYTES)
+    return SERIALIZED_ATTACHMENT_FIXED_BYTES +
+        ciphertextB64Bytes +
+        MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES
+}
+
+internal val MAX_ENCRYPTED_ATTACHMENT_BYTES: Long = maxSerializedAttachmentBytes("FILE")
+internal const val MAX_ATTACHMENT_UPLOAD_RESPONSE_BYTES = 64L * 1024L
+
+internal fun readBoundedAttachmentBody(body: okhttp3.ResponseBody): ByteArray? {
+    if (body.contentLength() > MAX_ENCRYPTED_ATTACHMENT_BYTES) return null
+    return BoundedInputReader.read(body.byteStream(), MAX_ENCRYPTED_ATTACHMENT_BYTES)
+}
+
+internal fun readBoundedAttachmentResponse(body: okhttp3.ResponseBody): JSONObject? {
+    if (body.contentLength() > MAX_ATTACHMENT_UPLOAD_RESPONSE_BYTES) return null
+    val raw = BoundedInputReader.read(body.byteStream(), MAX_ATTACHMENT_UPLOAD_RESPONSE_BYTES)
+        ?: return null
+    return try {
+        JSONObject(String(raw, StandardCharsets.UTF_8))
+    } catch (_: Exception) {
+        null
+    } finally {
+        raw.fill(0)
+    }
+}
+
 class EncryptedAttachmentService(
     private val appContext: Context,
     private val nodeConfigService: INodeConfigService,
@@ -40,6 +91,12 @@ class EncryptedAttachmentService(
         onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult = withContext(Dispatchers.IO) {
         val session = nodeConfigService.getActiveSession() ?: return@withContext AttachmentUploadResult(false)
+        if (
+            encryptedBytes.isEmpty() ||
+            encryptedBytes.size.toLong() > maxSerializedAttachmentBytes(mediaType)
+        ) {
+            return@withContext AttachmentUploadResult(false)
+        }
         val query = listOf(
             "chat_id" to chatId,
             "media_type" to mediaType.uppercase(),
@@ -62,7 +119,7 @@ class EncryptedAttachmentService(
 
         runCatching {
             client.newCall(request).execute().use { response ->
-                val json = response.body?.string()?.takeIf { it.isNotBlank() }?.let { JSONObject(it) }
+                val json = response.body?.let(::readBoundedAttachmentResponse)
                 AttachmentUploadResult(
                     accepted = response.isSuccessful && json?.optBoolean("accepted", false) == true,
                     attachmentId = json?.optString("attachment_id")?.takeIf { it.isNotBlank() }
@@ -84,7 +141,8 @@ class EncryptedAttachmentService(
         try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@use null
-                response.body?.bytes()
+                val body = response.body ?: return@use null
+                readBoundedAttachmentBody(body)
             }
         } catch (e: IOException) {
             null
@@ -147,5 +205,6 @@ class EncryptedAttachmentService(
     private companion object {
         const val KEYSTORE_PROVIDER = "AndroidKeyStore"
         const val LEGACY_EXPORT_KEY_ALIAS = "abyssal_attachment_export_v1"
+
     }
 }

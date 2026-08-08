@@ -11,7 +11,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.ResponseBody
-import okio.Buffer
 import org.json.JSONObject
 
 class GitHubReleaseUpdateService(
@@ -61,14 +60,8 @@ class GitHubReleaseUpdateService(
     }
 
     private fun readBounded(body: ResponseBody): ByteArray {
-        val source = body.source()
-        val buffer = Buffer()
-        while (buffer.size <= MAX_RESPONSE_BYTES) {
-            val read = source.read(buffer, MAX_RESPONSE_BYTES + 1L - buffer.size)
-            if (read == -1L) break
-        }
-        check(buffer.size <= MAX_RESPONSE_BYTES)
-        return buffer.readByteArray()
+        return BoundedInputReader.read(body.byteStream(), MAX_RESPONSE_BYTES)
+            ?: error("Update metadata exceeds the safety limit")
     }
 
     internal fun parseRelease(release: JSONObject): AvailableAppUpdate? {
@@ -147,7 +140,7 @@ class GitHubReleaseUpdateService(
         const val OFFICIAL_DOWNLOAD_HOST = "github.com"
         const val APK_CONTENT_TYPE = "application/vnd.android.package-archive"
         const val MAX_VERSION_PART = 1_000_000
-        const val MAX_RESPONSE_BYTES = 512 * 1024
+        const val MAX_RESPONSE_BYTES = 512L * 1024L
         const val MIN_APK_BYTES = 1024L * 1024L
         const val MAX_APK_BYTES = 256L * 1024L * 1024L
     }

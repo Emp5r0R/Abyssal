@@ -5,6 +5,7 @@ import com.abyssal.chat.domain.model.Message
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -81,6 +82,26 @@ class InMemoryMessageRepositoryTest {
 
         assertEquals(message.id, repository.getMessages("dm_kept").first().single().id)
         assertFalse(repository.getMessages("dm_kept").first().single().isExpired)
+    }
+
+    @Test
+    fun messageSenderKeysAreOwnedAndWipedOnDuplicateAndClear() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val firstKey = ByteArray(32) { 7 }
+        val message = testMessage("keyed").copy(senderPublicKey = firstKey)
+
+        repository.saveMessage("dm_keys", message)
+
+        val stored = repository.getMessages("dm_keys").first().single()
+        assertArrayEquals(ByteArray(32), firstKey)
+        assertArrayEquals(ByteArray(32) { 7 }, stored.senderPublicKey)
+
+        val duplicateKey = ByteArray(32) { 9 }
+        repository.saveMessage("dm_keys", message.copy(senderPublicKey = duplicateKey))
+        assertArrayEquals(ByteArray(32), duplicateKey)
+
+        repository.clearAllData()
+        assertArrayEquals(ByteArray(32), stored.senderPublicKey)
     }
 
     private fun testMessage(id: String) = Message(

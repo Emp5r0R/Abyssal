@@ -170,7 +170,7 @@ class InMemoryPayloadCipher {
             signature = decode(json.getString("signature_b64")),
             wrappedKey = wrappedKey,
             senderUsername = senderUsername,
-            senderPublicKey = senderPublicKey,
+            senderPublicKey = senderPublicKey.copyOf(),
             prekeyId = envelope.optString("prekey_id"),
             isPrekey = envelope.optBoolean("is_prekey", false)
         )

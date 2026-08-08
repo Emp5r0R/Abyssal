@@ -7,13 +7,21 @@ import com.abyssal.chat.domain.repository.IDisguiseManager
 
 class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
 
-    private var disguiseEnabled = readCalculatorAliasEnabled()
-    private var unlockPin = DEFAULT_PIN
+    // Secrets intentionally live only for the lifetime of the application process. If
+    // Android recreates the process, the old calculator alias is stale and must not
+    // fall back to a predictable unlock code.
+    private var disguiseEnabled = false
+    private var unlockPin = ""
     private var duressPin = ""
 
+    init {
+        resetStaleCamouflage()
+    }
+
     override fun setDisguiseEnabled(enabled: Boolean) {
-        disguiseEnabled = enabled
-        applyLauncherIcon(enabled)
+        if (applyLauncherIcon(enabled)) {
+            disguiseEnabled = enabled
+        }
     }
 
     override fun isDisguiseEnabled(): Boolean {
@@ -21,7 +29,7 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
     }
 
     override fun savePin(pin: String) {
-        unlockPin = pin.ifBlank { DEFAULT_PIN }
+        unlockPin = pin.trim()
     }
 
     override fun saveDuressPin(pin: String) {
@@ -29,7 +37,7 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
     }
 
     override fun verifyPin(pin: String): Boolean {
-        return pin == unlockPin
+        return unlockPin.isNotEmpty() && pin == unlockPin
     }
 
     override fun verifyDuressPin(pin: String): Boolean {
@@ -44,37 +52,23 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         return duressPin
     }
 
-    private companion object {
-        const val DEFAULT_PIN = "2026"
-    }
-
-    private fun applyLauncherIcon(enabled: Boolean) {
+    private fun applyLauncherIcon(enabled: Boolean): Boolean {
         val packageManager = context.packageManager
         val abyssal = ComponentName(context, "${context.packageName}.LauncherAbyssal")
         val calculator = ComponentName(context, "${context.packageName}.LauncherCalculator")
-        runCatching {
-            if (!enabled) {
-                packageManager.setComponentEnabledSetting(
-                    abyssal,
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                    PackageManager.DONT_KILL_APP
-                )
-            }
-            packageManager.setComponentEnabledSetting(
-                calculator,
-                if (enabled) {
-                    PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                } else {
-                    PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-                },
-                PackageManager.DONT_KILL_APP
-            )
-        }
+        val enable = PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+        val disable = PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+        return runCatching {
+            val first = if (enabled) calculator else abyssal
+            val second = if (enabled) abyssal else calculator
+            packageManager.setComponentEnabledSetting(first, enable, PackageManager.DONT_KILL_APP)
+            packageManager.setComponentEnabledSetting(second, disable, PackageManager.DONT_KILL_APP)
+        }.isSuccess
     }
 
-    private fun readCalculatorAliasEnabled(): Boolean {
-        val calculator = ComponentName(context, "${context.packageName}.LauncherCalculator")
-        return context.packageManager.getComponentEnabledSetting(calculator) ==
-            PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+    private fun resetStaleCamouflage() {
+        // Package-manager alias state survives process death, but the PIN does not.
+        // Reset both aliases so a stale calculator cover can never accept a default PIN.
+        applyLauncherIcon(enabled = false)
     }
 }
