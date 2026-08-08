@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     env,
     net::SocketAddr,
     path::PathBuf,
@@ -13,7 +14,7 @@ use abyssal_core::secure_protocol::{
     prekey_id_for_public,
 };
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::Request,
     extract::{
         ws::{Message, WebSocket},
@@ -32,6 +33,7 @@ use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -44,7 +46,12 @@ use zeroize::{Zeroize, Zeroizing};
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 const FILE_ATTACHMENT_LIMIT_BYTES: usize = 200 * 1024 * 1024;
-const ENCRYPTION_OVERHEAD_BYTES: usize = 64 * 1024;
+const CHACHA20_POLY1305_TAG_BYTES: usize = 16;
+const SERIALIZED_ATTACHMENT_FIXED_BYTES: usize = 16 * 1024;
+// Recipient-specific wrapped keys are serialized into the JSON envelope. Keep
+// this budget in sync with the Android client so a maximum plaintext file fits
+// without allowing an unbounded request body.
+const MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES: usize = 4 * 1024 * 1024;
 const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
 const WS_MAX_BYTES_PER_WINDOW: usize = 4 * 1024 * 1024;
@@ -58,6 +65,7 @@ const MAX_USERNAME_BYTES: usize = 80;
 const MAX_CODE_BYTES: usize = 128;
 const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
+const MAX_LOGIN_LIMIT_ENTRIES: usize = 4_096;
 const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
 const OPAQUE_HANDSHAKE_TTL_MS: u64 = 60_000;
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
@@ -75,6 +83,11 @@ const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_REPLAY_IDS: usize = 50_000;
 const PREKEY_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_PREKEY_ID_BYTES: usize = 32;
+const DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB: usize = 320;
+const DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 2;
+const MAX_ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 16;
+const DEFAULT_ATTACHMENT_UPLOAD_CONCURRENCY: usize = 2;
+const MAX_ATTACHMENT_UPLOAD_CONCURRENCY: usize = 4;
 const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_INVITE_CODE_ID_V1";
 
 type CodeId = [u8; 32];
@@ -84,6 +97,7 @@ type HmacSha256 = Hmac<Sha256>;
 struct AppState {
     node_id: String,
     attachment_ram_limit_bytes: usize,
+    attachment_account_limit_bytes: usize,
     max_rooms_per_user: usize,
     web_origins: Vec<String>,
     session_inactivity_ms: u64,
@@ -108,6 +122,9 @@ struct AppState {
     direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
     pending: Arc<Mutex<HashMap<PendingKey, Vec<OutboundFrame>>>>,
     attachments: Arc<Mutex<HashMap<Uuid, AttachmentRecord>>>,
+    attachment_bytes_by_code: Arc<Mutex<HashMap<CodeId, usize>>>,
+    attachment_downloads: Arc<Semaphore>,
+    attachment_uploads: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -200,6 +217,7 @@ struct PrekeyClaim {
     chat_id: String,
     message_id: String,
     sender_username: String,
+    recipient_username: String,
     created_at_ms: u64,
 }
 
@@ -215,6 +233,7 @@ impl Drop for PrekeyClaim {
         self.chat_id.zeroize();
         self.message_id.zeroize();
         self.sender_username.zeroize();
+        self.recipient_username.zeroize();
     }
 }
 
@@ -229,6 +248,7 @@ struct AttachmentRecord {
     encrypted_bytes: Vec<u8>,
     chat_id: String,
     media_type: String,
+    owner_code_id: CodeId,
     one_time: bool,
     delete_after_download: bool,
     expires_at_ms: Option<u64>,
@@ -239,6 +259,7 @@ impl Drop for AttachmentRecord {
         self.encrypted_bytes.zeroize();
         self.chat_id.zeroize();
         self.media_type.zeroize();
+        self.owner_code_id.zeroize();
     }
 }
 
@@ -576,16 +597,22 @@ async fn main() {
         .parse()
         .expect("ABYSSAL_BIND_ADDR must be a valid socket address");
 
-    let attachment_body_limit = FILE_ATTACHMENT_LIMIT_BYTES + ENCRYPTION_OVERHEAD_BYTES;
+    let attachment_body_limit = max_serialized_attachment_bytes("FILE");
     let account_routes = Router::new()
         .route("/v2/account/start", post(start_opaque_account))
         .route("/v2/account/finish", post(finish_opaque_account))
         .route("/v1/account/logout", post(logout_account))
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
-    let attachment_routes = Router::new()
+    let attachment_upload_routes = Router::new()
         .route("/v1/attachment", post(upload_attachment))
-        .route("/v1/attachment/:id", get(download_attachment))
-        .layer(DefaultBodyLimit::max(attachment_body_limit));
+        .layer(DefaultBodyLimit::max(attachment_body_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limit_attachment_uploads,
+        ));
+    let attachment_download_routes =
+        Router::new().route("/v1/attachment/:id", get(download_attachment));
+    let attachment_routes = attachment_upload_routes.merge(attachment_download_routes);
 
     let web_origins = state.web_origins.clone();
     let mut app = Router::new()
@@ -654,6 +681,22 @@ impl AppState {
         OsRng.fill_bytes(&mut invite_code_pepper);
         let attachment_ram_limit_bytes =
             read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512).saturating_mul(1024 * 1024);
+        let attachment_account_limit_bytes = read_usize_env(
+            "ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB",
+            DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB,
+        )
+        .saturating_mul(1024 * 1024)
+        .min(attachment_ram_limit_bytes);
+        let attachment_download_concurrency = read_usize_env(
+            "ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY",
+            DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY,
+        )
+        .clamp(1, MAX_ATTACHMENT_DOWNLOAD_CONCURRENCY);
+        let attachment_upload_concurrency = read_usize_env(
+            "ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY",
+            DEFAULT_ATTACHMENT_UPLOAD_CONCURRENCY,
+        )
+        .clamp(1, MAX_ATTACHMENT_UPLOAD_CONCURRENCY);
         let max_rooms_per_user = read_usize_env("ABYSSAL_MAX_ROOMS_PER_USER", 5).clamp(1, 100);
         let web_origins = parse_origins_from_env("ABYSSAL_WEB_ORIGINS");
         let session_inactivity_minutes =
@@ -680,6 +723,7 @@ impl AppState {
         Self {
             node_id,
             attachment_ram_limit_bytes,
+            attachment_account_limit_bytes,
             max_rooms_per_user,
             web_origins,
             session_inactivity_ms,
@@ -704,6 +748,9 @@ impl AppState {
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
+            attachment_bytes_by_code: Arc::new(Mutex::new(HashMap::new())),
+            attachment_downloads: Arc::new(Semaphore::new(attachment_download_concurrency)),
+            attachment_uploads: Arc::new(Semaphore::new(attachment_upload_concurrency)),
         }
     }
 
@@ -722,6 +769,18 @@ impl AppState {
         info!(
             "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
             self.attachment_ram_limit_bytes
+        );
+        info!(
+            "ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT bytes={}",
+            self.attachment_account_limit_bytes
+        );
+        info!(
+            "ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY permits={}",
+            self.attachment_uploads.available_permits()
+        );
+        info!(
+            "ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY permits={}",
+            self.attachment_downloads.available_permits()
         );
         info!(
             "ABYSSAL_ROOM_LIMIT max_rooms_per_user={}",
@@ -801,7 +860,7 @@ async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http: ws:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:* http://[::1]:* ws://localhost:* ws://127.0.0.1:* ws://[::1]:*; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'";
 
 async fn security_headers(request: Request, next: Next) -> Response {
     let clear_site_data = request.uri().path() == "/v1/account/logout";
@@ -858,6 +917,20 @@ async fn security_headers(request: Request, next: Next) -> Response {
             HeaderValue::from_static("\"cache\", \"cookies\", \"storage\""),
         );
     }
+    response
+}
+
+async fn limit_attachment_uploads(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let permit = match acquire_attachment_upload_permit(&state.attachment_uploads) {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let response = next.run(request).await;
+    drop(permit);
     response
 }
 
@@ -962,6 +1035,16 @@ fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: u
 async fn login_attempt_allowed(state: &AppState, code_id: &CodeId) -> bool {
     let now = now_ms();
     let mut limits = state.login_limits.lock().await;
+    limits.retain(|_, rate| now.saturating_sub(rate.window_start_ms) < LOGIN_RATE_WINDOW_MS);
+    if !limits.contains_key(code_id) && limits.len() >= MAX_LOGIN_LIMIT_ENTRIES {
+        if let Some(oldest) = limits
+            .iter()
+            .min_by_key(|(_, rate)| rate.window_start_ms)
+            .map(|(code_id, _)| *code_id)
+        {
+            limits.remove(&oldest);
+        }
+    }
     let rate = limits.entry(*code_id).or_insert(RateState {
         window_start_ms: now,
         count: 0,
@@ -1052,12 +1135,41 @@ async fn attachment_sweeper(state: AppState) {
 async fn prune_expired_attachments(state: &AppState) {
     let now = now_ms();
     let mut attachments = state.attachments.lock().await;
+    let mut usage = state.attachment_bytes_by_code.lock().await;
     let before = attachments.len();
-    attachments.retain(|_, record| record.expires_at_ms.is_none_or(|expires| now < expires));
+    attachments.retain(|_, record| {
+        if record.expires_at_ms.is_none_or(|expires| now < expires) {
+            true
+        } else {
+            subtract_attachment_usage(
+                &mut usage,
+                &record.owner_code_id,
+                record.encrypted_bytes.len(),
+            );
+            false
+        }
+    });
     let removed = before.saturating_sub(attachments.len());
     if removed > 0 {
         info!("expired_attachments_removed count={removed}");
     }
+}
+
+async fn remove_chat_attachments(state: &AppState, chat_id: &str) {
+    let mut attachments = state.attachments.lock().await;
+    let mut usage = state.attachment_bytes_by_code.lock().await;
+    attachments.retain(|_, record| {
+        if record.chat_id != chat_id {
+            true
+        } else {
+            subtract_attachment_usage(
+                &mut usage,
+                &record.owner_code_id,
+                record.encrypted_bytes.len(),
+            );
+            false
+        }
+    });
 }
 
 async fn session_sweeper(state: AppState) {
@@ -1074,12 +1186,47 @@ async fn session_sweeper(state: AppState) {
         if removed > 0 {
             info!("expired_sessions_removed count={removed}");
         }
-        state
-            .prekey_claims
-            .lock()
-            .await
-            .retain(|_, claim| now.saturating_sub(claim.created_at_ms) < PREKEY_CLAIM_TTL_MS);
+        let pending = state.pending.lock().await;
+        let mut claims = state.prekey_claims.lock().await;
+        prune_prekey_claims(&mut claims, &pending, now);
     }
+}
+
+fn pending_contains_prekey_frame(
+    pending: &HashMap<PendingKey, Vec<OutboundFrame>>,
+    key: &PrekeyClaimKey,
+    claim: &PrekeyClaim,
+) -> bool {
+    pending.iter().any(|(pending_key, frames)| {
+        pending_key.recipient_username == claim.recipient_username
+            && frames.iter().any(|frame| {
+                matches!(
+                    frame,
+                    OutboundFrame::Message {
+                        chat_id,
+                        message_id,
+                        prekey_id,
+                        is_prekey: true,
+                        sender_username,
+                        ..
+                    } if chat_id == &claim.chat_id
+                        && message_id == &claim.message_id
+                        && sender_username == &claim.sender_username
+                        && prekey_id == &key.prekey_id
+                )
+            })
+    })
+}
+
+fn prune_prekey_claims(
+    claims: &mut HashMap<PrekeyClaimKey, PrekeyClaim>,
+    pending: &HashMap<PendingKey, Vec<OutboundFrame>>,
+    now: u64,
+) {
+    claims.retain(|key, claim| {
+        now.saturating_sub(claim.created_at_ms) < PREKEY_CLAIM_TTL_MS
+            || pending_contains_prekey_frame(pending, key, claim)
+    });
 }
 
 fn session_is_expired(session: &AuthSession, now: u64, inactivity_limit_ms: u64) -> bool {
@@ -1124,13 +1271,32 @@ fn normalize_media_type(media_type: Option<&str>) -> String {
     }
 }
 
-fn encrypted_attachment_limit_bytes(media_type: &str) -> usize {
+fn base64_no_padding_length(raw_bytes: usize) -> usize {
+    let groups = raw_bytes / 3;
+    groups
+        .saturating_mul(4)
+        .saturating_add(match raw_bytes % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        })
+}
+
+fn max_serialized_attachment_bytes(media_type: &str) -> usize {
     let plain_limit = match media_type {
         "IMAGE" => IMAGE_ATTACHMENT_LIMIT_BYTES,
         "VIDEO" => VIDEO_ATTACHMENT_LIMIT_BYTES,
         _ => FILE_ATTACHMENT_LIMIT_BYTES,
     };
-    plain_limit + ENCRYPTION_OVERHEAD_BYTES
+    SERIALIZED_ATTACHMENT_FIXED_BYTES
+        .saturating_add(base64_no_padding_length(
+            plain_limit.saturating_add(CHACHA20_POLY1305_TAG_BYTES),
+        ))
+        .saturating_add(MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES)
+}
+
+fn encrypted_attachment_limit_bytes(media_type: &str) -> usize {
+    max_serialized_attachment_bytes(media_type)
 }
 
 fn valid_chat_id(chat_id: &str) -> bool {
@@ -1215,6 +1381,68 @@ fn current_attachment_bytes(attachments: &HashMap<Uuid, AttachmentRecord>) -> us
         .values()
         .map(|record| record.encrypted_bytes.len())
         .sum()
+}
+
+fn subtract_attachment_usage(
+    usage: &mut HashMap<CodeId, usize>,
+    owner_code_id: &CodeId,
+    bytes: usize,
+) {
+    let Some(current) = usage.get_mut(owner_code_id) else {
+        return;
+    };
+    if *current <= bytes {
+        usage.remove(owner_code_id);
+    } else {
+        *current -= bytes;
+    }
+}
+
+fn attachment_capacity_allows(
+    used_total: usize,
+    used_account: usize,
+    incoming: usize,
+    total_limit: usize,
+    account_limit: usize,
+) -> bool {
+    used_total
+        .checked_add(incoming)
+        .is_some_and(|total| total <= total_limit)
+        && used_account
+            .checked_add(incoming)
+            .is_some_and(|account| account <= account_limit)
+}
+
+fn acquire_attachment_download_permit(
+    downloads: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, StatusCode> {
+    downloads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)
+}
+
+fn acquire_attachment_upload_permit(
+    uploads: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, StatusCode> {
+    uploads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)
+}
+
+fn attachment_download_response(bytes: Vec<u8>, permit: OwnedSemaphorePermit) -> Response {
+    let state = Some((Some(Bytes::from(bytes)), permit));
+    let stream = futures_util::stream::unfold(state, |state| async move {
+        let (bytes, permit) = state?;
+        bytes.map(|bytes| (Ok::<Bytes, Infallible>(bytes), Some((None, permit))))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response
 }
 
 async fn touch_activity(state: &AppState) {
@@ -1519,7 +1747,10 @@ fn valid_prekey_id(value: &str) -> bool {
 }
 
 fn valid_identity_public_bundle(public_key: &[u8], prekey_id: &str) -> bool {
-    if public_key.len() != IDENTITY_PUBLIC_BYTES || !valid_prekey_id(prekey_id) {
+    if public_key.len() != IDENTITY_PUBLIC_BYTES
+        || !valid_prekey_id(prekey_id)
+        || prekey_id.is_empty()
+    {
         return false;
     }
     let long_term = &public_key[..IDENTITY_FINGERPRINT_BYTES];
@@ -1527,15 +1758,11 @@ fn valid_identity_public_bundle(public_key: &[u8], prekey_id: &str) -> bool {
         return false;
     }
     let one_time = &public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET];
-    if prekey_id.is_empty() {
-        one_time.iter().all(|byte| *byte == 0)
-    } else {
-        one_time.iter().any(|byte| *byte != 0)
-            && one_time
-                .try_into()
-                .map(|public| prekey_id_for_public(public) == prekey_id)
-                .unwrap_or(false)
-    }
+    one_time.iter().any(|byte| *byte != 0)
+        && one_time
+            .try_into()
+            .map(|public| prekey_id_for_public(public) == prekey_id)
+            .unwrap_or(false)
 }
 
 async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) {
@@ -1658,15 +1885,25 @@ async fn upload_attachment(
     let one_time = query.one_time.unwrap_or(false);
     prune_expired_attachments(&state).await;
     let mut attachments = state.attachments.lock().await;
+    let mut usage = state.attachment_bytes_by_code.lock().await;
     let used_bytes = current_attachment_bytes(&attachments);
-    if used_bytes.saturating_add(body.len()) > state.attachment_ram_limit_bytes {
+    let account_used = usage.get(&auth.code_id).copied().unwrap_or_default();
+    if !attachment_capacity_allows(
+        used_bytes,
+        account_used,
+        body.len(),
+        state.attachment_ram_limit_bytes,
+        state.attachment_account_limit_bytes,
+    ) {
         warn!(
-            "attachment_upload_rejected chat_id={} media_type={} reason=ram_limit used={} incoming={} limit={}",
+            "attachment_upload_rejected chat_id={} media_type={} reason=ram_limit used={} account_used={} incoming={} limit={} account_limit={}",
             chat_id,
             media_type,
             used_bytes,
+            account_used,
             body.len(),
-            state.attachment_ram_limit_bytes
+            state.attachment_ram_limit_bytes,
+            state.attachment_account_limit_bytes,
         );
         return StatusCode::from_u16(507)
             .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
@@ -1678,12 +1915,15 @@ async fn upload_attachment(
             encrypted_bytes: body.to_vec(),
             chat_id: chat_id.to_string(),
             media_type,
+            owner_code_id: auth.code_id,
             one_time,
             delete_after_download: query.delete_after_download.unwrap_or(one_time),
             expires_at_ms: ttl_ms,
         },
     );
+    usage.insert(auth.code_id, account_used.saturating_add(body.len()));
     drop(attachments);
+    drop(usage);
 
     Json(serde_json::json!({
         "accepted": true,
@@ -1703,6 +1943,10 @@ async fn download_attachment(
         Err(status) => return status.into_response(),
     };
     touch_activity(&state).await;
+    let download_permit = match acquire_attachment_download_permit(&state.attachment_downloads) {
+        Ok(permit) => permit,
+        Err(status) => return status.into_response(),
+    };
 
     let chat_id = {
         let attachments = state.attachments.lock().await;
@@ -1719,6 +1963,7 @@ async fn download_attachment(
     }
 
     let mut attachments = state.attachments.lock().await;
+    let mut usage = state.attachment_bytes_by_code.lock().await;
     let Some(record) = attachments.get(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1726,14 +1971,20 @@ async fn download_attachment(
         .expires_at_ms
         .is_some_and(|expires| now_ms() >= expires)
     {
+        let owner_code_id = record.owner_code_id;
+        let encrypted_len = record.encrypted_bytes.len();
         attachments.remove(&id);
+        subtract_attachment_usage(&mut usage, &owner_code_id, encrypted_len);
         return StatusCode::NOT_FOUND.into_response();
     }
 
     let bytes = record.encrypted_bytes.clone();
     let media_type = record.media_type.clone();
     if record.one_time || record.delete_after_download {
+        let owner_code_id = record.owner_code_id;
+        let encrypted_len = record.encrypted_bytes.len();
         attachments.remove(&id);
+        subtract_attachment_usage(&mut usage, &owner_code_id, encrypted_len);
     }
     info!(
         "attachment_downloaded id={} media_type={} bytes={}",
@@ -1742,12 +1993,7 @@ async fn download_attachment(
         bytes.len()
     );
 
-    let mut response = bytes.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    response
+    attachment_download_response(bytes, download_permit)
 }
 
 async fn account_error(
@@ -2376,6 +2622,7 @@ async fn claim_prekeys(
                 chat_id: chat_id.to_string(),
                 message_id: message_id.to_string(),
                 sender_username: sender_username.to_string(),
+                recipient_username: username.clone(),
                 created_at_ms: now_ms(),
             },
         ));
@@ -2383,8 +2630,10 @@ async fn claim_prekeys(
     drop(accounts);
 
     let now = now_ms();
+    let pending = state.pending.lock().await;
     let mut claims = state.prekey_claims.lock().await;
-    claims.retain(|_, claim| now.saturating_sub(claim.created_at_ms) < PREKEY_CLAIM_TTL_MS);
+    prune_prekey_claims(&mut claims, &pending, now);
+    drop(pending);
     if claims_to_add
         .iter()
         .any(|(key, _)| claims.contains_key(key))
@@ -2403,19 +2652,62 @@ async fn release_prekey_claims(
     message_id: &str,
     sender_username: &str,
 ) {
-    state.prekey_claims.lock().await.retain(|_, claim| {
-        claim.chat_id != chat_id
-            || claim.message_id != message_id
-            || claim.sender_username != sender_username
+    release_prekey_claim(state, chat_id, message_id, sender_username, None).await;
+}
+
+async fn release_prekey_claim(
+    state: &AppState,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    prekey_id: Option<&str>,
+) {
+    state.prekey_claims.lock().await.retain(|key, claim| {
+        !(claim.chat_id == chat_id
+            && claim.message_id == message_id
+            && claim.sender_username == sender_username
+            && prekey_id.is_none_or(|expected| key.prekey_id == expected))
     });
+}
+
+fn is_prekey_frame(frame: &OutboundFrame) -> bool {
+    matches!(
+        frame,
+        OutboundFrame::Message {
+            is_prekey: true,
+            prekey_id,
+            ..
+        } if !prekey_id.is_empty()
+    )
+}
+
+fn prekey_claim_details(frame: &OutboundFrame) -> Option<(String, String, String, String)> {
+    match frame {
+        OutboundFrame::Message {
+            chat_id,
+            message_id,
+            prekey_id,
+            is_prekey: true,
+            sender_username,
+            ..
+        } if !prekey_id.is_empty() => Some((
+            chat_id.clone(),
+            message_id.clone(),
+            sender_username.clone(),
+            prekey_id.clone(),
+        )),
+        _ => None,
+    }
 }
 
 async fn queue_pending_frame(
     state: &AppState,
     chat_id: &str,
     recipient_username: String,
-    frame: OutboundFrame,
+    mut frame: OutboundFrame,
 ) {
+    let mut dropped_claim = None;
+    let mut enqueue = true;
     let mut pending = state.pending.lock().await;
     let queue = pending
         .entry(PendingKey {
@@ -2424,10 +2716,32 @@ async fn queue_pending_frame(
         })
         .or_default();
     if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
-        let mut evicted = queue.remove(0);
-        evicted.zeroize_sensitive();
+        if let Some(eviction_index) = queue
+            .iter()
+            .position(|candidate| !is_prekey_frame(candidate))
+        {
+            let mut evicted = queue.remove(eviction_index);
+            evicted.zeroize_sensitive();
+        } else {
+            dropped_claim = prekey_claim_details(&frame);
+            enqueue = false;
+            frame.zeroize_sensitive();
+        }
     }
-    queue.push(frame);
+    if enqueue {
+        queue.push(frame);
+    }
+    drop(pending);
+    if let Some((chat_id, message_id, sender_username, prekey_id)) = dropped_claim {
+        release_prekey_claim(
+            state,
+            &chat_id,
+            &message_id,
+            &sender_username,
+            Some(&prekey_id),
+        )
+        .await;
+    }
 }
 
 async fn update_identity_state(
@@ -2652,6 +2966,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     }
     drop(pending);
     state.attachments.lock().await.clear();
+    state.attachment_bytes_by_code.lock().await.clear();
     state.room_catalog.lock().await.clear();
     state.direct_catalog.lock().await.clear();
     state.rooms.lock().await.clear();
@@ -2719,6 +3034,7 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
     }
     catalog.remove(chat_id);
     drop(catalog);
+    let mut released_claims = Vec::new();
     {
         let mut pending = state.pending.lock().await;
         let keys = pending
@@ -2729,11 +3045,25 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
         for key in keys {
             if let Some(mut frames) = pending.remove(&key) {
                 for frame in &mut frames {
+                    if let Some(details) = prekey_claim_details(frame) {
+                        released_claims.push(details);
+                    }
                     frame.zeroize_sensitive();
                 }
             }
         }
     }
+    for (claim_chat_id, message_id, sender_username, prekey_id) in released_claims {
+        release_prekey_claim(
+            state,
+            &claim_chat_id,
+            &message_id,
+            &sender_username,
+            Some(&prekey_id),
+        )
+        .await;
+    }
+    remove_chat_attachments(state, chat_id).await;
     state.rooms.lock().await.remove(chat_id);
     broadcast_to_all(
         state,
@@ -3025,6 +3355,26 @@ mod tests {
     fn content_security_policy_allows_wasm_without_javascript_eval() {
         assert!(CONTENT_SECURITY_POLICY.contains("script-src 'self' 'wasm-unsafe-eval'"));
         assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("connect-src 'self' https: wss:"));
+        assert!(CONTENT_SECURITY_POLICY.contains("http://127.0.0.1:*"));
+        assert!(CONTENT_SECURITY_POLICY.contains("ws://localhost:*"));
+        assert!(!CONTENT_SECURITY_POLICY.contains(" wss: http: ws:;"));
+    }
+
+    #[test]
+    fn serialized_attachment_limits_budget_base64_and_recipient_envelopes() {
+        assert_eq!(base64_no_padding_length(0), 0);
+        assert_eq!(base64_no_padding_length(1), 2);
+        assert_eq!(base64_no_padding_length(2), 3);
+        assert_eq!(base64_no_padding_length(3), 4);
+
+        let image_limit = max_serialized_attachment_bytes("IMAGE");
+        let video_limit = max_serialized_attachment_bytes("VIDEO");
+        let file_limit = max_serialized_attachment_bytes("FILE");
+        assert!(image_limit < video_limit);
+        assert!(video_limit < file_limit);
+        assert!(file_limit > FILE_ATTACHMENT_LIMIT_BYTES);
+        assert!(file_limit <= DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB * 1024 * 1024);
     }
 
     #[test]
@@ -3085,6 +3435,77 @@ mod tests {
         assert!(record_rate_attempt(&mut state, 1_100, 100, 2));
         assert_eq!(state.count, 1);
         assert_eq!(state.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn login_limiter_prunes_stale_entries_and_evicts_oldest_at_capacity() {
+        let state = test_state();
+        let now = now_ms();
+        let oldest = test_code_id(&format!("login-code-{}", MAX_LOGIN_LIMIT_ENTRIES - 1));
+        {
+            let mut limits = state.login_limits.lock().await;
+            for index in 0..MAX_LOGIN_LIMIT_ENTRIES {
+                let code_id = test_code_id(&format!("login-code-{index}"));
+                limits.insert(
+                    code_id,
+                    RateState {
+                        window_start_ms: now.saturating_sub(index as u64),
+                        count: 1,
+                        bytes: 0,
+                    },
+                );
+            }
+            limits.insert(
+                test_code_id("stale-login-code"),
+                RateState {
+                    window_start_ms: now.saturating_sub(LOGIN_RATE_WINDOW_MS + 1),
+                    count: 1,
+                    bytes: 0,
+                },
+            );
+        }
+
+        let fresh = test_code_id("fresh-login-code");
+        assert!(login_attempt_allowed(&state, &fresh).await);
+        let limits = state.login_limits.lock().await;
+        assert!(limits.len() <= MAX_LOGIN_LIMIT_ENTRIES);
+        assert!(!limits.contains_key(&oldest));
+        assert!(!limits.contains_key(&test_code_id("stale-login-code")));
+        assert!(limits.contains_key(&fresh));
+    }
+
+    #[test]
+    fn attachment_capacity_enforces_global_and_per_account_limits_without_overflow() {
+        assert!(attachment_capacity_allows(0, 0, 4, 10, 4));
+        assert!(!attachment_capacity_allows(0, 0, 5, 10, 4));
+        assert!(!attachment_capacity_allows(9, 0, 2, 10, 4));
+        assert!(!attachment_capacity_allows(
+            usize::MAX,
+            0,
+            1,
+            usize::MAX,
+            usize::MAX
+        ));
+    }
+
+    #[test]
+    fn attachment_download_permit_lives_with_response() {
+        let downloads = Arc::new(Semaphore::new(1));
+        let permit = acquire_attachment_download_permit(&downloads).expect("first download");
+        let response = attachment_download_response(vec![1, 2, 3], permit);
+
+        assert!(acquire_attachment_download_permit(&downloads).is_err());
+        drop(response);
+        assert!(acquire_attachment_download_permit(&downloads).is_ok());
+    }
+
+    #[test]
+    fn attachment_upload_permit_rejects_excess_body_readers() {
+        let uploads = Arc::new(Semaphore::new(1));
+        let permit = acquire_attachment_upload_permit(&uploads).expect("first upload");
+        assert!(acquire_attachment_upload_permit(&uploads).is_err());
+        drop(permit);
+        assert!(acquire_attachment_upload_permit(&uploads).is_ok());
     }
 
     #[test]
@@ -3270,6 +3691,221 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_prekey_frame_keeps_claim_alive_until_queue_is_removed() {
+        let state = test_state();
+        let code_id = test_code_id("code-b");
+        let prekey_id = test_prekey_id(b'B');
+        let key = PrekeyClaimKey {
+            code_id,
+            prekey_id: prekey_id.clone(),
+        };
+        let claim = PrekeyClaim {
+            chat_id: "dm_alice_bob".to_string(),
+            message_id: "message-1".to_string(),
+            sender_username: "Alice".to_string(),
+            recipient_username: "Bob".to_string(),
+            created_at_ms: now_ms().saturating_sub(PREKEY_CLAIM_TTL_MS + 1),
+        };
+        state.prekey_claims.lock().await.insert(key.clone(), claim);
+        state.pending.lock().await.insert(
+            PendingKey {
+                chat_id: "dm_alice_bob".to_string(),
+                recipient_username: "Bob".to_string(),
+            },
+            vec![test_message_frame(
+                "dm_alice_bob",
+                "message-1",
+                "Alice",
+                &prekey_id,
+                true,
+            )],
+        );
+
+        {
+            let pending = state.pending.lock().await;
+            let mut claims = state.prekey_claims.lock().await;
+            prune_prekey_claims(&mut claims, &pending, now_ms());
+            assert!(claims.contains_key(&key));
+        }
+
+        state.pending.lock().await.clear();
+        let pending = state.pending.lock().await;
+        let mut claims = state.prekey_claims.lock().await;
+        prune_prekey_claims(&mut claims, &pending, now_ms());
+        assert!(!claims.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn pending_queue_never_evicts_the_required_prekey_frame() {
+        let state = test_state();
+        let prekey_id = test_prekey_id(b'B');
+        let mut frames = vec![test_message_frame(
+            "dm_alice_bob",
+            "first-contact",
+            "Alice",
+            &prekey_id,
+            true,
+        )];
+        frames.extend((0..MAX_PENDING_FRAMES_PER_ROOM - 1).map(|index| {
+            test_message_frame(
+                "dm_alice_bob",
+                &format!("message-{index}"),
+                "Alice",
+                "",
+                false,
+            )
+        }));
+        state.pending.lock().await.insert(
+            PendingKey {
+                chat_id: "dm_alice_bob".to_string(),
+                recipient_username: "Bob".to_string(),
+            },
+            frames,
+        );
+
+        queue_pending_frame(
+            &state,
+            "dm_alice_bob",
+            "Bob".to_string(),
+            test_message_frame("dm_alice_bob", "new-message", "Alice", "", false),
+        )
+        .await;
+
+        let pending = state.pending.lock().await;
+        let queue = pending
+            .get(&PendingKey {
+                chat_id: "dm_alice_bob".to_string(),
+                recipient_username: "Bob".to_string(),
+            })
+            .expect("pending queue");
+        assert_eq!(queue.len(), MAX_PENDING_FRAMES_PER_ROOM);
+        assert!(queue.iter().any(|frame| {
+            matches!(
+                frame,
+                OutboundFrame::Message {
+                    message_id,
+                    is_prekey: true,
+                    ..
+                } if message_id == "first-contact"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn deleting_room_releases_only_claims_for_removed_prekey_frames() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        let room = test_room("forum_claim_cleanup");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room: room.clone(),
+                owner_code_id: test_code_id("code-a"),
+            },
+        );
+
+        let removed_prekey_id = test_prekey_id(b'B');
+        let retained_prekey_id = test_prekey_id(b'C');
+        let removed_key = PrekeyClaimKey {
+            code_id: test_code_id("code-b"),
+            prekey_id: removed_prekey_id.clone(),
+        };
+        let retained_key = PrekeyClaimKey {
+            code_id: test_code_id("code-c"),
+            prekey_id: retained_prekey_id.clone(),
+        };
+        let claim = |recipient_username: &str| PrekeyClaim {
+            chat_id: room.id.clone(),
+            message_id: "message-1".to_string(),
+            sender_username: "Alice".to_string(),
+            recipient_username: recipient_username.to_string(),
+            created_at_ms: now_ms(),
+        };
+        state.prekey_claims.lock().await.extend([
+            (removed_key.clone(), claim("Bob")),
+            (retained_key.clone(), claim("Carol")),
+        ]);
+        state.pending.lock().await.insert(
+            PendingKey {
+                chat_id: room.id.clone(),
+                recipient_username: "Bob".to_string(),
+            },
+            vec![test_message_frame(
+                &room.id,
+                "message-1",
+                "Alice",
+                &removed_prekey_id,
+                true,
+            )],
+        );
+        let attachment_id = Uuid::new_v4();
+        state.attachments.lock().await.insert(
+            attachment_id,
+            AttachmentRecord {
+                encrypted_bytes: vec![1, 2, 3],
+                chat_id: room.id.clone(),
+                media_type: "FILE".to_string(),
+                owner_code_id: test_code_id("code-a"),
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: None,
+            },
+        );
+        state
+            .attachment_bytes_by_code
+            .lock()
+            .await
+            .insert(test_code_id("code-a"), 3);
+
+        delete_room(&state, alice_id, &room.id)
+            .await
+            .expect("owner can delete room");
+        let claims = state.prekey_claims.lock().await;
+        assert!(!claims.contains_key(&removed_key));
+        assert!(claims.contains_key(&retained_key));
+        drop(claims);
+        assert!(state.attachments.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+    }
+
+    #[test]
+    fn identity_bundle_rejects_empty_prekey_id_and_zero_one_time_key() {
+        let public = vec![7_u8; IDENTITY_PUBLIC_BYTES];
+        let prekey_id = prekey_id_for_public(&[7_u8; ONE_TIME_KEY_BYTES]);
+        assert!(valid_identity_public_bundle(&public, &prekey_id));
+        assert!(!valid_identity_public_bundle(&public, ""));
+
+        let mut zero_one_time = public;
+        zero_one_time[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET].fill(0);
+        assert!(!valid_identity_public_bundle(&zero_one_time, &prekey_id));
+    }
+
+    #[tokio::test]
+    async fn expired_attachment_pruning_decrements_owner_usage() {
+        let state = test_state();
+        let owner = test_code_id("code-a");
+        let attachment_id = Uuid::new_v4();
+        state.attachments.lock().await.insert(
+            attachment_id,
+            AttachmentRecord {
+                encrypted_bytes: vec![1, 2, 3],
+                chat_id: "dm_alice_bob".to_string(),
+                media_type: "FILE".to_string(),
+                owner_code_id: owner,
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: Some(0),
+            },
+        );
+        state.attachment_bytes_by_code.lock().await.insert(owner, 3);
+
+        prune_expired_attachments(&state).await;
+        assert!(state.attachments.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -3784,6 +4420,7 @@ mod tests {
         AppState {
             node_id: "test-node".to_string(),
             attachment_ram_limit_bytes: 8 * 1024 * 1024,
+            attachment_account_limit_bytes: 4 * 1024 * 1024,
             max_rooms_per_user: 2,
             web_origins: Vec::new(),
             session_inactivity_ms: 60_000,
@@ -3807,6 +4444,9 @@ mod tests {
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
+            attachment_bytes_by_code: Arc::new(Mutex::new(HashMap::new())),
+            attachment_downloads: Arc::new(Semaphore::new(DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY)),
+            attachment_uploads: Arc::new(Semaphore::new(DEFAULT_ATTACHMENT_UPLOAD_CONCURRENCY)),
             prekey_claims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -3931,6 +4571,28 @@ mod tests {
 
     fn test_prekey_id(fill: u8) -> String {
         prekey_id_for_public(&[fill; ONE_TIME_KEY_BYTES])
+    }
+
+    fn test_message_frame(
+        chat_id: &str,
+        message_id: &str,
+        sender_username: &str,
+        prekey_id: &str,
+        is_prekey: bool,
+    ) -> OutboundFrame {
+        OutboundFrame::Message {
+            chat_id: chat_id.to_string(),
+            version: E2EE_PROTOCOL_VERSION,
+            message_id: message_id.to_string(),
+            nonce_b64: "nonce".to_string(),
+            ciphertext_b64: "ciphertext".to_string(),
+            signature_b64: "signature".to_string(),
+            wrapped_key_b64: "wrapped".to_string(),
+            prekey_id: prekey_id.to_string(),
+            is_prekey,
+            sender_username: sender_username.to_string(),
+            sender_public_key_b64: "public".to_string(),
+        }
     }
 
     fn test_room(id: &str) -> RoomRecord {

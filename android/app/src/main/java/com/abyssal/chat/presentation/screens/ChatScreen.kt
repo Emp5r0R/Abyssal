@@ -106,6 +106,7 @@ import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
+import com.abyssal.chat.data.network.BoundedInputReader
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.DeepBlack
@@ -334,7 +335,12 @@ private fun ChatContent(
                             onSaveAttachment = {
                                 saveTargetMessage = message
                                 onExternalSystemUiStart()
-                                saveLauncher.launch(AttachmentSavePolicy.sanitizedFileName(message.attachmentName))
+                                runCatching {
+                                    saveLauncher.launch(AttachmentSavePolicy.sanitizedFileName(message.attachmentName))
+                                }.onFailure {
+                                    onExternalSystemUiEnd()
+                                    saveTargetMessage = null
+                                }
                             }
                         )
                     }
@@ -947,7 +953,11 @@ private fun AttachmentDialog(
                 enabled = imagesOk,
                 onClick = {
                     onExternalSystemUiStart()
-                    imagePicker.launch("image/*")
+                    runCatching { imagePicker.launch("image/*") }
+                        .onFailure {
+                            onExternalSystemUiEnd()
+                            localError = "Wrong information."
+                        }
                 }
             )
             AttachmentRow(
@@ -956,7 +966,11 @@ private fun AttachmentDialog(
                 enabled = videosOk,
                 onClick = {
                     onExternalSystemUiStart()
-                    videoPicker.launch("video/*")
+                    runCatching { videoPicker.launch("video/*") }
+                        .onFailure {
+                            onExternalSystemUiEnd()
+                            localError = "Wrong information."
+                        }
                 }
             )
             AttachmentRow(
@@ -965,7 +979,11 @@ private fun AttachmentDialog(
                 enabled = filesOk,
                 onClick = {
                     onExternalSystemUiStart()
-                    filePicker.launch("*/*")
+                    runCatching { filePicker.launch("*/*") }
+                        .onFailure {
+                            onExternalSystemUiEnd()
+                            localError = "Wrong information."
+                        }
                 }
             )
         }
@@ -1877,8 +1895,10 @@ private fun Context.listBundledEmojiAssets(): List<BundledEmojiAsset> {
 
 private fun Context.readBundledEmoji(asset: BundledEmojiAsset): BundledEmojiPayload? {
     return runCatching {
-        val bytes = assets.open(asset.path).use { it.readBytes() }
-        if (bytes.isEmpty() || bytes.size > attachmentLimitBytes("IMAGE")) return null
+        val bytes = assets.open(asset.path).use {
+            BoundedInputReader.read(it, attachmentLimitBytes("IMAGE"))
+        } ?: return null
+        if (bytes.isEmpty()) return null
         BundledEmojiPayload(
             fileName = asset.fileName,
             mimeType = asset.mimeType,
@@ -1903,9 +1923,8 @@ private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: 
     if (knownSize > maxBytes) return null
     val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
     val bytes = contentResolver.openInputStream(uri)?.use { input ->
-        input.readBytes()
+        BoundedInputReader.read(input, maxBytes)
     } ?: return null
-    if (bytes.size > maxBytes) return null
     return PickedAttachment(mediaType, name, mimeType, bytes)
 }
 

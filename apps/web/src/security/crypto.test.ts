@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   base64ToBytes,
+  base64NoPaddingLength,
   bytesToBase64,
   conversationSafetyNumber,
   finishOpaqueLogin,
   finishOpaqueRegistration,
   identityContext,
   InMemoryPayloadCipher,
+  maxSerializedAttachmentBytes,
   startOpaque,
   wipeBytes,
 } from "./crypto";
@@ -44,6 +46,23 @@ describe("OPAQUE client bindings", () => {
     await expect(
       finishOpaqueLogin("password-one", login, new Uint8Array([1, 2, 3])),
     ).rejects.toThrow();
+  });
+});
+
+describe("serialized attachment bounds", () => {
+  it("accounts for base64 expansion and recipient envelope budget", () => {
+    expect(base64NoPaddingLength(0)).toBe(0);
+    expect(base64NoPaddingLength(1)).toBe(2);
+    expect(base64NoPaddingLength(2)).toBe(3);
+    expect(base64NoPaddingLength(3)).toBe(4);
+
+    const imageLimit = maxSerializedAttachmentBytes("IMAGE");
+    const videoLimit = maxSerializedAttachmentBytes("VIDEO");
+    const fileLimit = maxSerializedAttachmentBytes("FILE");
+    expect(imageLimit).toBeLessThan(videoLimit);
+    expect(videoLimit).toBeLessThan(fileLimit);
+    expect(fileLimit).toBeGreaterThan(200 * 1024 * 1024);
+    expect(fileLimit).toBeLessThanOrEqual(320 * 1024 * 1024);
   });
 });
 

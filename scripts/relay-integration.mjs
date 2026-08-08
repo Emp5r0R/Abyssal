@@ -273,6 +273,49 @@ try {
   assert.equal(replayedPlain.text, "offline secret");
   acknowledgeFrame(bobReconnect, replayedFrame, replayedPlain);
 
+  const attachmentBytes = new Uint8Array([1, 2, 3, 4]);
+  const uploadResponse = await fetch(
+    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}` },
+      body: attachmentBytes,
+    },
+  );
+  assert.equal(uploadResponse.status, 200);
+  const upload = await uploadResponse.json();
+  assert.equal(upload.accepted, true);
+  assert.match(String(upload.attachment_id), /^[0-9a-f-]{36}$/);
+
+  const downloadResponse = await fetch(
+    `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
+    { headers: { authorization: `Bearer ${bob.token}` } },
+  );
+  assert.equal(downloadResponse.status, 200);
+  assert.deepEqual(new Uint8Array(await downloadResponse.arrayBuffer()), attachmentBytes);
+
+  const oneTimeUploadResponse = await fetch(
+    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&media_type=FILE&one_time=true&delete_after_download=true`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}` },
+      body: attachmentBytes,
+    },
+  );
+  assert.equal(oneTimeUploadResponse.status, 200);
+  const oneTimeUpload = await oneTimeUploadResponse.json();
+  assert.equal(oneTimeUpload.accepted, true);
+  const oneTimeDownloadUrl = `${baseUrl}/v1/attachment/${encodeURIComponent(oneTimeUpload.attachment_id)}`;
+  const firstOneTimeDownload = await fetch(oneTimeDownloadUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(firstOneTimeDownload.status, 200);
+  assert.deepEqual(new Uint8Array(await firstOneTimeDownload.arrayBuffer()), attachmentBytes);
+  const secondOneTimeDownload = await fetch(oneTimeDownloadUrl, {
+    headers: { authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(secondOneTimeDownload.status, 404);
+
   const unauthorizedUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=dm_guessed&media_type=FILE`, {
     method: "POST",
     headers: { authorization: `Bearer ${alice.token}` },

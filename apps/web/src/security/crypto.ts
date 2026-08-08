@@ -10,7 +10,13 @@ const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder("utf-8", { fatal: true });
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const USERNAME_PATTERN = /^[\x20-\x7e]{1,80}$/;
-const MAX_PAYLOAD_BYTES = 220 * 1024 * 1024;
+const CHACHA20_POLY1305_TAG_BYTES = 16;
+const SERIALIZED_ATTACHMENT_FIXED_BYTES = 16 * 1024;
+// Keep the serialized envelope budget aligned with the relay and Android
+// client. Recipient-specific wrapped keys are included in the JSON payload.
+const MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES = 4 * 1024 * 1024;
+const MAX_ATTACHMENT_PLAINTEXT_BYTES = 200 * 1024 * 1024;
+const MAX_SERIALIZED_ATTACHMENT_BYTES = maxSerializedAttachmentBytes("FILE");
 const IDENTITY_PUBLIC_KEY_BYTES = 128;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 
@@ -303,7 +309,7 @@ export class InMemoryPayloadCipher {
     serialized: Uint8Array,
     recipientUsername: string,
   ): Uint8Array {
-    if (serialized.byteLength <= 0 || serialized.byteLength > MAX_PAYLOAD_BYTES + 64 * 1024) {
+    if (serialized.byteLength <= 0 || serialized.byteLength > MAX_SERIALIZED_ATTACHMENT_BYTES) {
       throw new Error("Payload unavailable");
     }
     const parsed = parseJson<ReturnType<typeof serializePayload>>(DECODER.decode(serialized));
@@ -462,6 +468,23 @@ export class InMemoryPayloadCipher {
       prekeyId,
     };
   }
+}
+
+export function base64NoPaddingLength(rawBytes: number): number {
+  if (!Number.isSafeInteger(rawBytes) || rawBytes < 0) throw new Error("Payload unavailable");
+  const groups = Math.floor(rawBytes / 3);
+  return groups * 4 + (rawBytes % 3 === 0 ? 0 : rawBytes % 3 === 1 ? 2 : 3);
+}
+
+export function maxSerializedAttachmentBytes(mediaType: string): number {
+  const plainLimit = mediaType.toUpperCase() === "IMAGE"
+    ? 20 * 1024 * 1024
+    : mediaType.toUpperCase() === "VIDEO"
+      ? 100 * 1024 * 1024
+      : MAX_ATTACHMENT_PLAINTEXT_BYTES;
+  return SERIALIZED_ATTACHMENT_FIXED_BYTES
+    + base64NoPaddingLength(plainLimit + CHACHA20_POLY1305_TAG_BYTES)
+    + MAX_RECIPIENT_ENVELOPE_OVERHEAD_BYTES;
 }
 
 export function payloadToFrame(payload: EncryptedPayload): Record<string, unknown> {

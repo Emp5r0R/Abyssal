@@ -12,11 +12,13 @@ import com.abyssal.chat.domain.repository.INodeConfigService
 import java.util.Collections
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
 import org.json.JSONArray
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,7 +32,10 @@ class RealChatTransport(
     private val client: OkHttpClient
 ) : IChatTransport {
     private val _wipeCommands = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    private val _incomingPayloads = MutableSharedFlow<IncomingTransportPayload>(extraBufferCapacity = 32)
+    private val _incomingPayloads = Channel<IncomingTransportPayload>(
+        capacity = 32,
+        onUndeliveredElement = ::wipeIncomingPayload
+    )
     private val _roomChanges = MutableSharedFlow<RoomChange>(extraBufferCapacity = 32)
     private val _presence = MutableStateFlow<List<UserPresence>>(emptyList())
     private val _serverStatus = MutableStateFlow(ServerStatus("DISCONNECTED", "No node", 0))
@@ -65,6 +70,10 @@ class RealChatTransport(
         webSocket = null
         joinedChatIds.clear()
         identityPins.clear()
+        while (true) {
+            val payload = _incomingPayloads.tryReceive().getOrNull() ?: break
+            wipeIncomingPayload(payload)
+        }
         _presence.value = emptyList()
         _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
     }
@@ -73,7 +82,7 @@ class RealChatTransport(
 
     override fun getIncomingWipeCommands(): Flow<Unit> = _wipeCommands.asSharedFlow()
 
-    override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.asSharedFlow()
+    override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.receiveAsFlow()
 
     override fun getRoomChanges(): Flow<RoomChange> = _roomChanges.asSharedFlow()
 
@@ -235,20 +244,20 @@ class RealChatTransport(
                             val chatId = json.optString("chat_id").takeIf { it.isNotBlank() } ?: return
                             val messageId = json.optString("message_id").takeIf { it.isNotBlank() } ?: return
                             val senderUsername = json.optString("sender_username").takeIf { it.isNotBlank() } ?: return
-                            _incomingPayloads.tryEmit(
-                                IncomingTransportPayload(
-                                    chatId = chatId,
-                                    messageId = messageId,
-                                    nonce = decode(json.getString("nonce_b64")),
-                                    ciphertext = decode(json.getString("ciphertext_b64")),
-                                    signature = decode(json.getString("signature_b64")),
-                                    wrappedKey = decode(json.getString("wrapped_key_b64")),
-                                    senderUsername = senderUsername,
-                                    senderPublicKey = decode(json.getString("sender_public_key_b64")),
-                                    prekeyId = json.optString("prekey_id"),
-                                    isPrekey = json.optBoolean("is_prekey", false)
-                                )
+                            val payload = IncomingTransportPayload(
+                                chatId = chatId,
+                                messageId = messageId,
+                                nonce = decode(json.getString("nonce_b64")),
+                                ciphertext = decode(json.getString("ciphertext_b64")),
+                                signature = decode(json.getString("signature_b64")),
+                                wrappedKey = decode(json.getString("wrapped_key_b64")),
+                                senderUsername = senderUsername,
+                                senderPublicKey = decode(json.getString("sender_public_key_b64")),
+                                prekeyId = json.optString("prekey_id"),
+                                isPrekey = json.optBoolean("is_prekey", false)
                             )
+                            if (!_incomingPayloads.trySend(payload).isSuccess) wipeIncomingPayload(payload)
+                            Unit
                         }
                         "presence" -> {
                             val users = json.optJSONArray("users") ?: return
@@ -360,6 +369,14 @@ class RealChatTransport(
             .toString()
 
         webSocket?.send(frame)
+    }
+
+    private fun wipeIncomingPayload(payload: IncomingTransportPayload) {
+        payload.nonce.fill(0)
+        payload.ciphertext.fill(0)
+        payload.signature.fill(0)
+        payload.wrappedKey.fill(0)
+        payload.senderPublicKey.fill(0)
     }
 
     private fun ChatSession.toRoomJson(): JSONObject {

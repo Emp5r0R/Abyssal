@@ -608,7 +608,8 @@ private fun SettingsDialog(
             cancel = "Cancel",
             confirm = "Save",
             onCancel = onDismiss,
-            onConfirm = { onSave(disguiseEnabled, pinCode.ifBlank { "2026" }, duressPin) }
+            onConfirm = { onSave(disguiseEnabled, pinCode.trim(), duressPin.trim()) },
+            confirmEnabled = !disguiseEnabled || pinCode.isNotBlank()
         )
     }
 }

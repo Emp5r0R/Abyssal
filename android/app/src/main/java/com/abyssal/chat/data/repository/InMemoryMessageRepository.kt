@@ -66,6 +66,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                             val elapsed = now - msg.timestampMs
                             if (elapsed >= overallLimit * 1000L) {
                                 updated = true
+                                wipeMessageKey(msg)
                                 return@filter false
                             }
                         }
@@ -75,7 +76,10 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                         if (readTime != null && msg.selfDestructDurationSec > 0) {
                             val elapsed = now - readTime
                             val keep = elapsed < msg.selfDestructDurationSec * 1000L
-                            if (!keep) updated = true
+                            if (!keep) {
+                                updated = true
+                                wipeMessageKey(msg)
+                            }
                             keep
                         } else {
                             true
@@ -101,8 +105,14 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     override suspend fun saveMessage(chatId: String, message: Message) {
         ensureSessionExists(chatId, message.selfDestructDurationSec)
         val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
-        if (currentChatMsgs.any { it.id == message.id }) return
-        currentChatMsgs.add(message)
+        val existing = currentChatMsgs.firstOrNull { it.id == message.id }
+        if (existing != null) {
+            if (existing !== message) wipeMessageKey(message)
+            return
+        }
+        val storedMessage = message.copy(senderPublicKey = message.senderPublicKey?.copyOf())
+        wipeMessageKey(message)
+        currentChatMsgs.add(storedMessage)
         _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
         updateLastMessages()
     }
@@ -125,6 +135,8 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     override suspend fun deleteChatSession(chatId: String) {
         _sessions.value = _sessions.value.filterNot { it.id == chatId }
+        val removed = _messages.value[chatId].orEmpty()
+        removed.forEach(::wipeMessageKey)
         _messages.value = _messages.value.toMutableMap().apply { remove(chatId) }
     }
 
@@ -193,6 +205,11 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun clearAllData() {
+        _messages.value.values.flatten().forEach(::wipeMessageKey)
         resetToEmpty()
+    }
+
+    private fun wipeMessageKey(message: Message) {
+        message.senderPublicKey?.fill(0)
     }
 }

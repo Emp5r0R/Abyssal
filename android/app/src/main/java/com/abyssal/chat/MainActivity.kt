@@ -1,5 +1,6 @@
 package com.abyssal.chat
 
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -113,6 +114,16 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         viewModel.onHostResumed()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        if (
+            ::viewModel.isInitialized &&
+            level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+        ) {
+            viewModel.lockForLifecycleExit()
+        }
+        super.onTrimMemory(level)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {

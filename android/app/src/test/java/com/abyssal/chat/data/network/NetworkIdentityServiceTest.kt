@@ -37,4 +37,27 @@ class NetworkIdentityServiceTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun rejectsOversizedAccountResponseWithoutReadingItIntoHeap() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setChunkedBody("x".repeat(1_048_577), 8192)
+        )
+        server.start()
+        try {
+            val baseUrl = server.url("/").toString().removeSuffix("/")
+            val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
+
+            val result = service.enterAccount(
+                code = "ABYS-INVITE-1234",
+                password = "correct horse battery staple",
+                endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
+            )
+
+            assertFalse(result.accepted)
+        } finally {
+            server.shutdown()
+        }
+    }
 }

@@ -41,6 +41,18 @@ APK_SOURCE="$ROOT_DIR/android/app/build/outputs/apk/release/app-release.apk"
 AAB_SOURCE="$ROOT_DIR/android/app/build/outputs/bundle/release/app-release.aab"
 [[ -f "$APK_SOURCE" && -f "$AAB_SOURCE" ]] || { printf 'Expected release artifacts were not produced.\n' >&2; exit 1; }
 
+for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+  NATIVE_LIBRARY="$ROOT_DIR/android/app/src/main/jniLibs/$abi/libabyssal_core.so"
+  [[ -s "$NATIVE_LIBRARY" ]] || {
+    printf 'Missing native crypto library for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
+    exit 1
+  }
+  grep -aFq 'ABYSSAL_E2EE_PAYLOAD_V5' "$NATIVE_LIBRARY" || {
+    printf 'Native crypto library is not protocol v5 for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
+    exit 1
+  }
+done
+
 APKSIGNER="${ABYSSAL_APKSIGNER:-}"
 if [[ -z "$APKSIGNER" && -n "${ANDROID_SDK_ROOT:-}" ]]; then
   APKSIGNER="$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name apksigner -print 2>/dev/null | sort -V | tail -1)"
@@ -53,7 +65,16 @@ if [[ -z "$APKSIGNER" ]]; then
 fi
 [[ -x "$APKSIGNER" ]] || { printf 'apksigner was not found. Set ANDROID_SDK_ROOT or ABYSSAL_APKSIGNER.\n' >&2; exit 1; }
 
+JARSIGNER="${ABYSSAL_JARSIGNER:-$(command -v jarsigner || true)}"
+[[ -x "$JARSIGNER" ]] || { printf 'jarsigner was not found. Set ABYSSAL_JARSIGNER.\n' >&2; exit 1; }
+
 "$APKSIGNER" verify --verbose --print-certs "$APK_SOURCE"
+AAB_VERIFY_OUTPUT="$(LC_ALL=C "$JARSIGNER" -verify -verbose "$AAB_SOURCE" 2>&1)"
+if ! printf '%s\n' "$AAB_VERIFY_OUTPUT" | grep -Fq 'jar verified.'; then
+  printf 'AAB signature verification did not confirm a signed bundle: %s\n' "$AAB_SOURCE" >&2
+  exit 1
+fi
+unset AAB_VERIFY_OUTPUT
 
 mkdir -p "$OUTPUT_DIR"
 APK_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-universal-release.apk"

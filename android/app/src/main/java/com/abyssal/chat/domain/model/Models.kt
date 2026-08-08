@@ -218,7 +218,7 @@ data class RoomChange(
 
 data class DisguiseSettings(
     val isDisguised: Boolean = false,
-    val pin: String = "2026", // Default RAM-only unlock PIN
+    val pin: String = "",
     val duressPin: String = ""
 )
 

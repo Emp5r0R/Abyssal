@@ -8,7 +8,10 @@ services:
     init: true
     stop_grace_period: 10s
     pids_limit: 128
-    mem_limit: ${ABYSSAL_CONTAINER_MEMORY_LIMIT:-1g}
+    # Keep headroom for the 512 MiB global attachment pool, two roughly
+    # 271 MiB serialized upload bodies, two downloads, and runtime overhead.
+    # Override with ABYSSAL_CONTAINER_MEMORY_LIMIT when sizing a host.
+    mem_limit: ${ABYSSAL_CONTAINER_MEMORY_LIMIT:-2g}
     env_file:
       - path: ../mirage-server/.env
         required: false

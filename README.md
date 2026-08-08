@@ -29,8 +29,10 @@ Root `package.json` owns the npm workspace. Root `Cargo.toml` and `Cargo.lock` o
 - Every authenticated session has a strict node-provided inactivity deadline. User interaction refreshes it; background time and time spent behind the calculator cover do not. Expiry clears local RAM state, disconnects transport, and requires account entry again. Process death, explicit logout, wipe, or relay restart also clears session state.
 - Explicit logout and client-side expiry also make a best-effort relay call to revoke the bearer token immediately. The relay independently rejects expired tokens and closes idle WebSockets, so client enforcement is not the only boundary.
 - The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe.
+- Camouflage has no default PIN and is never recoverable from disk. Android resets the stale calculator launcher alias and the RAM-only PIN after process death; configure a new camouflage PIN after signing in to a fresh process.
 - The relay stores generated codes, OPAQUE password records, encrypted identity envelopes, sessions, rooms, clients, presence, and pending recipient-specific ciphertext in RAM only. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
 - Files, images, and videos may only be written to disk through an explicit user save flow. Android and web authenticate and decrypt attachments in memory, then save the original bytes under a sanitized original filename. One-time attachments remain view-only and expose no save control.
+- Attachment plaintext limits are 20 MiB for images, 100 MiB for videos, and 200 MiB for other files. Relay upload limits include the encrypted envelope: the 16-byte AEAD tag is expanded by unpadded base64, then the serialized body reserves a 16 KiB fixed budget plus up to 4 MiB for recipient-specific envelopes. A default 320 MiB encrypted-RAM quota applies per account in addition to the global RAM limit, and at most two attachment downloads run concurrently by default.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
 - Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
 - The web client never calls `localStorage`, `sessionStorage`, IndexedDB, Cache Storage, cookies, or a service worker. Account state, messages, PINs, decrypted media URLs, and crypto keys live in the current JavaScript process only. Relay responses use `Cache-Control: no-store`.
@@ -113,7 +115,7 @@ Open `http://localhost:4173`, then enter `http://127.0.0.1:4020` as the node URL
 
 Web client behavior:
 
-- Account entry automatically creates an account for an unused code or logs into its existing RAM account.
+- Account entry automatically creates an account for an unused code or logs into its existing RAM account. Each account request body is capped at 16 KiB; OPAQUE handshakes expire after 60 seconds and code attempts are rate-limited to six per minute.
 - Rooms, owner quotas, room media policy, live presence, encrypted messages, replies, read expiry, absolute expiry, GIFs, upload progress, images, videos, and explicit attachment downloads use the existing relay protocol. Dashboard room and DM entries never render message plaintext.
 - Existing DMs are listed in the sidebar. Select any other account in `DIRECT` or the live presence rail to create/open the canonical pairwise conversation. The relay sends DM frames only to its two participants and rejects unauthorized joins and attachment requests.
 - Every bundled reaction has a `:filename:` shortcut, such as `:fire:`. Picker reactions carry a validated shortcut inside encrypted attachment metadata and render in equal-size inline frames without exposing the selection to the relay.
@@ -148,6 +150,9 @@ ABYSSAL_BIND_ADDR=0.0.0.0:4020 \
 ABYSSAL_NODE_ID=abyssal-node-1 \
 ABYSSAL_CODE_COUNT=8 \
 ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
+ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB=320 \
+ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY=2 \
+ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY=2 \
 ABYSSAL_MAX_ROOMS_PER_USER=5 \
 ABYSSAL_SESSION_INACTIVITY_MINUTES=15 \
 ABYSSAL_INACTIVITY_LIMIT_HOURS=0 \
@@ -167,6 +172,9 @@ Every authenticated user can create rooms and trigger a relay RAM wipe. Rooms ar
 Security-related relay knobs:
 
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
+- `ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB`: per-account in-memory encrypted attachment quota, capped by the global RAM limit. Default: `320`.
+- `ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY`: maximum concurrent attachment responses across the relay. Default: `2`; accepted range: `1` to `16`.
+- `ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY`: maximum concurrent attachment request-body reads. Default: `2`; accepted range: `1` to `4`. This bounds large encrypted request allocations before the RAM quota check.
 - `ABYSSAL_MAX_ROOMS_PER_USER`: active room quota for each account. Default: `5`; accepted range: `1` to `100`.
 - `ABYSSAL_SESSION_INACTIVITY_MINUTES`: strict bearer-token and WebSocket inactivity limit. Default: `15`; accepted range: `1` to `1440`. The Android client displays the node policy and enforces the same deadline locally.
 - `ABYSSAL_INACTIVITY_LIMIT_HOURS`: dead-man switch. `0` disables it. A positive value wipes relay RAM state and broadcasts `GLOBAL_WIPE` after that many idle hours.
@@ -175,11 +183,11 @@ Security-related relay knobs:
 
 The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
 
-Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v5 encrypts message, attachment, and read-receipt content with ChaCha20-Poly1305; each recipient's content key travels through an authenticated `vodozemac` Olm Double Ratchet session, and Ed25519 signatures bind the outer ciphertext. Initial asynchronous messages use a recipient-specific one-time prekey; its public key deterministically commits to the advertised prekey ID, and recipients verify that ID against the key embedded in the Olm envelope before decrypting. The recipient rotates that prekey after successful use, and the relay claims each advertised prekey for a bounded delivery window so concurrent sends cannot reuse it. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender, message ID, and consumed prekey. Presence also carries a stable long-term identity directory checkpoint, while clients pin the long-term identity portion across prekey rotation. This is still not Signal or MLS: rooms use pairwise fanout, there is no signed key-transparency log or multi-device protocol, and no independent Abyssal audit. Compare direct-chat safety numbers and directory checkpoints out of band. See [SECURITY.md](SECURITY.md).
+Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v5 encrypts message, attachment, and read-receipt content with ChaCha20-Poly1305; each recipient's content key travels through an authenticated `vodozemac` Olm Double Ratchet session, and Ed25519 signatures bind the outer ciphertext. Initial asynchronous messages use a recipient-specific one-time prekey; its public key deterministically commits to the advertised prekey ID, and recipients verify that ID against the key embedded in the Olm envelope before decrypting. The recipient rotates that prekey after successful use. A relay prekey claim lasts 10 minutes when idle, but a matching queued ciphertext keeps the claim until acknowledgement, eviction, or queue removal, so a delayed frame cannot race a later sender for the same prekey. Client decryption checkpoints ratchet/account/prekey metadata before processing and restores it when Olm succeeds but outer AEAD or content binding fails. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender, message ID, and consumed prekey. Presence also carries a stable long-term identity directory checkpoint, while clients pin the long-term identity portion across prekey rotation. This is still not Signal or MLS: rooms use pairwise fanout, there is no signed key-transparency log or multi-device protocol, and no independent Abyssal audit. Compare direct-chat safety numbers and directory checkpoints out of band. See [SECURITY.md](SECURITY.md).
 
 ## Docker
 
-The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly.
+The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, two roughly 271 MiB serialized upload bodies, two downloads, and runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host.
 
 ```bash
 cp mirage-server/.env.example mirage-server/.env

@@ -189,7 +189,17 @@ class NetworkIdentityService(
             .build()
         return client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use null
-            response.body?.string()?.takeIf { it.isNotBlank() }?.let(::JSONObject)
+            val body = response.body ?: return@use null
+            if (body.contentLength() > MAX_ACCOUNT_RESPONSE_BYTES) return@use null
+            val raw = BoundedInputReader.read(body.byteStream(), MAX_ACCOUNT_RESPONSE_BYTES)
+                ?: return@use null
+            try {
+                raw.takeIf { it.isNotEmpty() }?.let {
+                    JSONObject(String(it, StandardCharsets.UTF_8))
+                }
+            } finally {
+                raw.fill(0)
+            }
         }
     }
 
@@ -237,6 +247,7 @@ class NetworkIdentityService(
         const val MAX_MAX_ROOMS_PER_USER = 100
         const val DEFAULT_MAX_ROOMS_PER_USER = 5
         const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        const val MAX_ACCOUNT_RESPONSE_BYTES = 1 * 1024 * 1024L
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
