@@ -6,7 +6,7 @@ version = 4
 name = "abyssal-core"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "chacha20poly1305",
  "getrandom 0.2.17",
  "hkdf",
@@ -169,7 +169,7 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "http",
@@ -230,6 +230,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -1023,7 +1029,7 @@ version = "0.1.0"
 dependencies = [
  "abyssal-core",
  "axum",
- "base64",
+ "base64 0.23.1",
  "ed25519-dalek",
  "futures-util",
  "hmac",
@@ -2116,7 +2122,7 @@ checksum = "b98bf83c0992966775b8012f194b07b44928996163e5a05b741b43891571ae5b"
 dependencies = [
  "aes",
  "arrayvec",
- "base64",
+ "base64 0.22.1",
  "base64ct",
  "cbc",
  "chacha20poly1305",
