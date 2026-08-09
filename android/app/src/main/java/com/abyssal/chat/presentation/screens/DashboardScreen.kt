@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -62,6 +63,7 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
+import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.BorderCyan
@@ -485,8 +487,13 @@ private fun SettingsDialog(
     onEndSession: () -> Unit
 ) {
     var disguiseEnabled by remember(initialSettings) { mutableStateOf(initialSettings.isDisguised) }
-    var pinCode by remember(initialSettings) { mutableStateOf(initialSettings.pin) }
-    var duressPin by remember(initialSettings) { mutableStateOf(initialSettings.duressPin) }
+    var pinCode by remember(initialSettings) { mutableStateOf("") }
+    var duressPin by remember(initialSettings) { mutableStateOf("") }
+    val canSaveDisguise = isValidCamouflageConfiguration(
+        enabled = disguiseEnabled,
+        unlockPin = pinCode.trim(),
+        duressPin = duressPin.trim()
+    )
 
     MirageDialog(title = "Security", onDismiss = onDismiss) {
         SectionLabel(
@@ -570,10 +577,12 @@ private fun SettingsDialog(
         if (disguiseEnabled) {
             OutlinedTextField(
                 value = pinCode,
-                onValueChange = { if (it.length <= 12) pinCode = it },
+                onValueChange = { pinCode = it.filter(::isCamouflageInput).take(32) },
                 label = { Text("Unlock PIN or expression") },
                 colors = mirageTextFieldColors(),
                 singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 16.dp)
@@ -587,10 +596,12 @@ private fun SettingsDialog(
             )
             OutlinedTextField(
                 value = duressPin,
-                onValueChange = { if (it.length <= 12) duressPin = it },
+                onValueChange = { duressPin = it.filter(::isCamouflageInput).take(32) },
                 label = { Text("Duress PIN") },
                 colors = mirageTextFieldColors(),
                 singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 14.dp)
@@ -609,7 +620,7 @@ private fun SettingsDialog(
             confirm = "Save",
             onCancel = onDismiss,
             onConfirm = { onSave(disguiseEnabled, pinCode.trim(), duressPin.trim()) },
-            confirmEnabled = !disguiseEnabled || pinCode.isNotBlank()
+            confirmEnabled = canSaveDisguise
         )
     }
 }
@@ -620,7 +631,11 @@ private fun CamouflagePinSetupDialog(
 ) {
     var pinCode by remember { mutableStateOf("") }
     var duressPin by remember { mutableStateOf("") }
-    val canSave = pinCode.length >= 4
+    val canSave = isValidCamouflageConfiguration(
+        enabled = true,
+        unlockPin = pinCode.trim(),
+        duressPin = duressPin.trim()
+    )
 
     MirageDialog(title = "Calculator PIN", onDismiss = {}) {
         Text(
@@ -631,10 +646,11 @@ private fun CamouflagePinSetupDialog(
         )
         OutlinedTextField(
             value = pinCode,
-            onValueChange = { if (it.length <= 32) pinCode = it },
+            onValueChange = { pinCode = it.filter(::isCamouflageInput).take(32) },
             label = { Text("Camouflage PIN") },
             colors = mirageTextFieldColors(),
             singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
             modifier = Modifier
                 .fillMaxWidth()
@@ -642,10 +658,11 @@ private fun CamouflagePinSetupDialog(
         )
         OutlinedTextField(
             value = duressPin,
-            onValueChange = { if (it.length <= 32) duressPin = it },
+            onValueChange = { duressPin = it.filter(::isCamouflageInput).take(32) },
             label = { Text("Duress PIN") },
             colors = mirageTextFieldColors(),
             singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
             modifier = Modifier
                 .fillMaxWidth()
@@ -1065,6 +1082,8 @@ private fun formatDuration(totalSeconds: Int): String {
     val seconds = safeSeconds % 60
     return "%d:%02d".format(minutes, seconds)
 }
+
+private fun isCamouflageInput(value: Char): Boolean = value in "0123456789.+-*/()"
 
 @Preview
 @Composable

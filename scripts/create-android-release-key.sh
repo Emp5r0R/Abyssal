@@ -20,6 +20,17 @@ umask 077
 STORE_PASSWORD="${ABYSSAL_KEYSTORE_PASSWORD:-$(openssl rand -hex 32)}"
 KEY_PASSWORD="${ABYSSAL_KEY_PASSWORD:-$STORE_PASSWORD}"
 
+for signing_value in "$KEYSTORE_PATH" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; do
+  [[ -n "$signing_value" ]] || {
+    printf 'Signing values must not be empty.\n' >&2
+    exit 1
+  }
+  [[ ! "$signing_value" =~ [[:cntrl:]] ]] || {
+    printf 'Signing values must not contain control characters.\n' >&2
+    exit 1
+  }
+done
+
 keytool -genkeypair \
   -keystore "$KEYSTORE_PATH" \
   -storetype PKCS12 \
@@ -33,10 +44,12 @@ keytool -genkeypair \
   -dname "CN=Abyssal Android Release, OU=Abyssal, O=Abyssal"
 
 {
-  printf 'ABYSSAL_KEYSTORE_PATH=%q\n' "$KEYSTORE_PATH"
-  printf 'ABYSSAL_KEYSTORE_PASSWORD=%q\n' "$STORE_PASSWORD"
-  printf 'ABYSSAL_KEY_ALIAS=%q\n' "$KEY_ALIAS"
-  printf 'ABYSSAL_KEY_PASSWORD=%q\n' "$KEY_PASSWORD"
+  # This is deliberately literal data, not shell syntax. The release build
+  # uses parse-android-release-env.sh and never sources this file.
+  printf 'ABYSSAL_KEYSTORE_PATH=%s\n' "$KEYSTORE_PATH"
+  printf 'ABYSSAL_KEYSTORE_PASSWORD=%s\n' "$STORE_PASSWORD"
+  printf 'ABYSSAL_KEY_ALIAS=%s\n' "$KEY_ALIAS"
+  printf 'ABYSSAL_KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
 } >"$ENV_FILE"
 
 chmod 600 "$KEYSTORE_PATH" "$ENV_FILE"

@@ -6,21 +6,33 @@ ENV_FILE="${ABYSSAL_RELEASE_ENV:-$ROOT_DIR/deploy/release.env}"
 GRADLE_HOME="${ABYSSAL_GRADLE_HOME:-$ROOT_DIR/.gradle-local}"
 OUTPUT_DIR="${ABYSSAL_RELEASE_OUTPUT_DIR:-$ROOT_DIR/build-outputs}"
 
+# Packaging is deliberately downstream of the complete non-packaging gate.
+# This keeps a release build from being used to bypass supply-chain, crypto,
+# Rust, web, Android, integration, or advisory checks.
+"$ROOT_DIR/check.sh" all
+
 if [[ ! -f "$ENV_FILE" ]]; then
   printf 'Signing environment not found: %s\n' "$ENV_FILE" >&2
   printf 'Run ./scripts/create-android-release-key.sh once, then back up its outputs.\n' >&2
   exit 1
 fi
 
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-: "${ABYSSAL_KEYSTORE_PATH:?Missing ABYSSAL_KEYSTORE_PATH}"
-: "${ABYSSAL_KEYSTORE_PASSWORD:?Missing ABYSSAL_KEYSTORE_PASSWORD}"
-: "${ABYSSAL_KEY_ALIAS:?Missing ABYSSAL_KEY_ALIAS}"
-: "${ABYSSAL_KEY_PASSWORD:?Missing ABYSSAL_KEY_PASSWORD}"
+# The signing file is a data-only format. Never source it: passwords and paths
+# may contain shell metacharacters and must remain literal data.
+mapfile -t RELEASE_ENV_VALUES < <("$ROOT_DIR/scripts/parse-android-release-env.sh" "$ENV_FILE")
+[[ "${#RELEASE_ENV_VALUES[@]}" -eq 4 ]] || {
+  printf 'Signing environment parser returned an invalid record count.\n' >&2
+  exit 1
+}
+decode_release_value() {
+  printf '%s' "$1" | base64 --decode
+}
+ABYSSAL_KEYSTORE_PATH="$(decode_release_value "${RELEASE_ENV_VALUES[0]}")"
+ABYSSAL_KEYSTORE_PASSWORD="$(decode_release_value "${RELEASE_ENV_VALUES[1]}")"
+ABYSSAL_KEY_ALIAS="$(decode_release_value "${RELEASE_ENV_VALUES[2]}")"
+ABYSSAL_KEY_PASSWORD="$(decode_release_value "${RELEASE_ENV_VALUES[3]}")"
+unset RELEASE_ENV_VALUES
 export ABYSSAL_KEYSTORE_PATH ABYSSAL_KEYSTORE_PASSWORD ABYSSAL_KEY_ALIAS ABYSSAL_KEY_PASSWORD
-
-[[ -f "$ABYSSAL_KEYSTORE_PATH" ]] || { printf 'Keystore not found: %s\n' "$ABYSSAL_KEYSTORE_PATH" >&2; exit 1; }
 
 RECORDED_CRYPTO_DIGEST="$(tr -d '[:space:]' < "$ROOT_DIR/rust-core/generated-bindings.sha256")"
 CURRENT_CRYPTO_DIGEST="$("$ROOT_DIR/scripts/crypto-source-digest.sh")"

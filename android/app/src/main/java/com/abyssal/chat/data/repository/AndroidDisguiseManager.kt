@@ -30,46 +30,55 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
     // Android recreates the process, the old calculator alias is stale and must not
     // fall back to a predictable unlock code.
     private var disguiseEnabled = false
-    private var unlockPin = ""
-    private var duressPin = ""
+    private var credentialVerifier = InMemoryCamouflageVerifier()
 
     init {
         resetStaleCamouflage()
     }
 
-    override fun setDisguiseEnabled(enabled: Boolean) {
-        if (applyLauncherIcon(enabled)) {
-            disguiseEnabled = enabled
+    override fun configure(enabled: Boolean, unlockPin: String, duressPin: String): Boolean {
+        if (!enabled) {
+            // Keep the verifier material intact if PackageManager cannot complete the
+            // alias transition. This avoids turning a failed disable into a partial wipe.
+            if (!applyLauncherIcon(enabled = false)) return false
+            credentialVerifier.destroy()
+            credentialVerifier = InMemoryCamouflageVerifier()
+            disguiseEnabled = false
+            return true
         }
+
+        // Prepare a complete verifier before exposing the calculator alias. A failed
+        // alias transition destroys the candidate and leaves the active verifier intact.
+        val candidate = InMemoryCamouflageVerifier()
+        if (!candidate.configure(unlockPin, duressPin)) return false
+        // Updating verifier material while already disguised does not require a
+        // package-manager transition and avoids disturbing an active alias.
+        if (!disguiseEnabled && !applyLauncherIcon(enabled = true)) {
+            candidate.destroy()
+            return false
+        }
+        credentialVerifier.destroy()
+        credentialVerifier = candidate
+        disguiseEnabled = true
+        return true
     }
 
     override fun isDisguiseEnabled(): Boolean {
         return disguiseEnabled
     }
 
-    override fun savePin(pin: String) {
-        unlockPin = pin.trim()
+    override fun clear() {
+        // Teardown prioritizes removing verifier material even if PackageManager is
+        // unavailable. A fresh process resets stale aliases during initialization.
+        credentialVerifier.destroy()
+        credentialVerifier = InMemoryCamouflageVerifier()
+        disguiseEnabled = false
+        runCatching { applyLauncherIcon(enabled = false) }
     }
 
-    override fun saveDuressPin(pin: String) {
-        duressPin = pin
-    }
+    override fun verifyPin(pin: String): Boolean = credentialVerifier.verifyUnlock(pin)
 
-    override fun verifyPin(pin: String): Boolean {
-        return unlockPin.isNotEmpty() && pin == unlockPin
-    }
-
-    override fun verifyDuressPin(pin: String): Boolean {
-        return duressPin.isNotBlank() && pin == duressPin
-    }
-
-    override fun getPin(): String {
-        return unlockPin
-    }
-
-    override fun getDuressPin(): String {
-        return duressPin
-    }
+    override fun verifyDuressPin(pin: String): Boolean = credentialVerifier.verifyDuress(pin)
 
     private fun applyLauncherIcon(enabled: Boolean): Boolean {
         val packageManager = context.packageManager
@@ -97,4 +106,23 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         // Reset both aliases so a stale calculator cover can never accept a default PIN.
         applyLauncherIcon(enabled = false)
     }
+
 }
+
+internal fun isValidCamouflagePin(value: String): Boolean =
+    // A four-digit PIN has only 10,000 guesses if the process heap is copied.
+    // PBKDF2 slows that search but cannot create entropy, so require six chars.
+    value.length in 6..32 && value.all { it in "0123456789.+-*/()" }
+
+internal fun camouflagePinsAreDistinct(unlockPin: String, duressPin: String): Boolean =
+    duressPin.isBlank() || unlockPin != duressPin
+
+internal fun isValidCamouflageConfiguration(
+    enabled: Boolean,
+    unlockPin: String,
+    duressPin: String
+): Boolean = !enabled || (
+    isValidCamouflagePin(unlockPin) &&
+        (duressPin.isBlank() ||
+            (isValidCamouflagePin(duressPin) && camouflagePinsAreDistinct(unlockPin, duressPin)))
+    )

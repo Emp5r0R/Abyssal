@@ -6,11 +6,15 @@ import java.util.concurrent.CancellationException
 internal object AttachmentDocumentWriter {
     private const val CHUNK_BYTES = 64 * 1024
 
-    fun writeIfNonEmpty(bytes: ByteArray, openOutput: () -> OutputStream?): Boolean {
+    fun writeIfNonEmpty(
+        bytes: ByteArray,
+        shouldCancel: () -> Boolean = { false },
+        openOutput: () -> OutputStream?
+    ): Boolean {
         if (bytes.isEmpty()) return false
         val output = openOutput() ?: return false
         return try {
-            output.use { write(bytes, it) }
+            output.use { write(bytes, it, shouldCancel) }
             true
         } catch (error: CancellationException) {
             throw error
@@ -22,10 +26,11 @@ internal object AttachmentDocumentWriter {
     fun writeIfNonEmptyOrDelete(
         bytes: ByteArray,
         openOutput: () -> OutputStream?,
-        deleteOutput: () -> Unit
+        deleteOutput: () -> Unit,
+        shouldCancel: () -> Boolean = { false }
     ): Boolean {
         val written = try {
-            writeIfNonEmpty(bytes, openOutput)
+            writeIfNonEmpty(bytes, shouldCancel, openOutput)
         } catch (error: CancellationException) {
             runCatching { deleteOutput() }
             throw error
@@ -34,9 +39,14 @@ internal object AttachmentDocumentWriter {
         return written
     }
 
-    fun write(bytes: ByteArray, output: OutputStream) {
+    fun write(
+        bytes: ByteArray,
+        output: OutputStream,
+        shouldCancel: () -> Boolean = { false }
+    ) {
         var offset = 0
         while (offset < bytes.size) {
+            if (shouldCancel()) throw CancellationException("attachment save cancelled")
             val count = minOf(CHUNK_BYTES, bytes.size - offset)
             output.write(bytes, offset, count)
             offset += count

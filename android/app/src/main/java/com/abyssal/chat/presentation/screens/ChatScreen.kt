@@ -880,14 +880,20 @@ private fun AttachmentDialog(
             if (picked == null) {
                 localError = "Wrong information."
             } else {
-                onSendAttachment(
-                    picked.mediaType,
-                    picked.name,
-                    picked.mimeType,
-                    picked.bytes,
-                    oneTimeView && allowOneTime,
-                    deleteAfterDownload || (oneTimeView && allowOneTime)
-                )
+                var transferred = false
+                try {
+                    onSendAttachment(
+                        picked.mediaType,
+                        picked.name,
+                        picked.mimeType,
+                        picked.bytes,
+                        oneTimeView && allowOneTime,
+                        deleteAfterDownload || (oneTimeView && allowOneTime)
+                    )
+                    transferred = true
+                } finally {
+                    if (!transferred) picked.bytes.fill(0)
+                }
             }
         }
     }
@@ -1125,8 +1131,15 @@ private fun BundledGifDialog(
                         asset = asset,
                         onClick = {
                             scope.launch {
-                                withContext(Dispatchers.IO) { context.readBundledEmoji(asset) }
-                                    ?.let(onSend)
+                                val payload = withContext(Dispatchers.IO) { context.readBundledEmoji(asset) }
+                                    ?: return@launch
+                                var transferred = false
+                                try {
+                                    onSend(payload)
+                                    transferred = true
+                                } finally {
+                                    if (!transferred) payload.bytes.fill(0)
+                                }
                             }
                         }
                     )

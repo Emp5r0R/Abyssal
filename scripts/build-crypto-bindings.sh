@@ -5,16 +5,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WASM_BINDGEN_BIN="${WASM_BINDGEN_BIN:-$(command -v wasm-bindgen || true)}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ROOT_DIR/android-sdk/ndk/27.3.13750724}"
 LLVM_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+EXPECTED_RUST_VERSION="1.97.1"
+EXPECTED_WASM_BINDGEN_VERSION="0.2.126"
+EXPECTED_CARGO_NDK_VERSION="4.1.2"
+EXPECTED_NDK_REVISION="27.3.13750724"
 
 if [[ -z "$WASM_BINDGEN_BIN" && -x "${HOME:-}/.cargo/bin/wasm-bindgen" ]]; then
   WASM_BINDGEN_BIN="$HOME/.cargo/bin/wasm-bindgen"
 fi
 if [[ -z "$WASM_BINDGEN_BIN" ]]; then
-  echo "wasm-bindgen 0.2.126 is required (set WASM_BINDGEN_BIN)." >&2
+  echo "wasm-bindgen $EXPECTED_WASM_BINDGEN_VERSION is required (set WASM_BINDGEN_BIN)." >&2
   exit 1
 fi
 if ! cargo ndk --version >/dev/null 2>&1; then
-  echo "cargo-ndk is required (run cargo install cargo-ndk)." >&2
+  echo "cargo-ndk $EXPECTED_CARGO_NDK_VERSION is required." >&2
   exit 1
 fi
 if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
@@ -25,6 +29,30 @@ if [[ ! -x "$LLVM_STRIP" ]]; then
   echo "Android NDK llvm-strip not found: $LLVM_STRIP" >&2
   exit 1
 fi
+
+actual_rust_version="$(rustc --version | awk '{print $2}')"
+actual_wasm_bindgen_version="$("$WASM_BINDGEN_BIN" --version | awk '{print $2}')"
+actual_cargo_ndk_version="$(cargo ndk --version | awk '{print $2}')"
+actual_ndk_revision="$(sed -n 's/^Pkg.Revision = //p' "$ANDROID_NDK_HOME/source.properties")"
+[[ "$actual_rust_version" == "$EXPECTED_RUST_VERSION" ]] || {
+  printf 'Rust %s is required; found %s.\n' "$EXPECTED_RUST_VERSION" "$actual_rust_version" >&2
+  exit 1
+}
+[[ "$actual_wasm_bindgen_version" == "$EXPECTED_WASM_BINDGEN_VERSION" ]] || {
+  printf 'wasm-bindgen %s is required; found %s.\n' \
+    "$EXPECTED_WASM_BINDGEN_VERSION" "$actual_wasm_bindgen_version" >&2
+  exit 1
+}
+[[ "$actual_cargo_ndk_version" == "$EXPECTED_CARGO_NDK_VERSION" ]] || {
+  printf 'cargo-ndk %s is required; found %s.\n' \
+    "$EXPECTED_CARGO_NDK_VERSION" "$actual_cargo_ndk_version" >&2
+  exit 1
+}
+[[ "$actual_ndk_revision" == "$EXPECTED_NDK_REVISION" ]] || {
+  printf 'Android NDK %s is required; found %s.\n' \
+    "$EXPECTED_NDK_REVISION" "${actual_ndk_revision:-unknown}" >&2
+  exit 1
+}
 
 rustup target add \
   wasm32-unknown-unknown \
@@ -37,9 +65,15 @@ cargo build \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
   --package abyssal-core \
   --release \
+  --locked \
   --bin uniffi-bindgen \
   --features bindgen-cli
-cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --package abyssal-core --release --lib
+cargo build \
+  --manifest-path "$ROOT_DIR/Cargo.toml" \
+  --package abyssal-core \
+  --release \
+  --locked \
+  --lib
 "$ROOT_DIR/target/release/uniffi-bindgen" generate \
   "$ROOT_DIR/target/release/libabyssal_core.so" \
   --library \
@@ -56,6 +90,7 @@ cargo build \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
   --package abyssal-core \
   --release \
+  --locked \
   --target wasm32-unknown-unknown
 "$WASM_BINDGEN_BIN" \
   --target web \
@@ -71,7 +106,7 @@ ANDROID_NDK_HOME="$ANDROID_NDK_HOME" cargo ndk \
   -t x86 \
   -t x86_64 \
   -o "$ROOT_DIR/android/app/src/main/jniLibs" \
-  build --package abyssal-core --release --lib
+  build --package abyssal-core --release --locked --lib
 for library in "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
   "$LLVM_STRIP" --strip-unneeded "$library"
 done
@@ -85,6 +120,17 @@ for artifact in \
     exit 1
   fi
 done
+
+(
+  cd "$ROOT_DIR"
+  sha256sum \
+    apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
+    android/app/src/main/jniLibs/arm64-v8a/libabyssal_core.so \
+    android/app/src/main/jniLibs/armeabi-v7a/libabyssal_core.so \
+    android/app/src/main/jniLibs/x86/libabyssal_core.so \
+    android/app/src/main/jniLibs/x86_64/libabyssal_core.so \
+    > rust-core/generated-artifacts.sha256
+)
 
 "$ROOT_DIR/scripts/crypto-source-digest.sh" > \
   "$ROOT_DIR/rust-core/generated-bindings.sha256"

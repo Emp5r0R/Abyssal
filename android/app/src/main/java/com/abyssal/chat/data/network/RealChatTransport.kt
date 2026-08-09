@@ -28,6 +28,31 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
 
+/** Mirrors the JVM UTF-8 encoder without allocating a second copy of hostile input. */
+internal fun exceedsUtf8ByteLimit(value: String, maxBytes: Int): Boolean {
+    var encodedBytes = 0L
+    var index = 0
+    while (index < value.length) {
+        val character = value[index]
+        val width = when {
+            character.code <= 0x7f -> 1
+            character.code <= 0x7ff -> 2
+            Character.isHighSurrogate(character) &&
+                index + 1 < value.length &&
+                Character.isLowSurrogate(value[index + 1]) -> {
+                index += 1
+                4
+            }
+            Character.isSurrogate(character) -> 1
+            else -> 3
+        }
+        encodedBytes += width
+        if (encodedBytes > maxBytes) return true
+        index += 1
+    }
+    return false
+}
+
 class RealChatTransport(
     private val nodeConfigService: INodeConfigService,
     private val client: OkHttpClient
@@ -156,7 +181,9 @@ class RealChatTransport(
                     }
                 })
                 .toString()
-            if (frame.length > MAX_WEBSOCKET_FRAME_CHARS) {
+            // Outbound encrypted frames contain ASCII JSON and base64url only, so
+            // character count equals wire bytes here.
+            if (frame.length > MAX_WEBSOCKET_FRAME_BYTES) {
                 _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
                 false
             } else {
@@ -238,7 +265,7 @@ class RealChatTransport(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (text.length > MAX_WEBSOCKET_FRAME_CHARS) return
+                if (disconnectForOversizedTextFrame(webSocket, text, nodeId)) return
                 runCatching {
                     val json = JSONObject(text)
                     when (json.optString("type")) {
@@ -372,6 +399,20 @@ class RealChatTransport(
                 _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
             }
         }
+    }
+
+    internal fun disconnectForOversizedTextFrame(
+        socket: WebSocket,
+        text: String,
+        nodeId: String
+    ): Boolean {
+        if (!exceedsUtf8ByteLimit(text, MAX_WEBSOCKET_FRAME_BYTES)) return false
+        connecting.set(false)
+        if (!socket.close(1009, "message too big")) socket.cancel()
+        if (webSocket === socket) webSocket = null
+        clearPresence()
+        _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+        return true
     }
 
     private fun sendJoinFrame(chatId: String) {
@@ -555,7 +596,7 @@ class RealChatTransport(
 
     private companion object {
         const val PROTOCOL_VERSION = 6
-        const val MAX_WEBSOCKET_FRAME_CHARS = 1 * 1024 * 1024
+        const val MAX_WEBSOCKET_FRAME_BYTES = 1 * 1024 * 1024
         const val MAX_CIPHERTEXT_BYTES = 1 * 1024 * 1024
         const val MAX_WRAPPED_KEY_BYTES = 4096
         const val MESSAGE_NONCE_BYTES = 12

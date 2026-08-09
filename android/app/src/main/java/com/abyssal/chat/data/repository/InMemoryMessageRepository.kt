@@ -7,6 +7,7 @@ import com.abyssal.chat.domain.repository.IMessageSender
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,6 +19,7 @@ import java.util.UUID
 
 class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     private val scope = CoroutineScope(Dispatchers.Default + Job())
+    private val stateLock = Any()
 
     private val _sessions = MutableStateFlow<List<ChatSession>>(emptyList())
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
@@ -28,31 +30,34 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     private fun resetToEmpty() {
-        _sessions.value.forEach { it.lastMessage?.let(::wipeMessageKeys) }
-        _sessions.value = emptyList()
-        _messages.value = emptyMap()
+        synchronized(stateLock) {
+            _sessions.value.forEach { it.lastMessage?.let(::wipeMessageKeys) }
+            _sessions.value = emptyList()
+            _messages.value = emptyMap()
+        }
     }
 
     private fun updateLastMessages() {
-        val currentMsgs = _messages.value
-        _sessions.value = _sessions.value.map { session ->
-            val msgs = currentMsgs[session.id] ?: emptyList()
-            val last = msgs.lastOrNull()
-            
-            // Mask actual message content in personal DM previews
-            val previewMsg = last?.let { msg ->
-                if (!session.isForum) {
-                    msg.copy(
-                        content = "Message received",
-                        senderPublicKey = null,
-                        attachmentKey = null
-                    )
-                } else {
-                    msg.copy(senderPublicKey = null, attachmentKey = null)
+        synchronized(stateLock) {
+            val currentMsgs = _messages.value
+            _sessions.value = _sessions.value.map { session ->
+                val msgs = currentMsgs[session.id] ?: emptyList()
+                val last = msgs.lastOrNull()
+
+                // Mask actual message content in personal DM previews
+                val previewMsg = last?.let { msg ->
+                    if (!session.isForum) {
+                        msg.copy(
+                            content = "Message received",
+                            senderPublicKey = null,
+                            attachmentKey = null
+                        )
+                    } else {
+                        msg.copy(senderPublicKey = null, attachmentKey = null)
+                    }
                 }
+                session.copy(lastMessage = previewMsg)
             }
-            
-            session.copy(lastMessage = previewMsg)
         }
     }
 
@@ -61,41 +66,43 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             while (isActive) {
                 delay(100) // Fast 100ms sweep cycle
                 val now = System.currentTimeMillis()
-                var updated = false
-                
-                val cleanMessages = _messages.value.mapValues { (_, list) ->
-                    val filtered = list.filter { msg ->
-                        // 1. Overall absolute self-destruct check (expires regardless of read or not)
-                        val overallLimit = msg.absoluteExpirySec
-                        if (overallLimit > 0) {
-                            val elapsed = now - msg.timestampMs
-                            if (elapsed >= overallLimit * 1000L) {
-                                updated = true
-                                wipeMessageKeys(msg)
-                                return@filter false
-                            }
-                        }
-                        
-                        // 2. Read-destruct check (expires X seconds after read)
-                        val readTime = msg.readTimestampMs
-                        if (readTime != null && msg.selfDestructDurationSec > 0) {
-                            val elapsed = now - readTime
-                            val keep = elapsed < msg.selfDestructDurationSec * 1000L
-                            if (!keep) {
-                                updated = true
-                                wipeMessageKeys(msg)
-                            }
-                            keep
-                        } else {
-                            true
-                        }
-                    }
-                    filtered
-                }
+                synchronized(stateLock) {
+                    var updated = false
 
-                if (updated) {
-                    _messages.value = cleanMessages
-                    updateLastMessages()
+                    val cleanMessages = _messages.value.mapValues { (_, list) ->
+                        val filtered = list.filter { msg ->
+                            // 1. Overall absolute self-destruct check (expires regardless of read or not)
+                            val overallLimit = msg.absoluteExpirySec
+                            if (overallLimit > 0) {
+                                val elapsed = now - msg.timestampMs
+                                if (elapsed >= overallLimit * 1000L) {
+                                    updated = true
+                                    wipeMessageKeys(msg)
+                                    return@filter false
+                                }
+                            }
+
+                            // 2. Read-destruct check (expires X seconds after read)
+                            val readTime = msg.readTimestampMs
+                            if (readTime != null && msg.selfDestructDurationSec > 0) {
+                                val elapsed = now - readTime
+                                val keep = elapsed < msg.selfDestructDurationSec * 1000L
+                                if (!keep) {
+                                    updated = true
+                                    wipeMessageKeys(msg)
+                                }
+                                keep
+                            } else {
+                                true
+                            }
+                        }
+                        filtered
+                    }
+
+                    if (updated) {
+                        _messages.value = cleanMessages
+                        updateLastMessages()
+                    }
                 }
             }
         }
@@ -108,46 +115,52 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun saveMessage(chatId: String, message: Message) {
-        ensureSessionExists(chatId, message.selfDestructDurationSec)
-        val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
-        val existing = currentChatMsgs.firstOrNull { it.id == message.id }
-        if (existing != null) {
-            if (existing !== message) wipeMessageKeys(message)
-            return
+        synchronized(stateLock) {
+            ensureSessionExists(chatId, message.selfDestructDurationSec)
+            val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
+            val existing = currentChatMsgs.firstOrNull { it.id == message.id }
+            if (existing != null) {
+                if (existing !== message) wipeMessageKeys(message)
+                return
+            }
+            val storedMessage = message.copy(
+                senderPublicKey = message.senderPublicKey?.copyOf(),
+                attachmentKey = message.attachmentKey?.copyOf()
+            )
+            wipeMessageKeys(message)
+            currentChatMsgs.add(storedMessage)
+            _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
+            updateLastMessages()
         }
-        val storedMessage = message.copy(
-            senderPublicKey = message.senderPublicKey?.copyOf(),
-            attachmentKey = message.attachmentKey?.copyOf()
-        )
-        wipeMessageKeys(message)
-        currentChatMsgs.add(storedMessage)
-        _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
-        updateLastMessages()
     }
 
     override suspend fun createForumSession(session: ChatSession) {
-        val current = _sessions.value.toMutableList()
-        val existingIndex = current.indexOfFirst { it.id == session.id }
-        if (existingIndex >= 0) {
-            current[existingIndex] = session.copy(
-                lastMessage = current[existingIndex].lastMessage,
-                unreadCount = current[existingIndex].unreadCount
-            )
-        } else {
-            current.add(session)
+        synchronized(stateLock) {
+            val current = _sessions.value.toMutableList()
+            val existingIndex = current.indexOfFirst { it.id == session.id }
+            if (existingIndex >= 0) {
+                current[existingIndex] = session.copy(
+                    lastMessage = current[existingIndex].lastMessage,
+                    unreadCount = current[existingIndex].unreadCount
+                )
+            } else {
+                current.add(session)
+            }
+            _sessions.value = current
+            _messages.value = _messages.value.toMutableMap().apply { putIfAbsent(session.id, emptyList()) }
+            updateLastMessages()
         }
-        _sessions.value = current
-        _messages.value = _messages.value.toMutableMap().apply { putIfAbsent(session.id, emptyList()) }
-        updateLastMessages()
     }
 
     override suspend fun deleteChatSession(chatId: String) {
-        val removedSession = _sessions.value.firstOrNull { it.id == chatId }
-        _sessions.value = _sessions.value.filterNot { it.id == chatId }
-        val removed = _messages.value[chatId].orEmpty()
-        removed.forEach(::wipeMessageKeys)
-        removedSession?.lastMessage?.let(::wipeMessageKeys)
-        _messages.value = _messages.value.toMutableMap().apply { remove(chatId) }
+        synchronized(stateLock) {
+            val removedSession = _sessions.value.firstOrNull { it.id == chatId }
+            _sessions.value = _sessions.value.filterNot { it.id == chatId }
+            val removed = _messages.value[chatId].orEmpty()
+            removed.forEach(::wipeMessageKeys)
+            removedSession?.lastMessage?.let(::wipeMessageKeys)
+            _messages.value = _messages.value.toMutableMap().apply { remove(chatId) }
+        }
     }
 
     private fun ensureSessionExists(chatId: String, selfDestructSec: Int) {
@@ -191,50 +204,65 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun markAsRead(chatId: String, messageId: String) {
-        val chatMsgs = _messages.value[chatId] ?: return
-        var changed = false
-        val updated = chatMsgs.map { msg ->
-            if (msg.id == messageId && msg.readTimestampMs == null) {
-                changed = true
-                msg.copy(readTimestampMs = System.currentTimeMillis())
-            } else {
-                msg
-            }
-        }
-        if (changed) {
-            _messages.value = _messages.value.toMutableMap().apply { put(chatId, updated) }
-            
-            _sessions.value = _sessions.value.map { session ->
-                if (session.id == chatId) {
-                    session.copy(unreadCount = 0)
+        synchronized(stateLock) {
+            val chatMsgs = _messages.value[chatId] ?: return
+            var changed = false
+            val updated = chatMsgs.map { msg ->
+                if (msg.id == messageId && msg.readTimestampMs == null) {
+                    changed = true
+                    msg.copy(readTimestampMs = System.currentTimeMillis())
                 } else {
-                    session
+                    msg
+                }
+            }
+            if (changed) {
+                _messages.value = _messages.value.toMutableMap().apply { put(chatId, updated) }
+
+                _sessions.value = _sessions.value.map { session ->
+                    if (session.id == chatId) {
+                        session.copy(unreadCount = 0)
+                    } else {
+                        session
+                    }
                 }
             }
         }
     }
 
     override suspend fun forgetAttachmentKey(chatId: String, messageId: String) {
-        val current = _messages.value[chatId] ?: return
-        var changed = false
-        val updated = current.map { message ->
-            if (message.id == messageId && message.attachmentKey != null) {
-                changed = true
-                message.attachmentKey.fill(0)
-                message.copy(attachmentKey = null)
-            } else {
-                message
+        synchronized(stateLock) {
+            val current = _messages.value[chatId] ?: return
+            var changed = false
+            val updated = current.map { message ->
+                if (message.id == messageId && message.attachmentKey != null) {
+                    changed = true
+                    message.attachmentKey.fill(0)
+                    message.copy(attachmentKey = null)
+                } else {
+                    message
+                }
             }
-        }
-        if (changed) {
-            _messages.value = _messages.value.toMutableMap().apply { put(chatId, updated) }
-            updateLastMessages()
+            if (changed) {
+                _messages.value = _messages.value.toMutableMap().apply { put(chatId, updated) }
+                updateLastMessages()
+            }
         }
     }
 
     override suspend fun clearAllData() {
-        _messages.value.values.flatten().forEach(::wipeMessageKeys)
-        resetToEmpty()
+        clearAllDataNow()
+    }
+
+    override fun clearAllDataNow() {
+        synchronized(stateLock) {
+            _messages.value.values.flatten().forEach(::wipeMessageKeys)
+            resetToEmpty()
+        }
+    }
+
+    override fun close() {
+        clearAllDataNow()
+        scope.cancel()
     }
 
     private fun wipeMessageKeys(message: Message) {

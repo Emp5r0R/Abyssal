@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   absoluteRetention,
   classifyMedia,
@@ -44,6 +45,7 @@ import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   decryptAndCompleteAttachment,
   downloadEncryptedAttachment,
+  deleteUploadedAttachment,
   finishOpaqueAccount,
   RelaySocket,
   releaseAttachmentDownloadClaim,
@@ -113,6 +115,8 @@ export function useAbyssalSession() {
   const roomsRef = useRef<RoomRecord[]>([]);
   const directsRef = useRef<DirectRecord[]>([]);
   const presenceRef = useRef<PresenceUser[]>([]);
+  const messagesRef = useRef<Record<string, ChatMessage[]>>({});
+  const mediaRef = useRef<DecryptedMedia | null>(null);
   const activeRoomRef = useRef<string | null>(null);
   const requestedDirectRef = useRef<string | null>(null);
   const ownMessageIdsRef = useRef(new Set<string>());
@@ -137,42 +141,57 @@ export function useAbyssalSession() {
   }, [presence]);
 
   useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
     activeRoomRef.current = activeRoomId;
   }, [activeRoomId]);
 
+  const updateMessages = useCallback((update: (current: Record<string, ChatMessage[]>) => Record<string, ChatMessage[]>) => {
+    const next = update(messagesRef.current);
+    messagesRef.current = next;
+    setMessages(next);
+  }, []);
+
   const clearMedia = useCallback(() => {
-    setMedia((current) => {
-      if (current) URL.revokeObjectURL(current.objectUrl);
-      return null;
-    });
+    const current = mediaRef.current;
+    mediaRef.current = null;
+    if (current) URL.revokeObjectURL(current.objectUrl);
+    setMedia(null);
   }, []);
 
   useEffect(() => {
     return () => {
-      if (media) URL.revokeObjectURL(media.objectUrl);
+      const current = mediaRef.current;
+      mediaRef.current = null;
+      if (current) URL.revokeObjectURL(current.objectUrl);
     };
-  }, [media]);
+  }, []);
 
   const clearMemory = useCallback(() => {
     loginAbortRef.current?.abort();
     loginAbortRef.current = null;
+    const currentSession = sessionRef.current;
     sessionRef.current = null;
     socketRef.current?.close();
     socketRef.current = null;
     cipherRef.current.clear();
     clearMedia();
+    if (currentSession) wipeBytes(currentSession.identityPublicKey);
+    const currentMessages = messagesRef.current;
+    messagesRef.current = {};
+    wipeMessageMap(currentMessages);
     setSession(null);
     setConnection("disconnected");
     setRooms([]);
     setDirects([]);
     setPresence([]);
-    setMessages((current) => {
-      wipeMessageMap(current);
-      return {};
-    });
+    setMessages({});
     setActiveRoomId(null);
     setRemainingSessionSec(0);
     setUpload(EMPTY_UPLOAD);
+    setNotice(null);
     ownMessageIdsRef.current.clear();
     receivedFrameIdsRef.current.clear();
     identityPinsRef.current.clear();
@@ -184,6 +203,13 @@ export function useAbyssalSession() {
     retainWhenHiddenRef.current = false;
     lastActivityRef.current = 0;
     lastActivitySignalRef.current = 0;
+  }, [clearMedia]);
+
+  const clearPrivateView = useCallback(() => {
+    clearMedia();
+    activeRoomRef.current = null;
+    setActiveRoomId(null);
+    setNotice(null);
   }, [clearMedia]);
 
   const logout = useCallback(async () => {
@@ -244,7 +270,7 @@ export function useAbyssalSession() {
     }
     if (frame.type === "room_deleted") {
       setRooms((current) => current.filter((room) => room.id !== frame.chat_id));
-      setMessages((current) => {
+      updateMessages((current) => {
         const next = { ...current };
         wipeMessageList(next[frame.chat_id]);
         delete next[frame.chat_id];
@@ -355,7 +381,7 @@ export function useAbyssalSession() {
         const targetId = typeof payload.message_id === "string" ? payload.message_id : "";
         if (!ownMessageIdsRef.current.has(targetId)) return;
         const readAtMs = Date.now();
-        setMessages((current) => {
+        updateMessages((current) => {
           const list = current[frame.chat_id];
           if (!list) return current;
           let changed = false;
@@ -388,11 +414,11 @@ export function useAbyssalSession() {
         message.readAtMs = Date.now();
         sendReadReceiptRef.current(frame.chat_id, message.id);
       }
-      setMessages((current) => appendUnique(current, message));
+      updateMessages((current) => appendUnique(current, message));
     } catch {
       // Authentication failure or malformed plaintext stays outside UI state.
     }
-  }, [clearMemory]);
+  }, [clearMemory, updateMessages]);
 
   const login = useCallback(async (input: LoginInput): Promise<AccountSession> => {
     if (sessionRef.current || loginAbortRef.current) throw new Error("Action unavailable");
@@ -480,6 +506,13 @@ export function useAbyssalSession() {
           wipeBytes(context);
           wipeBytes(response);
         }
+        if (
+          !nextSession ||
+          nextSession.nodeId !== start.node_id ||
+          nextSession.created !== (start.mode === "registration")
+        ) {
+          throw new Error("Wrong information");
+        }
       } finally {
         wipeOpaqueStart(opaque);
       }
@@ -559,27 +592,20 @@ export function useAbyssalSession() {
       const remaining = Math.max(0, Math.ceil((lastActivityRef.current + session.sessionInactivitySec * 1000 - now) / 1000));
       setRemainingSessionSec(remaining);
       if (remaining === 0) void logout();
-      setMessages((current) => pruneExpired(current, now));
+      updateMessages((current) => pruneExpired(current, now));
     }, 500);
     return () => window.clearInterval(timer);
-  }, [logout, session]);
+  }, [logout, session, updateMessages]);
 
   useEffect(() => {
     const pageHide = () => {
-      loginAbortRef.current?.abort();
-      loginAbortRef.current = null;
+      document.documentElement.classList.add("abyssal-page-hidden");
       const current = sessionRef.current;
-      sessionRef.current = null;
-      if (!current) return;
-      socketRef.current?.close();
-      void revokeSession(current);
-      cipherRef.current.clear();
-      setMessages((messages) => {
-        wipeMessageMap(messages);
-        return {};
-      });
+      if (current) void revokeSession(current);
+      flushSync(clearMemory);
     };
     const pageShow = (event: PageTransitionEvent) => {
+      document.documentElement.classList.remove("abyssal-page-hidden");
       if (event.persisted) clearMemory();
     };
     window.addEventListener("pagehide", pageHide);
@@ -592,7 +618,7 @@ export function useAbyssalSession() {
 
   const markRoomRead = useCallback((chatId: string) => {
     const now = Date.now();
-    setMessages((current) => {
+    updateMessages((current) => {
       const roomMessages = current[chatId];
       if (!roomMessages) return current;
       let changed = false;
@@ -604,18 +630,22 @@ export function useAbyssalSession() {
       });
       return changed ? { ...current, [chatId]: nextMessages } : current;
     });
-  }, []);
+  }, [updateMessages]);
 
   const openRoom = useCallback((chatId: string | null) => {
+    clearMedia();
+    setNotice(null);
     activeRoomRef.current = chatId;
     setActiveRoomId(chatId);
     if (chatId) {
       socketRef.current?.join(chatId);
       window.setTimeout(() => markRoomRead(chatId), 350);
     }
-  }, [markRoomRead]);
+  }, [clearMedia, markRoomRead]);
 
   const openDirect = useCallback((peerUsername: string): boolean => {
+    clearMedia();
+    setNotice(null);
     const existing = directsRef.current.find(
       (direct) => direct.peer_username.toLowerCase() === peerUsername.trim().toLowerCase(),
     );
@@ -626,7 +656,7 @@ export function useAbyssalSession() {
     if (connection !== "connected") return false;
     requestedDirectRef.current = peerUsername.trim();
     return socketRef.current?.openDirect(peerUsername.trim()) ?? false;
-  }, [connection, openRoom]);
+  }, [clearMedia, connection, openRoom]);
 
   const recipientKeysFor = useCallback((chatId: string, includeSelf = false) => {
     const currentSession = sessionRef.current;
@@ -720,10 +750,10 @@ export function useAbyssalSession() {
     wipeEncryptedPayload(encrypted);
     if (accepted) {
       ownMessageIdsRef.current.add(message.id);
-      setMessages((current) => appendUnique(current, message));
+      updateMessages((current) => appendUnique(current, message));
     }
     return accepted;
-  }, [activeRoomId, connection, messages, recipientKeysFor]);
+  }, [activeRoomId, connection, messages, recipientKeysFor, updateMessages]);
 
   const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
@@ -758,6 +788,7 @@ export function useAbyssalSession() {
     let encrypted: EncryptedAttachment | null = null;
     let message: ChatMessage | null = null;
     let retainedMessage: ChatMessage | null = null;
+    let uploadedAttachmentId: string | null = null;
     try {
       setUpload({ active: true, name: file.name || "attachment", loaded: 0, total: file.size });
       const fileBuffer = await file.arrayBuffer();
@@ -779,6 +810,7 @@ export function useAbyssalSession() {
         { ...options, ttlSec },
         (progress) => setUpload({ active: true, name: file.name || "attachment", ...progress }),
       );
+      uploadedAttachmentId = attachmentId;
       const now = Date.now();
       const outgoingMessage: ChatMessage = {
         id: messageId,
@@ -824,7 +856,7 @@ export function useAbyssalSession() {
       wipeEncryptedPayload(metadata);
       if (accepted) {
         ownMessageIdsRef.current.add(outgoingMessage.id);
-        setMessages((current) => appendUnique(current, outgoingMessage));
+        updateMessages((current) => appendUnique(current, outgoingMessage));
         retainedMessage = outgoingMessage;
       }
       return accepted;
@@ -843,9 +875,12 @@ export function useAbyssalSession() {
         // not leave the content key reachable from this stack frame.
         wipeBytes(message.attachment.encryptionKey);
       }
+      if (uploadedAttachmentId && !retainedMessage) {
+        await deleteUploadedAttachment(currentSession, uploadedAttachmentId).catch(() => undefined);
+      }
       setUpload(EMPTY_UPLOAD);
     }
-  }, [activeRoomId, connection, messages, recipientKeysFor]);
+  }, [activeRoomId, connection, messages, recipientKeysFor, updateMessages]);
 
   const viewAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
@@ -886,14 +921,16 @@ export function useAbyssalSession() {
       }
       if (sessionRef.current?.token !== currentSession.token) throw new Error("Action unavailable");
       const blob = new Blob([plain.slice().buffer], { type: attachment.mimeType });
-      setMedia({
+      const nextMedia: DecryptedMedia = {
         messageId: message.id,
         name: attachment.name,
         mediaType: attachment.mediaType,
         mimeType: attachment.mimeType,
         objectUrl: URL.createObjectURL(blob),
         oneTime: attachment.oneTime,
-      });
+      };
+      mediaRef.current = nextMedia;
+      setMedia(nextMedia);
       markRoomRead(message.chatId);
       if (attachment.oneTime) wipeMessageAttachment(message);
     } catch {
@@ -1016,6 +1053,7 @@ export function useAbyssalSession() {
     login,
     logout,
     clearMemory,
+    clearPrivateView,
     touchActivity,
     openRoom,
     openDirect,

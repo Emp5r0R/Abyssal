@@ -46,6 +46,20 @@ class ChatViewModelPolicyTest {
     }
 
     @Test
+    fun calculatorResultCannotOverwriteNewerInputOrCancelledJob() {
+        assertTrue(canApplyCalculatorEvaluation(4L, 4L, true))
+        assertFalse(canApplyCalculatorEvaluation(3L, 4L, true))
+        assertFalse(canApplyCalculatorEvaluation(4L, 4L, false))
+    }
+
+    @Test
+    fun uploadedAttachmentIsDeletedUntilMetadataIsAccepted() {
+        assertTrue(shouldDeleteUploadedAttachment("123e4567-e89b-12d3-a456-426614174000", false))
+        assertFalse(shouldDeleteUploadedAttachment("123e4567-e89b-12d3-a456-426614174000", true))
+        assertFalse(shouldDeleteUploadedAttachment(null, false))
+    }
+
+    @Test
     fun attachmentMetadataMatchesWebWireFieldsWithoutLegacyCryptoId() {
         val key = ByteArray(32) { it.toByte() }
         val message = Message(

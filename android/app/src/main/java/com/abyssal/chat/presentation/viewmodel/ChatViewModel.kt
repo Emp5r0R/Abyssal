@@ -9,6 +9,7 @@ import com.abyssal.chat.data.network.ATTACHMENT_WIRE_OVERHEAD_BYTES
 import com.abyssal.chat.data.network.decryptAndCompleteAttachment
 import com.abyssal.chat.data.network.normalizeAttachmentId
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
+import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.AvailableAppUpdate
@@ -39,12 +40,16 @@ import com.abyssal.chat.domain.repository.IMessageSender
 import com.abyssal.chat.domain.repository.INodeConfigService
 import java.nio.charset.StandardCharsets
 import java.util.Base64
+import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -58,6 +63,9 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import uniffi.abyssal_core.decryptAttachment as decryptAttachmentBlob
 import uniffi.abyssal_core.encryptAttachment as encryptAttachmentBlob
@@ -83,6 +91,17 @@ internal fun canInstallAccountEntryResult(
     result.token != null &&
     result.publicKey != null &&
     result.prekeyId != null
+
+internal fun canApplyCalculatorEvaluation(
+    resultGeneration: Long,
+    currentGeneration: Long,
+    coroutineIsActive: Boolean
+): Boolean = coroutineIsActive && resultGeneration == currentGeneration
+
+internal fun shouldDeleteUploadedAttachment(
+    uploadedAttachmentId: String?,
+    metadataAccepted: Boolean
+): Boolean = uploadedAttachmentId != null && !metadataAccepted
 
 internal fun isDecryptedAttachmentSizeValid(
     actualBytes: Long,
@@ -187,8 +206,21 @@ class ChatViewModel(
     private var requestedDirectUsername: String? = null
     private var accountEntryJob: Job? = null
     private var attachmentUploadJob: Job? = null
+    private val sessionGeneration = AtomicLong(0L)
+    // This gate covers only short local state transitions. Network claims and
+    // provider writes remain cancellable and never hold up a local purge.
+    private val attachmentSessionGate = Mutex()
+    private val attachmentJobs = Collections.synchronizedSet(mutableSetOf<Job>())
+    @Volatile
+    private var calculatorEvaluationJob: Job? = null
+    private val calculatorInputGeneration = AtomicLong(0L)
+    private val calculatorEvaluationGate = Mutex()
     private val ownMessageIds = mutableSetOf<String>()
     private val receivedFrameIds = linkedSetOf<String>()
+    // All accesses occur on viewModelScope/Main: UI entry points, attachment jobs,
+    // logout, and teardown. Network callbacks never touch these collections directly.
+    private val activeAttachmentViews = mutableSetOf<String>()
+    private val consumedOneTimeAttachments = mutableSetOf<String>()
 
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -200,9 +232,7 @@ class ChatViewModel(
 
     init {
         _disguiseSettings.value = DisguiseSettings(
-            isDisguised = disguiseManager.isDisguiseEnabled(),
-            pin = disguiseManager.getPin(),
-            duressPin = disguiseManager.getDuressPin()
+            isDisguised = disguiseManager.isDisguiseEnabled()
         )
         _isLocked.value = disguiseManager.isDisguiseEnabled()
 
@@ -440,8 +470,10 @@ class ChatViewModel(
                     updateSessionSecurityState()
                     _isLocked.value = false
                     if (result.created) {
-                        disguiseManager.setDisguiseEnabled(true)
-                        _disguiseSettings.value = DisguiseSettings(isDisguised = true, pin = "")
+                        // A new account has no camouflage verifier yet. Keep the
+                        // normal launcher active until the mandatory prompt saves
+                        // and verifies the PIN material atomically.
+                        _disguiseSettings.value = DisguiseSettings(isDisguised = false)
                         _isLocked.value = false
                         _showCamouflagePinPrompt.value = true
                     }
@@ -581,6 +613,8 @@ class ChatViewModel(
             )
             var attachmentKey: ByteArray? = null
             var messageToWipe: Message? = null
+            var uploadedAttachmentId: String? = null
+            var metadataAccepted = false
             try {
                 val sender = currentUser.value ?: return@launch
                 val metadataRecipients = recipientIdentities(chatId, includeSelf = false)
@@ -633,7 +667,8 @@ class ChatViewModel(
                             )
                         }
                     )
-                    val attachmentId = upload.attachmentId
+                    val attachmentId = upload.attachmentId?.let(::normalizeAttachmentId)
+                    uploadedAttachmentId = attachmentId
                     if (!upload.accepted || attachmentId == null) {
                         _attachmentError.value = "Wrong information."
                         return@launch
@@ -675,6 +710,7 @@ class ChatViewModel(
                         wipeEncryptedPayload(encryptedMetadata)
                     }
                     if (accepted) {
+                        metadataAccepted = true
                         ownMessageIds += message.id
                         messageSender.saveLocalAttachmentMessage(chatId, message)
                     } else {
@@ -685,6 +721,13 @@ class ChatViewModel(
                     blob.fill(0)
                 }
             } finally {
+                if (shouldDeleteUploadedAttachment(uploadedAttachmentId, metadataAccepted)) {
+                    withContext(NonCancellable) {
+                        runCatching {
+                            attachmentService.deleteUploadedAttachment(requireNotNull(uploadedAttachmentId))
+                        }
+                    }
+                }
                 messageToWipe?.let(::wipeMessageSecrets)
                 attachmentKey?.fill(0)
                 bytes.fill(0)
@@ -697,41 +740,83 @@ class ChatViewModel(
         }
     }
 
+    private fun launchAttachmentOperation(block: suspend () -> Unit): Job {
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) { block() }
+        attachmentJobs += job
+        job.invokeOnCompletion { attachmentJobs.remove(job) }
+        job.start()
+        return job
+    }
+
+    private fun cancelAttachmentOperations() {
+        val jobs = synchronized(attachmentJobs) { attachmentJobs.toList() }
+        jobs.forEach(Job::cancel)
+    }
+
     fun viewAttachment(message: Message) {
         val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
-        viewModelScope.launch {
-            _attachmentError.value = null
-            val downloaded = attachmentService.downloadEncryptedAttachment(attachmentId)
-            val bytes = downloaded?.let { encrypted ->
-                decryptAndCompleteAttachment(
-                    downloaded = encrypted,
-                    decrypt = { decryptAttachment(chatId, message, encrypted.bytes) },
-                    complete = { claim ->
-                        attachmentService.completeAttachmentDownload(attachmentId, claim)
-                    },
-                    release = { claim ->
-                        attachmentService.releaseAttachmentDownloadClaim(attachmentId, claim)
+        val generation = sessionGeneration.get()
+        if (!activeAttachmentViews.add(attachmentId)) return
+        if (message.oneTimeView && !consumedOneTimeAttachments.add(attachmentId)) {
+            activeAttachmentViews.remove(attachmentId)
+            return
+        }
+        launchAttachmentOperation viewAttachmentOperation@{
+            var plaintext: ByteArray? = null
+            var previewInstalled = false
+            try {
+                _attachmentError.value = null
+                val downloaded = attachmentService.downloadEncryptedAttachment(attachmentId)
+                plaintext = downloaded?.let { encrypted ->
+                    decryptAndCompleteAttachment(
+                        downloaded = encrypted,
+                        decrypt = {
+                            if (!isSessionGenerationValid(generation)) null
+                            else decryptAttachment(chatId, message, encrypted.bytes)
+                        },
+                        complete = { claim ->
+                            if (!isSessionGenerationValid(generation)) false
+                            else attachmentService.completeAttachmentDownload(attachmentId, claim)
+                        },
+                        release = { claim ->
+                            attachmentService.releaseAttachmentDownloadClaim(attachmentId, claim)
+                        }
+                    )
+                }
+                if (plaintext == null) {
+                    if (message.oneTimeView) consumedOneTimeAttachments.remove(attachmentId)
+                    _attachmentError.value = "Wrong information."
+                    return@viewAttachmentOperation
+                }
+                val installed = attachmentSessionGate.withLock {
+                    if (!isSessionGenerationValid(generation)) {
+                        false
+                    } else {
+                        replaceAttachmentPreview(
+                            DecryptedAttachment(
+                                messageId = message.id,
+                                name = message.attachmentName ?: "attachment",
+                                mediaType = message.mediaType ?: "FILE",
+                                mimeType = message.attachmentMimeType ?: "application/octet-stream",
+                                bytes = requireNotNull(plaintext),
+                                oneTimeView = message.oneTimeView
+                            )
+                        )
+                        plaintext = null
+                        previewInstalled = true
+                        markMessageAsRead(message.id)
+                        if (message.oneTimeView) {
+                            messageRepository.forgetAttachmentKey(chatId, message.id)
+                        }
+                        true
                     }
-                )
-            }
-            if (bytes == null) {
-                _attachmentError.value = "Wrong information."
-                return@launch
-            }
-            replaceAttachmentPreview(
-                DecryptedAttachment(
-                    messageId = message.id,
-                    name = message.attachmentName ?: "attachment",
-                    mediaType = message.mediaType ?: "FILE",
-                    mimeType = message.attachmentMimeType ?: "application/octet-stream",
-                    bytes = bytes,
-                    oneTimeView = message.oneTimeView
-                )
-            )
-            markMessageAsRead(message.id)
-            if (message.oneTimeView) {
-                messageRepository.forgetAttachmentKey(chatId, message.id)
+                }
+                if (!installed) return@viewAttachmentOperation
+            } finally {
+                plaintext?.fill(0)
+                if (message.oneTimeView && !previewInstalled) consumedOneTimeAttachments.remove(attachmentId)
+                activeAttachmentViews.remove(attachmentId)
             }
         }
     }
@@ -740,7 +825,8 @@ class ChatViewModel(
         if (!AttachmentSavePolicy.canSave(message)) return
         val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
-        viewModelScope.launch {
+        val generation = sessionGeneration.get()
+        launchAttachmentOperation saveAttachmentOperation@{
             _attachmentError.value = null
             var temporaryBytes: ByteArray? = null
             try {
@@ -750,9 +836,13 @@ class ChatViewModel(
                     val bytes = downloaded?.let { encrypted ->
                         decryptAndCompleteAttachment(
                             downloaded = encrypted,
-                            decrypt = { decryptAttachment(chatId, message, encrypted.bytes) },
+                            decrypt = {
+                                if (!isSessionGenerationValid(generation)) null
+                                else decryptAttachment(chatId, message, encrypted.bytes)
+                            },
                             complete = { claim ->
-                                attachmentService.completeAttachmentDownload(attachmentId, claim)
+                                if (!isSessionGenerationValid(generation)) false
+                                else attachmentService.completeAttachmentDownload(attachmentId, claim)
                             },
                             release = { claim ->
                                 attachmentService.releaseAttachmentDownloadClaim(attachmentId, claim)
@@ -761,7 +851,7 @@ class ChatViewModel(
                     }
                     if (bytes == null) {
                         _attachmentError.value = "Wrong information."
-                        return@launch
+                        return@saveAttachmentOperation
                     }
                     DecryptedAttachment(
                         messageId = message.id,
@@ -774,12 +864,14 @@ class ChatViewModel(
                 }
                 if (attachment.bytes.isEmpty()) {
                     _attachmentError.value = "Wrong information."
-                    return@launch
+                    return@saveAttachmentOperation
                 }
                 if (cachedAttachment == null) temporaryBytes = attachment.bytes
-                if (!attachmentService.saveDecryptedAttachment(attachment, outputUri)) {
+                if (!isSessionGenerationValid(generation)) return@saveAttachmentOperation
+                val saved = attachmentService.saveDecryptedAttachment(attachment, outputUri)
+                if (!saved) {
                     _attachmentError.value = "Wrong information."
-                    return@launch
+                    return@saveAttachmentOperation
                 }
                 if (cachedAttachment != null) replaceAttachmentPreview(null)
                 markMessageAsRead(message.id)
@@ -896,24 +988,24 @@ class ChatViewModel(
 
     fun updateDisguiseSettings(enabled: Boolean, pin: String, duressPin: String) {
         val normalizedPin = pin.trim()
-        if (enabled && normalizedPin.isBlank()) return
-        disguiseManager.setDisguiseEnabled(enabled)
-        disguiseManager.savePin(normalizedPin)
-        disguiseManager.saveDuressPin(duressPin.trim())
-        _disguiseSettings.value = DisguiseSettings(enabled, normalizedPin, duressPin.trim())
+        val normalizedDuressPin = duressPin.trim()
+        if (!isValidCamouflageConfiguration(enabled, normalizedPin, normalizedDuressPin)) return
+        cancelCalculatorEvaluation()
+        if (!disguiseManager.configure(enabled, normalizedPin, normalizedDuressPin)) return
+        _disguiseSettings.value = DisguiseSettings(enabled)
+        if (!enabled) _isLocked.value = false
     }
 
     fun completeCamouflagePinSetup(pin: String, duressPin: String) {
         val safePin = pin.trim()
-        if (safePin.isBlank()) return
-        disguiseManager.setDisguiseEnabled(true)
-        disguiseManager.savePin(safePin)
-        disguiseManager.saveDuressPin(duressPin.trim())
+        val safeDuressPin = duressPin.trim()
+        if (!isValidCamouflageConfiguration(true, safePin, safeDuressPin)) return
+        cancelCalculatorEvaluation()
+        if (!disguiseManager.configure(true, safePin, safeDuressPin)) return
         _disguiseSettings.value = DisguiseSettings(
-            isDisguised = true,
-            pin = safePin,
-            duressPin = duressPin.trim()
+            isDisguised = true
         )
+        _isLocked.value = false
         _showCamouflagePinPrompt.value = false
     }
 
@@ -993,34 +1085,89 @@ class ChatViewModel(
     fun onCalculatorInput(input: String) {
         val current = _calculatorDisplay.value
         when (input) {
-            "C" -> _calculatorDisplay.value = "0"
-            "⌫" -> _calculatorDisplay.value = current.dropLast(1).ifBlank { "0" }
-            "=" -> _calculatorDisplay.value = evaluateExpression(current)
+            "C" -> {
+                cancelCalculatorEvaluation()
+                _calculatorDisplay.value = "0"
+            }
+            "⌫" -> {
+                cancelCalculatorEvaluation()
+                _calculatorDisplay.value = current.dropLast(1).ifBlank { "0" }
+            }
+            "=" -> startCalculatorEvaluation(current)
             "+", "-", "*", "/", "(", ")" -> {
+                cancelCalculatorEvaluation()
                 _calculatorDisplay.value = if (current == "0" || current == "Error") input else current + input
             }
-            else -> _calculatorDisplay.value = if (current == "0" || current == "Error") input else current + input
+            else -> {
+                cancelCalculatorEvaluation()
+                _calculatorDisplay.value = if (current == "0" || current == "Error") input else current + input
+            }
         }
     }
 
-    private fun evaluateExpression(expr: String): String {
+    private data class CalculatorEvaluation(
+        val duressMatched: Boolean,
+        val unlockMatched: Boolean,
+        val display: String
+    )
+
+    private fun startCalculatorEvaluation(expression: String) {
+        val generation = calculatorInputGeneration.incrementAndGet()
+        calculatorEvaluationJob?.cancel()
+        val job = viewModelScope.launch(Dispatchers.Default) {
+            val evaluation = calculatorEvaluationGate.withLock {
+                ensureActive()
+                val cleanExpr = expression.replace(" ", "")
+                val duressMatched = disguiseManager.verifyDuressPin(cleanExpr)
+                ensureActive()
+                val unlockMatched = !duressMatched && disguiseManager.verifyPin(cleanExpr)
+                ensureActive()
+                CalculatorEvaluation(
+                    duressMatched = duressMatched,
+                    unlockMatched = unlockMatched,
+                    display = if (duressMatched || unlockMatched) "0" else evaluateCalculatorOnly(cleanExpr)
+                )
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
+                if (!canApplyCalculatorEvaluation(
+                        resultGeneration = generation,
+                        currentGeneration = calculatorInputGeneration.get(),
+                        coroutineIsActive = isActive
+                    )) return@withContext
+                when {
+                    evaluation.duressMatched -> {
+                        _calculatorDisplay.value = "0"
+                        viewModelScope.launch { executeDuressWipe() }
+                    }
+                    evaluation.unlockMatched -> {
+                        if (!expireSessionIfNeeded()) {
+                            _isLocked.value = false
+                            checkForAppUpdate()
+                            if (sessionInactivityPolicy.isActive()) {
+                                sessionInactivityPolicy.touch()
+                                updateSessionSecurityState()
+                            }
+                            _calculatorDisplay.value = "0"
+                        }
+                    }
+                    else -> _calculatorDisplay.value = evaluation.display
+                }
+            }
+        }
+        calculatorEvaluationJob = job
+        job.invokeOnCompletion {
+            if (calculatorEvaluationJob === job) calculatorEvaluationJob = null
+        }
+    }
+
+    private fun cancelCalculatorEvaluation() {
+        calculatorInputGeneration.incrementAndGet()
+        calculatorEvaluationJob?.cancel()
+        calculatorEvaluationJob = null
+    }
+
+    private fun evaluateCalculatorOnly(expr: String): String {
         val cleanExpr = expr.replace(" ", "")
-        if (disguiseManager.verifyDuressPin(cleanExpr)) {
-            viewModelScope.launch {
-                executeDuressWipe()
-            }
-            return "0"
-        }
-        if (disguiseManager.verifyPin(cleanExpr)) {
-            if (expireSessionIfNeeded()) return "0"
-            _isLocked.value = false
-            checkForAppUpdate()
-            if (sessionInactivityPolicy.isActive()) {
-                sessionInactivityPolicy.touch()
-                updateSessionSecurityState()
-            }
-            return "0"
-        }
         return runCatching {
             val parser = CalculatorParser(cleanExpr)
             val value = parser.parse()
@@ -1053,9 +1200,15 @@ class ChatViewModel(
         // Stop an in-flight account response before taking the session snapshot. This
         // prevents a late successful response from installing a new identity after logout.
         cancelAccountEntryBeforeLogout()
-        val remoteSession = nodeConfigService.getActiveSession()
+        // Invalidate local attachment operations immediately. Their callbacks re-check
+        // this generation before destructive completion, while cancellation releases
+        // claims without making the local purge wait for network or provider I/O.
+        cancelAttachmentOperations()
         attachmentUploadJob?.cancel()
         attachmentUploadJob = null
+        attachmentSessionGate.withLock { sessionGeneration.incrementAndGet() }
+        cancelCalculatorEvaluation()
+        val remoteSession = nodeConfigService.getActiveSession()
         sessionInactivityPolicy.clear()
         retainSessionInBackground = false
         lastRemoteActivitySignalMs = 0L
@@ -1076,6 +1229,8 @@ class ChatViewModel(
         _attachmentUploadProgress.value = AttachmentUploadProgress()
         ownMessageIds.clear()
         receivedFrameIds.clear()
+        activeAttachmentViews.clear()
+        consumedOneTimeAttachments.clear()
         if (revokeRemote && remoteSession != null) {
             identityService.revokeSession(remoteSession)
         }
@@ -1104,6 +1259,11 @@ class ChatViewModel(
             remainingSec = remainingSec
         )
     }
+
+    private fun isSessionGenerationValid(generation: Long): Boolean =
+        generation == sessionGeneration.get() &&
+            currentUser.value != null &&
+            sessionInactivityPolicy.isActive()
 
     private fun elapsedRealtimeMs(): Long = System.nanoTime() / 1_000_000L
 
@@ -1487,15 +1647,26 @@ class ChatViewModel(
     }
 
     override fun onCleared() {
+        // ViewModelStore teardown is a hard local boundary. Do not join network or
+        // provider jobs here; invalidate their generations and let cancellation cleanup
+        // release claims best-effort while memory is synchronously purged.
+        sessionGeneration.incrementAndGet()
+        cancelAttachmentOperations()
+        attachmentUploadJob?.cancel()
+        attachmentUploadJob = null
+        cancelCalculatorEvaluation()
+        activeAttachmentViews.clear()
+        consumedOneTimeAttachments.clear()
         ownMessageIds.clear()
         receivedFrameIds.clear()
         replaceAttachmentPreview(null)
+        messageRepository.clearAllDataNow()
+        messageRepository.close()
+        disguiseManager.clear()
         _currentUser.value?.publicKey?.fill(0)
         _currentUser.value = null
         accountEntryJob?.cancel()
         accountEntryJob = null
-        attachmentUploadJob?.cancel()
-        attachmentUploadJob = null
         payloadCipher.clear()
         chatTransport.disconnect()
         super.onCleared()

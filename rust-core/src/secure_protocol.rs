@@ -19,7 +19,7 @@ use std::{
 };
 use vodozemac::{
     olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle},
-    Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature,
+    Curve25519PublicKey, Curve25519SecretKey, Ed25519PublicKey, Ed25519Signature,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -50,6 +50,7 @@ const MAX_PEERS: usize = 256;
 const MAX_SESSIONS_PER_PEER: usize = 4;
 const PROTOCOL_VERSION: u32 = 6;
 const IDENTITY_ENVELOPE_VERSION: u8 = 4;
+const KEY_VALIDATION_SCALAR: [u8; 32] = [0x42; 32];
 
 pub struct AbyssalOpaqueSuite;
 
@@ -258,11 +259,8 @@ pub fn conversation_safety_number(
     first_public_key: Vec<u8>,
     second_public_key: Vec<u8>,
 ) -> Result<String, AbyssalError> {
-    if first_public_key.len() != IDENTITY_PUBLIC_BYTES
-        || second_public_key.len() != IDENTITY_PUBLIC_BYTES
-    {
-        return Err("Identity unavailable".to_string().into());
-    }
+    validate_identity_public_bundle(&first_public_key, None).map_err(AbyssalError::from)?;
+    validate_identity_public_bundle(&second_public_key, None).map_err(AbyssalError::from)?;
     let first_identity = &first_public_key[..IDENTITY_FINGERPRINT_BYTES];
     let second_identity = &second_public_key[..IDENTITY_FINGERPRINT_BYTES];
     let (first, second) = if first_identity <= second_identity {
@@ -565,7 +563,10 @@ impl E2eeSession {
             }),
             sealing: Mutex::new(Some(SealingMaterial { key: *key, context })),
         });
-        if session.public_key() != expected_public_key {
+        let actual_public_key = session.public_key();
+        validate_identity_public_bundle(&actual_public_key, Some(&session.prekey_id()))
+            .map_err(AbyssalError::from)?;
+        if !constant_time_eq(&actual_public_key, &expected_public_key) {
             return Err("Identity unavailable".to_string().into());
         }
         Ok(session)
@@ -628,12 +629,7 @@ impl E2eeSession {
         let mut seen = HashSet::with_capacity(recipients.len());
         for recipient in &recipients {
             validate_username(&recipient.username)?;
-            if recipient.public_key.len() != IDENTITY_PUBLIC_BYTES
-                || recipient.prekey_id.is_empty()
-                || validate_prekey_bundle(
-                    &recipient.prekey_id,
-                    &recipient.public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET],
-                )
+            if validate_identity_public_bundle(&recipient.public_key, Some(&recipient.prekey_id))
                 .is_err()
                 || !seen.insert(peer_key(&recipient.username))
             {
@@ -741,7 +737,6 @@ impl E2eeSession {
         validate_message_context(&chat_id, &message_id, &sender_username)?;
         validate_username(&recipient_username)?;
         if version != PROTOCOL_VERSION
-            || sender_public_key.len() != IDENTITY_PUBLIC_BYTES
             || identity_public.len() != IDENTITY_PUBLIC_BYTES
             || nonce.len() != NONCE_BYTES
             || ciphertext.len() > MAX_PAYLOAD_BYTES + 16
@@ -749,6 +744,8 @@ impl E2eeSession {
         {
             return Err("Payload unavailable".to_string().into());
         }
+        validate_identity_public_bundle(&sender_public_key, None).map_err(AbyssalError::from)?;
+        validate_identity_public_bundle(&identity_public, None).map_err(AbyssalError::from)?;
         if !constant_time_eq(&sender_public_key, &identity_public) {
             return Err("Payload unavailable".to_string().into());
         }
@@ -1263,6 +1260,105 @@ fn signature_input_v6(
     ]))
 }
 
+/// Build the exact protocol-v6 recipient-envelope signature transcript.
+///
+/// This helper is intentionally kept outside the UniFFI surface. The relay
+/// and its adversarial tests use the same canonical construction as clients.
+#[allow(clippy::too_many_arguments)]
+pub fn message_signature_input_v6(
+    version: u32,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    identity_public: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    recipient_username: &str,
+    wrapped_key: &[u8],
+    recipient_prekey_id: &str,
+    is_prekey: bool,
+) -> Result<Vec<u8>, String> {
+    validate_message_context(chat_id, message_id, sender_username)?;
+    if version != PROTOCOL_VERSION
+        || identity_public.len() != IDENTITY_PUBLIC_BYTES
+        || nonce.len() != NONCE_BYTES
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    let envelope = RecipientEnvelope {
+        username: recipient_username.to_string(),
+        wrapped_key: wrapped_key.to_vec(),
+        prekey_id: recipient_prekey_id.to_string(),
+        is_prekey,
+        signature: Vec::new(),
+    };
+    let result = signature_input_v6(
+        version,
+        &message_aad(chat_id, message_id, sender_username),
+        nonce,
+        ciphertext,
+        identity_public,
+        &envelope,
+    );
+    let mut envelope = envelope;
+    envelope.wrapped_key.zeroize();
+    envelope.signature.zeroize();
+    result
+}
+
+/// Verify the exact protocol-v6 recipient-envelope signature transcript.
+///
+/// The relay must verify signatures with the same canonical transcript as the
+/// clients, while still binding the long-term signing key to the account
+/// identity authenticated by the relay before calling this helper.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_message_signature_v6(
+    version: u32,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    identity_public: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    recipient_username: &str,
+    wrapped_key: &[u8],
+    recipient_prekey_id: &str,
+    is_prekey: bool,
+    signature: &[u8],
+) -> Result<(), String> {
+    if version != PROTOCOL_VERSION
+        || identity_public.len() != IDENTITY_PUBLIC_BYTES
+        || nonce.len() != NONCE_BYTES
+        || signature.len() != 64
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    let signature_input = Zeroizing::new(message_signature_input_v6(
+        version,
+        chat_id,
+        message_id,
+        sender_username,
+        identity_public,
+        nonce,
+        ciphertext,
+        recipient_username,
+        wrapped_key,
+        recipient_prekey_id,
+        is_prekey,
+    )?);
+    let verifying_key = Ed25519PublicKey::from_slice(
+        identity_public[32..IDENTITY_FINGERPRINT_BYTES]
+            .try_into()
+            .map_err(|_| "Sender unavailable".to_string())?,
+    )
+    .map_err(|_| "Sender unavailable".to_string())?;
+    let signature =
+        Ed25519Signature::from_slice(signature).map_err(|_| "Payload unavailable".to_string())?;
+    verifying_key
+        .verify(&signature_input, &signature)
+        .map_err(|_| "Payload unavailable".to_string())
+}
+
 fn validate_recipient_envelope(envelope: &RecipientEnvelope) -> Result<(), String> {
     validate_username(&envelope.username).map_err(|_| "Payload unavailable".to_string())?;
     if !valid_prekey_id(&envelope.prekey_id)
@@ -1366,6 +1462,54 @@ fn validate_prekey_bundle(prekey_id: &str, public_key: &[u8]) -> Result<(), Stri
     Ok(())
 }
 
+/// Validate the public identity bundle before storing or routing it.
+///
+/// This is intentionally shared by every protocol boundary.  Besides shape,
+/// Ed25519 encoding, and the one-time-key commitment, it performs a real
+/// X25519 contribution check for the identity, one-time, and fallback keys so
+/// known low-order/non-contributory keys cannot enter relay fanout state.
+pub fn validate_identity_public_bundle(
+    public_key: &[u8],
+    prekey_id: Option<&str>,
+) -> Result<(), String> {
+    if public_key.len() != IDENTITY_PUBLIC_BYTES {
+        return Err("Identity unavailable".to_string());
+    }
+    let identity_curve = &public_key[..32];
+    let identity_ed = &public_key[32..IDENTITY_FINGERPRINT_BYTES];
+    let one_time = &public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET];
+    let fallback = &public_key[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES];
+    if identity_curve.iter().all(|byte| *byte == 0)
+        || identity_ed.iter().all(|byte| *byte == 0)
+        || fallback.iter().all(|byte| *byte == 0)
+    {
+        return Err("Identity unavailable".to_string());
+    }
+    let identity_curve = Curve25519PublicKey::from_slice(identity_curve)
+        .map_err(|_| "Identity unavailable".to_string())?;
+    let one_time = Curve25519PublicKey::from_slice(one_time)
+        .map_err(|_| "Identity unavailable".to_string())?;
+    let fallback = Curve25519PublicKey::from_slice(fallback)
+        .map_err(|_| "Identity unavailable".to_string())?;
+    let validation_secret = Curve25519SecretKey::from_slice(&KEY_VALIDATION_SCALAR);
+    if validation_secret.diffie_hellman(&identity_curve).is_none()
+        || validation_secret.diffie_hellman(&one_time).is_none()
+        || validation_secret.diffie_hellman(&fallback).is_none()
+    {
+        return Err("Identity unavailable".to_string());
+    }
+    let identity_ed: &[u8; 32] = identity_ed
+        .try_into()
+        .map_err(|_| "Identity unavailable".to_string())?;
+    Ed25519PublicKey::from_slice(identity_ed).map_err(|_| "Identity unavailable".to_string())?;
+    if let Some(prekey_id) = prekey_id {
+        validate_prekey_bundle(prekey_id, one_time.as_bytes())?;
+    } else if one_time.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err("Identity unavailable".to_string());
+    }
+    Ok(())
+}
+
 fn validate_identifier(identifier: &[u8]) -> Result<(), String> {
     if !identifier.is_empty() && identifier.len() <= MAX_CONTEXT_BYTES {
         Ok(())
@@ -1375,7 +1519,12 @@ fn validate_identifier(identifier: &[u8]) -> Result<(), String> {
 }
 
 fn validate_username(username: &str) -> Result<(), String> {
-    if !username.is_empty() && username.len() <= 80 && username.is_ascii() {
+    if !username.is_empty()
+        && username.len() <= 80
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         Ok(())
     } else {
         Err("Recipient unavailable".to_string())
@@ -1383,11 +1532,18 @@ fn validate_username(username: &str) -> Result<(), String> {
 }
 
 fn validate_message_context(chat_id: &str, message_id: &str, sender: &str) -> Result<(), String> {
-    if chat_id.is_empty() || chat_id.len() > 128 || message_id.is_empty() || message_id.len() > 128
-    {
+    if !valid_context_identifier(chat_id) || !valid_context_identifier(message_id) {
         return Err("Payload unavailable".to_string());
     }
     validate_username(sender)
+}
+
+fn valid_context_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn protocol_error<E: core::fmt::Debug>(_: E) -> String {
@@ -1718,6 +1874,60 @@ mod tests {
         assert!(validate_prekey_bundle("", &[0_u8; ONE_TIME_KEY_BYTES]).is_err());
         assert!(validate_prekey_bundle("", &public_key).is_err());
         assert!(validate_prekey_bundle("not-the-commitment", &public_key).is_err());
+    }
+
+    #[test]
+    fn identity_bundle_rejects_malformed_long_term_and_fallback_keys() {
+        let session = E2eeSession::create(vec![61; 64]).expect("identity");
+        let public_key = session.public_key();
+        assert!(validate_identity_public_bundle(&public_key, Some(&session.prekey_id())).is_ok());
+
+        let mut zero_curve = public_key.clone();
+        zero_curve[..32].fill(0);
+        assert!(validate_identity_public_bundle(&zero_curve, None).is_err());
+
+        let mut low_order_curve = public_key.clone();
+        low_order_curve[..32].fill(0);
+        low_order_curve[0] = 1;
+        assert!(validate_identity_public_bundle(&low_order_curve, None).is_err());
+
+        let mut low_order_one_time = public_key.clone();
+        low_order_one_time[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET].fill(0);
+        low_order_one_time[ONE_TIME_KEY_OFFSET] = 1;
+        let mut low_order_one_time_key = [0_u8; ONE_TIME_KEY_BYTES];
+        low_order_one_time_key[0] = 1;
+        let low_order_prekey = prekey_id_for_public(&low_order_one_time_key);
+        assert!(
+            validate_identity_public_bundle(&low_order_one_time, Some(&low_order_prekey)).is_err()
+        );
+
+        let mut low_order_fallback = public_key.clone();
+        low_order_fallback[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES].fill(0);
+        low_order_fallback[FALLBACK_KEY_OFFSET] = 1;
+        assert!(validate_identity_public_bundle(&low_order_fallback, None).is_err());
+
+        let mut zero_ed = public_key.clone();
+        zero_ed[32..IDENTITY_FINGERPRINT_BYTES].fill(0);
+        assert!(validate_identity_public_bundle(&zero_ed, None).is_err());
+
+        let mut zero_fallback = public_key.clone();
+        zero_fallback[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES].fill(0);
+        assert!(validate_identity_public_bundle(&zero_fallback, None).is_err());
+
+        let mut bad_prekey = public_key;
+        bad_prekey[ONE_TIME_KEY_OFFSET] ^= 1;
+        assert!(validate_identity_public_bundle(&bad_prekey, Some(&session.prekey_id())).is_err());
+    }
+
+    #[test]
+    fn context_usernames_reject_ambiguous_or_injection_prone_values() {
+        assert!(validate_username("Alice_01").is_ok());
+        assert!(validate_username("Alice Bob").is_err());
+        assert!(validate_username("Alice\nBob").is_err());
+        assert!(validate_username("Alice\"Bob").is_err());
+        assert!(validate_message_context("room_1", "message-1", "Alice").is_ok());
+        assert!(validate_message_context("room 1", "message-1", "Alice").is_err());
+        assert!(validate_message_context("room_1", "message 1", "Alice").is_err());
     }
 
     #[test]

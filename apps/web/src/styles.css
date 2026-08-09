@@ -38,6 +38,11 @@ body,
   overflow: hidden;
 }
 
+html.abyssal-page-hidden body {
+  visibility: hidden;
+  background: #04060a;
+}
+
 body {
   background: var(--bg);
 }

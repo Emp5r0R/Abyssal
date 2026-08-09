@@ -225,9 +225,7 @@ data class RoomChange(
 )
 
 data class DisguiseSettings(
-    val isDisguised: Boolean = false,
-    val pin: String = "",
-    val duressPin: String = ""
+    val isDisguised: Boolean = false
 )
 
 data class UserPresence(

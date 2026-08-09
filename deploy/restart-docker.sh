@@ -5,8 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "$SCRIPT_DIR/remote-env.sh"
 
-ssh \
-  -o StrictHostKeyChecking=accept-new \
-  -i "$ABYSSAL_SSH_KEY" \
+printf -v REMOTE_COMMAND 'cd %q && bash deploy/server-restart.sh' \
+  "$ABYSSAL_REMOTE_DIR"
+
+ssh "${ABYSSAL_SSH_OPTIONS[@]}" \
   "$ABYSSAL_SSH_HOST" \
-  "cd '$ABYSSAL_REMOTE_DIR' && bash deploy/server-restart.sh"
+  "$REMOTE_COMMAND"

@@ -1,0 +1,5 @@
+12f747904ec0d65ed6df0b617dd1749d1657d4cf8e86ffed04ced1fcb18df11b  apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm
+7083bf7e1363a9f9dde3915eff2c57cd9f96f84aae5d055807b65ec1542159af  android/app/src/main/jniLibs/arm64-v8a/libabyssal_core.so
+b4b0ae481e2c27a8ec2ed9e868ce86dd5dbe3c77653ef1a3c13c401a4d3b97f6  android/app/src/main/jniLibs/armeabi-v7a/libabyssal_core.so
+65489b1ad30d56d797c841e4f03917e0131113026c8a3730869b9fb04183e9d5  android/app/src/main/jniLibs/x86/libabyssal_core.so
+0d3d88c186fc5d803127de727614b73ccfbe43c526b2c6534200b968df33f590  android/app/src/main/jniLibs/x86_64/libabyssal_core.so

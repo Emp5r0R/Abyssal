@@ -16,6 +16,7 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType
@@ -238,6 +239,25 @@ class EncryptedAttachmentService(
         downloaded
     }
 
+    override suspend fun deleteUploadedAttachment(attachmentId: String): Boolean = withContext(Dispatchers.IO) {
+        val session = nodeConfigService.getActiveSession() ?: return@withContext false
+        val normalizedAttachmentId = normalizeAttachmentId(attachmentId) ?: return@withContext false
+        val request = Request.Builder()
+            .url("${session.endpoint.apiBaseUrl}/v1/attachment/$normalizedAttachmentId")
+            .header("Authorization", "Bearer ${session.token}")
+            .delete()
+            .build()
+        try {
+            awaitHttpResponse(callFactory.newCall(request)) { response ->
+                response.isSuccessful || response.code == 404
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     override suspend fun completeAttachmentDownload(attachmentId: String, claim: String): Boolean =
         attachmentClaimRequest(attachmentId, claim, complete = true)
 
@@ -275,6 +295,7 @@ class EncryptedAttachmentService(
         attachment: DecryptedAttachment,
         outputUri: Uri
     ): Boolean = withContext(Dispatchers.IO) {
+        val operationJob = currentCoroutineContext()[kotlinx.coroutines.Job]
         AttachmentDocumentWriter.writeIfNonEmptyOrDelete(
             bytes = attachment.bytes,
             openOutput = {
@@ -283,7 +304,8 @@ class EncryptedAttachmentService(
             },
             deleteOutput = {
                 runCatching { appContext.contentResolver.delete(outputUri, null, null) }
-            }
+            },
+            shouldCancel = { operationJob?.isActive == false }
         )
     }
 

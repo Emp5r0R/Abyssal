@@ -8,7 +8,7 @@ Abyssal releases require a clean full test run, a stable Android signing key, ve
 ./scripts/create-android-release-key.sh
 ```
 
-This creates an ignored keystore under `.secrets/` and an ignored `deploy/release.env`. Back up both in an encrypted offline location. Never commit either file. Android updates must use the same signing key.
+This creates an ignored keystore under `.secrets/` and an ignored `deploy/release.env`. The environment file is a strict data-only file with exactly four literal assignments; it is never sourced or executed. Back up both in an encrypted offline location. Never commit either file. Android updates must use the same signing key.
 
 ## Verification
 
@@ -16,7 +16,7 @@ This creates an ignored keystore under `.secrets/` and an ignored `deploy/releas
 ./check.sh all
 ```
 
-The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/debug and release builds, and a live disposable-relay integration test.
+The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without packaging an APK or AAB, and a live disposable-relay integration test. Android packaging remains an explicit release-only step.
 
 ## Signed Android artifacts
 
@@ -24,7 +24,7 @@ The command checks shell syntax and repository whitespace, then runs web lint/te
 ANDROID_SDK_ROOT="$HOME/Android/Sdk" ./scripts/build-android-release.sh
 ```
 
-The script requires `deploy/release.env`, rejects generated crypto bindings that do not match the recorded Rust-source digest, verifies the APK signature with `apksigner`, and writes the universal APK, AAB, and SHA-256 manifest to ignored `build-outputs/`.
+The script requires `deploy/release.env`, validates that the environment and keystore are regular files owned by the current user with no group/world permissions, rejects generated crypto bindings that do not match the recorded Rust-source digest, verifies the APK signature with `apksigner`, and writes the universal APK, AAB, and SHA-256 manifest to ignored `build-outputs/`. Passwords and paths are parsed as literal data, so shell substitutions, backticks, and semicolons are never evaluated.
 
 ## Publish
 
