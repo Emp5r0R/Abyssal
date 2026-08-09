@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WASM_BINDGEN_BIN="${WASM_BINDGEN_BIN:-$(command -v wasm-bindgen || true)}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ROOT_DIR/android-sdk/ndk/27.3.13750724}"
 LLVM_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
@@ -9,6 +9,41 @@ EXPECTED_RUST_VERSION="1.97.1"
 EXPECTED_WASM_BINDGEN_VERSION="0.2.126"
 EXPECTED_CARGO_NDK_VERSION="4.1.2"
 EXPECTED_NDK_REVISION="27.3.13750724"
+
+# Rust embeds source paths in panic/backtrace metadata.  The checked-in WASM
+# and native libraries must be identical when generated on a developer host
+# and on a clean CI runner, so intentionally replace all ambient Rust flags
+# with a fixed, path-independent set of remapping flags.
+resolve_path() {
+  local path="$1"
+  local base="$2"
+  if [[ "$path" != /* ]]; then
+    path="$base/$path"
+  fi
+  if [[ -d "$path" ]]; then
+    (cd -- "$path" && pwd -P)
+  else
+    realpath -m -- "$path"
+  fi
+}
+
+INVOCATION_DIR="$(pwd -P)"
+EFFECTIVE_CARGO_HOME="$(resolve_path "${CARGO_HOME:-${HOME:-$ROOT_DIR}/.cargo}" "$INVOCATION_DIR")"
+EFFECTIVE_RUSTUP_HOME="$(resolve_path "${RUSTUP_HOME:-${HOME:-$ROOT_DIR}/.rustup}" "$INVOCATION_DIR")"
+ANDROID_NDK_HOME="$(resolve_path "$ANDROID_NDK_HOME" "$ROOT_DIR")"
+
+remap_flags=(
+  "--remap-path-prefix=${ROOT_DIR}=/abyssal/src"
+  "--remap-path-prefix=${EFFECTIVE_CARGO_HOME}=/abyssal/cargo"
+  "--remap-path-prefix=${EFFECTIVE_RUSTUP_HOME}=/abyssal/rustup"
+  "--remap-path-prefix=${ANDROID_NDK_HOME}=/abyssal/android-ndk"
+)
+CARGO_ENCODED_RUSTFLAGS="${remap_flags[0]}"
+for ((flag_index = 1; flag_index < ${#remap_flags[@]}; flag_index++)); do
+  CARGO_ENCODED_RUSTFLAGS+=$'\x1f'"${remap_flags[$flag_index]}"
+done
+export CARGO_ENCODED_RUSTFLAGS
+unset RUSTFLAGS
 
 if [[ -z "$WASM_BINDGEN_BIN" && -x "${HOME:-}/.cargo/bin/wasm-bindgen" ]]; then
   WASM_BINDGEN_BIN="$HOME/.cargo/bin/wasm-bindgen"
@@ -119,6 +154,25 @@ for artifact in \
     echo "Generated crypto artifact does not contain protocol v6: $artifact" >&2
     exit 1
   fi
+done
+
+for build_path in \
+  "$ROOT_DIR" \
+  "$EFFECTIVE_CARGO_HOME" \
+  "$EFFECTIVE_RUSTUP_HOME" \
+  "$ANDROID_NDK_HOME"; do
+  # A path of / would match every artifact byte and is not a useful remap
+  # target; the configured project/toolchain paths are always more specific.
+  [[ -n "$build_path" && "$build_path" != "/" ]] || continue
+  for artifact in \
+    "$ROOT_DIR"/apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
+    "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
+    if grep -aFq -- "$build_path" "$artifact"; then
+      printf 'Generated crypto artifact leaks build path %s: %s\n' \
+        "$build_path" "$artifact" >&2
+      exit 1
+    fi
+  done
 done
 
 (
