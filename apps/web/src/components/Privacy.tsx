@@ -1,21 +1,36 @@
 import { Delete, Divide, Equal, Minus, Plus, X } from "lucide-react";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { evaluateExpression } from "../security/calculator";
+import type { PrivacyPinGate } from "../security/privacyPin";
 import { Dialog, Field } from "./Ui";
 
 export function PinSetup({
   onComplete,
 }: {
-  onComplete: (pin: string, duressPin: string) => void;
+  onComplete: (pin: string, duressPin: string) => Promise<void>;
 }) {
   const [pin, setPin] = useState("");
   const [confirm, setConfirm] = useState("");
   const [duress, setDuress] = useState("");
-  const valid = /^\d{4,12}$/.test(pin) && pin === confirm && (!duress || (/^\d{4,12}$/.test(duress) && duress !== pin));
+  const [busy, setBusy] = useState(false);
+  const valid = /^\d{6,12}$/.test(pin) && pin === confirm && (!duress || (/^\d{6,12}$/.test(duress) && duress !== pin));
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (valid) onComplete(pin, duress);
+    if (!valid || busy) return;
+    const coverPin = pin;
+    const duressPin = duress;
+    setPin("");
+    setConfirm("");
+    setDuress("");
+    setBusy(true);
+    try {
+      await onComplete(coverPin, duressPin);
+    } catch {
+      // Keep the same non-specific failure surface as account entry.
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -23,15 +38,15 @@ export function PinSetup({
       title="Set privacy cover PIN"
       description="PIN exists only in this browser tab. Remember it. Reloading clears session."
       actions={
-        <button className="primary-button" form="pin-setup-form" disabled={!valid} type="submit">
-          ENABLE COVER
+        <button className="primary-button" form="pin-setup-form" disabled={!valid || busy} type="submit">
+          {busy ? "SECURING" : "ENABLE COVER"}
         </button>
       }
     >
       <form id="pin-setup-form" className="stack-form" onSubmit={submit}>
-        <Field label="Cover PIN" type="password" inputMode="numeric" autoComplete="off" maxLength={12} value={pin} onChange={(event) => setPin(digits(event.target.value))} />
-        <Field label="Confirm PIN" type="password" inputMode="numeric" autoComplete="off" maxLength={12} value={confirm} onChange={(event) => setConfirm(digits(event.target.value))} />
-        <Field label="Duress PIN (optional)" type="password" inputMode="numeric" autoComplete="off" maxLength={12} value={duress} onChange={(event) => setDuress(digits(event.target.value))} />
+        <Field label="Cover PIN" type="password" inputMode="numeric" autoComplete="off" minLength={6} maxLength={12} value={pin} onChange={(event) => setPin(digits(event.target.value))} />
+        <Field label="Confirm PIN" type="password" inputMode="numeric" autoComplete="off" minLength={6} maxLength={12} value={confirm} onChange={(event) => setConfirm(digits(event.target.value))} />
+        <Field label="Duress PIN (optional)" type="password" inputMode="numeric" autoComplete="off" minLength={6} maxLength={12} value={duress} onChange={(event) => setDuress(digits(event.target.value))} />
       </form>
     </Dialog>
   );
@@ -47,61 +62,69 @@ const KEYS = [
 ];
 
 export function CalculatorCover({
-  pin,
-  duressPin,
+  pinGate,
   onUnlock,
   onDuress,
 }: {
-  pin: string;
-  duressPin: string;
+  pinGate: PrivacyPinGate;
   onUnlock: () => void;
   onDuress: () => void;
 }) {
-  const [input, setInput] = useState("");
   const [display, setDisplay] = useState("0");
+  const inputRef = useRef("");
+  const mountedRef = useRef(true);
 
   useEffect(() => {
     const previous = document.title;
     document.title = "Calculator";
-    return () => { document.title = previous; };
+    return () => {
+      mountedRef.current = false;
+      inputRef.current = "";
+      document.title = previous;
+    };
   }, []);
 
-  const press = (key: string) => {
+  const replaceInput = (value: string) => {
+    inputRef.current = value;
+  };
+
+  const press = async (key: string) => {
     if (key === "C") {
-      setInput("");
+      replaceInput("");
       setDisplay("0");
       return;
     }
     if (key === "DEL") {
-      const next = input.slice(0, -1);
-      setInput(next);
+      const next = inputRef.current.slice(0, -1);
+      replaceInput(next);
       setDisplay(next || "0");
       return;
     }
     if (key === "=") {
-      if (input === pin) {
-        setInput("");
+      const submitted = inputRef.current;
+      replaceInput("");
+      if (/^\d{6,12}$/u.test(submitted)) {
         setDisplay("0");
-        onUnlock();
-        return;
-      }
-      if (duressPin && input === duressPin) {
-        setInput("");
-        setDisplay("0");
-        onDuress();
-        return;
+        const result = await pinGate.verify(submitted);
+        if (!mountedRef.current) return;
+        if (result === "unlock" || result === "duress") {
+          setDisplay("0");
+          if (result === "duress") onDuress();
+          else onUnlock();
+          return;
+        }
       }
       try {
-        const result = evaluateExpression(input);
-        setInput(result);
+        const result = evaluateExpression(submitted);
+        replaceInput(result);
         setDisplay(result);
       } catch {
-        setInput("");
+        replaceInput("");
         setDisplay("Error");
       }
       return;
     }
-    if (input.length >= 40) return;
+    if (inputRef.current.length >= 40) return;
 
     let append = key;
     if (key === "sin") append = "sin(";
@@ -112,8 +135,8 @@ export function CalculatorCover({
     else if (key === "√") append = "sqrt(";
     else if (key === "x²") append = "^2";
 
-    const next = input + append;
-    setInput(next);
+    const next = inputRef.current + append;
+    replaceInput(next);
     setDisplay(next);
   };
 
@@ -146,7 +169,7 @@ export function CalculatorCover({
                   : "number"
               }
               aria-label={calculatorLabel(key)}
-              onClick={() => press(key)}
+              onClick={() => void press(key)}
             >
               {calculatorIcon(key) ?? key}
             </button>
@@ -187,4 +210,3 @@ function calculatorIcon(key: string) {
 function calculatorLabel(key: string): string {
   return ({ "/": "Divide", "*": "Multiply", "-": "Subtract", "+": "Add", "=": "Equals", "DEL": "Delete", C: "Clear" } as Record<string, string>)[key] ?? key;
 }
-

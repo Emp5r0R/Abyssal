@@ -16,8 +16,8 @@ docker compose -f deploy/docker-compose.yml create --build --remove-orphans mira
 container_id="$(docker compose -f deploy/docker-compose.yml ps -aq mirage-server)"
 [[ -n "$container_id" ]] || { echo "Abyssal container was not created." >&2; exit 1; }
 echo "Invite codes print once below. They cannot be retrieved after this attachment closes."
-timeout 9s docker start --attach --sig-proxy=false "$container_id" || status=$?
-if [[ ${status:-0} -ne 0 && ${status:-0} -ne 124 ]]; then
+timeout --signal=KILL 9s docker start --attach "$container_id" || status=$?
+if [[ ${status:-0} -ne 0 && ${status:-0} -ne 137 ]]; then
   exit "$status"
 fi
 docker compose -f deploy/docker-compose.yml ps

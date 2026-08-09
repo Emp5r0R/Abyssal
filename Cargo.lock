@@ -1024,6 +1024,7 @@ dependencies = [
  "abyssal-core",
  "axum",
  "base64",
+ "ed25519-dalek",
  "futures-util",
  "hmac",
  "rand",

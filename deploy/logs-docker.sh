@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/remote-env.sh"
 
-ssh \
-  -o StrictHostKeyChecking=accept-new \
-  -i "$ABYSSAL_SSH_KEY" \
+printf -v REMOTE_COMMAND 'cd %q && bash deploy/server-status.sh' \
+  "$ABYSSAL_REMOTE_DIR"
+
+ssh "${ABYSSAL_SSH_OPTIONS[@]}" \
   "$ABYSSAL_SSH_HOST" \
-  "cd '$ABYSSAL_REMOTE_DIR' && docker compose -f deploy/docker-compose.yml ps && curl --fail --silent http://127.0.0.1:4020/health"
+  "$REMOTE_COMMAND"

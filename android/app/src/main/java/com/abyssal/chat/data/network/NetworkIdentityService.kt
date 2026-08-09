@@ -22,6 +22,112 @@ import uniffi.abyssal_core.opaqueClientFinishLogin
 import uniffi.abyssal_core.opaqueClientFinishRegistration
 import uniffi.abyssal_core.opaqueClientStart
 
+internal data class ValidatedOpaqueStartResponse(
+    val handshakeId: String,
+    val mode: String,
+    val nodeId: String,
+    val responseB64: String,
+    val identityPublicB64: String?,
+    val identityPrekeyId: String?,
+    val identityEnvelopeB64: String?
+)
+
+internal data class ValidatedAccountResponse(
+    val created: Boolean,
+    val token: String,
+    val nodeId: String,
+    val username: String,
+    val maxRoomsPerUser: Int,
+    val sessionInactivitySec: Int,
+    val identityPublicB64: String,
+    val identityPrekeyId: String
+)
+
+internal fun validateOpaqueStartResponse(json: JSONObject): ValidatedOpaqueStartResponse? {
+    if (!json.hasOnlyKeys(OPAQUE_START_RESPONSE_KEYS)) return null
+    if (json.strictBoolean("accepted") != true || !json.isNullish("error")) return null
+    val mode = json.strictString("mode")?.takeIf { it == "registration" || it == "login" }
+        ?: return null
+    val handshakeId = json.strictString("handshake_id")?.takeIf(UUID_V4_REGEX::matches)
+        ?: return null
+    val nodeId = json.strictString("node_id")?.takeIf(NODE_ID_REGEX::matches) ?: return null
+    val responseB64 = json.strictString("response_b64")
+        ?.takeIf { isCanonicalBase64Url(it, 1, MAX_OPAQUE_RESPONSE_BYTES) }
+        ?: return null
+
+    var identityPublicB64: String? = null
+    var identityPrekeyId: String? = null
+    var identityEnvelopeB64: String? = null
+    if (mode == "registration") {
+        if (
+            !json.isNullish("identity_public_b64") ||
+            !json.isNullish("identity_prekey_id") ||
+            !json.isNullish("identity_envelope_b64")
+        ) return null
+    } else {
+        identityPublicB64 = json.strictString("identity_public_b64")
+        identityPrekeyId = json.strictString("identity_prekey_id")
+        identityEnvelopeB64 = json.strictString("identity_envelope_b64")
+    }
+    if (mode == "login" && (
+        identityPublicB64 == null ||
+        !isCanonicalBase64Url(identityPublicB64, IDENTITY_PUBLIC_KEY_BYTES, IDENTITY_PUBLIC_KEY_BYTES) ||
+        identityPrekeyId?.matches(PREKEY_ID_REGEX) != true ||
+        identityEnvelopeB64 == null ||
+        !isCanonicalBase64Url(identityEnvelopeB64, 1, MAX_IDENTITY_ENVELOPE_BYTES)
+    )) return null
+    return ValidatedOpaqueStartResponse(
+        handshakeId,
+        mode,
+        nodeId,
+        responseB64,
+        identityPublicB64,
+        identityPrekeyId,
+        identityEnvelopeB64
+    )
+}
+
+internal fun validateAcceptedAccountResponse(
+    json: JSONObject,
+    expectedNodeId: String,
+    expectedCreated: Boolean,
+    expectedPrekeyId: String
+): ValidatedAccountResponse? {
+    if (!json.hasOnlyKeys(ACCOUNT_RESPONSE_KEYS)) return null
+    if (json.strictBoolean("accepted") != true || !json.isNullish("error")) return null
+    val created = json.strictBoolean("created")?.takeIf { it == expectedCreated } ?: return null
+    val token = json.strictString("token")?.takeIf(UUID_V4_REGEX::matches) ?: return null
+    val nodeId = json.strictString("node_id")
+        ?.takeIf { NODE_ID_REGEX.matches(it) && it == expectedNodeId }
+        ?: return null
+    val username = json.strictString("username")?.takeIf(USERNAME_REGEX::matches) ?: return null
+    val maxRooms = json.strictInt("max_rooms_per_user")
+        ?.takeIf { it in MIN_MAX_ROOMS_PER_USER..MAX_MAX_ROOMS_PER_USER }
+        ?: return null
+    val inactivity = json.strictInt("session_inactivity_sec")
+        ?.takeIf { it in MIN_SESSION_INACTIVITY_SEC..MAX_SESSION_INACTIVITY_SEC }
+        ?: return null
+    val publicKeyB64 = json.strictString("identity_public_b64")
+        ?.takeIf { isCanonicalBase64Url(it, IDENTITY_PUBLIC_KEY_BYTES, IDENTITY_PUBLIC_KEY_BYTES) }
+        ?: return null
+    val prekeyId = json.strictString("identity_prekey_id")
+        ?.takeIf { PREKEY_ID_REGEX.matches(it) && it == expectedPrekeyId }
+        ?: return null
+    json.strictString("identity_envelope_b64")
+        ?.takeIf { isCanonicalBase64Url(it, 1, MAX_IDENTITY_ENVELOPE_BYTES) }
+        ?: return null
+    return ValidatedAccountResponse(
+        created,
+        token,
+        nodeId,
+        username,
+        maxRooms,
+        inactivity,
+        publicKeyB64,
+        prekeyId
+    )
+}
+
 class NetworkIdentityService(
     client: OkHttpClient,
     private val payloadCipher: InMemoryPayloadCipher,
@@ -52,18 +158,11 @@ class NetworkIdentityService(
                     .put("registration_request_b64", encode(opaque.registrationRequest))
                     .put("credential_request_b64", encode(opaque.credentialRequest))
             ) ?: return@withContext rejected()
-            if (!start.optBoolean("accepted", false)) return@withContext rejected()
-
-            val handshakeId = start.optString("handshake_id")
-                .takeIf { HANDSHAKE_ID_REGEX.matches(it) }
-                ?: return@withContext rejected()
-            val mode = start.optString("mode")
-            val nodeId = start.optString("node_id")
-                .takeIf { isBoundedAscii(it, MAX_NODE_ID_CHARS) }
-                ?: return@withContext rejected()
-            responseBytes = decode(start.optString("response_b64")).also {
-                require(it.isNotEmpty() && it.size <= MAX_OPAQUE_RESPONSE_BYTES)
-            }
+            val validatedStart = validateOpaqueStartResponse(start) ?: return@withContext rejected()
+            val handshakeId = validatedStart.handshakeId
+            val mode = validatedStart.mode
+            val nodeId = validatedStart.nodeId
+            responseBytes = decodeIdentityBase64(validatedStart.responseB64)
             context = identityContext(nodeId, code)
 
             val finishBody = JSONObject().put("handshake_id", handshakeId)
@@ -92,21 +191,18 @@ class NetworkIdentityService(
                     }
                 }
                 "login" -> {
-                    val serverPrekeyId = start.optString("identity_prekey_id")
-                        .takeIf { it.matches(PREKEY_ID_REGEX) }
+                    val serverPrekeyId = validatedStart.identityPrekeyId
                         ?: return@withContext rejectedAndClear()
                     var identityPublic: ByteArray? = null
                     var identityEnvelope: ByteArray? = null
                     try {
-                        val identityPublicBytes = decode(start.optString("identity_public_b64"))
-                        if (identityPublicBytes.size != IDENTITY_PUBLIC_KEY_BYTES) {
-                            return@withContext rejectedAndClear()
-                        }
+                        val identityPublicBytes = decodeIdentityBase64(
+                            validatedStart.identityPublicB64 ?: return@withContext rejectedAndClear()
+                        )
                         identityPublic = identityPublicBytes
-                        val identityEnvelopeBytes = decode(start.optString("identity_envelope_b64"))
-                        if (identityEnvelopeBytes.isEmpty() || identityEnvelopeBytes.size > MAX_IDENTITY_ENVELOPE_BYTES) {
-                            return@withContext rejectedAndClear()
-                        }
+                        val identityEnvelopeBytes = decodeIdentityBase64(
+                            validatedStart.identityEnvelopeB64 ?: return@withContext rejectedAndClear()
+                        )
                         identityEnvelope = identityEnvelopeBytes
                         val result = opaqueClientFinishLogin(
                             passwordBytes,
@@ -141,9 +237,15 @@ class NetworkIdentityService(
 
             val finish = postJson(endpoint, "/v2/account/finish", finishBody)
                 ?: return@withContext rejectedAndClear()
-            if (!finish.optBoolean("accepted", false)) return@withContext rejectedAndClear()
+            val expectedPrekeyId = payloadCipher.prekeyId()
+            val validatedFinish = validateAcceptedAccountResponse(
+                json = finish,
+                expectedNodeId = nodeId,
+                expectedCreated = mode == "registration",
+                expectedPrekeyId = expectedPrekeyId
+            ) ?: return@withContext rejectedAndClear()
             val publicKey = payloadCipher.publicKey()
-            val serverPublicKey = decode(finish.optString("identity_public_b64"))
+            val serverPublicKey = decodeIdentityBase64(validatedFinish.identityPublicB64)
             if (!publicKey.contentEquals(serverPublicKey)) {
                 publicKey.fill(0)
                 serverPublicKey.fill(0)
@@ -151,7 +253,7 @@ class NetworkIdentityService(
             }
             serverPublicKey.fill(0)
             try {
-                parseAccepted(finish, publicKey)
+                parseAccepted(validatedFinish, publicKey)
             } catch (_: Exception) {
                 publicKey.fill(0)
                 throw IllegalArgumentException("Identity unavailable")
@@ -235,29 +337,20 @@ class NetworkIdentityService(
         }
     }
 
-    private fun parseAccepted(json: JSONObject, publicKey: ByteArray): IdentityValidationResult {
-        val token = json.optString("token").takeIf { isBoundedAscii(it, MAX_TOKEN_CHARS) }
-            ?: throw IllegalArgumentException("Identity unavailable")
-        val nodeId = json.optString("node_id").takeIf { isBoundedAscii(it, MAX_NODE_ID_CHARS) }
-            ?: throw IllegalArgumentException("Identity unavailable")
-        val username = json.optString("username").takeIf { isBoundedAscii(it, MAX_USERNAME_CHARS) }
-            ?: throw IllegalArgumentException("Identity unavailable")
+    private fun parseAccepted(
+        response: ValidatedAccountResponse,
+        publicKey: ByteArray
+    ): IdentityValidationResult {
         return IdentityValidationResult(
             accepted = true,
-            created = json.optBoolean("created", false),
-            token = token,
-            nodeId = nodeId,
-            username = username,
-            maxRoomsPerUser = json
-                .optInt("max_rooms_per_user", DEFAULT_MAX_ROOMS_PER_USER)
-                .coerceIn(MIN_MAX_ROOMS_PER_USER, MAX_MAX_ROOMS_PER_USER),
-            sessionInactivitySec = json
-                .optInt("session_inactivity_sec", DEFAULT_SESSION_INACTIVITY_SEC)
-                .coerceIn(MIN_SESSION_INACTIVITY_SEC, MAX_SESSION_INACTIVITY_SEC),
+            created = response.created,
+            token = response.token,
+            nodeId = response.nodeId,
+            username = response.username,
+            maxRoomsPerUser = response.maxRoomsPerUser,
+            sessionInactivitySec = response.sessionInactivitySec,
             publicKey = publicKey,
-            prekeyId = json.optString("identity_prekey_id")
-                .takeIf { it.matches(PREKEY_ID_REGEX) }
-                ?: throw IllegalArgumentException("Identity unavailable")
+            prekeyId = response.identityPrekeyId
         )
     }
 
@@ -278,34 +371,72 @@ class NetworkIdentityService(
     }
 
     private companion object {
-        const val MIN_SESSION_INACTIVITY_SEC = 60
-        const val MAX_SESSION_INACTIVITY_SEC = 24 * 60 * 60
-        const val DEFAULT_SESSION_INACTIVITY_SEC = 15 * 60
-        const val MIN_MAX_ROOMS_PER_USER = 1
-        const val MAX_MAX_ROOMS_PER_USER = 100
-        const val DEFAULT_MAX_ROOMS_PER_USER = 5
         const val MIN_PASSWORD_CHARS = 8
         const val MAX_PASSWORD_CHARS = 512
         const val MAX_CODE_CHARS = 128
-        const val MAX_NODE_ID_CHARS = 128
-        const val MAX_USERNAME_CHARS = 80
-        const val MAX_TOKEN_CHARS = 128
-        const val IDENTITY_PUBLIC_KEY_BYTES = 128
-        const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
-        const val MAX_OPAQUE_RESPONSE_BYTES = 64 * 1024
         const val MAX_ACCOUNT_RESPONSE_BYTES = 1 * 1024 * 1024L
-        val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
-        val HANDSHAKE_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,128}$")
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
-        fun isBoundedAscii(value: String, maxLength: Int): Boolean =
-            value.length in 1..maxLength && value.all { it.code in 0x20..0x7e }
-
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-
-        fun decode(value: String): ByteArray {
-            require(value.isNotBlank())
-            return Base64.getUrlDecoder().decode(value)
-        }
     }
+}
+
+private const val MIN_SESSION_INACTIVITY_SEC = 60
+private const val MAX_SESSION_INACTIVITY_SEC = 24 * 60 * 60
+private const val MIN_MAX_ROOMS_PER_USER = 1
+private const val MAX_MAX_ROOMS_PER_USER = 100
+private const val IDENTITY_PUBLIC_KEY_BYTES = 128
+private const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
+private const val MAX_OPAQUE_RESPONSE_BYTES = 64 * 1024
+private val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
+private val UUID_V4_REGEX = Regex(
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+private val NODE_ID_REGEX = Regex("^[A-Za-z0-9._:-]{1,128}$")
+private val USERNAME_REGEX = Regex("^[A-Za-z0-9_-]{1,80}$")
+private val BASE64_URL_REGEX = Regex("^[A-Za-z0-9_-]+$")
+private val OPAQUE_START_RESPONSE_KEYS = setOf(
+    "accepted", "mode", "handshake_id", "response_b64", "node_id",
+    "identity_public_b64", "identity_prekey_id", "identity_envelope_b64", "error"
+)
+private val ACCOUNT_RESPONSE_KEYS = setOf(
+    "accepted", "created", "token", "node_id", "username", "max_rooms_per_user",
+    "session_inactivity_sec", "identity_public_b64", "identity_prekey_id",
+    "identity_envelope_b64", "error"
+)
+
+private fun JSONObject.hasOnlyKeys(allowed: Set<String>): Boolean =
+    keys().asSequence().all { it in allowed }
+
+private fun JSONObject.isNullish(name: String): Boolean = !has(name) || isNull(name)
+
+private fun JSONObject.strictBoolean(name: String): Boolean? =
+    if (!has(name) || isNull(name)) null else opt(name) as? Boolean
+
+private fun JSONObject.strictString(name: String): String? =
+    if (!has(name) || isNull(name)) null else opt(name) as? String
+
+private fun JSONObject.strictInt(name: String): Int? {
+    if (!has(name) || isNull(name)) return null
+    return when (val value = opt(name)) {
+        is Int -> value
+        is Long -> value.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+        else -> null
+    }
+}
+
+private fun isCanonicalBase64Url(value: String, minBytes: Int, maxBytes: Int): Boolean {
+    if (!BASE64_URL_REGEX.matches(value) || value.length > ((maxBytes + 2) / 3) * 4) return false
+    val decoded = runCatching { decodeIdentityBase64(value) }.getOrNull() ?: return false
+    return try {
+        decoded.size in minBytes..maxBytes &&
+            Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) == value
+    } finally {
+        decoded.fill(0)
+    }
+}
+
+private fun decodeIdentityBase64(value: String): ByteArray {
+    require(value.isNotBlank())
+    return Base64.getUrlDecoder().decode(value)
 }

@@ -34,6 +34,7 @@ Root `package.json` owns the npm workspace. Root `Cargo.toml` and `Cargo.lock` o
 - Files, images, and videos may only be written to disk through an explicit user save flow. Android and web authenticate and decrypt attachments in memory, then save the original bytes under a sanitized original filename. One-time attachments remain view-only and expose no save control.
 - Attachment plaintext limits are 20 MiB for images, 100 MiB for videos, and 200 MiB for other files. Protocol-v6 attachments are stateless binary XChaCha20-Poly1305 blobs: one version byte, a 24-byte nonce, ciphertext, and a 16-byte tag, so the wire body is the plaintext size plus exactly 41 bytes. The bulk key is delivered inside the encrypted, ratcheted message metadata; the relay stores and streams only the opaque blob. A default 320 MiB encrypted-RAM quota applies per account in addition to the global RAM limit, with bounded upload and download concurrency.
 - `Delete after download` and one-time attachments are destructive only after the client receives the exact non-empty ciphertext, authenticates and decrypts it, then explicitly completes its recipient-bound claim. In a DM each intended recipient gets one completion; in a room the eligible recipients are snapshotted at upload and each can complete once. Failed, truncated, interrupted, cancelled, or unauthenticated transfers release the claim for retry; concurrent claims by the same recipient are rejected; and the owner can preview their upload without consuming a recipient claim. The relay removes the encrypted blob and releases quota only after every eligible recipient completes, or when the configured retention policy expires it.
+- Attachment upload cleanup is owner-scoped: if metadata encryption or local WebSocket enqueue fails after blob upload, the client immediately deletes the orphaned relay blob and releases its RAM quota. The cleanup endpoint accepts only the uploading account; it cannot delete another account's attachment. A connection loss after local enqueue but before relay receipt cannot be proven without a protocol acknowledgement, so that edge case remains bounded by attachment quota, configured expiry, restart, or wipe.
 - There is no Room, SQLite, DataStore, SharedPreferences, or app-owned message database.
 - Bundled static UI assets, including GIF reactions, are packaged with the APK. They are not user messages or account/session state.
 - The web client never calls `localStorage`, `sessionStorage`, IndexedDB, Cache Storage, cookies, or a service worker. Account state, messages, PINs, decrypted media URLs, and crypto keys live in the current JavaScript process only. Relay responses use `Cache-Control: no-store`.
@@ -95,7 +96,7 @@ Then build and verify the signed universal APK and AAB:
 ANDROID_SDK_ROOT="$HOME/Android/Sdk" ./scripts/build-android-release.sh
 ```
 
-The ignored `deploy/release.env` and `.secrets/abyssal-release.jks` are both required to sign future compatible updates. Full release steps are in [docs/RELEASE.md](docs/RELEASE.md).
+The ignored `deploy/release.env` and `.secrets/abyssal-release.jks` are both required to sign future compatible updates. `deploy/release.env` is literal data with exactly four signing assignments; the build parses it without shell evaluation and requires owner-only permissions on both files. Full release steps are in [docs/RELEASE.md](docs/RELEASE.md).
 
 ## Web
 
@@ -139,7 +140,9 @@ Run the complete repository suite from the root:
 ./check.sh all
 ```
 
-Targeted modes are available for `quick`, `web`, `rust`, `android`, `integration`, `crypto`, `audit`, and `shell`. The full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/debug and release builds, shell syntax checks, a live disposable-relay OPAQUE/ratcheted-E2EE DM/offline-replay/access-control integration test, and npm/RustSec dependency advisory scans. `crypto` regenerates the shared WASM, Kotlin, and four stripped Android ABI libraries, then records a deterministic digest of their Rust inputs. Normal, full, and signed-release checks reject non-v6 or stale generated artifacts.
+Targeted modes are available for `quick`, `web`, `rust`, `android`, `android-package`, `integration`, `crypto`, `audit`, and `shell`. Full mode runs web lint/unit/component/build checks, Rust formatting/tests/clippy, Android JVM tests/release lint/Kotlin compilation without APK or AAB packaging, shell syntax checks, a live disposable-relay OPAQUE/ratcheted-E2EE DM/offline-replay/access-control integration test, and npm/RustSec dependency advisory scans. `android-package` is an explicit packaging-only gate. `crypto` regenerates the shared WASM, Kotlin, and four stripped Android ABI libraries, then records a deterministic digest of their Rust inputs. Normal, full, and signed-release checks reject non-v6 or stale generated artifacts.
+
+Security-sensitive build inputs are pinned and checked: Rust `1.97.1`, Gradle `8.7` plus its wrapper/distribution hashes, Android NDK `27.3.13750724`, `wasm-bindgen-cli` `0.2.126`, and `cargo-ndk` `4.1.2`. Gradle resolves against tracked SHA-256 dependency-verification metadata. CI action revisions and Docker image/frontend digests are immutable. A separate CI job regenerates every WASM/JNI binding and rejects any byte-level difference from the tracked artifacts. Dependabot covers Cargo, npm, Gradle, Actions, and Docker; advisory scans and CodeQL cover the supported Rust and JavaScript/TypeScript surfaces. Docker build context rules exclude local toolchains, deployment configuration, npm credentials, and release keystores before data reaches the builder.
 
 ## Rust Server
 
@@ -152,6 +155,7 @@ ABYSSAL_NODE_ID=abyssal-node-1 \
 ABYSSAL_CODE_COUNT=8 \
 ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
 ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB=320 \
+ABYSSAL_ATTACHMENT_MAX_LIFETIME_HOURS=168 \
 ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY=2 \
 ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY=2 \
 ABYSSAL_MAX_ROOMS_PER_USER=5 \
@@ -177,6 +181,7 @@ Security-related relay knobs:
 
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
 - `ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB`: per-account in-memory encrypted attachment quota, capped by the global RAM limit. Default: `320`.
+- `ABYSSAL_ATTACHMENT_MAX_LIFETIME_HOURS`: hard relay-side maximum lifetime for every encrypted attachment, including an explicit `ttl=0`/no-expiry request. Default: `168` hours (7 days); accepted range: `1` to `720` hours. Room absolute-expiry rules may shorten this value, never extend it. Expired blobs are removed from RAM and release quota.
 - `ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY`: maximum concurrent attachment responses across the relay. Default: `2`; accepted range: `1` to `16`.
 - `ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY`: maximum concurrent attachment request-body reads. Default: `2`; accepted range: `1` to `4`. This bounds large encrypted request allocations before the RAM quota check.
 - `ABYSSAL_MAX_ROOMS_PER_USER`: active room quota for each account. Default: `5`; accepted range: `1` to `100`.
@@ -188,11 +193,11 @@ Security-related relay knobs:
 
 The relay accepts websocket dummy frames shaped like `{"type":"dummy","padding_b64":"..."}` and discards them before room routing. This supports future optional cover traffic without polluting message queues.
 
-Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v6 encrypts text, read receipts, and control metadata with ChaCha20-Poly1305 and carries each recipient's content key through an authenticated `vodozemac` Olm Double Ratchet session. Every recipient envelope contains exactly one Ed25519 signature over the v6 version, authenticated context, common ciphertext, sender identity key, intended username, prekey metadata, and recipient-specific ratchet envelope; the relay validates envelope shape and forwards only the envelope selected for that recipient, while clients verify the signature before accepting plaintext. Initial asynchronous messages use a recipient-specific one-time prekey; its public key deterministically commits to the advertised prekey ID, and recipients verify that ID against the key embedded in the Olm envelope before decrypting. The recipient rotates that prekey after successful use. Attachment bulk data is separate stateless XChaCha20-Poly1305: a version byte, 24-byte nonce, ciphertext, and 16-byte tag. Its 32-byte key is delivered in encrypted ratcheted message metadata, so the relay never receives the attachment key or plaintext. A relay prekey claim lasts 10 minutes when idle, but a matching queued ciphertext keeps the claim until acknowledgement, eviction, or queue removal, so a delayed frame cannot race a later sender for the same prekey. Client decryption checkpoints ratchet/account/prekey metadata before processing and restores it when Olm succeeds but outer AEAD, signature, or content binding fails. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender, message ID, and consumed prekey. Presence also carries a stable long-term identity directory checkpoint, while clients pin the long-term identity portion across prekey rotation. This is not Signal or MLS: rooms use pairwise fanout, there is no key-transparency witness, multi-device protocol, persistent rollback anchor, or independent Abyssal audit. Compare direct-chat safety numbers and directory checkpoints out of band. See [SECURITY.md](SECURITY.md).
+Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Protocol v6 encrypts text, read receipts, and control metadata with ChaCha20-Poly1305 and carries each recipient's content key through an authenticated `vodozemac` Olm Double Ratchet session. Every recipient envelope contains exactly one Ed25519 signature over the v6 version, authenticated context, common ciphertext, sender identity key, intended username, prekey metadata, and recipient-specific ratchet envelope. The relay binds the signing key to the authenticated account and verifies every recipient signature before claiming prekeys, registering replay IDs, or changing identity state; it then forwards only the envelope selected for that recipient. Clients independently verify the same signature before accepting plaintext. Initial asynchronous messages use a recipient-specific one-time prekey; its public key deterministically commits to the advertised prekey ID, and recipients verify that ID against the key embedded in the Olm envelope before decrypting. The recipient rotates that prekey after successful use. Attachment bulk data is separate stateless XChaCha20-Poly1305: a version byte, 24-byte nonce, ciphertext, and 16-byte tag. Its 32-byte key is delivered in encrypted ratcheted message metadata, so the relay never receives the attachment key or plaintext. A relay prekey claim lasts 10 minutes when idle, but a matching queued ciphertext keeps the claim until acknowledgement, eviction, or queue removal, so a delayed frame cannot race a later sender for the same prekey. Client decryption checkpoints ratchet/account/prekey metadata before processing and restores it when Olm succeeds but outer AEAD, signature, or content binding fails. Ratchet/account snapshots are encrypted by an OPAQUE export-key-derived key before the relay keeps the latest copy in RAM. Pending ciphertext remains queued until the recipient decrypts it and acknowledges the authenticated sender, message ID, and consumed prekey. Presence also carries a stable long-term identity directory checkpoint, while clients pin the long-term identity portion across prekey rotation. This is not Signal or MLS: rooms use pairwise fanout, there is no key-transparency witness, multi-device protocol, persistent rollback anchor, or independent Abyssal audit. Compare direct-chat safety numbers and directory checkpoints out of band. See [SECURITY.md](SECURITY.md).
 
 ## Docker
 
-The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The runtime image contains only the static web bundle, compiled Rust binary, CA certificates, and the health-check client. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, disabled core dumps, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, two roughly 200 MiB encrypted upload bodies, two downloads, and runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host. Attachment uploads have a 30-second idle deadline and a 10-minute total deadline, while stalled download producers release their buffers and permits after 30 seconds. Automatic restart is deliberately disabled: a crash must remain visible, because restarting creates a new invite-code set that is only recoverable from the operator's attached stdout.
+The relay can run cleanly in Docker. Build stages compile the web bundle and Rust relay. The minimal runtime image contains the static web bundle and compiled relay; the relay binary performs its own loopback health check without `curl` or a package-manager install. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, disabled core dumps, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, two roughly 200 MiB encrypted upload bodies, two downloads, and runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host. Attachment uploads have a 30-second idle deadline and a 10-minute total deadline, while stalled download producers release their buffers and permits after 30 seconds. Automatic restart is deliberately disabled: a crash must remain visible, because restarting creates a new invite-code set that is only recoverable from the operator's attached stdout.
 
 Docker is the supported launcher. A systemd unit is intentionally not shipped: journald would persist one-time startup codes and relay metadata, while a hidden restart could generate an unrecoverable fresh code set. Keep Docker's `none` log driver and disabled automatic restart unchanged.
 
@@ -222,6 +227,20 @@ cp deploy/deploy.env.example deploy/deploy.env
 $EDITOR deploy/deploy.env
 ```
 
+Before the first connection, establish host-key trust out of band. Obtain the
+server's SSH host-key SHA-256 fingerprint from the provider console or a
+trusted administrator, then place the matching host-key line in the configured
+`ABYSSAL_SSH_KNOWN_HOSTS` file and verify it with:
+
+```bash
+ssh-keygen -F chat.example.com -f "$HOME/.ssh/known_hosts"
+```
+
+The file must already exist and be readable. The helpers require
+`StrictHostKeyChecking=yes`, `BatchMode=yes`, and `IdentitiesOnly=yes`; they
+fail closed when the host is absent or changes. Do not use an unauthenticated
+`ssh-keyscan` result or an `accept-new` policy to trust a first connection.
+
 Sync the repo and rebuild/restart Docker on the server:
 
 ```bash
@@ -237,9 +256,14 @@ If you are already SSH'd into the server at `/home/ubuntu/abyssal`, use the serv
 ```bash
 ./deploy/server-start.sh
 ./deploy/server-restart.sh
-./deploy/server-logs.sh
+./deploy/server-status.sh
 ./deploy/server-stop.sh
 ```
+
+`server-logs.sh` is a compatibility alias for the status/health check. The
+Compose service uses Docker's `none` log driver, so there are no persistent
+container logs to retrieve. Keep the startup terminal attached when rotating
+invite codes.
 
 Run only the sync:
 
@@ -253,11 +277,16 @@ Run only the Docker rebuild/restart:
 ./deploy/restart-docker.sh
 ```
 
-Check container health without persistent logs:
+Check container status and the built-in health probe without persistent logs:
 
 ```bash
 ./deploy/logs-docker.sh
 ```
+
+Despite its historical name, `logs-docker.sh` reports `docker compose ps` and
+the container/health state through `server-status.sh`; it never attempts to
+read Docker logs. A failing status means the operator must inspect the
+attached startup terminal, not recover codes from a log store.
 
 Invite codes cannot be retrieved after startup. This command explains the destructive recovery path and exits:
 
@@ -277,19 +306,29 @@ Stop the server:
 ./deploy/stop-docker.sh
 ```
 
-Equivalent raw `rsync` command:
+Equivalent raw `rsync` command (the helper above is preferred because it
+performs these checks automatically):
 
 ```bash
 SSH_HOST=ubuntu@chat.example.com
 SSH_KEY="$HOME/.ssh/abyssal"
+KNOWN_HOSTS="$HOME/.ssh/known_hosts"
 REMOTE_DIR=/home/ubuntu/abyssal
+[[ "$SSH_HOST" =~ ^[A-Za-z_][A-Za-z0-9._-]*@([A-Za-z0-9._-]+|\[[A-Fa-f0-9:]+\])$ ]] || exit 1
+[[ "$REMOTE_DIR" =~ ^/([A-Za-z0-9._~+-]+/)*[A-Za-z0-9._~+-]+$ ]] || exit 1
+case "$REMOTE_DIR" in */*//*|*/./*|*/../*|*/.|*/..) exit 1 ;; esac
+[[ -f "$SSH_KEY" ]] || exit 1
+[[ -f "$KNOWN_HOSTS" && -r "$KNOWN_HOSTS" ]] || exit 1
+printf -v SSH_COMMAND 'ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q -i %q' "$KNOWN_HOSTS" "$SSH_KEY"
+printf -v REMOTE_RSYNC_PATH 'mkdir -p -- %q && rsync' "$REMOTE_DIR"
 SYNC_DIR="$(mktemp -d)"
 trap 'rm -rf "$SYNC_DIR"' EXIT
 
 git archive --format=tar HEAD | tar -xf - -C "$SYNC_DIR"
 
 rsync -az --delete \
-  -e "ssh -o StrictHostKeyChecking=accept-new -i $SSH_KEY" \
+  -e "$SSH_COMMAND" \
+  --rsync-path="$REMOTE_RSYNC_PATH" \
   --exclude '.git/' --exclude '.secrets/' --exclude 'README.local.md' \
   --exclude 'deploy/deploy.env' --exclude 'deploy/release.env' \
   --exclude 'mirage-server/.env' \
@@ -301,11 +340,18 @@ Override the target without editing scripts:
 ```bash
 ABYSSAL_SSH_HOST=ubuntu@chat.example.com \
 ABYSSAL_SSH_KEY="$HOME/.ssh/abyssal" \
+ABYSSAL_SSH_KNOWN_HOSTS="$HOME/.ssh/known_hosts" \
 ABYSSAL_REMOTE_DIR=/home/ubuntu/abyssal \
 ./deploy/deploy-server.sh
 ```
 
 Command-line environment values override `deploy/deploy.env`. Set `ABYSSAL_DEPLOY_ENV` to use a different local configuration file.
+The helpers validate the final `ABYSSAL_SSH_HOST`, `ABYSSAL_SSH_KEY`,
+`ABYSSAL_SSH_KNOWN_HOSTS`, and `ABYSSAL_REMOTE_DIR` values after overrides.
+Hosts must be `user@host`, the known-hosts path must be a readable regular
+file, remote directories must be canonical non-root absolute paths, and remote
+commands are shell-escaped before SSH/rsync execution. Invalid values fail
+before any network connection.
 
 ## ARM64 Server Deployment
 

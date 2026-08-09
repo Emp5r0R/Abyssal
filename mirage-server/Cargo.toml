@@ -20,3 +20,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.7"
 abyssal-core = { path = "../rust-core" }
 base64 = "0.22"
+
+[dev-dependencies]
+ed25519-dalek = "2.2"

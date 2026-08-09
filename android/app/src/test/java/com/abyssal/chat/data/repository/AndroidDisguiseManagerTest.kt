@@ -36,4 +36,33 @@ class AndroidDisguiseManagerTest {
         assertFalse(result)
         assertEquals(listOf("enable", "disable", "rollback"), events)
     }
+
+    @Test
+    fun camouflageVerifierAcceptsOnlyCalculatorSafePins() {
+        assertTrue(isValidCamouflagePin("482613"))
+        assertTrue(isValidCamouflagePin("12+345"))
+        assertTrue(isValidCamouflagePin("(12)*345"))
+        assertFalse(isValidCamouflagePin("4826"))
+        assertFalse(isValidCamouflagePin("123"))
+        assertFalse(isValidCamouflagePin("12 34"))
+        assertFalse(isValidCamouflagePin("PIN4826"))
+        assertFalse(isValidCamouflagePin("9".repeat(33)))
+    }
+
+    @Test
+    fun duressPinMustNotEqualUnlockPin() {
+        assertTrue(camouflagePinsAreDistinct("482613", ""))
+        assertTrue(camouflagePinsAreDistinct("482613", "739102"))
+        assertFalse(camouflagePinsAreDistinct("482613", "482613"))
+    }
+
+    @Test
+    fun camouflageConfigurationRequiresVerifierBeforeEnable() {
+        assertTrue(isValidCamouflageConfiguration(false, "", ""))
+        assertTrue(isValidCamouflageConfiguration(true, "482613", "739102"))
+        assertTrue(isValidCamouflageConfiguration(true, "482613", ""))
+        assertFalse(isValidCamouflageConfiguration(true, "4826", "739102"))
+        assertFalse(isValidCamouflageConfiguration(true, "482613", "482613"))
+        assertFalse(isValidCamouflageConfiguration(true, "482613", "123"))
+    }
 }

@@ -145,6 +145,37 @@ class EncryptedAttachmentServiceTest {
     }
 
     @Test
+    fun ownerDeleteRemovesUploadedAttachmentWithBearerAuth() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(204))
+        server.start()
+        try {
+            val service = service(server)
+
+            assertTrue(service.deleteUploadedAttachment(ATTACHMENT_ID))
+
+            val request = server.takeRequest()
+            assertEquals("DELETE", request.method)
+            assertEquals("/v1/attachment/$ATTACHMENT_ID", request.path)
+            assertEquals("Bearer token", request.getHeader("Authorization"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun ownerDeleteTreatsAlreadyExpiredAttachmentAsSuccess() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(404))
+        server.start()
+        try {
+            assertTrue(service(server).deleteUploadedAttachment(ATTACHMENT_ID))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun noClaimDownloadDoesNotRequireCompletion() = runBlocking {
         val server = MockWebServer()
         server.enqueue(MockResponse().setBody("owner ciphertext"))

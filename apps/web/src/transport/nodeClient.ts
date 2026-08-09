@@ -19,6 +19,16 @@ const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 const ATTACHMENT_CLAIM_HEADER = "X-Abyssal-Attachment-Claim";
 const ATTACHMENT_CLAIM_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ATTACHMENT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_V4_PATTERN = ATTACHMENT_ID_PATTERN;
+const BASE64_URL_PATTERN = /^[A-Za-z0-9_-]+$/u;
+const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
+const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
+const MAX_OPAQUE_JSON_BYTES = 768 * 1024;
+const MAX_OPAQUE_MESSAGE_BYTES = 16 * 1024;
+const MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024;
+const MAX_RELAY_TEXT_BYTES = 1024 * 1024;
 const ATTACHMENT_BLOB_OVERHEAD_BYTES = 41;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES =
   maxSerializedAttachmentBytes("FILE") - ATTACHMENT_BLOB_OVERHEAD_BYTES;
@@ -53,14 +63,8 @@ export async function startOpaqueAccount(
     }),
     signal,
   });
-  const payload = (await response.json().catch(() => null)) as OpaqueAccountStartResponse | null;
-  if (
-    !response.ok ||
-    !payload?.accepted ||
-    !payload.handshake_id ||
-    !payload.response_b64 ||
-    (payload.mode !== "registration" && payload.mode !== "login")
-  ) {
+  const payload = await readBoundedJson(response, MAX_OPAQUE_JSON_BYTES, signal).catch(() => null);
+  if (!response.ok || !validOpaqueStartResponse(payload)) {
     throw new Error("Wrong information");
   }
   return payload;
@@ -104,16 +108,8 @@ export async function finishOpaqueAccount(
     }),
     signal,
   });
-  const payload = (await response.json().catch(() => null)) as AccountResponse | null;
-  if (
-    !response.ok ||
-    !payload?.accepted ||
-    !payload.token ||
-    !payload.username ||
-    !payload.identity_public_b64 ||
-    !payload.identity_prekey_id ||
-    !payload.identity_envelope_b64
-  ) {
+  const payload = await readBoundedJson(response, MAX_OPAQUE_JSON_BYTES, signal).catch(() => null);
+  if (!response.ok || !validAccountResponse(payload)) {
     throw new Error("Wrong information");
   }
   const identityPublicKey = base64ToBytes(payload.identity_public_b64);
@@ -171,11 +167,13 @@ export class RelaySocket {
     };
     socket.onmessage = (event) => {
       if (typeof event.data !== "string") return;
-      try {
-        this.onFrame(JSON.parse(event.data) as IncomingFrame);
-      } catch {
-        // Invalid relay frames never reach application state.
+      if (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES)) {
+        this.#manualClose = true;
+        socket.close(1009, "frame too large");
+        return;
       }
+      const frame = parseIncomingFrame(event.data);
+      if (frame) this.onFrame(frame);
     };
     socket.onerror = () => socket.close();
     socket.onclose = () => {
@@ -293,7 +291,11 @@ export function uploadEncryptedAttachment(
       if (request.status < 200 || request.status >= 300 || typeof id !== "string") {
         reject(new Error("Upload rejected"));
       } else {
-        resolve(id);
+        try {
+          resolve(validateAttachmentId(id));
+        } catch {
+          reject(new Error("Upload rejected"));
+        }
       }
     };
     // XMLHttpRequest accepts ArrayBufferView at runtime. TypeScript's DOM
@@ -307,11 +309,12 @@ export async function downloadEncryptedAttachment(
   session: AccountSession,
   attachmentId: string,
 ): Promise<DownloadedEncryptedAttachment> {
+  const validatedAttachmentId = validateAttachmentId(attachmentId);
   let claim: string | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let encrypted: Uint8Array | undefined;
   try {
-    const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}`, {
+    const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}`, {
       cache: "no-store",
       credentials: "omit",
       referrerPolicy: "no-referrer",
@@ -347,7 +350,7 @@ export async function downloadEncryptedAttachment(
   } catch (error) {
     encrypted?.fill(0);
     if (reader) await reader.cancel().catch(() => undefined);
-    if (claim) await releaseAttachmentDownloadClaim(session, attachmentId, claim).catch(() => undefined);
+    if (claim) await releaseAttachmentDownloadClaim(session, validatedAttachmentId, claim).catch(() => undefined);
     throw error;
   } finally {
     reader?.releaseLock();
@@ -359,9 +362,10 @@ export async function completeAttachmentDownload(
   attachmentId: string,
   claim: string,
 ): Promise<void> {
+  const validatedAttachmentId = validateAttachmentId(attachmentId);
   const validatedClaim = validateAttachmentClaim(claim);
   const response = await fetch(
-    `${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}/complete`,
+    `${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}/complete`,
     {
       method: "POST",
       cache: "no-store",
@@ -378,9 +382,10 @@ export async function releaseAttachmentDownloadClaim(
   attachmentId: string,
   claim: string,
 ): Promise<void> {
+  const validatedAttachmentId = validateAttachmentId(attachmentId);
   const validatedClaim = validateAttachmentClaim(claim);
   const response = await fetch(
-    `${session.endpoint.apiBaseUrl}/v1/attachment/${encodeURIComponent(attachmentId)}/claim`,
+    `${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}/claim`,
     {
       method: "DELETE",
       cache: "no-store",
@@ -390,6 +395,24 @@ export async function releaseAttachmentDownloadClaim(
     },
   );
   if (!response.ok) throw new Error("Attachment unavailable");
+}
+
+export async function deleteUploadedAttachment(
+  session: AccountSession,
+  attachmentId: string,
+): Promise<void> {
+  const validatedAttachmentId = validateAttachmentId(attachmentId);
+  const response = await fetch(
+    `${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}`,
+    {
+      method: "DELETE",
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers: { Authorization: `Bearer ${session.token}` },
+    },
+  );
+  if (!response.ok && response.status !== 404) throw new Error("Attachment unavailable");
 }
 
 export async function decryptAndCompleteAttachment(
@@ -455,6 +478,239 @@ function validateAttachmentClaim(claim: string): string {
     throw new Error("Attachment unavailable");
   }
   return claim;
+}
+
+function validateAttachmentId(attachmentId: string): string {
+  const normalized = attachmentId.trim().toLowerCase();
+  if (!ATTACHMENT_ID_PATTERN.test(normalized)) throw new Error("Attachment unavailable");
+  return normalized;
+}
+
+async function readBoundedJson(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Wrong information");
+  let bytes = new Uint8Array(0);
+  let length = 0;
+  try {
+    signal?.throwIfAborted();
+    const declared = parseBoundedContentLength(response.headers.get("content-length"), maxBytes);
+    const contentEncoding = response.headers.get("content-encoding")?.trim().toLowerCase();
+    const exactDeclaredLength = !contentEncoding || contentEncoding === "identity";
+    bytes = new Uint8Array(declared ?? Math.min(4_096, maxBytes));
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) break;
+      try {
+        const nextLength = length + value.byteLength;
+        if (!Number.isSafeInteger(nextLength) || nextLength > maxBytes) {
+          throw new Error("Wrong information");
+        }
+        if (nextLength > bytes.byteLength) {
+          const nextCapacity = Math.min(maxBytes, Math.max(nextLength, bytes.byteLength * 2 || 4_096));
+          const expanded = new Uint8Array(nextCapacity);
+          expanded.set(bytes.subarray(0, length));
+          bytes.fill(0);
+          bytes = expanded;
+        }
+        bytes.set(value, length);
+        length = nextLength;
+      } finally {
+        value.fill(0);
+      }
+    }
+    signal?.throwIfAborted();
+    if (length === 0 || (exactDeclaredLength && declared !== undefined && declared !== length)) {
+      throw new Error("Wrong information");
+    }
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length));
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    bytes.fill(0);
+    reader.releaseLock();
+  }
+}
+
+function parseBoundedContentLength(value: string | null, maxBytes: number): number | undefined {
+  if (value === null) return undefined;
+  const normalized = value.trim();
+  if (!/^\d+$/u.test(normalized)) throw new Error("Wrong information");
+  const length = Number(normalized);
+  if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
+    throw new Error("Wrong information");
+  }
+  return length;
+}
+
+function validOpaqueStartResponse(value: unknown): value is OpaqueAccountStartResponse {
+  if (!plainObjectWithKeys(value, [
+    "accepted", "mode", "handshake_id", "response_b64", "node_id",
+    "identity_public_b64", "identity_prekey_id", "identity_envelope_b64", "error",
+  ])) return false;
+  const payload = value as Record<string, unknown>;
+  if (
+    payload.accepted !== true ||
+    (payload.mode !== "registration" && payload.mode !== "login") ||
+    !validUuid(payload.handshake_id) ||
+    !validBase64Url(payload.response_b64, 1, MAX_OPAQUE_MESSAGE_BYTES) ||
+    !validNodeId(payload.node_id) ||
+    !nullish(payload.error)
+  ) return false;
+  if (payload.mode === "registration") {
+    return nullish(payload.identity_public_b64) &&
+      nullish(payload.identity_prekey_id) &&
+      nullish(payload.identity_envelope_b64);
+  }
+  return validBase64Url(payload.identity_public_b64, 128, 128) &&
+    typeof payload.identity_prekey_id === "string" &&
+    /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
+    validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES);
+}
+
+function validAccountResponse(value: unknown): value is AccountResponse & {
+  token: string;
+  username: string;
+  identity_public_b64: string;
+  identity_prekey_id: string;
+  identity_envelope_b64: string;
+} {
+  if (!plainObjectWithKeys(value, [
+    "accepted", "created", "token", "node_id", "username", "max_rooms_per_user",
+    "session_inactivity_sec", "identity_public_b64", "identity_prekey_id",
+    "identity_envelope_b64", "error",
+  ])) return false;
+  const payload = value as Record<string, unknown>;
+  return payload.accepted === true &&
+    typeof payload.created === "boolean" &&
+    validUuid(payload.token) &&
+    validNodeId(payload.node_id) &&
+    typeof payload.username === "string" && USERNAME_PATTERN.test(payload.username) &&
+    Number.isInteger(payload.max_rooms_per_user) &&
+    (payload.max_rooms_per_user as number) >= 1 &&
+    (payload.max_rooms_per_user as number) <= 100 &&
+    Number.isInteger(payload.session_inactivity_sec) &&
+    (payload.session_inactivity_sec as number) >= 60 &&
+    (payload.session_inactivity_sec as number) <= 86_400 &&
+    validBase64Url(payload.identity_public_b64, 128, 128) &&
+    typeof payload.identity_prekey_id === "string" &&
+    /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
+    validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES) &&
+    nullish(payload.error);
+}
+
+function plainObjectWithKeys(value: unknown, allowedKeys: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    return false;
+  }
+  return Object.keys(value).every((key) => allowedKeys.includes(key)) &&
+    allowedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function validUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_V4_PATTERN.test(value);
+}
+
+function validNodeId(value: unknown): value is string {
+  return typeof value === "string" && NODE_ID_PATTERN.test(value);
+}
+
+function validBase64Url(value: unknown, minBytes: number, maxBytes: number): value is string {
+  if (
+    typeof value !== "string" ||
+    !BASE64_URL_PATTERN.test(value) ||
+    value.length > Math.ceil(maxBytes / 3) * 4
+  ) return false;
+  let decoded: Uint8Array | null = null;
+  try {
+    decoded = base64ToBytes(value);
+    // Decoders can accept non-canonical unused bits (and some malformed
+    // modulo-four lengths). Re-encoding is the strict, allocation-bounded
+    // canonicality check for every security-sensitive response field.
+    return decoded.byteLength >= minBytes &&
+      decoded.byteLength <= maxBytes &&
+      bytesToBase64(decoded) === value;
+  } catch {
+    return false;
+  } finally {
+    decoded?.fill(0);
+  }
+}
+
+function nullish(value: unknown): boolean {
+  return value === undefined || value === null;
+}
+
+function parseIncomingFrame(text: string): IncomingFrame | null {
+  if (!utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES)) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const frame = value as Record<string, unknown>;
+  switch (frame.type) {
+    case "GLOBAL_WIPE":
+    case "global_wipe":
+      return frame as IncomingFrame;
+    case "presence":
+      return Array.isArray(frame.users) ? frame as IncomingFrame : null;
+    case "rooms":
+      return Array.isArray(frame.rooms) ? frame as IncomingFrame : null;
+    case "room_created":
+      return plainRecord(frame.room) ? frame as IncomingFrame : null;
+    case "room_deleted":
+      return typeof frame.chat_id === "string" ? frame as IncomingFrame : null;
+    case "directs":
+      return Array.isArray(frame.directs) ? frame as IncomingFrame : null;
+    case "direct_opened":
+      return plainRecord(frame.direct) ? frame as IncomingFrame : null;
+    case "message":
+      return Number.isSafeInteger(frame.version) &&
+        typeof frame.chat_id === "string" &&
+        typeof frame.message_id === "string" &&
+        typeof frame.nonce_b64 === "string" &&
+        typeof frame.ciphertext_b64 === "string" &&
+        typeof frame.signature_b64 === "string" &&
+        typeof frame.wrapped_key_b64 === "string" &&
+        typeof frame.sender_username === "string" &&
+        typeof frame.sender_public_key_b64 === "string" &&
+        (frame.identity_public_b64 === undefined || typeof frame.identity_public_b64 === "string") &&
+        typeof frame.prekey_id === "string" &&
+        typeof frame.is_prekey === "boolean"
+        ? frame as IncomingFrame
+        : null;
+    default:
+      return null;
+  }
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function utf8LengthWithin(value: string, maxBytes: number): boolean {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length &&
+      value.charCodeAt(index + 1) >= 0xdc00 && value.charCodeAt(index + 1) <= 0xdfff) {
+      bytes += 4;
+      index += 1;
+    } else bytes += 3;
+    if (bytes > maxBytes) return false;
+  }
+  return true;
 }
 
 function attachmentClaimHeaders(session: AccountSession, claim: string): Record<string, string> {

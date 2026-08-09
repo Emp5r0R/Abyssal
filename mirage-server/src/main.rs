@@ -1,9 +1,10 @@
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet},
     convert::Infallible,
     env,
     io::{self, Write},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -12,7 +13,8 @@ use std::{
 use abyssal_core::secure_protocol::{
     opaque_server_finish_login, opaque_server_finish_registration,
     opaque_server_registration_response, opaque_server_setup, opaque_server_start_login,
-    prekey_id_for_public,
+    validate_identity_public_bundle as validate_core_identity_public_bundle,
+    verify_message_signature_v6,
 };
 use axum::{
     body::{Body, Bytes},
@@ -35,6 +37,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -50,6 +56,7 @@ const FILE_ATTACHMENT_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 // Stateless attachment blobs contain a version byte, XChaCha nonce, and
 // authentication tag in addition to the encrypted plaintext.
 const ATTACHMENT_WIRE_OVERHEAD_BYTES: usize = 41;
+const ATTACHMENT_BLOB_VERSION: u8 = 1;
 const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
 const WS_MAX_BYTES_PER_WINDOW: usize = 4 * 1024 * 1024;
@@ -85,10 +92,16 @@ const E2EE_PROTOCOL_VERSION: u32 = 6;
 const IDENTITY_ENVELOPE_VERSION: u8 = 4;
 const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_REPLAY_IDS: usize = 50_000;
+const MAX_REPLAY_IDS_PER_SENDER: usize = 2_048;
 const PREKEY_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
 const ATTACHMENT_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_PREKEY_ID_BYTES: usize = 32;
 const DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB: usize = 320;
+// A zero/omitted client TTL still receives this bounded relay-side lifetime.
+// This prevents an orphaned encrypted blob from remaining in RAM forever.
+const DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS: usize = 7 * 24;
+const MIN_ATTACHMENT_MAX_LIFETIME_HOURS: usize = 1;
+const MAX_ATTACHMENT_MAX_LIFETIME_HOURS: usize = 30 * 24;
 const DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 2;
 const MAX_ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 16;
 const DEFAULT_ATTACHMENT_UPLOAD_CONCURRENCY: usize = 2;
@@ -110,6 +123,7 @@ struct AppState {
     node_id: String,
     attachment_ram_limit_bytes: usize,
     attachment_account_limit_bytes: usize,
+    attachment_max_lifetime_sec: u64,
     max_rooms_per_user: usize,
     conversation_ops: Arc<Mutex<()>>,
     pending_message_ttl_ms: u64,
@@ -118,13 +132,13 @@ struct AppState {
     inactivity_limit_ms: Option<u64>,
     last_activity_ms: Arc<Mutex<u64>>,
     account_ops: Arc<Mutex<()>>,
-    opaque_setup: Arc<Vec<u8>>,
+    opaque_setup: Arc<Zeroizing<Vec<u8>>>,
     opaque_handshakes: Arc<Mutex<HashMap<Uuid, OpaqueHandshake>>>,
-    invite_code_pepper: Arc<CodeId>,
+    invite_code_pepper: Arc<Zeroizing<CodeId>>,
     boot_codes: Arc<Mutex<Option<Vec<String>>>>,
     available_codes: Arc<Mutex<HashSet<CodeId>>>,
     accounts: Arc<Mutex<HashMap<CodeId, Account>>>,
-    sessions: Arc<Mutex<HashMap<String, AuthSession>>>,
+    sessions: Arc<Mutex<HashMap<SessionToken, AuthSession>>>,
     active_connections: Arc<Mutex<HashMap<CodeId, Uuid>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
@@ -172,6 +186,27 @@ struct AuthSession {
     code_id: CodeId,
     username: String,
     last_activity_ms: u64,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct SessionToken(String);
+
+impl SessionToken {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Borrow<str> for SessionToken {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for SessionToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 #[derive(Clone)]
@@ -650,8 +685,66 @@ struct DirectRecord {
     peer_username: String,
 }
 
+fn configured_bind_addr() -> SocketAddr {
+    env::var("ABYSSAL_BIND_ADDR")
+        .or_else(|_| env::var("MIRAGE_BIND_ADDR"))
+        .unwrap_or_else(|_| "0.0.0.0:4020".to_string())
+        .parse()
+        .expect("ABYSSAL_BIND_ADDR must be a valid socket address")
+}
+
+fn healthcheck_response_is_healthy(response: &[u8]) -> bool {
+    response.starts_with(b"HTTP/1.1 200 ")
+        && response
+            .windows(b"\"ok\":true".len())
+            .any(|window| window == b"\"ok\":true")
+}
+
+async fn healthcheck(bind_addr: SocketAddr) -> bool {
+    let health_addr = env::var("ABYSSAL_HEALTHCHECK_ADDR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_addr.port()));
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(health_addr)).await
+    else {
+        return false;
+    };
+    let request = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if tokio::time::timeout(Duration::from_secs(2), stream.write_all(request))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut response = Vec::with_capacity(512);
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok::<bool, io::Error>(healthcheck_response_is_healthy(&response));
+            }
+            response.extend_from_slice(&buffer[..read]);
+            if healthcheck_response_is_healthy(&response) {
+                return Ok::<bool, io::Error>(true);
+            }
+            if response.len() >= 4096 {
+                return Ok::<bool, io::Error>(false);
+            }
+        }
+    })
+    .await;
+    matches!(result, Ok(Ok(true)))
+}
+
 #[tokio::main]
 async fn main() {
+    let configured_bind_addr = configured_bind_addr();
+    if env::args().nth(1).as_deref() == Some("--healthcheck") {
+        let healthy = healthcheck(configured_bind_addr).await;
+        std::process::exit(i32::from(!healthy));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -666,11 +759,7 @@ async fn main() {
         tokio::spawn(inactivity_watcher(state.clone()));
     }
 
-    let bind_addr: SocketAddr = env::var("ABYSSAL_BIND_ADDR")
-        .or_else(|_| env::var("MIRAGE_BIND_ADDR"))
-        .unwrap_or_else(|_| "0.0.0.0:4020".to_string())
-        .parse()
-        .expect("ABYSSAL_BIND_ADDR must be a valid socket address");
+    let bind_addr = configured_bind_addr;
 
     let account_routes = Router::new()
         .route("/v2/account/start", post(start_opaque_account))
@@ -679,7 +768,10 @@ async fn main() {
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
     let attachment_upload_routes = Router::new().route("/v1/attachment", post(upload_attachment));
     let attachment_download_routes = Router::new()
-        .route("/v1/attachment/:id", get(download_attachment))
+        .route(
+            "/v1/attachment/:id",
+            get(download_attachment).delete(delete_attachment),
+        )
         .route(
             "/v1/attachment/:id/complete",
             post(complete_attachment_claim),
@@ -765,6 +857,15 @@ impl AppState {
         )
         .saturating_mul(1024 * 1024)
         .min(attachment_ram_limit_bytes);
+        let attachment_max_lifetime_sec = read_usize_env(
+            "ABYSSAL_ATTACHMENT_MAX_LIFETIME_HOURS",
+            DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS,
+        )
+        .clamp(
+            MIN_ATTACHMENT_MAX_LIFETIME_HOURS,
+            MAX_ATTACHMENT_MAX_LIFETIME_HOURS,
+        )
+        .saturating_mul(60 * 60) as u64;
         let attachment_download_concurrency = read_usize_env(
             "ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY",
             DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY,
@@ -803,6 +904,7 @@ impl AppState {
             node_id,
             attachment_ram_limit_bytes,
             attachment_account_limit_bytes,
+            attachment_max_lifetime_sec,
             max_rooms_per_user,
             conversation_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms,
@@ -811,9 +913,9 @@ impl AppState {
             inactivity_limit_ms,
             last_activity_ms: Arc::new(Mutex::new(now_ms())),
             account_ops: Arc::new(Mutex::new(())),
-            opaque_setup: Arc::new(opaque_server_setup()),
+            opaque_setup: Arc::new(Zeroizing::new(opaque_server_setup())),
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
-            invite_code_pepper: Arc::new(invite_code_pepper),
+            invite_code_pepper: Arc::new(Zeroizing::new(invite_code_pepper)),
             boot_codes: Arc::new(Mutex::new(Some(boot_codes))),
             available_codes: Arc::new(Mutex::new(available_codes)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
@@ -858,6 +960,10 @@ impl AppState {
         info!(
             "ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT bytes={}",
             self.attachment_account_limit_bytes
+        );
+        info!(
+            "ABYSSAL_ATTACHMENT_MAX_LIFETIME seconds={}",
+            self.attachment_max_lifetime_sec
         );
         info!(
             "ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY permits={}",
@@ -947,10 +1053,33 @@ fn normalize_web_origin(value: &str) -> Result<String, String> {
     let authority = uri
         .authority()
         .ok_or_else(|| "web origin rejected".to_string())?;
-    if !matches!(scheme, "http" | "https") || uri.path() != "/" || uri.query().is_some() {
+    if !matches!(scheme, "http" | "https")
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+        || authority.as_str().contains('@')
+        || authority.host().is_empty()
+        || (scheme == "http"
+            && !matches!(
+                authority.host().to_ascii_lowercase().as_str(),
+                "localhost" | "127.0.0.1" | "[::1]" | "::1"
+            ))
+    {
         return Err("web origin rejected".to_string());
     }
-    Ok(format!("{scheme}://{authority}"))
+    Ok(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.as_str().to_ascii_lowercase()
+    ))
+}
+
+fn normalized_origin_authority(value: &str) -> Option<String> {
+    let uri = value.trim().trim_end_matches('/').parse::<Uri>().ok()?;
+    let authority = uri.authority()?;
+    if authority.as_str().contains('@') || authority.host().is_empty() {
+        return None;
+    }
+    Some(authority.as_str().to_ascii_lowercase())
 }
 
 fn resolve_web_root() -> Option<PathBuf> {
@@ -1038,6 +1167,26 @@ fn derive_code_id(pepper: &[u8], code: &str) -> CodeId {
     mac.update(CODE_ID_DOMAIN);
     mac.update(code.as_bytes());
     mac.finalize().into_bytes().into()
+}
+
+fn zeroize_code_id_set(set: &mut HashSet<CodeId>) {
+    for mut code_id in set.drain() {
+        code_id.zeroize();
+    }
+}
+
+fn zeroize_code_id_map<V>(map: &mut HashMap<CodeId, V>) {
+    for (mut code_id, value) in map.drain() {
+        code_id.zeroize();
+        drop(value);
+    }
+}
+
+fn remove_code_id_map_entry<V>(map: &mut HashMap<CodeId, V>, code_id: &CodeId) {
+    if let Some((mut removed_code_id, value)) = map.remove_entry(code_id) {
+        removed_code_id.zeroize();
+        drop(value);
+    }
 }
 
 fn generate_codes(
@@ -1134,15 +1283,20 @@ fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: u
 async fn login_attempt_allowed(state: &AppState, code_id: &CodeId) -> bool {
     let now = now_ms();
     let mut limits = state.login_limits.lock().await;
-    limits.retain(|_, rate| now.saturating_sub(rate.window_start_ms) < LOGIN_RATE_WINDOW_MS);
+    let stale = limits
+        .iter()
+        .filter_map(|(candidate, rate)| {
+            (now.saturating_sub(rate.window_start_ms) >= LOGIN_RATE_WINDOW_MS).then_some(*candidate)
+        })
+        .collect::<Vec<_>>();
+    for candidate in stale {
+        remove_code_id_map_entry(&mut limits, &candidate);
+    }
+    // Do not evict a live entry to make room for an attacker-controlled new
+    // code.  Failing closed preserves every existing code's quota instead of
+    // allowing unbounded churn to bypass the limiter.
     if !limits.contains_key(code_id) && limits.len() >= MAX_LOGIN_LIMIT_ENTRIES {
-        if let Some(oldest) = limits
-            .iter()
-            .min_by_key(|(_, rate)| rate.window_start_ms)
-            .map(|(code_id, _)| *code_id)
-        {
-            limits.remove(&oldest);
-        }
+        return false;
     }
     let rate = limits.entry(*code_id).or_insert(RateState {
         window_start_ms: now,
@@ -1158,7 +1312,15 @@ async fn login_attempt_allowed(state: &AppState, code_id: &CodeId) -> bool {
 }
 
 async fn clear_login_limit(state: &AppState, code_id: &CodeId) {
-    state.login_limits.lock().await.remove(code_id);
+    let mut limits = state.login_limits.lock().await;
+    remove_code_id_map_entry(&mut limits, code_id);
+}
+
+async fn known_code_id(state: &AppState, code_id: &CodeId) -> bool {
+    if state.accounts.lock().await.contains_key(code_id) {
+        return true;
+    }
+    state.available_codes.lock().await.contains(code_id)
 }
 
 fn random_username() -> String {
@@ -1455,6 +1617,10 @@ fn encrypted_attachment_limit_bytes(media_type: &str) -> usize {
     max_serialized_attachment_bytes(media_type)
 }
 
+fn valid_encrypted_attachment_body(body: &[u8]) -> bool {
+    body.len() >= ATTACHMENT_WIRE_OVERHEAD_BYTES && body.first() == Some(&ATTACHMENT_BLOB_VERSION)
+}
+
 fn declared_attachment_length(
     headers: &HeaderMap,
     max_bytes: usize,
@@ -1666,16 +1832,25 @@ fn effective_attachment_ttl_sec(
     requested: Option<u64>,
     access: &ConversationAccess,
     media_type: &str,
+    max_lifetime_sec: u64,
 ) -> u64 {
     let requested = requested.unwrap_or_default().min(86_400);
-    let ConversationAccess::Room(room) = access else {
-        return requested;
+    let effective = if let ConversationAccess::Room(room) = access {
+        let enforced = enforced_attachment_ttl_sec(room, media_type);
+        match (requested, enforced) {
+            (0, enforced) => enforced,
+            (requested, 0) => requested,
+            (requested, enforced) => requested.min(enforced),
+        }
+    } else {
+        requested
     };
-    let enforced = enforced_attachment_ttl_sec(room, media_type);
-    match (requested, enforced) {
-        (0, enforced) => enforced,
-        (requested, 0) => requested,
-        (requested, enforced) => requested.min(enforced),
+    // Even an explicit zero/no-expiry request gets a finite relay-side
+    // lifetime.  Room policy can still shorten this value, never extend it.
+    if effective == 0 {
+        max_lifetime_sec
+    } else {
+        effective.min(max_lifetime_sec)
     }
 }
 
@@ -1695,7 +1870,9 @@ fn subtract_attachment_usage(
         return;
     };
     if *current <= bytes {
-        usage.remove(owner_code_id);
+        if let Some((mut removed_code_id, _)) = usage.remove_entry(owner_code_id) {
+            removed_code_id.zeroize();
+        }
     } else {
         *current -= bytes;
     }
@@ -1971,6 +2148,12 @@ async fn start_opaque_account(
         Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
     };
     let code_id = derive_code_id(&state.invite_code_pepper[..], &code);
+    // Unknown HMAC IDs must not allocate limiter entries. Otherwise an
+    // attacker can fill the bounded map with random codes and deny real
+    // invite holders even though every request is rejected.
+    if !known_code_id(&state, &code_id).await {
+        return opaque_start_error(StatusCode::UNAUTHORIZED, &state);
+    }
     if !login_attempt_allowed(&state, &code_id).await {
         return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
     }
@@ -1982,19 +2165,20 @@ async fn start_opaque_account(
     if let Some(account) = state.accounts.lock().await.get(&code_id).cloned() {
         let request_bytes =
             match decode_bounded(&request.credential_request_b64, ACCOUNT_BODY_LIMIT_BYTES) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => Zeroizing::new(bytes),
                 Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
             };
         let (server_state, response) = match opaque_server_start_login(
             &state.opaque_setup,
             &account.password_file,
-            &request_bytes,
+            request_bytes.as_slice(),
             code.as_bytes(),
         ) {
             Ok(result) => result,
             Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
         };
-        store_opaque_handshake(
+        let response = Zeroizing::new(response);
+        if !store_opaque_handshake(
             &state,
             handshake_id,
             OpaqueHandshake::Login {
@@ -2004,14 +2188,17 @@ async fn start_opaque_account(
                 created_at_ms: now_ms(),
             },
         )
-        .await;
+        .await
+        {
+            return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
+        }
         return (
             StatusCode::OK,
             Json(OpaqueAccountStartResponse {
                 accepted: true,
                 mode: Some("login"),
                 handshake_id: Some(handshake_id),
-                response_b64: Some(URL_SAFE_NO_PAD.encode(response)),
+                response_b64: Some(URL_SAFE_NO_PAD.encode(response.as_slice())),
                 node_id: state.node_id.clone(),
                 identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&account.identity_public)),
                 identity_prekey_id: Some(account.prekey_id.clone()),
@@ -2021,23 +2208,21 @@ async fn start_opaque_account(
         );
     }
 
-    if !state.available_codes.lock().await.contains(&code_id) {
-        return opaque_start_error(StatusCode::UNAUTHORIZED, &state);
-    }
     let request_bytes =
         match decode_bounded(&request.registration_request_b64, ACCOUNT_BODY_LIMIT_BYTES) {
-            Ok(bytes) => bytes,
+            Ok(bytes) => Zeroizing::new(bytes),
             Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
         };
     let response = match opaque_server_registration_response(
         &state.opaque_setup,
-        &request_bytes,
+        request_bytes.as_slice(),
         code.as_bytes(),
     ) {
         Ok(response) => response,
         Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
     };
-    store_opaque_handshake(
+    let response = Zeroizing::new(response);
+    if !store_opaque_handshake(
         &state,
         handshake_id,
         OpaqueHandshake::Registration {
@@ -2045,14 +2230,17 @@ async fn start_opaque_account(
             created_at_ms: now_ms(),
         },
     )
-    .await;
+    .await
+    {
+        return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
+    }
     (
         StatusCode::OK,
         Json(OpaqueAccountStartResponse {
             accepted: true,
             mode: Some("registration"),
             handshake_id: Some(handshake_id),
-            response_b64: Some(URL_SAFE_NO_PAD.encode(response)),
+            response_b64: Some(URL_SAFE_NO_PAD.encode(response.as_slice())),
             node_id: state.node_id.clone(),
             identity_public_b64: None,
             identity_prekey_id: None,
@@ -2089,19 +2277,25 @@ async fn finish_opaque_account(
                 .registration_upload_b64
                 .as_deref()
                 .ok_or(())
-                .and_then(|value| decode_bounded(value, ACCOUNT_BODY_LIMIT_BYTES).map_err(|_| ()))
-            {
+                .and_then(|value| {
+                    decode_bounded(value, ACCOUNT_BODY_LIMIT_BYTES)
+                        .map(Zeroizing::new)
+                        .map_err(|_| ())
+                }) {
                 Ok(value) => value,
                 Err(_) => {
                     return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
                 }
             };
-            let identity_public = match request
+            let mut identity_public = match request
                 .identity_public_b64
                 .as_deref()
                 .ok_or(())
-                .and_then(|value| decode_exact(value, IDENTITY_PUBLIC_BYTES).map_err(|_| ()))
-            {
+                .and_then(|value| {
+                    decode_exact(value, IDENTITY_PUBLIC_BYTES)
+                        .map(Zeroizing::new)
+                        .map_err(|_| ())
+                }) {
                 Ok(value) => value,
                 Err(_) => {
                     return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
@@ -2114,23 +2308,27 @@ async fn finish_opaque_account(
             if !valid_identity_public_bundle(&identity_public, &prekey_id) {
                 return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await;
             }
-            let identity_envelope = match request
+            let mut identity_envelope = match request
                 .identity_envelope_b64
                 .as_deref()
                 .ok_or(())
                 .and_then(|value| {
-                    decode_bounded(value, MAX_IDENTITY_ENVELOPE_BYTES).map_err(|_| ())
+                    decode_bounded(value, MAX_IDENTITY_ENVELOPE_BYTES)
+                        .map(Zeroizing::new)
+                        .map_err(|_| ())
                 }) {
                 Ok(value) if !value.is_empty() => value,
                 _ => return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await,
             };
-            let password_file = match opaque_server_finish_registration(&upload) {
+            let password_file = match opaque_server_finish_registration(upload.as_slice()) {
                 Ok(value) => value,
                 Err(_) => {
                     return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await
                 }
             };
-            state.available_codes.lock().await.remove(code_id);
+            if let Some(mut removed_code_id) = state.available_codes.lock().await.take(code_id) {
+                removed_code_id.zeroize();
+            }
             let mut accounts = state.accounts.lock().await;
             let username = random_unique_username(&accounts);
             accounts.insert(
@@ -2138,8 +2336,8 @@ async fn finish_opaque_account(
                 Account {
                     username: username.clone(),
                     password_file,
-                    identity_public,
-                    identity_envelope,
+                    identity_public: std::mem::take(&mut *identity_public),
+                    identity_envelope: std::mem::take(&mut *identity_envelope),
                     prekey_id,
                     state_revision: 0,
                     state_revision_window: 1,
@@ -2161,14 +2359,17 @@ async fn finish_opaque_account(
                 .credential_finalization_b64
                 .as_deref()
                 .ok_or(())
-                .and_then(|value| decode_bounded(value, ACCOUNT_BODY_LIMIT_BYTES).map_err(|_| ()))
-            {
+                .and_then(|value| {
+                    decode_bounded(value, ACCOUNT_BODY_LIMIT_BYTES)
+                        .map(Zeroizing::new)
+                        .map_err(|_| ())
+                }) {
                 Ok(value) => value,
                 Err(_) => {
                     return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
                 }
             };
-            if opaque_server_finish_login(server_state, &finalization).is_err() {
+            if opaque_server_finish_login(server_state, finalization.as_slice()).is_err() {
                 return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
             }
             if code_has_active_session(&state, code_id).await {
@@ -2212,7 +2413,7 @@ async fn prune_opaque_handshakes(state: &AppState) {
     });
 }
 
-async fn store_opaque_handshake(state: &AppState, id: Uuid, handshake: OpaqueHandshake) {
+async fn store_opaque_handshake(state: &AppState, id: Uuid, handshake: OpaqueHandshake) -> bool {
     let now = now_ms();
     let mut handshakes = state.opaque_handshakes.lock().await;
     handshakes.retain(|_, handshake| {
@@ -2222,19 +2423,15 @@ async fn store_opaque_handshake(state: &AppState, id: Uuid, handshake: OpaqueHan
         };
         now.saturating_sub(created_at_ms) < OPAQUE_HANDSHAKE_TTL_MS
     });
+    // A live handshake contains OPAQUE state.  Never evict it to accept an
+    // attacker-controlled handshake; the caller returns a bounded failure and
+    // dropping this value invokes its zeroizing Drop implementation.
     if handshakes.len() >= MAX_OPAQUE_HANDSHAKES {
-        if let Some(oldest_id) = handshakes
-            .iter()
-            .min_by_key(|(_, handshake)| match handshake {
-                OpaqueHandshake::Registration { created_at_ms, .. }
-                | OpaqueHandshake::Login { created_at_ms, .. } => *created_at_ms,
-            })
-            .map(|(id, _)| *id)
-        {
-            handshakes.remove(&oldest_id);
-        }
+        drop(handshake);
+        return false;
     }
     handshakes.insert(id, handshake);
+    true
 }
 
 fn decode_bounded(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
@@ -2266,22 +2463,7 @@ fn valid_prekey_id(value: &str) -> bool {
 }
 
 fn valid_identity_public_bundle(public_key: &[u8], prekey_id: &str) -> bool {
-    if public_key.len() != IDENTITY_PUBLIC_BYTES
-        || !valid_prekey_id(prekey_id)
-        || prekey_id.is_empty()
-    {
-        return false;
-    }
-    let long_term = &public_key[..IDENTITY_FINGERPRINT_BYTES];
-    if long_term.iter().all(|byte| *byte == 0) {
-        return false;
-    }
-    let one_time = &public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET];
-    one_time.iter().any(|byte| *byte != 0)
-        && one_time
-            .try_into()
-            .map(|public| prekey_id_for_public(public) == prekey_id)
-            .unwrap_or(false)
+    validate_core_identity_public_bundle(public_key, Some(prekey_id)).is_ok()
 }
 
 async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) {
@@ -2303,7 +2485,11 @@ async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) 
         // Logout invalidates the session even when its upgrade has not yet
         // installed a client handle. Do not leave that reservation blocking
         // the next login.
-        state.active_connections.lock().await.remove(code_id);
+        if let Some((mut removed_code_id, _)) =
+            state.active_connections.lock().await.remove_entry(code_id)
+        {
+            removed_code_id.zeroize();
+        }
         return;
     }
 
@@ -2336,7 +2522,9 @@ async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) 
         .get(code_id)
         .is_some_and(|client_id| old_ids.contains(client_id))
     {
-        active_connections.remove(code_id);
+        if let Some((mut removed_code_id, _)) = active_connections.remove_entry(code_id) {
+            removed_code_id.zeroize();
+        }
     }
     drop(active_connections);
     broadcast_presence(state).await;
@@ -2355,18 +2543,18 @@ async fn auth_from_headers(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<AuthSession, StatusCode> {
-    let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    active_session(state, &token, true)
+    let token = Zeroizing::new(bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?);
+    active_session(state, token.as_str(), true)
         .await
         .ok_or(StatusCode::UNAUTHORIZED)
 }
 
 async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
-    let Some(token) = bearer_token(&headers) else {
+    let Some(token) = bearer_token(&headers).map(Zeroizing::new) else {
         return StatusCode::UNAUTHORIZED;
     };
     let _account_guard = state.account_ops.lock().await;
-    let session = state.sessions.lock().await.remove(&token);
+    let session = state.sessions.lock().await.remove(token.as_str());
     let Some(session) = session else {
         return StatusCode::UNAUTHORIZED;
     };
@@ -2410,18 +2598,25 @@ async fn upload_attachment(
             Ok(body) => body,
             Err(status) => return status.into_response(),
         };
-
     let _conversation_guard = state.conversation_ops.lock().await;
     let auth = match auth_from_headers(&state, &headers).await {
         Ok(auth) if auth.code_id == initial_auth.code_id => auth,
         Ok(_) | Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
+    if !valid_encrypted_attachment_body(&encrypted_body) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let access =
         match attachment_conversation_access(&state, &auth.username, &chat_id, &media_type).await {
             Ok(access) => access,
             Err(status) => return status.into_response(),
         };
-    let ttl_ms = effective_attachment_ttl_sec(query.ttl_sec, &access, &media_type);
+    let ttl_ms = effective_attachment_ttl_sec(
+        query.ttl_sec,
+        &access,
+        &media_type,
+        state.attachment_max_lifetime_sec,
+    );
     let ttl_ms = (ttl_ms > 0).then(|| now_ms().saturating_add(ttl_ms.saturating_mul(1000)));
     let one_time = query.one_time.unwrap_or(false);
     let delete_after_download = query.delete_after_download.unwrap_or(one_time);
@@ -2585,6 +2780,43 @@ async fn release_attachment_claim(
     }
 }
 
+async fn delete_attachment(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let auth = match auth_from_headers(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(status) => return status,
+    };
+    let _conversation_guard = state.conversation_ops.lock().await;
+    touch_activity(&state).await;
+
+    delete_owned_attachment(&state, id, &auth.code_id).await
+}
+
+async fn delete_owned_attachment(state: &AppState, id: Uuid, owner_code_id: &CodeId) -> StatusCode {
+    let mut attachments = state.attachments.lock().await;
+    let Some(record) = attachments.get(&id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    if record.owner_code_id != *owner_code_id {
+        return StatusCode::FORBIDDEN;
+    }
+    let Some(record) = attachments.remove(&id) else {
+        return StatusCode::NOT_FOUND;
+    };
+    drop(attachments);
+
+    let mut usage = state.attachment_bytes_by_code.lock().await;
+    subtract_attachment_usage(
+        &mut usage,
+        &record.owner_code_id,
+        record.encrypted_bytes.len(),
+    );
+    StatusCode::NO_CONTENT
+}
+
 async fn account_error(
     status: StatusCode,
     state: &AppState,
@@ -2630,7 +2862,7 @@ async fn issue_session(
     let mut sessions = state.sessions.lock().await;
     sessions.retain(|_, session| session.code_id != code_id);
     sessions.insert(
-        token.clone(),
+        SessionToken::new(token.clone()),
         AuthSession {
             code_id,
             username: username.clone(),
@@ -2665,10 +2897,10 @@ async fn ws_handler(
     if !websocket_origin_allowed(&headers, &state.web_origins) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(token) = websocket_protocol_token(&headers) else {
+    let Some(token) = websocket_protocol_token(&headers).map(Zeroizing::new) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let auth = active_session(&state, &token, true).await;
+    let auth = active_session(&state, token.as_str(), true).await;
 
     match auth {
         Some(session) => {
@@ -2714,41 +2946,34 @@ fn websocket_origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> 
     else {
         return true;
     };
-    let Ok(uri) = origin.parse::<Uri>() else {
-        return false;
-    };
-    if !matches!(uri.scheme_str(), Some("http" | "https"))
-        || !matches!(uri.path(), "" | "/")
-        || uri.query().is_some()
-    {
-        return false;
-    }
-    let Some(origin_authority) = uri.authority().map(|value| value.as_str()) else {
+    let Ok(normalized_origin) = normalize_web_origin(origin) else {
         return false;
     };
     let same_host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|host| host.eq_ignore_ascii_case(origin_authority));
+        .and_then(|host| normalized_origin_authority(&format!("https://{host}")))
+        .is_some_and(|host| {
+            normalized_origin_authority(origin).is_some_and(|origin_host| origin_host == host)
+        });
     same_host
         || allowed_origins
             .iter()
-            .any(|allowed| allowed == origin.trim_end_matches('/'))
+            .any(|allowed| allowed == &normalized_origin)
 }
 
 async fn socket_loop(
     state: AppState,
-    mut session_token: String,
+    session_token: Zeroizing<String>,
     auth: AuthSession,
     client_id: Uuid,
     socket: WebSocket,
 ) {
-    if active_session(&state, &session_token, false)
+    if active_session(&state, session_token.as_str(), false)
         .await
         .is_none()
     {
         release_connection_reservation(&state, &auth.code_id, client_id).await;
-        session_token.zeroize();
         return;
     }
     let (mut sink, mut stream) = socket.split();
@@ -2784,7 +3009,7 @@ async fn socket_loop(
     loop {
         tokio::select! {
             _ = session_watchdog.tick() => {
-                if active_session(&state, &session_token, false).await.is_none() {
+                if active_session(&state, session_token.as_str(), false).await.is_none() {
                     break;
                 }
             }
@@ -2792,7 +3017,7 @@ async fn socket_loop(
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         let text = Zeroizing::new(text);
-                        if active_session(&state, &session_token, true).await.is_none() {
+                        if active_session(&state, session_token.as_str(), true).await.is_none() {
                             break;
                         }
                         if let Err(err) = check_ws_frame_allowed(&state, client_id, text.len()).await {
@@ -2821,7 +3046,6 @@ async fn socket_loop(
 
     cleanup_client(&state, client_id).await;
     writer.abort();
-    session_token.zeroize();
 }
 
 async fn check_ws_frame_allowed(
@@ -3034,12 +3258,36 @@ async fn route_encrypted_message(
     if version != E2EE_PROTOCOL_VERSION || !valid_chat_id(&chat_id) || !valid_chat_id(&message_id) {
         return Err("encrypted message rejected".to_string());
     }
-    decode_exact(&nonce_b64, MESSAGE_NONCE_BYTES)?;
-    decode_bounded(&ciphertext_b64, WS_MAX_FRAME_BYTES)?;
+    let nonce = Zeroizing::new(decode_exact(&nonce_b64, MESSAGE_NONCE_BYTES)?);
+    let ciphertext = Zeroizing::new(decode_bounded(&ciphertext_b64, WS_MAX_FRAME_BYTES)?);
 
     decode_bounded(&identity_envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
 
     let (sender_code_id, sender_username) = client_identity(state, sender_id).await?;
+    let sender_identity_public =
+        Zeroizing::new(decode_exact(&identity_public_b64, IDENTITY_PUBLIC_BYTES)?);
+    // Validate the complete bundle before any recipient fanout.  The relay
+    // must not distribute a sender identity containing a low-order or
+    // otherwise non-contributory X25519 key, even when its fingerprint looks
+    // consistent with the authenticated account.
+    if !valid_identity_public_bundle(&sender_identity_public, &prekey_id) {
+        return Err("authenticated identity required".to_string());
+    }
+    let authenticated_identity_public = Zeroizing::new(
+        state
+            .accounts
+            .lock()
+            .await
+            .get(&sender_code_id)
+            .map(|account| account.identity_public.clone())
+            .ok_or_else(|| "authenticated identity required".to_string())?,
+    );
+    if authenticated_identity_public.len() != IDENTITY_PUBLIC_BYTES
+        || authenticated_identity_public[..IDENTITY_FINGERPRINT_BYTES]
+            != sender_identity_public[..IDENTITY_FINGERPRINT_BYTES]
+    {
+        return Err("authenticated identity required".to_string());
+    }
     let access = conversation_access(state, &sender_username, &chat_id)
         .await
         .ok_or_else(|| "conversation unavailable".to_string())?;
@@ -3080,14 +3328,31 @@ async fn route_encrypted_message(
         if envelope.is_prekey == envelope.prekey_id.is_empty() {
             return Err("recipient envelope rejected".to_string());
         }
-        let mut wrapped = decode_bounded(&envelope.wrapped_key_b64, MAX_WRAPPED_KEY_BYTES)?;
+        let wrapped = Zeroizing::new(decode_bounded(
+            &envelope.wrapped_key_b64,
+            MAX_WRAPPED_KEY_BYTES,
+        )?);
         if wrapped.is_empty() {
-            wrapped.zeroize();
             return Err("recipient envelope rejected".to_string());
         }
-        wrapped.zeroize();
-        let mut signature = decode_exact(&envelope.signature_b64, MESSAGE_SIGNATURE_BYTES)?;
-        signature.zeroize();
+        let signature = Zeroizing::new(decode_exact(
+            &envelope.signature_b64,
+            MESSAGE_SIGNATURE_BYTES,
+        )?);
+        verify_message_signature_v6(
+            version,
+            &chat_id,
+            &message_id,
+            &sender_username,
+            &sender_identity_public,
+            &nonce,
+            &ciphertext,
+            &envelope.recipient_username,
+            &wrapped,
+            &envelope.prekey_id,
+            envelope.is_prekey,
+            &signature,
+        )?;
         let recipient_username = envelope.recipient_username.clone();
         envelope_map.insert(recipient_username, envelope);
     }
@@ -3193,14 +3458,18 @@ async fn register_message_id(
     if replay_ids.contains_key(&key) {
         return Err("message replay rejected".to_string());
     }
+    if replay_ids
+        .keys()
+        .filter(|candidate| candidate.sender_username == sender_username)
+        .count()
+        >= MAX_REPLAY_IDS_PER_SENDER
+    {
+        return Err("sender replay window full".to_string());
+    }
     if replay_ids.len() >= MAX_REPLAY_IDS {
-        if let Some(oldest) = replay_ids
-            .iter()
-            .min_by_key(|(_, seen_at)| **seen_at)
-            .map(|(key, _)| key.clone())
-        {
-            replay_ids.remove(&oldest);
-        }
+        // Never evict a live replay-window entry to admit new traffic. An
+        // attacker could otherwise fill the map and replay an older message.
+        return Err("replay window full".to_string());
     }
     replay_ids.insert(key, now);
     Ok(())
@@ -3724,17 +3993,23 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     drop(pending_bytes);
     drop(pending);
     state.attachments.lock().await.clear();
-    state.attachment_bytes_by_code.lock().await.clear();
+    let mut attachment_usage = state.attachment_bytes_by_code.lock().await;
+    zeroize_code_id_map(&mut attachment_usage);
+    drop(attachment_usage);
     state.room_catalog.lock().await.clear();
     state.direct_catalog.lock().await.clear();
     state.rooms.lock().await.clear();
     let mut sessions = state.sessions.lock().await;
-    for (mut token, _) in sessions.drain() {
-        token.zeroize();
+    for (token, _) in sessions.drain() {
+        drop(token);
     }
     drop(sessions);
-    state.accounts.lock().await.clear();
-    state.available_codes.lock().await.clear();
+    let mut accounts = state.accounts.lock().await;
+    zeroize_code_id_map(&mut accounts);
+    drop(accounts);
+    let mut available_codes = state.available_codes.lock().await;
+    zeroize_code_id_set(&mut available_codes);
+    drop(available_codes);
     if let Some(mut boot_codes) = state.boot_codes.lock().await.take() {
         for code in &mut boot_codes {
             code.zeroize();
@@ -3744,9 +4019,12 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     state.replay_ids.lock().await.clear();
     state.prekey_claims.lock().await.clear();
     state.opaque_handshakes.lock().await.clear();
-    state.login_limits.lock().await.clear();
+    let mut login_limits = state.login_limits.lock().await;
+    zeroize_code_id_map(&mut login_limits);
+    drop(login_limits);
     state.clients.lock().await.clear();
-    state.active_connections.lock().await.clear();
+    let mut active_connections = state.active_connections.lock().await;
+    zeroize_code_id_map(&mut active_connections);
 }
 
 async fn create_room(
@@ -4124,13 +4402,29 @@ fn reserve_connection(
 async fn release_connection_reservation(state: &AppState, code_id: &CodeId, client_id: Uuid) {
     let mut active_connections = state.active_connections.lock().await;
     if active_connections.get(code_id) == Some(&client_id) {
-        active_connections.remove(code_id);
+        if let Some((mut removed_code_id, _)) = active_connections.remove_entry(code_id) {
+            removed_code_id.zeroize();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn healthcheck_accepts_only_a_successful_json_health_response() {
+        assert!(healthcheck_response_is_healthy(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"storage\":\"ram-only\"}"
+        ));
+        assert!(!healthcheck_response_is_healthy(
+            b"HTTP/1.1 503 Service Unavailable\r\n\r\n{\"ok\":false}"
+        ));
+        assert!(!healthcheck_response_is_healthy(
+            b"HTTP/1.1 200 OK\r\n\r\n{\"storage\":\"ram-only\"}"
+        ));
+    }
 
     #[test]
     fn content_security_policy_allows_wasm_without_javascript_eval() {
@@ -4234,7 +4528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_limiter_prunes_stale_entries_and_evicts_oldest_at_capacity() {
+    async fn login_limiter_prunes_stale_entries_and_fails_closed_at_capacity() {
         let state = test_state();
         let now = now_ms();
         let oldest = test_code_id(&format!("login-code-{}", MAX_LOGIN_LIMIT_ENTRIES - 1));
@@ -4262,32 +4556,69 @@ mod tests {
         }
 
         let fresh = test_code_id("fresh-login-code");
-        assert!(login_attempt_allowed(&state, &fresh).await);
+        assert!(!login_attempt_allowed(&state, &fresh).await);
         let limits = state.login_limits.lock().await;
-        assert!(limits.len() <= MAX_LOGIN_LIMIT_ENTRIES);
-        assert!(!limits.contains_key(&oldest));
+        assert_eq!(limits.len(), MAX_LOGIN_LIMIT_ENTRIES);
+        assert!(limits.contains_key(&oldest));
         assert!(!limits.contains_key(&test_code_id("stale-login-code")));
-        assert!(limits.contains_key(&fresh));
+        assert!(!limits.contains_key(&fresh));
+    }
+
+    #[tokio::test]
+    async fn unknown_code_flood_cannot_consume_known_code_limiter_capacity() {
+        let state = test_state();
+        let known = test_code_id("known-invite-code");
+        state.available_codes.lock().await.insert(known);
+
+        for index in 0..(MAX_LOGIN_LIMIT_ENTRIES * 2) {
+            let unknown = test_code_id(&format!("unknown-invite-{index}"));
+            assert!(!known_code_id(&state, &unknown).await);
+            // This mirrors start_opaque_account: unknown IDs return before
+            // login_attempt_allowed and therefore never allocate a slot.
+        }
+        assert!(state.login_limits.lock().await.is_empty());
+        assert!(known_code_id(&state, &known).await);
+
+        for _ in 0..LOGIN_MAX_ATTEMPTS_PER_WINDOW {
+            assert!(login_attempt_allowed(&state, &known).await);
+        }
+        assert!(!login_attempt_allowed(&state, &known).await);
     }
 
     #[tokio::test]
     async fn opaque_handshakes_are_bounded_in_ram() {
         let state = test_state();
-        for _ in 0..=MAX_OPAQUE_HANDSHAKES {
-            store_opaque_handshake(
+        let first_id = Uuid::new_v4();
+        for index in 0..MAX_OPAQUE_HANDSHAKES {
+            let id = if index == 0 { first_id } else { Uuid::new_v4() };
+            assert!(
+                store_opaque_handshake(
+                    &state,
+                    id,
+                    OpaqueHandshake::Registration {
+                        code_id: test_code_id("handshake"),
+                        created_at_ms: now_ms(),
+                    },
+                )
+                .await
+            );
+        }
+        assert!(
+            !store_opaque_handshake(
                 &state,
                 Uuid::new_v4(),
                 OpaqueHandshake::Registration {
-                    code_id: test_code_id("handshake"),
+                    code_id: test_code_id("overflow-handshake"),
                     created_at_ms: now_ms(),
                 },
             )
-            .await;
-        }
+            .await
+        );
         assert_eq!(
             state.opaque_handshakes.lock().await.len(),
             MAX_OPAQUE_HANDSHAKES
         );
+        assert!(state.opaque_handshakes.lock().await.contains_key(&first_id));
     }
 
     #[test]
@@ -4302,6 +4633,55 @@ mod tests {
             usize::MAX,
             usize::MAX
         ));
+    }
+
+    #[test]
+    fn encrypted_attachment_body_requires_version_and_authentication_overhead() {
+        assert!(!valid_encrypted_attachment_body(&[]));
+        assert!(!valid_encrypted_attachment_body(
+            &[ATTACHMENT_BLOB_VERSION; ATTACHMENT_WIRE_OVERHEAD_BYTES - 1]
+        ));
+        assert!(!valid_encrypted_attachment_body(
+            &[0; ATTACHMENT_WIRE_OVERHEAD_BYTES]
+        ));
+        assert!(valid_encrypted_attachment_body(
+            &[ATTACHMENT_BLOB_VERSION; ATTACHMENT_WIRE_OVERHEAD_BYTES]
+        ));
+    }
+
+    #[tokio::test]
+    async fn uploaded_attachment_cleanup_is_owner_only_and_releases_usage() {
+        let state = test_state();
+        let owner = test_code_id("cleanup-owner");
+        let other = test_code_id("cleanup-other");
+        let attachment_id = Uuid::new_v4();
+        state.attachments.lock().await.insert(
+            attachment_id,
+            AttachmentRecord {
+                encrypted_bytes: vec![1, 2, 3, 4],
+                chat_id: "dm_cleanup".to_string(),
+                media_type: "FILE".to_string(),
+                owner_code_id: owner,
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: None,
+                eligible_recipient_code_ids: HashSet::new(),
+                download_claims: HashMap::new(),
+                completed_recipient_code_ids: HashSet::new(),
+            },
+        );
+        state.attachment_bytes_by_code.lock().await.insert(owner, 4);
+
+        assert_eq!(
+            delete_owned_attachment(&state, attachment_id, &other).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            delete_owned_attachment(&state, attachment_id, &owner).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(!state.attachments.lock().await.contains_key(&attachment_id));
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -4410,7 +4790,7 @@ mod tests {
             },
         );
         state.sessions.lock().await.insert(
-            "slow-upload-token".to_string(),
+            SessionToken::new("slow-upload-token".to_string()),
             AuthSession {
                 code_id: test_code_id("slow-owner"),
                 username: "Alice".to_string(),
@@ -4951,7 +5331,7 @@ mod tests {
             },
         );
         state.sessions.lock().await.insert(
-            "solo-token".to_string(),
+            SessionToken::new("solo-token".to_string()),
             AuthSession {
                 code_id: test_code_id("solo-owner"),
                 username: "Alice".to_string(),
@@ -5088,6 +5468,20 @@ mod tests {
 
         headers.insert(
             header::ORIGIN,
+            HeaderValue::from_static("HTTPS://WEB.EXAMPLE"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("web.example"));
+        assert!(websocket_origin_allowed(&headers, &[]));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:4020"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:4020"));
+        assert!(websocket_origin_allowed(&headers, &[]));
+
+        headers.insert(
+            header::ORIGIN,
             HeaderValue::from_static("https://abyssal.example/path"),
         );
         assert!(!websocket_origin_allowed(&headers, &[]));
@@ -5150,8 +5544,23 @@ mod tests {
             normalize_web_origin("https://web.example/").as_deref(),
             Ok("https://web.example")
         );
+        assert_eq!(
+            normalize_web_origin("HTTPS://WEB.EXAMPLE:8443/").as_deref(),
+            Ok("https://web.example:8443")
+        );
+        assert!(normalize_web_origin("http://web.example").is_err());
+        assert_eq!(
+            normalize_web_origin("http://127.0.0.1:4020").as_deref(),
+            Ok("http://127.0.0.1:4020")
+        );
+        assert_eq!(
+            normalize_web_origin("http://localhost:4173/").as_deref(),
+            Ok("http://localhost:4173")
+        );
         assert!(normalize_web_origin("https://web.example/path").is_err());
         assert!(normalize_web_origin("file://web.example").is_err());
+        assert!(normalize_web_origin("https://user:password@web.example").is_err());
+        assert!(normalize_web_origin("https:///missing-host").is_err());
     }
 
     #[test]
@@ -5197,6 +5606,36 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn replay_window_never_evicts_live_entries_when_full() {
+        let state = test_state();
+        let now = now_ms();
+        let mut replay_ids = state.replay_ids.lock().await;
+        for index in 0..MAX_REPLAY_IDS {
+            replay_ids.insert(
+                ReplayKey {
+                    chat_id: "forum_full".to_string(),
+                    sender_username: "Alice".to_string(),
+                    message_id: format!("message-{index}"),
+                },
+                now,
+            );
+        }
+        drop(replay_ids);
+
+        assert!(
+            register_message_id(&state, "forum_full", "Alice", "new-message")
+                .await
+                .is_err()
+        );
+        assert_eq!(state.replay_ids.lock().await.len(), MAX_REPLAY_IDS);
+        assert!(state.replay_ids.lock().await.contains_key(&ReplayKey {
+            chat_id: "forum_full".to_string(),
+            sender_username: "Alice".to_string(),
+            message_id: "message-0".to_string(),
+        }));
     }
 
     #[tokio::test]
@@ -5383,7 +5822,9 @@ mod tests {
             },
             vec![PendingFrame::new(
                 frame,
-                now.saturating_sub(state.pending_message_ttl_ms - 1),
+                // Keep a real margin below the expiry boundary. A one-ms
+                // margin made this test depend on scheduler timing.
+                now.saturating_sub(state.pending_message_ttl_ms - 60_000),
             )],
         );
         *state.pending_bytes.lock().await = frame_bytes;
@@ -5533,14 +5974,195 @@ mod tests {
 
     #[test]
     fn identity_bundle_rejects_empty_prekey_id_and_zero_one_time_key() {
-        let public = vec![7_u8; IDENTITY_PUBLIC_BYTES];
-        let prekey_id = prekey_id_for_public(&[7_u8; ONE_TIME_KEY_BYTES]);
+        let public = test_identity_public(7);
+        let prekey_id = test_prekey_id(7);
         assert!(valid_identity_public_bundle(&public, &prekey_id));
         assert!(!valid_identity_public_bundle(&public, ""));
 
         let mut zero_one_time = public;
         zero_one_time[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET].fill(0);
         assert!(!valid_identity_public_bundle(&zero_one_time, &prekey_id));
+    }
+
+    #[test]
+    fn relay_registration_validation_rejects_low_order_keys_in_every_x25519_slot() {
+        let valid = test_identity_public(b'A');
+        let prekey_id = test_prekey_id(b'A');
+        assert!(valid_identity_public_bundle(&valid, &prekey_id));
+
+        for range in [
+            0..32,
+            ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET,
+            FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES,
+        ] {
+            let mut malformed = valid.clone();
+            malformed[range.clone()].fill(0);
+            malformed[range.start] = 1;
+            assert!(
+                !valid_identity_public_bundle(&malformed, &prekey_id),
+                "relay registration accepted a low-order key in {:?}",
+                range
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_endpoint_rejects_low_order_fallback_before_consuming_code() {
+        let state = test_state();
+        let code = "ABCD-12345678";
+        let code_id = test_code_id(code);
+        state.available_codes.lock().await.insert(code_id);
+        let password = b"correct horse battery staple".to_vec();
+        let start = abyssal_core::secure_protocol::opaque_client_start(password.clone())
+            .expect("OPAQUE client start");
+        let response = abyssal_core::secure_protocol::opaque_server_registration_response(
+            &state.opaque_setup,
+            &start.registration_request,
+            code.as_bytes(),
+        )
+        .expect("OPAQUE server response");
+        let finish = abyssal_core::secure_protocol::opaque_client_finish_registration(
+            password,
+            start.registration_state,
+            response,
+        )
+        .expect("OPAQUE client finish");
+        let valid = test_identity_public(b'A');
+        let mut low_order_fallback = valid;
+        low_order_fallback[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES].fill(0);
+        low_order_fallback[FALLBACK_KEY_OFFSET] = 1;
+        let handshake_id = Uuid::new_v4();
+        state.opaque_handshakes.lock().await.insert(
+            handshake_id,
+            OpaqueHandshake::Registration {
+                code_id,
+                created_at_ms: now_ms(),
+            },
+        );
+
+        let response = finish_opaque_account(
+            State(state.clone()),
+            Json(OpaqueAccountFinishRequest {
+                handshake_id,
+                registration_upload_b64: Some(URL_SAFE_NO_PAD.encode(finish.registration_upload)),
+                credential_finalization_b64: None,
+                identity_public_b64: Some(URL_SAFE_NO_PAD.encode(low_order_fallback)),
+                identity_prekey_id: Some(test_prekey_id(b'A')),
+                identity_envelope_b64: Some(URL_SAFE_NO_PAD.encode({
+                    let mut envelope = [0_u8; 256];
+                    envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                    envelope
+                })),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.accounts.lock().await.is_empty());
+        assert!(state.available_codes.lock().await.contains(&code_id));
+    }
+
+    #[tokio::test]
+    async fn identity_state_update_rejects_low_order_fallback_without_mutating_account() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        let code_id = test_code_id("code-a");
+        let (valid, prekey_id, previous_revision) = {
+            let accounts = state.accounts.lock().await;
+            let account = accounts.get(&code_id).expect("Alice account");
+            (
+                account.identity_public.clone(),
+                account.prekey_id.clone(),
+                account.state_revision,
+            )
+        };
+        let mut low_order_fallback = valid.clone();
+        low_order_fallback[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES].fill(0);
+        low_order_fallback[FALLBACK_KEY_OFFSET] = 1;
+
+        let result = apply_identity_state(
+            &state,
+            &code_id,
+            previous_revision + 1,
+            &URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            &URL_SAFE_NO_PAD.encode(low_order_fallback),
+            &prekey_id,
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let accounts = state.accounts.lock().await;
+        let account = accounts.get(&code_id).expect("Alice account");
+        assert_eq!(account.state_revision, previous_revision);
+        assert_eq!(account.identity_public, valid);
+        assert_eq!(account.prekey_id, prekey_id);
+    }
+
+    #[tokio::test]
+    async fn fanout_rejects_low_order_sender_bundle_before_recipient_delivery() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct should open");
+        let direct_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("direct")
+            .id
+            .clone();
+        join_room(&state, alice_id, direct_id.clone())
+            .await
+            .expect("Alice joins direct");
+        join_room(&state, bob_id, direct_id.clone())
+            .await
+            .expect("Bob joins direct");
+        while bob_rx.try_recv().is_ok() {}
+
+        let (valid, prekey_id) = {
+            let accounts = state.accounts.lock().await;
+            let account = accounts
+                .get(&test_code_id("code-a"))
+                .expect("Alice account");
+            (account.identity_public.clone(), account.prekey_id.clone())
+        };
+        let mut low_order_fallback = valid.clone();
+        low_order_fallback[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES].fill(0);
+        low_order_fallback[FALLBACK_KEY_OFFSET] = 1;
+
+        let result = route_encrypted_message(
+            &state,
+            alice_id,
+            direct_id,
+            E2EE_PROTOCOL_VERSION,
+            "low-order-fanout".to_string(),
+            URL_SAFE_NO_PAD.encode([2_u8; MESSAGE_NONCE_BYTES]),
+            URL_SAFE_NO_PAD.encode(b"ciphertext"),
+            Vec::new(),
+            1,
+            URL_SAFE_NO_PAD.encode({
+                let mut envelope = [0_u8; 256];
+                envelope[0] = IDENTITY_ENVELOPE_VERSION;
+                envelope
+            }),
+            URL_SAFE_NO_PAD.encode(low_order_fallback),
+            prekey_id,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(bob_rx.try_recv().is_err());
+        assert!(state.pending.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -5666,14 +6288,33 @@ mod tests {
         let access = ConversationAccess::Room(room);
 
         assert_eq!(
-            effective_attachment_ttl_sec(Some(100), &access, "VIDEO"),
+            effective_attachment_ttl_sec(Some(100), &access, "VIDEO", 604_800),
             20
         );
-        assert_eq!(effective_attachment_ttl_sec(None, &access, "VIDEO"), 20);
-        assert_eq!(effective_attachment_ttl_sec(Some(10), &access, "VIDEO"), 10);
         assert_eq!(
-            effective_attachment_ttl_sec(Some(u64::MAX), &ConversationAccess::Direct, "FILE"),
+            effective_attachment_ttl_sec(None, &access, "VIDEO", 604_800),
+            20
+        );
+        assert_eq!(
+            effective_attachment_ttl_sec(Some(10), &access, "VIDEO", 604_800),
+            10
+        );
+        assert_eq!(
+            effective_attachment_ttl_sec(
+                Some(u64::MAX),
+                &ConversationAccess::Direct,
+                "FILE",
+                604_800,
+            ),
             86_400
+        );
+        assert_eq!(
+            effective_attachment_ttl_sec(None, &ConversationAccess::Direct, "FILE", 604_800),
+            604_800
+        );
+        assert_eq!(
+            effective_attachment_ttl_sec(Some(100), &ConversationAccess::Direct, "FILE", 60,),
+            60
         );
     }
 
@@ -5866,13 +6507,39 @@ mod tests {
         join_room(&state, bob_id, direct_id.clone())
             .await
             .expect("Bob joins direct");
+        let identity_public = state
+            .accounts
+            .lock()
+            .await
+            .get(&test_code_id("code-a"))
+            .expect("Alice account")
+            .identity_public
+            .clone();
+        let wrapped_key = [4_u8; 256];
+        let valid_signature = test_valid_message_signature_b64(
+            b'A',
+            &direct_id,
+            "forward-envelope-signature",
+            "Alice",
+            &identity_public,
+            "Bob",
+            &wrapped_key,
+            "",
+            false,
+        );
         route_test_message_with_envelopes(
             &state,
             alice_id,
             &direct_id,
             E2EE_PROTOCOL_VERSION,
             "forward-envelope-signature",
-            vec![envelope(&test_signature_b64(b'D'))],
+            vec![InboundRecipientEnvelope {
+                recipient_username: "Bob".to_string(),
+                wrapped_key_b64: URL_SAFE_NO_PAD.encode(wrapped_key),
+                prekey_id: String::new(),
+                is_prekey: false,
+                signature_b64: valid_signature.clone(),
+            }],
         )
         .await
         .expect("valid v6 message should route");
@@ -5880,11 +6547,94 @@ mod tests {
             panic!("expected text frame");
         };
         let outbound: serde_json::Value = serde_json::from_str(&text).expect("outbound frame");
-        assert_eq!(outbound["signature_b64"], test_signature_b64(b'D'));
+        assert_eq!(outbound["signature_b64"], valid_signature);
         assert_eq!(
             outbound["identity_public_b64"],
             outbound["sender_public_key_b64"]
         );
+    }
+
+    #[tokio::test]
+    async fn forged_signature_cannot_claim_prekey_or_mutate_relay_state() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct should open");
+        let direct_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("direct")
+            .id
+            .clone();
+        join_room(&state, alice_id, direct_id.clone())
+            .await
+            .expect("Alice joins direct");
+        join_room(&state, bob_id, direct_id.clone())
+            .await
+            .expect("Bob joins direct");
+        while bob_rx.try_recv().is_ok() {}
+
+        let identity_public = state
+            .accounts
+            .lock()
+            .await
+            .get(&test_code_id("code-a"))
+            .expect("Alice account")
+            .identity_public
+            .clone();
+        let wrapped_key = [9_u8; 256];
+        let mut signature = URL_SAFE_NO_PAD
+            .decode(test_valid_message_signature_b64(
+                b'A',
+                &direct_id,
+                "forged-message",
+                "Alice",
+                &identity_public,
+                "Bob",
+                &wrapped_key,
+                &test_prekey_id(b'B'),
+                true,
+            ))
+            .expect("valid signature");
+        signature[0] ^= 1;
+        let result = route_test_message_with_envelopes(
+            &state,
+            alice_id,
+            &direct_id,
+            E2EE_PROTOCOL_VERSION,
+            "forged-message",
+            vec![InboundRecipientEnvelope {
+                recipient_username: "Bob".to_string(),
+                wrapped_key_b64: URL_SAFE_NO_PAD.encode(wrapped_key),
+                prekey_id: test_prekey_id(b'B'),
+                is_prekey: true,
+                signature_b64: URL_SAFE_NO_PAD.encode(signature),
+            }],
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state.prekey_claims.lock().await.is_empty());
+        assert!(state.replay_ids.lock().await.is_empty());
+        assert!(state.pending.lock().await.is_empty());
+        assert_eq!(*state.pending_bytes.lock().await, 0);
+        assert_eq!(
+            state
+                .accounts
+                .lock()
+                .await
+                .get(&test_code_id("code-a"))
+                .expect("Alice account")
+                .state_revision,
+            0
+        );
+        assert!(bob_rx.try_recv().is_err());
     }
 
     #[test]
@@ -6216,6 +6966,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_sender_quota_does_not_block_another_sender() {
+        let state = test_state();
+        for index in 0..MAX_REPLAY_IDS_PER_SENDER {
+            register_message_id(
+                &state,
+                "forum_sender_quota",
+                "Alice",
+                &format!("message-{index}"),
+            )
+            .await
+            .expect("sender quota should fill with unique messages");
+        }
+        assert!(
+            register_message_id(&state, "forum_sender_quota", "Alice", "message-overflow")
+                .await
+                .is_err()
+        );
+        assert!(
+            register_message_id(&state, "forum_sender_quota", "Bob", "message-1")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn identity_revision_window_accepts_reordering_once_without_rollback() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
@@ -6273,7 +7048,7 @@ mod tests {
         let code = "ABYS-SESSION-0001";
         let code_id = test_code_id(code);
         state.sessions.lock().await.insert(
-            "active-token".to_string(),
+            SessionToken::new("active-token".to_string()),
             AuthSession {
                 code_id,
                 username: "Alice".to_string(),
@@ -6326,6 +7101,7 @@ mod tests {
             node_id: "test-node".to_string(),
             attachment_ram_limit_bytes: 8 * 1024 * 1024,
             attachment_account_limit_bytes: 4 * 1024 * 1024,
+            attachment_max_lifetime_sec: DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS as u64 * 60 * 60,
             max_rooms_per_user: 2,
             conversation_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms: pending_message_ttl_ms_from_value(None),
@@ -6334,9 +7110,9 @@ mod tests {
             inactivity_limit_ms: None,
             last_activity_ms: Arc::new(Mutex::new(now_ms())),
             account_ops: Arc::new(Mutex::new(())),
-            opaque_setup: Arc::new(opaque_server_setup()),
+            opaque_setup: Arc::new(Zeroizing::new(opaque_server_setup())),
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
-            invite_code_pepper: Arc::new([7_u8; 32]),
+            invite_code_pepper: Arc::new(Zeroizing::new([7_u8; 32])),
             boot_codes: Arc::new(Mutex::new(None)),
             available_codes: Arc::new(Mutex::new(HashSet::new())),
             accounts: Arc::new(Mutex::new(HashMap::new())),
@@ -6368,7 +7144,7 @@ mod tests {
             Account {
                 username: username.to_string(),
                 password_file: vec![1; 192],
-                identity_public: vec![identity_fill; IDENTITY_PUBLIC_BYTES],
+                identity_public: test_identity_public(identity_fill),
                 prekey_id: test_prekey_id(identity_fill),
                 identity_envelope,
                 state_revision: 0,
@@ -6401,21 +7177,16 @@ mod tests {
         recipients: &[&str],
         message_id: &str,
     ) -> Result<(), String> {
-        let (code_id, _) = client_identity(state, sender_id).await?;
-        let state_revision = state
-            .accounts
-            .lock()
-            .await
-            .get(&code_id)
-            .map(|account| account.state_revision + 1)
-            .ok_or_else(|| "missing test account".to_string())?;
-        let (identity_public_b64, prekey_id) = state
+        let (code_id, sender_username) = client_identity(state, sender_id).await?;
+        let (state_revision, identity_public, identity_public_b64, prekey_id) = state
             .accounts
             .lock()
             .await
             .get(&code_id)
             .map(|account| {
                 (
+                    account.state_revision + 1,
+                    account.identity_public.clone(),
                     URL_SAFE_NO_PAD.encode(&account.identity_public),
                     account.prekey_id.clone(),
                 )
@@ -6431,12 +7202,25 @@ mod tests {
             URL_SAFE_NO_PAD.encode(b"ciphertext"),
             recipients
                 .iter()
-                .map(|username| InboundRecipientEnvelope {
-                    recipient_username: (*username).to_string(),
-                    wrapped_key_b64: URL_SAFE_NO_PAD.encode([4_u8; 256]),
-                    prekey_id: String::new(),
-                    is_prekey: false,
-                    signature_b64: test_signature_b64(b'S'),
+                .map(|username| {
+                    let wrapped_key = [4_u8; 256];
+                    InboundRecipientEnvelope {
+                        recipient_username: (*username).to_string(),
+                        wrapped_key_b64: URL_SAFE_NO_PAD.encode(wrapped_key),
+                        prekey_id: String::new(),
+                        is_prekey: false,
+                        signature_b64: test_valid_message_signature_b64(
+                            sender_username.as_bytes()[0],
+                            chat_id,
+                            message_id,
+                            &sender_username,
+                            &identity_public,
+                            username,
+                            &wrapped_key,
+                            "",
+                            false,
+                        ),
+                    }
                 })
                 .collect(),
             state_revision,
@@ -6523,15 +7307,57 @@ mod tests {
     }
 
     fn test_identity_public_b64(fill: u8) -> String {
-        URL_SAFE_NO_PAD.encode(vec![fill; IDENTITY_PUBLIC_BYTES])
+        URL_SAFE_NO_PAD.encode(test_identity_public(fill))
+    }
+
+    fn test_identity_public(fill: u8) -> Vec<u8> {
+        let signing_key = test_signing_key(fill);
+        let mut identity_public = vec![fill; IDENTITY_PUBLIC_BYTES];
+        identity_public[IDENTITY_FINGERPRINT_BYTES - 32..IDENTITY_FINGERPRINT_BYTES]
+            .copy_from_slice(signing_key.verifying_key().as_bytes());
+        identity_public
+    }
+
+    fn test_signing_key(fill: u8) -> SigningKey {
+        SigningKey::from_bytes(&[fill; 32])
     }
 
     fn test_prekey_id(fill: u8) -> String {
-        prekey_id_for_public(&[fill; ONE_TIME_KEY_BYTES])
+        abyssal_core::secure_protocol::prekey_id_for_public(&[fill; ONE_TIME_KEY_BYTES])
     }
 
     fn test_signature_b64(fill: u8) -> String {
         URL_SAFE_NO_PAD.encode([fill; MESSAGE_SIGNATURE_BYTES])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_valid_message_signature_b64(
+        fill: u8,
+        chat_id: &str,
+        message_id: &str,
+        sender_username: &str,
+        identity_public: &[u8],
+        recipient_username: &str,
+        wrapped_key: &[u8],
+        prekey_id: &str,
+        is_prekey: bool,
+    ) -> String {
+        let transcript = abyssal_core::secure_protocol::message_signature_input_v6(
+            E2EE_PROTOCOL_VERSION,
+            chat_id,
+            message_id,
+            sender_username,
+            identity_public,
+            &[2_u8; MESSAGE_NONCE_BYTES],
+            b"ciphertext",
+            recipient_username,
+            wrapped_key,
+            prekey_id,
+            is_prekey,
+        )
+        .expect("test transcript");
+        let signature = test_signing_key(fill).sign(&transcript);
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
     }
 
     fn test_message_frame(

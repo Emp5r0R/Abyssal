@@ -48,12 +48,15 @@ interface IMessageSender {
 interface IMessageRepository {
     fun getChatSessions(): Flow<List<ChatSession>>
     fun getMessages(chatId: String): Flow<List<Message>>
+    /** Synchronous RAM purge for ViewModel teardown; must not touch disk. */
+    fun clearAllDataNow()
     suspend fun saveMessage(chatId: String, message: Message)
     suspend fun markAsRead(chatId: String, messageId: String)
     suspend fun forgetAttachmentKey(chatId: String, messageId: String)
     suspend fun createForumSession(session: ChatSession)
     suspend fun deleteChatSession(chatId: String)
     suspend fun clearAllData()
+    fun close()
 }
 
 interface IChatTransport {
@@ -93,20 +96,20 @@ interface IEncryptedAttachmentService {
     ): AttachmentUploadResult
 
     suspend fun downloadEncryptedAttachment(attachmentId: String): EncryptedAttachmentDownload?
+    suspend fun deleteUploadedAttachment(attachmentId: String): Boolean
     suspend fun completeAttachmentDownload(attachmentId: String, claim: String): Boolean
     suspend fun releaseAttachmentDownloadClaim(attachmentId: String, claim: String): Boolean
     suspend fun saveDecryptedAttachment(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
 }
 
 interface IDisguiseManager {
-    fun setDisguiseEnabled(enabled: Boolean)
+    /** Atomically configures the in-RAM verifier and launcher alias state. */
+    fun configure(enabled: Boolean, unlockPin: String = "", duressPin: String = ""): Boolean
     fun isDisguiseEnabled(): Boolean
-    fun savePin(pin: String)
-    fun saveDuressPin(pin: String)
+    /** Wipes verifier material during ViewModel teardown without waiting on I/O. */
+    fun clear()
     fun verifyPin(pin: String): Boolean
     fun verifyDuressPin(pin: String): Boolean
-    fun getPin(): String
-    fun getDuressPin(): String
 }
 
 interface IAppUpdateService {

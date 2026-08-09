@@ -47,10 +47,14 @@ android {
                 storePassword = releaseStorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword
-                enableV1Signing = true
+                // minSdk 26 supports APK Signature Scheme v2/v3. Do not emit the
+                // legacy JAR/v1 scheme, which is not needed for this application.
+                enableV1Signing = false
                 enableV2Signing = true
                 enableV3Signing = true
-                enableV4Signing = true
+                // v4 is an optional incremental-install sidecar and is not part of
+                // the distributed artifact; keep release verification deterministic.
+                enableV4Signing = false
             }
         }
     }

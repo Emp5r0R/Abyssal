@@ -108,4 +108,29 @@ class AttachmentDocumentWriterTest {
 
         assertTrue(deleted)
     }
+
+    @Test
+    fun cooperativeCancellationDeletesPartialOutputBetweenChunks() {
+        var deleted = false
+        var checks = 0
+        val bytes = ByteArray(AttachmentDocumentWriterTest.CHUNK_TEST_BYTES) { 7 }
+
+        try {
+            AttachmentDocumentWriter.writeIfNonEmptyOrDelete(
+                bytes = bytes,
+                openOutput = { ByteArrayOutputStream() },
+                deleteOutput = { deleted = true },
+                shouldCancel = { ++checks > 1 }
+            )
+        } catch (_: CancellationException) {
+            // Expected: a cancelled provider write must not leave a partial file.
+        }
+
+        assertTrue(deleted)
+        assertTrue(checks > 1)
+    }
+
+    private companion object {
+        const val CHUNK_TEST_BYTES = 128 * 1024
+    }
 }

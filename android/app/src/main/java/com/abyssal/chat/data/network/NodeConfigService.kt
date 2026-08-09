@@ -7,6 +7,7 @@ import java.net.URI
 import java.util.Locale
 
 class InMemoryNodeConfigService : INodeConfigService {
+    @Volatile
     private var activeSession: NodeSession? = null
 
     override fun normalizeNodeUrl(input: String): Result<NodeEndpoint> {
