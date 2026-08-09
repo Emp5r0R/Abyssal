@@ -30,6 +30,14 @@ run_shell() {
     bash -n "$ROOT_DIR/$script"
   done < <(git -C "$ROOT_DIR" ls-files '*.sh' | sort)
 
+  while read -r mode _ _ script; do
+    if [[ "$mode" != "100755" ]]; then
+      printf 'Tracked shell script must be executable: %s (mode %s)\n' \
+        "$script" "$mode" >&2
+      exit 1
+    fi
+  done < <(git -C "$ROOT_DIR" ls-files -s '*.sh')
+
   "$ROOT_DIR/scripts/verify-gradle-wrapper.sh"
   "$ROOT_DIR/scripts/verify-gradle-dependencies.sh"
   "$ROOT_DIR/scripts/verify-crypto-artifacts.sh"
