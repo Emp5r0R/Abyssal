@@ -697,6 +697,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_seal_identity(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_sign_acknowledgement(
+    ): Int
     external fun uniffi_abyssal_core_checksum_constructor_e2eesession_create(
     ): Int
     external fun uniffi_abyssal_core_checksum_constructor_e2eesession_recover(
@@ -736,6 +738,8 @@ internal object UniffiLib {
     external fun uniffi_abyssal_core_fn_method_e2eesession_public_key(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_seal_identity(`ptr`: Long,`exportKey`: RustBuffer.ByValue,`context`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_e2eesession_sign_acknowledgement(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`originalSenderUsername`: RustBuffer.ByValue,`usedPrekeyId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_conversation_safety_number(`firstPublicKey`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -899,6 +903,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_seal_identity() != 32517) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_sign_acknowledgement() != 65231) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_constructor_e2eesession_create() != 62344) {
@@ -1317,6 +1324,17 @@ public interface E2eeSessionInterface {
 
     fun `sealIdentity`(`exportKey`: kotlin.ByteArray, `context`: kotlin.ByteArray): kotlin.ByteArray
 
+    /**
+     * Sign an acknowledgement as an independent action proof.
+     *
+     * The transcript contains only the protocol domain/version, conversation,
+     * message, original sender, and the prekey consumed by that message. It
+     * deliberately does not include the recipient's ratchet revision or
+     * identity-state signature so a duplicate delivery can be acknowledged
+     * after the state has advanced.
+     */
+    fun `signAcknowledgement`(`chatId`: kotlin.String, `messageId`: kotlin.String, `originalSenderUsername`: kotlin.String, `usedPrekeyId`: kotlin.String): kotlin.ByteArray
+
     companion object
 }
 
@@ -1510,6 +1528,33 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
 
 
 
+    /**
+     * Sign an acknowledgement as an independent action proof.
+     *
+     * The transcript contains only the protocol domain/version, conversation,
+     * message, original sender, and the prekey consumed by that message. It
+     * deliberately does not include the recipient's ratchet revision or
+     * identity-state signature so a duplicate delivery can be acknowledged
+     * after the state has advanced.
+     */
+    @Throws(AbyssalException::class)override fun `signAcknowledgement`(`chatId`: kotlin.String, `messageId`: kotlin.String, `originalSenderUsername`: kotlin.String, `usedPrekeyId`: kotlin.String): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_sign_acknowledgement(
+        it,
+
+        FfiConverterString.lower(`chatId`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterString.lower(`originalSenderUsername`),
+        FfiConverterString.lower(`usedPrekeyId`),_status)
+}
+    }
+    )
+    }
+
+
+
 
 
 
@@ -1629,6 +1674,8 @@ data class E2eeDecryption (
     var `identityPublic`: kotlin.ByteArray
     ,
     var `prekeyId`: kotlin.String
+    ,
+    var `stateSignature`: kotlin.ByteArray
 
 ){
 
@@ -1650,6 +1697,7 @@ public object FfiConverterTypeE2eeDecryption: FfiConverterRustBuffer<E2eeDecrypt
             FfiConverterByteArray.read(buf),
             FfiConverterByteArray.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
         )
     }
 
@@ -1658,7 +1706,8 @@ public object FfiConverterTypeE2eeDecryption: FfiConverterRustBuffer<E2eeDecrypt
             FfiConverterULong.allocationSize(value.`stateRevision`) +
             FfiConverterByteArray.allocationSize(value.`identityEnvelope`) +
             FfiConverterByteArray.allocationSize(value.`identityPublic`) +
-            FfiConverterString.allocationSize(value.`prekeyId`)
+            FfiConverterString.allocationSize(value.`prekeyId`) +
+            FfiConverterByteArray.allocationSize(value.`stateSignature`)
     )
 
     override fun write(value: E2eeDecryption, buf: ByteBuffer) {
@@ -1667,6 +1716,7 @@ public object FfiConverterTypeE2eeDecryption: FfiConverterRustBuffer<E2eeDecrypt
             FfiConverterByteArray.write(value.`identityEnvelope`, buf)
             FfiConverterByteArray.write(value.`identityPublic`, buf)
             FfiConverterString.write(value.`prekeyId`, buf)
+            FfiConverterByteArray.write(value.`stateSignature`, buf)
     }
 }
 
@@ -1690,6 +1740,8 @@ data class E2eePayload (
     var `identityPublic`: kotlin.ByteArray
     ,
     var `prekeyId`: kotlin.String
+    ,
+    var `stateSignature`: kotlin.ByteArray
 
 ){
 
@@ -1715,6 +1767,7 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterByteArray.read(buf),
             FfiConverterByteArray.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
         )
     }
 
@@ -1727,7 +1780,8 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterULong.allocationSize(value.`stateRevision`) +
             FfiConverterByteArray.allocationSize(value.`identityEnvelope`) +
             FfiConverterByteArray.allocationSize(value.`identityPublic`) +
-            FfiConverterString.allocationSize(value.`prekeyId`)
+            FfiConverterString.allocationSize(value.`prekeyId`) +
+            FfiConverterByteArray.allocationSize(value.`stateSignature`)
     )
 
     override fun write(value: E2eePayload, buf: ByteBuffer) {
@@ -1740,6 +1794,7 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterByteArray.write(value.`identityEnvelope`, buf)
             FfiConverterByteArray.write(value.`identityPublic`, buf)
             FfiConverterString.write(value.`prekeyId`, buf)
+            FfiConverterByteArray.write(value.`stateSignature`, buf)
     }
 }
 

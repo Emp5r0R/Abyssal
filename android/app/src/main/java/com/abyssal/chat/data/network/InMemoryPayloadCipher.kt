@@ -17,6 +17,10 @@ class InMemoryPayloadCipher {
     private var session: E2eeSession? = null
     private var pendingState: IdentityStateSnapshot? = null
 
+    data class DecryptionResult(
+        val plaintext: ByteArray
+    )
+
     @Synchronized
     fun createIdentity(exportKey: ByteArray, context: ByteArray): IdentityMaterial {
         clear()
@@ -57,7 +61,8 @@ class InMemoryPayloadCipher {
             revision = it.revision,
             envelope = it.envelope.clone(),
             identityPublicKey = it.identityPublicKey.clone(),
-            prekeyId = it.prekeyId
+            prekeyId = it.prekeyId,
+            stateSignature = it.stateSignature.clone()
         )
     }
 
@@ -83,7 +88,8 @@ class InMemoryPayloadCipher {
             encrypted.stateRevision,
             encrypted.identityEnvelope,
             encrypted.identityPublic,
-            encrypted.prekeyId
+            encrypted.prekeyId,
+            encrypted.stateSignature
         )
         return EncryptedTransportPayload(
             version = encrypted.version.toInt(),
@@ -96,12 +102,13 @@ class InMemoryPayloadCipher {
             stateRevision = encrypted.stateRevision,
             identityEnvelope = encrypted.identityEnvelope,
             identityPublicKey = encrypted.identityPublic,
-            prekeyId = encrypted.prekeyId
+            prekeyId = encrypted.prekeyId,
+            stateSignature = encrypted.stateSignature
         )
     }
 
     @Synchronized
-    fun decrypt(payload: IncomingTransportPayload, recipientUsername: String): ByteArray {
+    fun decrypt(payload: IncomingTransportPayload, recipientUsername: String): DecryptionResult {
         val decrypted = requireSession().decrypt(
             payload.chatId,
             payload.messageId,
@@ -117,25 +124,50 @@ class InMemoryPayloadCipher {
             payload.isPrekey,
             recipientUsername
         )
-        rememberState(
-            decrypted.stateRevision,
-            decrypted.identityEnvelope,
-            decrypted.identityPublic,
-            decrypted.prekeyId
-        )
+        var result: DecryptionResult? = null
         return try {
-            decrypted.plaintext
+            rememberState(
+                decrypted.stateRevision,
+                decrypted.identityEnvelope,
+                decrypted.identityPublic,
+                decrypted.prekeyId,
+                decrypted.stateSignature
+            )
+            result = DecryptionResult(plaintext = decrypted.plaintext)
+            result
         } finally {
+            if (result == null) decrypted.plaintext.fill(0)
             decrypted.identityEnvelope.fill(0)
             decrypted.identityPublic.fill(0)
+            decrypted.stateSignature.fill(0)
         }
     }
 
+    @Synchronized
+    fun signAcknowledgement(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        usedPrekeyId: String
+    ): ByteArray {
+        val signature = requireSession().signAcknowledgement(
+            chatId,
+            messageId,
+            senderUsername,
+            usedPrekeyId
+        )
+        require(signature.size == ACK_SIGNATURE_BYTES)
+        return signature
+    }
+
     fun serialize(payload: EncryptedTransportPayload): ByteArray {
+        require(payload.version == PROTOCOL_VERSION)
+        require(payload.stateSignature.size == STATE_SIGNATURE_BYTES)
         val json = JSONObject()
             .put("version", payload.version)
             .put("message_id", payload.messageId)
             .put("identity_public_b64", encode(payload.identityPublicKey))
+            .put("state_signature_b64", encode(payload.stateSignature))
             .put("nonce_b64", encode(payload.nonce))
             .put("ciphertext_b64", encode(payload.ciphertext))
             .put("envelopes", JSONArray().apply {
@@ -235,6 +267,7 @@ class InMemoryPayloadCipher {
     fun clear() {
         pendingState?.envelope?.fill(0)
         pendingState?.identityPublicKey?.fill(0)
+        pendingState?.stateSignature?.fill(0)
         pendingState = null
         session?.close()
         session = null
@@ -247,15 +280,19 @@ class InMemoryPayloadCipher {
         revision: ULong,
         envelope: ByteArray,
         identityPublicKey: ByteArray,
-        prekeyId: String
+        prekeyId: String,
+        stateSignature: ByteArray
     ) {
+        require(stateSignature.size == STATE_SIGNATURE_BYTES)
         pendingState?.envelope?.fill(0)
         pendingState?.identityPublicKey?.fill(0)
+        pendingState?.stateSignature?.fill(0)
         pendingState = IdentityStateSnapshot(
             revision = revision,
             envelope = envelope.clone(),
             identityPublicKey = identityPublicKey.clone(),
-            prekeyId = prekeyId
+            prekeyId = prekeyId,
+            stateSignature = stateSignature.clone()
         )
     }
 
@@ -266,9 +303,11 @@ class InMemoryPayloadCipher {
     )
 
     private companion object {
-        const val PROTOCOL_VERSION = 6
+        const val PROTOCOL_VERSION = 7
         const val MESSAGE_NONCE_BYTES = 12
         const val MESSAGE_SIGNATURE_BYTES = 64
+        const val STATE_SIGNATURE_BYTES = 64
+        const val ACK_SIGNATURE_BYTES = 64
         const val IDENTITY_PUBLIC_KEY_BYTES = 128
         const val MAX_WRAPPED_KEY_BYTES = 4096
         const val MAX_METADATA_SERIALIZED_BYTES = 1 * 1024 * 1024

@@ -12,8 +12,8 @@ services:
     pids_limit: 128
     ulimits:
       core: 0
-    # Keep headroom for the 512 MiB global attachment pool, two roughly
-    # 200 MiB encrypted upload bodies, two downloads, and runtime overhead.
+    # Keep headroom for the 512 MiB global attachment pool. The pool already
+    # accounts for stored blobs and in-flight upload/download references.
     # Override with ABYSSAL_CONTAINER_MEMORY_LIMIT when sizing a host.
     mem_limit: ${ABYSSAL_CONTAINER_MEMORY_LIMIT:-2g}
     env_file:

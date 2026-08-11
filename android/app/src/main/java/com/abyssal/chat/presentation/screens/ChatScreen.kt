@@ -118,6 +118,7 @@ import com.abyssal.chat.theme.PureWhite
 import com.abyssal.chat.theme.SelfDestructAmber
 import com.abyssal.chat.theme.SteelMuted
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -179,8 +180,8 @@ private fun ChatContent(
     onViewAttachment: (Message) -> Unit,
     onSaveAttachment: (Message, Uri) -> Unit,
     onDismissAttachmentPreview: () -> Unit,
-    onExternalSystemUiStart: () -> Unit,
-    onExternalSystemUiEnd: () -> Unit,
+    onExternalSystemUiStart: () -> Long,
+    onExternalSystemUiEnd: (Long) -> Boolean,
     onUserActivity: () -> Unit
 ) {
     var textInput by remember { mutableStateOf("") }
@@ -188,6 +189,7 @@ private fun ChatContent(
     var showAttachmentDialog by remember { mutableStateOf(false) }
     var showBundledGifDialog by remember { mutableStateOf(false) }
     var saveTargetMessage by remember { mutableStateOf<Message?>(null) }
+    var savePickerToken by remember { mutableStateOf<Long?>(null) }
     var replyingToMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
     var highlightedMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
     var hasPositionedMessageList by remember(session?.id) { mutableStateOf(false) }
@@ -268,10 +270,14 @@ private fun ChatContent(
         }
     }
     val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
-        onExternalSystemUiEnd()
-        val message = saveTargetMessage
-        if (uri != null && message != null) onSaveAttachment(message, uri)
-        saveTargetMessage = null
+        val token = savePickerToken
+        val accepted = token != null && onExternalSystemUiEnd(token)
+        if (token != null && savePickerToken == token) {
+            savePickerToken = null
+            val message = saveTargetMessage
+            saveTargetMessage = null
+            if (accepted && uri != null && message != null) onSaveAttachment(message, uri)
+        }
     }
 
     MirageBackground {
@@ -334,12 +340,16 @@ private fun ChatContent(
                             onViewAttachment = { onViewAttachment(message) },
                             onSaveAttachment = {
                                 saveTargetMessage = message
-                                onExternalSystemUiStart()
+                                val pickerToken = onExternalSystemUiStart()
+                                savePickerToken = pickerToken
                                 runCatching {
                                     saveLauncher.launch(AttachmentSavePolicy.sanitizedFileName(message.attachmentName))
                                 }.onFailure {
-                                    onExternalSystemUiEnd()
-                                    saveTargetMessage = null
+                                    if (savePickerToken == pickerToken) {
+                                        onExternalSystemUiEnd(pickerToken)
+                                        savePickerToken = null
+                                        saveTargetMessage = null
+                                    }
                                 }
                             }
                         )
@@ -860,54 +870,69 @@ private fun AttachmentDialog(
     attachmentError: String?,
     onDismiss: () -> Unit,
     onSendAttachment: (String, String, String, ByteArray, Boolean, Boolean) -> Unit,
-    onExternalSystemUiStart: () -> Unit,
-    onExternalSystemUiEnd: () -> Unit
+    onExternalSystemUiStart: () -> Long,
+    onExternalSystemUiEnd: (Long) -> Boolean
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var localError by remember { mutableStateOf<String?>(null) }
     var oneTimeView by remember { mutableStateOf(false) }
     var deleteAfterDownload by remember { mutableStateOf(false) }
+    var pickerToken by remember { mutableStateOf<Long?>(null) }
     val imagesOk = session?.allowImages != false
     val videosOk = session?.allowVideos != false
     val filesOk = session?.allowFiles != false
     fun handlePicked(uri: Uri?, mediaType: String, allowOneTime: Boolean) {
         if (uri == null) return
         scope.launch {
-            val picked = withContext(Dispatchers.IO) {
-                context.readPickedAttachment(uri, mediaType, attachmentLimitBytes(mediaType))
-            }
-            if (picked == null) {
-                localError = "Wrong information."
-            } else {
-                var transferred = false
-                try {
-                    onSendAttachment(
-                        picked.mediaType,
-                        picked.name,
-                        picked.mimeType,
-                        picked.bytes,
-                        oneTimeView && allowOneTime,
-                        deleteAfterDownload || (oneTimeView && allowOneTime)
-                    )
-                    transferred = true
-                } finally {
-                    if (!transferred) picked.bytes.fill(0)
+            try {
+                val picked = withContext(Dispatchers.IO) {
+                    context.readPickedAttachment(uri, mediaType, attachmentLimitBytes(mediaType))
                 }
+                if (picked == null) {
+                    localError = "Wrong information."
+                } else {
+                    var transferred = false
+                    try {
+                        onSendAttachment(
+                            picked.mediaType,
+                            picked.name,
+                            picked.mimeType,
+                            picked.bytes,
+                            oneTimeView && allowOneTime,
+                            deleteAfterDownload || (oneTimeView && allowOneTime)
+                        )
+                        transferred = true
+                    } finally {
+                        if (!transferred) picked.bytes.fill(0)
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // Content providers are external processes. Never let provider faults
+                // crash the app or expose a provider-specific error to the user.
+                localError = "Wrong information."
             }
         }
     }
+
+    fun finishPicker(uri: Uri?, mediaType: String, allowOneTime: Boolean) {
+        val token = pickerToken
+        val accepted = token != null && onExternalSystemUiEnd(token)
+        if (token != null && pickerToken == token) pickerToken = null
+        // Do not even open the provider URI for an expired or stale callback.
+        if (accepted) handlePicked(uri, mediaType, allowOneTime)
+    }
+
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        onExternalSystemUiEnd()
-        handlePicked(uri, "IMAGE", true)
+        finishPicker(uri, "IMAGE", true)
     }
     val videoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        onExternalSystemUiEnd()
-        handlePicked(uri, "VIDEO", true)
+        finishPicker(uri, "VIDEO", true)
     }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        onExternalSystemUiEnd()
-        handlePicked(uri, "FILE", false)
+        finishPicker(uri, "FILE", false)
     }
 
     MirageDialog(title = "Add attachment", onDismiss = onDismiss) {
@@ -958,10 +983,14 @@ private fun AttachmentDialog(
                 detail = roomMediaRuleDetail(session, "IMAGE", "Pick image or GIF up to 20 MB"),
                 enabled = imagesOk,
                 onClick = {
-                    onExternalSystemUiStart()
+                    val token = onExternalSystemUiStart()
+                    pickerToken = token
                     runCatching { imagePicker.launch("image/*") }
                         .onFailure {
-                            onExternalSystemUiEnd()
+                            if (pickerToken == token) {
+                                onExternalSystemUiEnd(token)
+                                pickerToken = null
+                            }
                             localError = "Wrong information."
                         }
                 }
@@ -971,10 +1000,14 @@ private fun AttachmentDialog(
                 detail = roomMediaRuleDetail(session, "VIDEO", "Pick video up to 100 MB"),
                 enabled = videosOk,
                 onClick = {
-                    onExternalSystemUiStart()
+                    val token = onExternalSystemUiStart()
+                    pickerToken = token
                     runCatching { videoPicker.launch("video/*") }
                         .onFailure {
-                            onExternalSystemUiEnd()
+                            if (pickerToken == token) {
+                                onExternalSystemUiEnd(token)
+                                pickerToken = null
+                            }
                             localError = "Wrong information."
                         }
                 }
@@ -984,10 +1017,14 @@ private fun AttachmentDialog(
                 detail = roomMediaRuleDetail(session, "FILE", "Pick file up to 200 MB"),
                 enabled = filesOk,
                 onClick = {
-                    onExternalSystemUiStart()
+                    val token = onExternalSystemUiStart()
+                    pickerToken = token
                     runCatching { filePicker.launch("*/*") }
                         .onFailure {
-                            onExternalSystemUiEnd()
+                            if (pickerToken == token) {
+                                onExternalSystemUiEnd(token)
+                                pickerToken = null
+                            }
                             localError = "Wrong information."
                         }
                 }
@@ -1743,6 +1780,7 @@ private fun RamImagePreview(bytes: ByteArray, mimeType: String) {
 private fun RamVideoPreview(bytes: ByteArray) {
     var prepared by remember(bytes) { mutableStateOf(false) }
     var playbackFailed by remember(bytes) { mutableStateOf(false) }
+    var prepareRequested by remember(bytes) { mutableStateOf(false) }
     val prepareStarted = remember(bytes) { AtomicBoolean(false) }
     val mediaPlayer = remember(bytes) {
         val player = runCatching { MediaPlayer() }.getOrNull() ?: return@remember null
@@ -1780,6 +1818,17 @@ private fun RamVideoPreview(bytes: ByteArray) {
         }
     }
 
+    // MediaPlayer is an external parser. A malformed authenticated attachment
+    // must not keep the chat surface waiting forever.
+    LaunchedEffect(prepareRequested, prepared, playbackFailed) {
+        if (!prepareRequested || prepared || playbackFailed) return@LaunchedEffect
+        delay(MAX_VIDEO_PREPARE_MS)
+        if (!prepared && !playbackFailed) {
+            playbackFailed = true
+            runCatching { mediaPlayer.reset() }
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -1799,6 +1848,7 @@ private fun RamVideoPreview(bytes: ByteArray) {
                                 runCatching {
                                     mediaPlayer.setSurface(renderSurface)
                                     if (prepareStarted.compareAndSet(false, true)) {
+                                        prepareRequested = true
                                         mediaPlayer.prepareAsync()
                                     } else if (prepared && !mediaPlayer.isPlaying) {
                                         mediaPlayer.start()
@@ -1947,23 +1997,31 @@ private fun Context.readBundledEmoji(asset: BundledEmojiAsset): BundledEmojiPayl
 }
 
 private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: Long): PickedAttachment? {
-    var knownSize = -1L
-    val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-        if (cursor.moveToFirst()) {
-            if (sizeIndex >= 0) knownSize = cursor.getLong(sizeIndex)
-            if (nameIndex >= 0) cursor.getString(nameIndex) else null
-        } else {
-            null
-        }
-    } ?: "attachment"
-    if (knownSize > maxBytes) return null
-    val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-    val bytes = contentResolver.openInputStream(uri)?.use { input ->
-        BoundedInputReader.read(input, maxBytes)
-    } ?: return null
-    return PickedAttachment(mediaType, name, mimeType, bytes)
+    return runCatching {
+        require(maxBytes in 1L..Int.MAX_VALUE.toLong())
+        var knownSize = -1L
+        val name = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (sizeIndex >= 0) knownSize = cursor.getLong(sizeIndex)
+                if (nameIndex >= 0) cursor.getString(nameIndex) else null
+            } else {
+                null
+            }
+        } ?: "attachment"
+        if (knownSize > maxBytes) return@runCatching null
+        val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+        val bytes = contentResolver.openInputStream(uri)?.use { input ->
+            BoundedInputReader.read(input, maxBytes)
+        } ?: return@runCatching null
+        PickedAttachment(
+            mediaType = mediaType,
+            name = AttachmentSavePolicy.sanitizedFileName(name),
+            mimeType = mimeType.take(128),
+            bytes = bytes
+        )
+    }.getOrNull()
 }
 
 private fun attachmentLimitBytes(mediaType: String): Long {
@@ -2039,6 +2097,7 @@ private fun appendMention(value: String, username: String): String {
 }
 
 private const val BUNDLED_EMOJI_ASSET_DIR = "abyssal_emojis"
+private const val MAX_VIDEO_PREPARE_MS = 15_000L
 
 @Preview
 @Composable
@@ -2072,8 +2131,8 @@ private fun ChatContentPreview() {
         onViewAttachment = {},
         onSaveAttachment = { _, _ -> },
         onDismissAttachmentPreview = {},
-        onExternalSystemUiStart = {},
-        onExternalSystemUiEnd = {},
+        onExternalSystemUiStart = { 1L },
+        onExternalSystemUiEnd = { true },
         onUserActivity = {}
     )
 }

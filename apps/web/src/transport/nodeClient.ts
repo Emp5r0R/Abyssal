@@ -12,6 +12,7 @@ import {
   base64ToBytes,
   bytesToBase64,
   maxSerializedAttachmentBytes,
+  STATE_SIGNATURE_BYTES,
   type IdentityStateSnapshot,
 } from "../security/crypto";
 
@@ -28,7 +29,12 @@ const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
 const MAX_OPAQUE_JSON_BYTES = 768 * 1024;
 const MAX_OPAQUE_MESSAGE_BYTES = 16 * 1024;
 const MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024;
-const MAX_RELAY_TEXT_BYTES = 1024 * 1024;
+export const MAX_RELAY_TEXT_BYTES = 1024 * 1024;
+const MAX_WS_TICKET_JSON_BYTES = 4 * 1024;
+const WS_TICKET_BYTES = 32;
+const WS_TICKET_LENGTH = 43;
+const WS_TICKET_MIN_EXPIRY_SEC = 1;
+const WS_TICKET_MAX_EXPIRY_SEC = 30;
 const ATTACHMENT_BLOB_OVERHEAD_BYTES = 41;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES =
   maxSerializedAttachmentBytes("FILE") - ATTACHMENT_BLOB_OVERHEAD_BYTES;
@@ -141,11 +147,33 @@ export async function revokeSession(session: AccountSession): Promise<void> {
   }).catch(() => undefined);
 }
 
+async function requestWebSocketTicket(
+  session: AccountSession,
+  signal: AbortSignal,
+): Promise<string> {
+  const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/ws-ticket`, {
+    method: "POST",
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+    headers: { Authorization: `Bearer ${session.token}` },
+    signal,
+  });
+  const payload = await readBoundedJson(response, MAX_WS_TICKET_JSON_BYTES, signal).catch(() => null);
+  if (!response.ok || !validWebSocketTicketResponse(payload)) {
+    throw new Error("Session unavailable");
+  }
+  return payload.ticket;
+}
+
 export class RelaySocket {
   #socket: WebSocket | null = null;
   #manualClose = false;
   #reconnectTimer: number | undefined;
   #attempt = 0;
+  #connectGeneration = 0;
+  #ticketAbort: AbortController | null = null;
+  #connecting = false;
 
   constructor(
     private readonly session: AccountSession,
@@ -154,38 +182,27 @@ export class RelaySocket {
   ) {}
 
   connect(): void {
-    if (this.#socket || this.#manualClose) return;
+    if (this.#socket || this.#manualClose || this.#connecting) return;
+    const generation = ++this.#connectGeneration;
+    const ticketAbort = new AbortController();
+    this.#ticketAbort = ticketAbort;
+    this.#connecting = true;
     this.onState("connecting");
-    const socket = new WebSocket(`${this.session.endpoint.wsBaseUrl}/v1/ws`, [
-      "abyssal-v1",
-      `bearer.${this.session.token}`,
-    ]);
-    this.#socket = socket;
-    socket.onopen = () => {
-      this.#attempt = 0;
-      this.onState("connected");
-    };
-    socket.onmessage = (event) => {
-      if (typeof event.data !== "string") return;
-      if (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES)) {
-        this.#manualClose = true;
-        socket.close(1009, "frame too large");
-        return;
-      }
-      const frame = parseIncomingFrame(event.data);
-      if (frame) this.onFrame(frame);
-    };
-    socket.onerror = () => socket.close();
-    socket.onclose = () => {
-      this.#socket = null;
-      this.onState("disconnected");
-      if (!this.#manualClose) this.scheduleReconnect();
-    };
+    void this.openSocketWithTicket(generation, ticketAbort);
   }
 
   send(frame: object): boolean {
     if (this.#socket?.readyState !== WebSocket.OPEN) return false;
-    this.#socket.send(JSON.stringify(frame));
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(frame);
+    } catch {
+      return false;
+    }
+    if (typeof serialized !== "string" || !utf8LengthWithin(serialized, MAX_RELAY_TEXT_BYTES)) {
+      return false;
+    }
+    this.#socket.send(serialized);
     return true;
   }
 
@@ -222,8 +239,13 @@ export class RelaySocket {
     messageId: string,
     senderUsername: string,
     state: IdentityStateSnapshot,
+    ackSignature: Uint8Array,
     usedPrekeyId: string,
   ): boolean {
+    if (
+      state.stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
+      ackSignature.byteLength !== STATE_SIGNATURE_BYTES
+    ) return false;
     return this.send({
       type: "message_ack",
       chat_id: chatId,
@@ -233,32 +255,102 @@ export class RelaySocket {
       identity_envelope_b64: bytesToBase64(state.envelope),
       identity_public_b64: bytesToBase64(state.identityPublicKey),
       prekey_id: state.prekeyId,
+      state_signature_b64: bytesToBase64(state.stateSignature),
+      ack_signature_b64: bytesToBase64(ackSignature),
       used_prekey_id: usedPrekeyId,
     });
   }
 
   syncIdentityState(state: IdentityStateSnapshot): boolean {
+    if (state.stateSignature.byteLength !== STATE_SIGNATURE_BYTES) return false;
     return this.send({
       type: "identity_state",
       state_revision: state.revision,
       identity_envelope_b64: bytesToBase64(state.envelope),
       identity_public_b64: bytesToBase64(state.identityPublicKey),
       prekey_id: state.prekeyId,
+      state_signature_b64: bytesToBase64(state.stateSignature),
     });
   }
 
   close(): void {
     this.#manualClose = true;
+    this.#connectGeneration += 1;
+    this.#ticketAbort?.abort();
+    this.#ticketAbort = null;
+    this.#connecting = false;
     window.clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
     this.#socket?.close(1000, "client disconnect");
     this.#socket = null;
     this.onState("disconnected");
   }
 
   private scheduleReconnect(): void {
+    if (this.#manualClose || this.#socket || this.#connecting || this.#reconnectTimer !== undefined) return;
     const jitter = crypto.getRandomValues(new Uint16Array(1))[0] % 500;
     const delay = Math.min(15_000, 750 * 2 ** Math.min(this.#attempt++, 5)) + jitter;
-    this.#reconnectTimer = window.setTimeout(() => this.connect(), delay);
+    this.#reconnectTimer = window.setTimeout(() => {
+      this.#reconnectTimer = undefined;
+      this.connect();
+    }, delay);
+  }
+
+  private async openSocketWithTicket(
+    generation: number,
+    ticketAbort: AbortController,
+  ): Promise<void> {
+    const ticketHolder = { value: "" };
+    let protocols: string[] | null = null;
+    try {
+      ticketHolder.value = await requestWebSocketTicket(this.session, ticketAbort.signal);
+      if (!this.isCurrentConnectionAttempt(generation, ticketAbort)) return;
+      protocols = ["abyssal-v1", `ticket.${ticketHolder.value}`];
+      const socket = new WebSocket(`${this.session.endpoint.wsBaseUrl}/v1/ws`, protocols);
+      protocols[1] = "ticket.";
+      this.#socket = socket;
+      socket.onopen = () => {
+        this.#attempt = 0;
+        this.onState("connected");
+      };
+      socket.onmessage = (event) => {
+        if (typeof event.data !== "string") return;
+        if (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES)) {
+          this.#manualClose = true;
+          socket.close(1009, "frame too large");
+          return;
+        }
+        const frame = parseIncomingFrame(event.data);
+        if (frame) this.onFrame(frame);
+      };
+      socket.onerror = () => socket.close();
+      socket.onclose = () => {
+        this.#socket = null;
+        this.onState("disconnected");
+        if (!this.#manualClose) this.scheduleReconnect();
+      };
+    } catch {
+      if (this.isCurrentConnectionAttempt(generation, ticketAbort)) {
+        this.#ticketAbort = null;
+        this.#connecting = false;
+        this.onState("disconnected");
+        this.scheduleReconnect();
+      }
+    } finally {
+      ticketHolder.value = "";
+      if (protocols) protocols[1] = "ticket.";
+      if (this.#connectGeneration === generation && this.#ticketAbort === ticketAbort) {
+        this.#ticketAbort = null;
+        this.#connecting = false;
+      }
+    }
+  }
+
+  private isCurrentConnectionAttempt(generation: number, ticketAbort: AbortController): boolean {
+    return this.#connectGeneration === generation &&
+      this.#ticketAbort === ticketAbort &&
+      !ticketAbort.signal.aborted &&
+      !this.#manualClose;
   }
 }
 
@@ -572,6 +664,21 @@ function validOpaqueStartResponse(value: unknown): value is OpaqueAccountStartRe
     typeof payload.identity_prekey_id === "string" &&
     /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
     validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES);
+}
+
+function validWebSocketTicketResponse(value: unknown): value is {
+  ticket: string;
+  expires_in_sec: number;
+} {
+  if (!plainObjectWithKeys(value, ["ticket", "expires_in_sec"])) return false;
+  const payload = value as Record<string, unknown>;
+  return typeof payload.ticket === "string" &&
+    payload.ticket.length === WS_TICKET_LENGTH &&
+    validBase64Url(payload.ticket, WS_TICKET_BYTES, WS_TICKET_BYTES) &&
+    typeof payload.expires_in_sec === "number" &&
+    Number.isInteger(payload.expires_in_sec) &&
+    payload.expires_in_sec >= WS_TICKET_MIN_EXPIRY_SEC &&
+    payload.expires_in_sec <= WS_TICKET_MAX_EXPIRY_SEC;
 }
 
 function validAccountResponse(value: unknown): value is AccountResponse & {

@@ -10,6 +10,7 @@ import {
   completeAttachmentDownload,
   decryptAndCompleteAttachment,
   deleteUploadedAttachment,
+  MAX_RELAY_TEXT_BYTES,
   uploadEncryptedAttachment,
 } from "./nodeClient";
 
@@ -31,6 +32,18 @@ const session: AccountSession = {
   identityPublicKey: new Uint8Array(128),
   identityPrekeyId: "test-prekey",
 };
+const WS_TICKET = bytesToBase64(new Uint8Array(32).fill(7));
+const ACK_SIGNATURE = new Uint8Array(64).fill(9);
+
+function websocketTicketResponse(expiresInSec = 30): Response {
+  return new Response(JSON.stringify({
+    ticket: WS_TICKET,
+    expires_in_sec: expiresInSec,
+  }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 const CLAIM_TRUNCATED = "11111111-1111-4111-8111-111111111111";
 const CLAIM_EXTRA = "22222222-2222-4222-8222-222222222222";
@@ -645,26 +658,43 @@ describe("account transport", () => {
 });
 
 describe("RelaySocket", () => {
-  it("uses subprotocol authentication and emits canonical DM commands", () => {
+  it("uses a short-lived ticket subprotocol and emits canonical DM commands", async () => {
     const original = globalThis.WebSocket;
     const sockets: FakeWebSocket[] = [];
     class TestWebSocket extends FakeWebSocket {
       constructor(url: string, protocols: string[]) {
-        super(url, protocols);
+        // Browser implementations copy the protocol list during construction.
+        super(url, [...protocols]);
         sockets.push(this);
       }
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockImplementation(() => Promise.resolve(websocketTicketResponse()));
     const frames: IncomingFrame[] = [];
     const states: string[] = [];
 
     try {
       const relay = new RelaySocket(session, (frame) => frames.push(frame), (state) => states.push(state));
       relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://node.example/v1/ws-ticket",
+        expect.objectContaining({
+          method: "POST",
+          cache: "no-store",
+          credentials: "omit",
+          referrerPolicy: "no-referrer",
+          headers: { Authorization: `Bearer ${SESSION_TOKEN}` },
+          signal: expect.any(AbortSignal),
+        }),
+      );
+      expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty("body");
       const socket = sockets[0];
       expect(socket.url).toBe("wss://node.example/v1/ws");
-      expect(socket.protocols).toEqual(["abyssal-v1", `bearer.${SESSION_TOKEN}`]);
+      expect(socket.protocols).toEqual(["abyssal-v1", `ticket.${WS_TICKET}`]);
+      expect(socket.protocols.join(" ")).not.toContain(SESSION_TOKEN);
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
       expect(relay.openDirect("Bob")).toBe(true);
@@ -673,7 +703,8 @@ describe("RelaySocket", () => {
         envelope: new Uint8Array([2, 3, 4]),
         identityPublicKey: new Uint8Array(128).fill(7),
         prekeyId: "test-prekey",
-      }, "used-prekey")).toBe(true);
+        stateSignature: new Uint8Array(64).fill(8),
+      }, ACK_SIGNATURE, "used-prekey")).toBe(true);
       expect(socket.sent).toEqual([
         JSON.stringify({ type: "open_direct", peer_username: "Bob" }),
         JSON.stringify({
@@ -685,6 +716,8 @@ describe("RelaySocket", () => {
           identity_envelope_b64: "AgME",
           identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
           prekey_id: "test-prekey",
+          state_signature_b64: bytesToBase64(new Uint8Array(64).fill(8)),
+          ack_signature_b64: bytesToBase64(ACK_SIGNATURE),
           used_prekey_id: "used-prekey",
         }),
       ]);
@@ -703,6 +736,7 @@ describe("RelaySocket", () => {
       // oversized relay frame permanently fails this authenticated socket closed.
       const parserRelay = new RelaySocket(session, (frame) => frames.push(frame), (state) => states.push(state));
       parserRelay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(2));
       const parserSocket = sockets[1];
       parserSocket.readyState = 1;
       parserSocket.onopen?.(new Event("open"));
@@ -719,6 +753,103 @@ describe("RelaySocket", () => {
       expect(states).toEqual(["connecting", "connected", "connecting", "connected"]);
       relay.close();
       parserRelay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("rejects cyclic and oversized outbound frames before browser send", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const socket = sockets[0];
+      socket.readyState = 1;
+      socket.onopen?.(new Event("open"));
+
+      const oversized = { type: "dummy", padding: "x".repeat(MAX_RELAY_TEXT_BYTES) };
+      expect(relay.send(oversized)).toBe(false);
+      const cyclic: { type: string; self?: unknown } = { type: "dummy" };
+      cyclic.self = cyclic;
+      expect(relay.send(cyclic)).toBe(false);
+      expect(socket.sent).toEqual([]);
+      expect(relay.activity()).toBe(true);
+      expect(socket.sent).toEqual([JSON.stringify({ type: "activity" })]);
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("rejects out-of-range ticket responses and schedules bounded reconnect", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementation(() => Promise.resolve(websocketTicketResponse(31)));
+    const timeoutSpy = vi.spyOn(window, "setTimeout");
+    const states: string[] = [];
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, (state) => states.push(state));
+      relay.connect();
+      await vi.waitFor(() => expect(states).toContain("disconnected"));
+      expect(sockets).toHaveLength(0);
+      expect(timeoutSpy.mock.calls.some(([, delay]) =>
+        typeof delay === "number" && delay >= 750 && delay <= 15_499,
+      )).toBe(true);
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("aborts a pending ticket request and cannot open a late socket", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    let resolveTicket: ((response: Response) => void) | undefined;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      new Promise<Response>((resolve) => {
+        resolveTicket = resolve;
+      }));
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      relay.close();
+      expect((fetchMock.mock.calls[0]?.[1] as RequestInit).signal?.aborted).toBe(true);
+      resolveTicket?.(websocketTicketResponse());
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      expect(sockets).toHaveLength(0);
     } finally {
       globalThis.WebSocket = original;
     }

@@ -202,14 +202,16 @@ data class EncryptedTransportPayload(
     val stateRevision: ULong,
     val identityEnvelope: ByteArray,
     val identityPublicKey: ByteArray = ByteArray(0),
-    val prekeyId: String = ""
+    val prekeyId: String = "",
+    val stateSignature: ByteArray
 )
 
 data class IdentityStateSnapshot(
     val revision: ULong,
     val envelope: ByteArray,
     val identityPublicKey: ByteArray = ByteArray(0),
-    val prekeyId: String = ""
+    val prekeyId: String = "",
+    val stateSignature: ByteArray
 )
 
 data class RecipientIdentity(

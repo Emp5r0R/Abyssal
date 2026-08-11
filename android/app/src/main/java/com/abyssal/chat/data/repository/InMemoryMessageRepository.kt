@@ -15,9 +15,21 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.LinkedHashMap
 import java.util.UUID
 
+internal const val MAX_MESSAGES_PER_CHAT = 500
+internal const val MAX_MESSAGES_TOTAL = 5_000
+internal const val MAX_MESSAGE_BYTES_PER_CHAT = 8L * 1024L * 1024L
+internal const val MAX_MESSAGE_BYTES_TOTAL = 32L * 1024L * 1024L
+
 class InMemoryMessageRepository : IMessageRepository, IMessageSender {
+    private data class MessageLocation(
+        val chatId: String,
+        val messages: MutableList<Message>,
+        val index: Int
+    )
+
     private val scope = CoroutineScope(Dispatchers.Default + Job())
     private val stateLock = Any()
 
@@ -39,24 +51,10 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     private fun updateLastMessages() {
         synchronized(stateLock) {
-            val currentMsgs = _messages.value
             _sessions.value = _sessions.value.map { session ->
-                val msgs = currentMsgs[session.id] ?: emptyList()
-                val last = msgs.lastOrNull()
-
-                // Mask actual message content in personal DM previews
-                val previewMsg = last?.let { msg ->
-                    if (!session.isForum) {
-                        msg.copy(
-                            content = "Message received",
-                            senderPublicKey = null,
-                            attachmentKey = null
-                        )
-                    } else {
-                        msg.copy(senderPublicKey = null, attachmentKey = null)
-                    }
-                }
-                session.copy(lastMessage = previewMsg)
+                // Dashboard is outside the chat boundary. Do not project even
+                // message metadata; the chat screen owns message visibility.
+                session.copy(lastMessage = null)
             }
         }
     }
@@ -116,20 +114,88 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     override suspend fun saveMessage(chatId: String, message: Message) {
         synchronized(stateLock) {
-            ensureSessionExists(chatId, message.selfDestructDurationSec)
-            val currentChatMsgs = _messages.value[chatId]?.toMutableList() ?: mutableListOf()
+            val candidateBytes = estimatedMessageBytes(message)
+            if (candidateBytes > MAX_MESSAGE_BYTES_PER_CHAT ||
+                candidateBytes > MAX_MESSAGE_BYTES_TOTAL
+            ) {
+                wipeMessageKeys(message)
+                return
+            }
+
+            val nextMessages = _messages.value
+                .mapValuesTo(LinkedHashMap()) { (_, messages) -> messages.toMutableList() }
+            val currentChatMsgs = nextMessages.getOrPut(chatId) { mutableListOf() }
             val existing = currentChatMsgs.firstOrNull { it.id == message.id }
             if (existing != null) {
                 if (existing !== message) wipeMessageKeys(message)
                 return
             }
+
+            var chatBytes = currentChatMsgs.sumOf(::estimatedMessageBytes)
+            var globalCount = nextMessages.values.sumOf { it.size }
+            var globalBytes = nextMessages.values.sumOf { messages ->
+                messages.sumOf(::estimatedMessageBytes)
+            }
+
+            fun evictAt(index: Int, messages: MutableList<Message>): Boolean {
+                if (index !in messages.indices) return false
+                val removed = messages.removeAt(index)
+                val removedBytes = estimatedMessageBytes(removed)
+                chatBytes -= if (messages === currentChatMsgs) removedBytes else 0L
+                globalBytes -= removedBytes
+                globalCount--
+                wipeMessageKeys(removed)
+                return true
+            }
+
+            fun oldestIndex(messages: MutableList<Message>): Int = messages.indices
+                .minWithOrNull(
+                    compareBy<Int>({ messages[it].timestampMs }, { messages[it].id }, { it })
+                ) ?: -1
+
+            while (
+                currentChatMsgs.size >= MAX_MESSAGES_PER_CHAT ||
+                chatBytes + candidateBytes > MAX_MESSAGE_BYTES_PER_CHAT
+            ) {
+                if (!evictAt(oldestIndex(currentChatMsgs), currentChatMsgs)) break
+            }
+
+            fun oldestGlobal(): MessageLocation? = nextMessages.entries
+                .asSequence()
+                .flatMap { (chat, messages) ->
+                    messages.indices.asSequence().map { index ->
+                        MessageLocation(chat, messages, index)
+                    }
+                }
+                .minWithOrNull(
+                    compareBy<MessageLocation>(
+                        { it.messages[it.index].timestampMs },
+                        { it.chatId },
+                        { it.messages[it.index].id },
+                        { it.index }
+                    )
+                )
+
+            while (
+                globalCount >= MAX_MESSAGES_TOTAL ||
+                globalBytes + candidateBytes > MAX_MESSAGE_BYTES_TOTAL
+            ) {
+                val victim = oldestGlobal() ?: break
+                if (!evictAt(victim.index, victim.messages)) break
+                if (victim.messages === currentChatMsgs) {
+                    chatBytes = currentChatMsgs.sumOf(::estimatedMessageBytes)
+                }
+            }
+
             val storedMessage = message.copy(
                 senderPublicKey = message.senderPublicKey?.copyOf(),
                 attachmentKey = message.attachmentKey?.copyOf()
             )
             wipeMessageKeys(message)
             currentChatMsgs.add(storedMessage)
-            _messages.value = _messages.value.toMutableMap().apply { put(chatId, currentChatMsgs) }
+            nextMessages[chatId] = currentChatMsgs
+            ensureSessionExists(chatId, message.selfDestructDurationSec)
+            _messages.value = nextMessages
             updateLastMessages()
         }
     }
@@ -269,4 +335,31 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         message.senderPublicKey?.fill(0)
         message.attachmentKey?.fill(0)
     }
+
+    private fun estimatedMessageBytes(message: Message): Long {
+        var total = 256L
+        fun addString(value: String?) {
+            if (value == null) return
+            total = total.saturatingAdd(value.length.toLong().saturatingMultiply(2L))
+        }
+        addString(message.id)
+        addString(message.sender)
+        addString(message.receiver)
+        addString(message.content)
+        addString(message.mediaType)
+        addString(message.attachmentId)
+        addString(message.attachmentName)
+        addString(message.attachmentMimeType)
+        addString(message.replyToMessageId)
+        addString(message.reactionShortcode)
+        total = total.saturatingAdd(message.senderPublicKey?.size?.toLong() ?: 0L)
+        total = total.saturatingAdd(message.attachmentKey?.size?.toLong() ?: 0L)
+        return total
+    }
+
+    private fun Long.saturatingAdd(value: Long): Long =
+        if (Long.MAX_VALUE - this < value) Long.MAX_VALUE else this + value
+
+    private fun Long.saturatingMultiply(value: Long): Long =
+        if (this != 0L && Long.MAX_VALUE / this < value) Long.MAX_VALUE else this * value
 }

@@ -19,6 +19,7 @@ import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityValidationResult
+import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MessageReplyPolicy
@@ -41,6 +42,7 @@ import com.abyssal.chat.domain.repository.INodeConfigService
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.Collections
+import java.util.LinkedHashSet
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CancellationException
@@ -50,7 +52,6 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -91,6 +92,69 @@ internal fun canInstallAccountEntryResult(
     result.token != null &&
     result.publicKey != null &&
     result.prekeyId != null
+
+internal const val ACK_SIGNATURE_BYTES = 64
+
+/**
+ * Send one acknowledgement with a fresh state snapshot and action proof.
+ * Both native buffers are owned only for this call and are wiped on every
+ * exit path, including cancellation after either buffer has been acquired.
+ */
+internal suspend fun acknowledgeWithEphemeralState(
+    snapshot: suspend () -> IdentityStateSnapshot?,
+    signAction: suspend () -> ByteArray,
+    send: suspend (IdentityStateSnapshot, ByteArray) -> Boolean
+): Boolean {
+    var state: IdentityStateSnapshot? = null
+    var signature: ByteArray? = null
+    return try {
+        state = snapshot() ?: return false
+        val actionSignature = signAction()
+        signature = actionSignature
+        if (actionSignature.size != ACK_SIGNATURE_BYTES) return false
+        send(requireNotNull(state), actionSignature)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        false
+    } finally {
+        state?.envelope?.fill(0)
+        state?.identityPublicKey?.fill(0)
+        state?.stateSignature?.fill(0)
+        signature?.fill(0)
+    }
+}
+
+/** One token per external picker invocation; stale callbacks are rejected. */
+internal class ExternalSystemUiTokenGate {
+    private var nextToken = 0L
+    private var activeToken: Long? = null
+
+    @Synchronized
+    fun begin(): Long {
+        nextToken = if (nextToken == Long.MAX_VALUE) 1L else nextToken + 1L
+        activeToken = nextToken
+        return nextToken
+    }
+
+    @Synchronized
+    fun end(token: Long): Boolean {
+        if (activeToken != token) return false
+        activeToken = null
+        return true
+    }
+
+    @Synchronized
+    fun expire(token: Long): Boolean = end(token)
+
+    @Synchronized
+    fun activeToken(): Long? = activeToken
+
+    @Synchronized
+    fun clear() {
+        activeToken = null
+    }
+}
 
 internal fun canApplyCalculatorEvaluation(
     resultGeneration: Long,
@@ -201,7 +265,9 @@ class ChatViewModel(
 
     private var retainSessionInBackground = false
     private var sessionInactivityTimeoutSec = DEFAULT_SESSION_INACTIVITY_SEC
-    private var externalSystemUiOpen = false
+    private val externalSystemUiTokens = ExternalSystemUiTokenGate()
+    private var externalSystemUiTimeoutJob: Job? = null
+    private var externalSystemUiGraceJob: Job? = null
     private var lastRemoteActivitySignalMs = 0L
     private var requestedDirectUsername: String? = null
     private var accountEntryJob: Job? = null
@@ -215,12 +281,22 @@ class ChatViewModel(
     private var calculatorEvaluationJob: Job? = null
     private val calculatorInputGeneration = AtomicLong(0L)
     private val calculatorEvaluationGate = Mutex()
-    private val ownMessageIds = mutableSetOf<String>()
+    private val ownMessageIds = LinkedHashSet<String>()
     private val receivedFrameIds = linkedSetOf<String>()
     // All accesses occur on viewModelScope/Main: UI entry points, attachment jobs,
     // logout, and teardown. Network callbacks never touch these collections directly.
     private val activeAttachmentViews = mutableSetOf<String>()
     private val consumedOneTimeAttachments = mutableSetOf<String>()
+
+    private fun rememberOwnMessageId(messageId: String) {
+        ownMessageIds.add(messageId)
+        while (ownMessageIds.size > MAX_OWN_MESSAGE_IDS) {
+            val iterator = ownMessageIds.iterator()
+            if (!iterator.hasNext()) break
+            iterator.next()
+            iterator.remove()
+        }
+    }
 
     val sessions: StateFlow<List<ChatSession>> = messageRepository.getChatSessions()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -229,6 +305,30 @@ class ChatViewModel(
     val activeMessages: StateFlow<List<Message>> = _activeChatId.flatMapLatest { id ->
         if (id != null) messageRepository.getMessages(id) else flowOf(emptyList())
     }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    private suspend fun acknowledgeIncoming(incoming: IncomingTransportPayload): Boolean {
+        return acknowledgeWithEphemeralState(
+            snapshot = { payloadCipher.stateSnapshot() },
+            signAction = {
+                payloadCipher.signAcknowledgement(
+                    incoming.chatId,
+                    incoming.messageId,
+                    incoming.senderUsername,
+                    incoming.prekeyId
+                )
+            },
+            send = { state, signature ->
+                chatTransport.acknowledgeMessage(
+                    incoming.chatId,
+                    incoming.messageId,
+                    incoming.senderUsername,
+                    state,
+                    incoming.prekeyId,
+                    signature
+                )
+            }
+        )
+    }
 
     init {
         _disguiseSettings.value = DisguiseSettings(
@@ -248,44 +348,15 @@ class ChatViewModel(
                     val username = currentUser.value?.username ?: return@collect
                     val replayKey = "${incoming.chatId}\u0000${incoming.senderUsername}\u0000${incoming.messageId}"
                     if (replayKey in receivedFrameIds) {
-                        val state = payloadCipher.stateSnapshot() ?: run {
-                            logoutLocal()
-                            return@collect
-                        }
-                        val acknowledged = try {
-                            chatTransport.acknowledgeMessage(
-                                incoming.chatId,
-                                incoming.messageId,
-                                incoming.senderUsername,
-                                state,
-                                incoming.prekeyId
-                            )
-                        } finally {
-                            state.envelope.fill(0)
-                            state.identityPublicKey.fill(0)
-                        }
-                        if (!acknowledged) logoutLocal()
+                        if (!acknowledgeIncoming(incoming)) logoutLocal()
                         return@collect
                     }
-                    val plainBytes = runCatching { payloadCipher.decrypt(incoming, username) }
+                    val decryption = runCatching { payloadCipher.decrypt(incoming, username) }
                         .getOrNull() ?: return@collect
+                    val plainBytes = decryption.plaintext
                     try {
                         if (plainBytes.size > MAX_DECRYPTED_MESSAGE_BYTES) return@collect
-                        val state = payloadCipher.stateSnapshot()
-                        if (state == null) return@collect
-                        val acknowledged = try {
-                            chatTransport.acknowledgeMessage(
-                                incoming.chatId,
-                                incoming.messageId,
-                                incoming.senderUsername,
-                                state,
-                                incoming.prekeyId
-                            )
-                        } finally {
-                            state.envelope.fill(0)
-                            state.identityPublicKey.fill(0)
-                        }
-                        if (!acknowledged) {
+                        if (!acknowledgeIncoming(incoming)) {
                             logoutLocal()
                             return@collect
                         }
@@ -487,8 +558,8 @@ class ChatViewModel(
                     _inviteCodeError.value = "Wrong information."
                 }
             } catch (error: CancellationException) {
-                // The logout path owns session revocation after cancel-and-join. If no
-                // session was installed, wipe the native identity and returned key here.
+                // The logout path cancels account entry before redacting local state. If
+                // no session was installed, wipe the returned native key here.
                 if (!installedSession) {
                     validation?.publicKey?.fill(0)
                     payloadCipher.clear()
@@ -539,7 +610,7 @@ class ChatViewModel(
             )
             val remoteRecipients = recipientIdentities(chatId, includeSelf = false)
             if (isLocalOnlyForum(chatId, remoteRecipients)) {
-                ownMessageIds += message.id
+                rememberOwnMessageId(message.id)
                 messageRepository.saveMessage(chatId, message)
                 return@launch
             }
@@ -555,7 +626,7 @@ class ChatViewModel(
                 wipeEncryptedPayload(encrypted)
             }
             if (accepted) {
-                ownMessageIds += message.id
+                rememberOwnMessageId(message.id)
                 messageRepository.saveMessage(chatId, message)
             }
         }
@@ -711,7 +782,7 @@ class ChatViewModel(
                     }
                     if (accepted) {
                         metadataAccepted = true
-                        ownMessageIds += message.id
+                        rememberOwnMessageId(message.id)
                         messageSender.saveLocalAttachmentMessage(chatId, message)
                     } else {
                         wipeMessageSecrets(message)
@@ -1013,36 +1084,69 @@ class ChatViewModel(
         if (disguiseSettings.value.isDisguised) _isLocked.value = true
     }
 
-    fun beginExternalSystemUi() {
-        externalSystemUiOpen = true
+    fun beginExternalSystemUi(): Long {
+        externalSystemUiTimeoutJob?.cancel()
+        externalSystemUiGraceJob?.cancel()
+        val token = externalSystemUiTokens.begin()
         recordUserActivity()
+        externalSystemUiTimeoutJob = viewModelScope.launch {
+            delay(EXTERNAL_SYSTEM_UI_TIMEOUT_MS)
+            if (externalSystemUiTokens.expire(token)) {
+                externalSystemUiGraceJob?.cancel()
+                externalSystemUiGraceJob = null
+                lockForLifecycleExit()
+            }
+        }
+        return token
     }
 
-    fun endExternalSystemUi() {
-        externalSystemUiOpen = false
+    fun endExternalSystemUi(token: Long): Boolean {
+        if (!externalSystemUiTokens.end(token)) return false
+        externalSystemUiTimeoutJob?.cancel()
+        externalSystemUiGraceJob?.cancel()
+        externalSystemUiTimeoutJob = null
+        externalSystemUiGraceJob = null
         recordUserActivity()
+        return true
     }
 
     fun lockForLifecycleExit() {
-        // A document picker temporarily pauses/stops the activity. Keep the
-        // decrypted preview until its result callback consumes it.
-        if (externalSystemUiOpen) return
+        // A picker may pause the activity, but its window is already outside this
+        // process. Clear decrypted preview before allowing the short picker grace
+        // period; a lost callback is closed by the timeout above.
         replaceAttachmentPreview(null)
         _calculatorDisplay.value = "0"
+        if (externalSystemUiTokens.activeToken() != null) return
         if (!sessionInactivityPolicy.isActive()) return
         if (disguiseSettings.value.isDisguised) _isLocked.value = true
         if (!retainSessionInBackground) endSession(lockBehindDisguise = true)
     }
 
     fun onHostTrimMemory(level: Int) {
-        if (externalSystemUiOpen) return
         replaceAttachmentPreview(null)
+        _calculatorDisplay.value = "0"
+        if (externalSystemUiTokens.activeToken() != null) return
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
             lockForLifecycleExit()
         }
     }
 
     fun onHostResumed() {
+        val pickerToken = externalSystemUiTokens.activeToken()
+        if (pickerToken != null) {
+            // ActivityResult callbacks normally follow onResume. Give that callback
+            // one event-loop window, then close a lost picker transition instead of
+            // keeping an authenticated session open indefinitely.
+            externalSystemUiGraceJob?.cancel()
+            externalSystemUiGraceJob = viewModelScope.launch {
+                delay(EXTERNAL_SYSTEM_UI_RESULT_GRACE_MS)
+                if (externalSystemUiTokens.expire(pickerToken)) {
+                    externalSystemUiTimeoutJob?.cancel()
+                    externalSystemUiTimeoutJob = null
+                    lockForLifecycleExit()
+                }
+            }
+        }
         if (expireSessionIfNeeded()) return
         if (sessionInactivityPolicy.isActive()) chatTransport.connect()
         checkForAppUpdate()
@@ -1072,14 +1176,15 @@ class ChatViewModel(
 
     private fun endSession(lockBehindDisguise: Boolean) {
         if (!sessionInactivityPolicy.isActive()) return
-        sessionInactivityPolicy.clear()
-        updateSessionSecurityState()
+        val remoteSession = prepareLocalLogout()
         if (lockBehindDisguise && disguiseSettings.value.isDisguised) {
             _isLocked.value = true
         } else {
             _isLocked.value = false
         }
-        viewModelScope.launch { logoutLocal(revokeRemote = true) }
+        if (remoteSession != null) {
+            viewModelScope.launch { identityService.revokeSession(remoteSession) }
+        }
     }
 
     fun onCalculatorInput(input: String) {
@@ -1189,25 +1294,25 @@ class ChatViewModel(
         _calculatorDisplay.value = "0"
     }
 
-    private suspend fun cancelAccountEntryBeforeLogout() {
-        val job = accountEntryJob ?: return
-        if (job === currentCoroutineContext()[Job]) return
-        job.cancelAndJoin()
-        if (accountEntryJob === job) accountEntryJob = null
-    }
-
-    private suspend fun logoutLocal(revokeRemote: Boolean = false) {
-        // Stop an in-flight account response before taking the session snapshot. This
-        // prevents a late successful response from installing a new identity after logout.
-        cancelAccountEntryBeforeLogout()
-        // Invalidate local attachment operations immediately. Their callbacks re-check
-        // this generation before destructive completion, while cancellation releases
-        // claims without making the local purge wait for network or provider I/O.
+    /**
+     * Redacts all local session state synchronously. Network revocation stays outside
+     * this boundary so lifecycle/logout never leaves a renderable authenticated frame.
+     */
+    private fun prepareLocalLogout(): NodeSession? {
+        // Cancel before clearing state. Account-entry continuations also check their
+        // coroutine activity before installing returned identity material.
+        accountEntryJob?.cancel()
+        accountEntryJob = null
         cancelAttachmentOperations()
         attachmentUploadJob?.cancel()
         attachmentUploadJob = null
-        attachmentSessionGate.withLock { sessionGeneration.incrementAndGet() }
+        sessionGeneration.incrementAndGet()
         cancelCalculatorEvaluation()
+        externalSystemUiTimeoutJob?.cancel()
+        externalSystemUiGraceJob?.cancel()
+        externalSystemUiTimeoutJob = null
+        externalSystemUiGraceJob = null
+        externalSystemUiTokens.clear()
         val remoteSession = nodeConfigService.getActiveSession()
         sessionInactivityPolicy.clear()
         retainSessionInBackground = false
@@ -1215,7 +1320,7 @@ class ChatViewModel(
         requestedDirectUsername = null
         _roomCreationLimit.value = DEFAULT_MAX_ROOMS_PER_USER
         updateSessionSecurityState()
-        messageRepository.clearAllData()
+        messageRepository.clearAllDataNow()
         identityService.logout()
         nodeConfigService.clear()
         payloadCipher.clear()
@@ -1231,6 +1336,11 @@ class ChatViewModel(
         receivedFrameIds.clear()
         activeAttachmentViews.clear()
         consumedOneTimeAttachments.clear()
+        return remoteSession
+    }
+
+    private suspend fun logoutLocal(revokeRemote: Boolean = false) {
+        val remoteSession = prepareLocalLogout()
         if (revokeRemote && remoteSession != null) {
             identityService.revokeSession(remoteSession)
         }
@@ -1238,10 +1348,11 @@ class ChatViewModel(
 
     private fun expireSessionIfNeeded(): Boolean {
         if (!sessionInactivityPolicy.isExpired()) return false
-        sessionInactivityPolicy.clear()
-        updateSessionSecurityState()
+        val remoteSession = prepareLocalLogout()
         if (disguiseSettings.value.isDisguised) _isLocked.value = true
-        viewModelScope.launch { logoutLocal(revokeRemote = true) }
+        if (remoteSession != null) {
+            viewModelScope.launch { identityService.revokeSession(remoteSession) }
+        }
         return true
     }
 
@@ -1296,6 +1407,7 @@ class ChatViewModel(
         payload.ciphertext.fill(0)
         payload.identityEnvelope.fill(0)
         payload.identityPublicKey.fill(0)
+        payload.stateSignature.fill(0)
         payload.envelopes.forEach {
             it.wrappedKey.fill(0)
             it.signature.fill(0)
@@ -1750,5 +1862,8 @@ class ChatViewModel(
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
         private const val IDENTITY_PUBLIC_KEY_BYTES = 128
         private const val MAX_RECEIVED_FRAME_IDS = 10_000
+        private const val MAX_OWN_MESSAGE_IDS = 10_000
+        private const val EXTERNAL_SYSTEM_UI_TIMEOUT_MS = 5 * 60 * 1_000L
+        private const val EXTERNAL_SYSTEM_UI_RESULT_GRACE_MS = 2_000L
     }
 }

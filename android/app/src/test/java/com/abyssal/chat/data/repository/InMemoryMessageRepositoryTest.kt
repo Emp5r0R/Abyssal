@@ -32,7 +32,7 @@ class InMemoryMessageRepositoryTest {
         val session = repository.getChatSessions().first().single()
         assertEquals("Dm canonical", session.name)
         assertFalse(session.isForum)
-        assertEquals("Message received", session.lastMessage?.content)
+        assertEquals(null, session.lastMessage)
     }
 
     @Test
@@ -48,7 +48,7 @@ class InMemoryMessageRepositoryTest {
         assertTrue(updated.isForum)
         assertEquals(30, updated.selfDestructTimerSec)
         assertFalse(updated.allowVideos)
-        assertEquals("payload", updated.lastMessage?.content)
+        assertEquals(null, updated.lastMessage)
     }
 
     @Test
@@ -125,6 +125,7 @@ class InMemoryMessageRepositoryTest {
         assertArrayEquals(ByteArray(32) { 7 }, stored.attachmentKey)
         assertArrayEquals(ByteArray(128) { 3 }, stored.senderPublicKey)
         val preview = repository.getChatSessions().first().single().lastMessage
+        assertEquals(null, preview)
         assertEquals(null, preview?.attachmentKey)
         assertEquals(null, preview?.senderPublicKey)
 
@@ -139,6 +140,115 @@ class InMemoryMessageRepositoryTest {
         repository.clearAllData()
         assertArrayEquals(ByteArray(32), stored.attachmentKey)
         assertArrayEquals(ByteArray(128), stored.senderPublicKey)
+    }
+
+    @Test
+    fun nonExpiringChatHistoryEvictsOldestByCountAndWipesKeys() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val firstSenderKey = ByteArray(128) { 1 }
+        val firstAttachmentKey = ByteArray(32) { 2 }
+        val first = testMessage("oldest").copy(
+            timestampMs = 1L,
+            selfDestructDurationSec = 0,
+            senderPublicKey = firstSenderKey,
+            attachmentKey = firstAttachmentKey
+        )
+        repository.saveMessage("dm_flood", first)
+
+        repeat(MAX_MESSAGES_PER_CHAT) { index ->
+            repository.saveMessage(
+                "dm_flood",
+                testMessage("message-$index").copy(
+                    timestampMs = 2L + index,
+                    selfDestructDurationSec = 0
+                )
+            )
+        }
+
+        val messages = repository.getMessages("dm_flood").first()
+        assertEquals(MAX_MESSAGES_PER_CHAT, messages.size)
+        assertTrue(messages.none { it.id == "oldest" })
+        assertArrayEquals(ByteArray(128), firstSenderKey)
+        assertArrayEquals(ByteArray(32), firstAttachmentKey)
+    }
+
+    @Test
+    fun perChatEvictionUsesTimestampThenIdInsteadOfArrivalOrder() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        repository.saveMessage(
+            "dm_ordered",
+            testMessage("late-arrival").copy(timestampMs = 2_000L, selfDestructDurationSec = 0)
+        )
+        repository.saveMessage(
+            "dm_ordered",
+            testMessage("early-timestamp").copy(timestampMs = 1_000L, selfDestructDurationSec = 0)
+        )
+        repeat(MAX_MESSAGES_PER_CHAT - 1) { index ->
+            repository.saveMessage(
+                "dm_ordered",
+                testMessage("filler-$index").copy(timestampMs = 3_000L + index, selfDestructDurationSec = 0)
+            )
+        }
+
+        val messages = repository.getMessages("dm_ordered").first()
+        assertEquals(MAX_MESSAGES_PER_CHAT, messages.size)
+        assertTrue(messages.any { it.id == "late-arrival" })
+        assertTrue(messages.none { it.id == "early-timestamp" })
+    }
+
+    @Test
+    fun globalHistoryEvictsOldestAcrossChatsWithoutExpiry() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        repeat(MAX_MESSAGES_TOTAL + 1) { index ->
+            repository.saveMessage(
+                "dm_${index % 11}",
+                testMessage("global-$index").copy(selfDestructDurationSec = 0)
+            )
+        }
+
+        val messages = (0 until 11).flatMap { chatIndex ->
+            repository.getMessages("dm_$chatIndex").first()
+        }
+        assertEquals(MAX_MESSAGES_TOTAL, messages.size)
+        assertTrue(messages.none { it.id == "global-0" })
+    }
+
+    @Test
+    fun byteCapsEvictOldestAndRejectSingleOversizedMessage() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val firstSenderKey = ByteArray(128) { 7 }
+        val firstAttachmentKey = ByteArray(32) { 8 }
+        val large = "x".repeat(3 * 1024 * 1024)
+        val first = testMessage("large-first").copy(
+            content = large,
+            selfDestructDurationSec = 0,
+            senderPublicKey = firstSenderKey,
+            attachmentKey = firstAttachmentKey
+        )
+        repository.saveMessage("dm_bytes", first)
+        repository.saveMessage(
+            "dm_bytes",
+            testMessage("large-second").copy(content = large, selfDestructDurationSec = 0)
+        )
+
+        val afterEviction = repository.getMessages("dm_bytes").first()
+        assertEquals(1, afterEviction.size)
+        assertEquals("large-second", afterEviction.single().id)
+        assertArrayEquals(ByteArray(128), firstSenderKey)
+        assertArrayEquals(ByteArray(32), firstAttachmentKey)
+
+        val oversizedKey = ByteArray(32) { 9 }
+        repository.saveMessage(
+            "dm_oversized",
+            testMessage("too-large").copy(
+                content = "y".repeat(5 * 1024 * 1024),
+                senderPublicKey = ByteArray(128) { 6 },
+                attachmentKey = oversizedKey,
+                selfDestructDurationSec = 0
+            )
+        )
+        assertTrue(repository.getMessages("dm_oversized").first().isEmpty())
+        assertArrayEquals(ByteArray(32), oversizedKey)
     }
 
     private fun testMessage(id: String) = Message(

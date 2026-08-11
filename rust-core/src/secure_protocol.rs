@@ -48,7 +48,8 @@ const MAX_IDENTITY_STATE_BYTES: usize = 512 * 1024;
 const MAX_RATCHET_ENVELOPE_BYTES: usize = 4096;
 const MAX_PEERS: usize = 256;
 const MAX_SESSIONS_PER_PEER: usize = 4;
-const PROTOCOL_VERSION: u32 = 6;
+const IDENTITY_STATE_SIGNATURE_BYTES: usize = 64;
+const PROTOCOL_VERSION: u32 = 7;
 const IDENTITY_ENVELOPE_VERSION: u8 = 4;
 const KEY_VALIDATION_SCALAR: [u8; 32] = [0x42; 32];
 
@@ -111,6 +112,7 @@ pub struct E2eePayload {
     pub identity_envelope: Vec<u8>,
     pub identity_public: Vec<u8>,
     pub prekey_id: String,
+    pub state_signature: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, uniffi::Record)]
@@ -120,6 +122,7 @@ pub struct E2eeDecryption {
     pub identity_envelope: Vec<u8>,
     pub identity_public: Vec<u8>,
     pub prekey_id: String,
+    pub state_signature: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, uniffi::Record)]
@@ -592,6 +595,32 @@ impl E2eeSession {
         state.one_time_key_id.clone()
     }
 
+    /// Sign an acknowledgement as an independent action proof.
+    ///
+    /// The transcript contains only the protocol domain/version, conversation,
+    /// message, original sender, and the prekey consumed by that message. It
+    /// deliberately does not include the recipient's ratchet revision or
+    /// identity-state signature so a duplicate delivery can be acknowledged
+    /// after the state has advanced.
+    pub fn sign_acknowledgement(
+        &self,
+        chat_id: String,
+        message_id: String,
+        original_sender_username: String,
+        used_prekey_id: String,
+    ) -> Result<Vec<u8>, AbyssalError> {
+        let state = lock(&self.state, "Identity unavailable")?;
+        sign_ack_signature_v7(
+            PROTOCOL_VERSION,
+            &chat_id,
+            &message_id,
+            &original_sender_username,
+            &used_prekey_id,
+            &state.account,
+        )
+        .map_err(AbyssalError::from)
+    }
+
     pub fn seal_identity(
         &self,
         export_key: Vec<u8>,
@@ -687,8 +716,17 @@ impl E2eeSession {
             let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
             let identity_public = public_key_from_state(&state);
             let prekey_id = state.one_time_key_id.clone();
+            let state_signature = sign_identity_state_v7(
+                PROTOCOL_VERSION,
+                state.revision,
+                &identity_envelope,
+                &identity_public,
+                &prekey_id,
+                &state.account,
+            )
+            .map_err(AbyssalError::from)?;
             for envelope in &mut envelopes {
-                let signature_input = signature_input_v6(
+                let signature_input = signature_input_v7(
                     PROTOCOL_VERSION,
                     &aad,
                     &nonce,
@@ -709,6 +747,7 @@ impl E2eeSession {
                 identity_envelope,
                 identity_public,
                 prekey_id,
+                state_signature,
             })
         })();
         if result.is_err() {
@@ -758,7 +797,7 @@ impl E2eeSession {
         };
         validate_recipient_envelope(&envelope).map_err(AbyssalError::from)?;
         let aad = message_aad(&chat_id, &message_id, &sender_username);
-        let signature_input = signature_input_v6(
+        let signature_input = signature_input_v7(
             version,
             &aad,
             &nonce,
@@ -820,13 +859,25 @@ impl E2eeSession {
                 .checked_add(1)
                 .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
             let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
+            let identity_public = public_key_from_state(&state);
+            let prekey_id = state.one_time_key_id.clone();
+            let state_signature = sign_identity_state_v7(
+                PROTOCOL_VERSION,
+                state.revision,
+                &identity_envelope,
+                &identity_public,
+                &prekey_id,
+                &state.account,
+            )
+            .map_err(AbyssalError::from)?;
             let plaintext = std::mem::take(&mut *plaintext);
             Ok(E2eeDecryption {
                 plaintext,
                 state_revision: state.revision,
                 identity_envelope,
-                identity_public: public_key_from_state(&state),
-                prekey_id: state.one_time_key_id.clone(),
+                identity_public,
+                prekey_id,
+                state_signature,
             })
         })();
         if result.is_err() {
@@ -1183,7 +1234,7 @@ fn identity_wrap_key(export_key: &[u8], context: &[u8]) -> Result<[u8; 32], Stri
 
 fn message_aad(chat_id: &str, message_id: &str, sender_username: &str) -> Vec<u8> {
     canonical_parts(&[
-        b"ABYSSAL_E2EE_PAYLOAD_V6",
+        b"ABYSSAL_E2EE_PAYLOAD_V7",
         chat_id.as_bytes(),
         message_id.as_bytes(),
         sender_username.as_bytes(),
@@ -1235,7 +1286,214 @@ fn attachment_aad(
     ])
 }
 
-fn signature_input_v6(
+fn sign_identity_state_v7(
+    version: u32,
+    state_revision: u64,
+    identity_envelope: &[u8],
+    identity_public: &[u8],
+    prekey_id: &str,
+    account: &Account,
+) -> Result<Vec<u8>, String> {
+    let transcript = Zeroizing::new(identity_state_signature_input_v7(
+        version,
+        state_revision,
+        identity_envelope,
+        identity_public,
+        prekey_id,
+    )?);
+    Ok(account.sign(&transcript).to_bytes().to_vec())
+}
+
+/// Build the exact protocol-v7 signed identity-state transcript.
+///
+/// The transcript covers the complete sealed state envelope and the public
+/// identity/prekey bundle returned with it.  The relay can use this helper to
+/// verify the state signature without decrypting the envelope.
+pub fn identity_state_signature_input_v7(
+    version: u32,
+    state_revision: u64,
+    identity_envelope: &[u8],
+    identity_public: &[u8],
+    prekey_id: &str,
+) -> Result<Vec<u8>, String> {
+    validate_identity_state_signature_fields(
+        version,
+        state_revision,
+        identity_envelope,
+        identity_public,
+        prekey_id,
+    )?;
+    let version = version.to_be_bytes();
+    let revision = state_revision.to_be_bytes();
+    Ok(canonical_parts(&[
+        b"ABYSSAL_E2EE_IDENTITY_STATE_SIGNATURE_V7",
+        &version,
+        &revision,
+        identity_envelope,
+        identity_public,
+        prekey_id.as_bytes(),
+    ]))
+}
+
+/// Verify a protocol-v7 signed identity-state snapshot.
+///
+/// The caller must bind `identity_public` to the authenticated account before
+/// accepting the snapshot.  This function verifies the Ed25519 signature and
+/// validates every transcript field, including the prekey commitment.
+pub fn verify_identity_state_signature_v7(
+    version: u32,
+    state_revision: u64,
+    identity_envelope: &[u8],
+    identity_public: &[u8],
+    prekey_id: &str,
+    state_signature: &[u8],
+) -> Result<(), String> {
+    if state_signature.len() != IDENTITY_STATE_SIGNATURE_BYTES {
+        return Err("Payload unavailable".to_string());
+    }
+    let transcript = Zeroizing::new(identity_state_signature_input_v7(
+        version,
+        state_revision,
+        identity_envelope,
+        identity_public,
+        prekey_id,
+    )?);
+    let verifying_key = Ed25519PublicKey::from_slice(
+        identity_public[32..IDENTITY_FINGERPRINT_BYTES]
+            .try_into()
+            .map_err(|_| "Identity unavailable".to_string())?,
+    )
+    .map_err(|_| "Identity unavailable".to_string())?;
+    let signature = Ed25519Signature::from_slice(state_signature)
+        .map_err(|_| "Payload unavailable".to_string())?;
+    verifying_key
+        .verify(&transcript, &signature)
+        .map_err(|_| "Payload unavailable".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_ack_signature_v7(
+    version: u32,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    used_prekey_id: &str,
+    account: &Account,
+) -> Result<Vec<u8>, String> {
+    let transcript = Zeroizing::new(ack_signature_input_v7(
+        version,
+        chat_id,
+        message_id,
+        sender_username,
+        used_prekey_id,
+    )?);
+    Ok(account.sign(&transcript).to_bytes().to_vec())
+}
+
+/// Build the exact protocol-v7 message acknowledgement transcript.
+///
+/// This proof covers only the acknowledgement action.  It intentionally does
+/// not include the current ratchet revision or state signature, because a
+/// duplicate delivery may be acknowledged after the recipient has advanced
+/// its ratchet state.  The relay verifies the signed state separately.
+pub fn ack_signature_input_v7(
+    version: u32,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    used_prekey_id: &str,
+) -> Result<Vec<u8>, String> {
+    validate_ack_signature_fields(
+        version,
+        chat_id,
+        message_id,
+        sender_username,
+        used_prekey_id,
+    )?;
+    let version = version.to_be_bytes();
+    Ok(canonical_parts(&[
+        b"ABYSSAL_E2EE_ACK_SIGNATURE_V7",
+        &version,
+        chat_id.as_bytes(),
+        message_id.as_bytes(),
+        sender_username.as_bytes(),
+        used_prekey_id.as_bytes(),
+    ]))
+}
+
+/// Verify a protocol-v7 message acknowledgement signature.
+pub fn verify_ack_signature_v7(
+    version: u32,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    used_prekey_id: &str,
+    identity_public: &[u8],
+    ack_signature: &[u8],
+) -> Result<(), String> {
+    if ack_signature.len() != IDENTITY_STATE_SIGNATURE_BYTES
+        || identity_public.len() != IDENTITY_PUBLIC_BYTES
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    let transcript = Zeroizing::new(ack_signature_input_v7(
+        version,
+        chat_id,
+        message_id,
+        sender_username,
+        used_prekey_id,
+    )?);
+    let verifying_key = Ed25519PublicKey::from_slice(
+        identity_public[32..IDENTITY_FINGERPRINT_BYTES]
+            .try_into()
+            .map_err(|_| "Identity unavailable".to_string())?,
+    )
+    .map_err(|_| "Identity unavailable".to_string())?;
+    let signature = Ed25519Signature::from_slice(ack_signature)
+        .map_err(|_| "Payload unavailable".to_string())?;
+    verifying_key
+        .verify(&transcript, &signature)
+        .map_err(|_| "Payload unavailable".to_string())
+}
+
+fn validate_ack_signature_fields(
+    version: u32,
+    chat_id: &str,
+    message_id: &str,
+    sender_username: &str,
+    used_prekey_id: &str,
+) -> Result<(), String> {
+    if version != PROTOCOL_VERSION
+        || (!used_prekey_id.is_empty() && !valid_prekey_id(used_prekey_id))
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    validate_message_context(chat_id, message_id, sender_username)
+        .map_err(|_| "Payload unavailable".to_string())
+}
+
+fn validate_identity_state_signature_fields(
+    version: u32,
+    state_revision: u64,
+    identity_envelope: &[u8],
+    identity_public: &[u8],
+    prekey_id: &str,
+) -> Result<(), String> {
+    if version != PROTOCOL_VERSION
+        || state_revision == 0
+        || identity_envelope.len() <= 1 + NONCE_BYTES + ATTACHMENT_TAG_BYTES
+        || identity_envelope.len() > MAX_IDENTITY_STATE_BYTES
+        || identity_envelope.first() != Some(&IDENTITY_ENVELOPE_VERSION)
+        || !valid_prekey_id(prekey_id)
+        || prekey_id.is_empty()
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    validate_identity_public_bundle(identity_public, Some(prekey_id))
+        .map_err(|_| "Payload unavailable".to_string())
+}
+
+fn signature_input_v7(
     version: u32,
     aad: &[u8],
     nonce: &[u8],
@@ -1247,7 +1505,7 @@ fn signature_input_v6(
     let version = version.to_be_bytes();
     let is_prekey = [u8::from(envelope.is_prekey)];
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_SIGNATURE_V6",
+        b"ABYSSAL_E2EE_SIGNATURE_V7",
         &version,
         aad,
         nonce,
@@ -1260,12 +1518,12 @@ fn signature_input_v6(
     ]))
 }
 
-/// Build the exact protocol-v6 recipient-envelope signature transcript.
+/// Build the exact protocol-v7 recipient-envelope signature transcript.
 ///
 /// This helper is intentionally kept outside the UniFFI surface. The relay
 /// and its adversarial tests use the same canonical construction as clients.
 #[allow(clippy::too_many_arguments)]
-pub fn message_signature_input_v6(
+pub fn message_signature_input_v7(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1292,7 +1550,7 @@ pub fn message_signature_input_v6(
         is_prekey,
         signature: Vec::new(),
     };
-    let result = signature_input_v6(
+    let result = signature_input_v7(
         version,
         &message_aad(chat_id, message_id, sender_username),
         nonce,
@@ -1306,13 +1564,13 @@ pub fn message_signature_input_v6(
     result
 }
 
-/// Verify the exact protocol-v6 recipient-envelope signature transcript.
+/// Verify the exact protocol-v7 recipient-envelope signature transcript.
 ///
 /// The relay must verify signatures with the same canonical transcript as the
 /// clients, while still binding the long-term signing key to the account
 /// identity authenticated by the relay before calling this helper.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_message_signature_v6(
+pub fn verify_message_signature_v7(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1333,7 +1591,7 @@ pub fn verify_message_signature_v6(
     {
         return Err("Payload unavailable".to_string());
     }
-    let signature_input = Zeroizing::new(message_signature_input_v6(
+    let signature_input = Zeroizing::new(message_signature_input_v7(
         version,
         chat_id,
         message_id,
@@ -1661,6 +1919,24 @@ impl WasmE2eeSession {
     #[wasm_bindgen(js_name = prekeyId)]
     pub fn wasm_prekey_id(&self) -> String {
         self.inner.prekey_id()
+    }
+
+    #[wasm_bindgen(js_name = signAcknowledgement)]
+    pub fn wasm_sign_acknowledgement(
+        &self,
+        chat_id: String,
+        message_id: String,
+        original_sender_username: String,
+        used_prekey_id: String,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.inner
+            .sign_acknowledgement(
+                chat_id,
+                message_id,
+                original_sender_username,
+                used_prekey_id,
+            )
+            .map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = sealIdentity)]
@@ -2199,6 +2475,262 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v7_state_signatures_round_trip_and_reject_tampering() {
+        let alice = sealed_session(73);
+        let bob = sealed_session(74);
+        let payload = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "state-signature-message".to_string(),
+                "Alice".to_string(),
+                b"signed state".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Bob".to_string(),
+                    public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
+                }],
+            )
+            .expect("encrypt");
+        assert_eq!(payload.version, PROTOCOL_VERSION);
+        assert_eq!(
+            payload.state_signature.len(),
+            IDENTITY_STATE_SIGNATURE_BYTES
+        );
+        verify_identity_state_signature_v7(
+            payload.version,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            &payload.prekey_id,
+            &payload.state_signature,
+        )
+        .expect("valid payload state signature");
+
+        let tampered_revision = payload.state_revision + 1;
+        assert!(verify_identity_state_signature_v7(
+            payload.version,
+            tampered_revision,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            &payload.prekey_id,
+            &payload.state_signature,
+        )
+        .is_err());
+
+        let mut tampered_envelope = payload.identity_envelope.clone();
+        tampered_envelope[1] ^= 1;
+        assert!(verify_identity_state_signature_v7(
+            payload.version,
+            payload.state_revision,
+            &tampered_envelope,
+            &payload.identity_public,
+            &payload.prekey_id,
+            &payload.state_signature,
+        )
+        .is_err());
+
+        let mut tampered_public = payload.identity_public.clone();
+        tampered_public[IDENTITY_FINGERPRINT_BYTES - 1] ^= 1;
+        assert!(verify_identity_state_signature_v7(
+            payload.version,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &tampered_public,
+            &payload.prekey_id,
+            &payload.state_signature,
+        )
+        .is_err());
+
+        let mut tampered_prekey = payload.prekey_id.clone().into_bytes();
+        tampered_prekey[0] = if tampered_prekey[0] == b'a' {
+            b'b'
+        } else {
+            b'a'
+        };
+        let tampered_prekey = String::from_utf8(tampered_prekey).expect("ascii prekey");
+        assert!(verify_identity_state_signature_v7(
+            payload.version,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            &tampered_prekey,
+            &payload.state_signature,
+        )
+        .is_err());
+
+        let mut tampered_signature = payload.state_signature.clone();
+        tampered_signature[0] ^= 1;
+        assert!(verify_identity_state_signature_v7(
+            payload.version,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            &payload.prekey_id,
+            &tampered_signature,
+        )
+        .is_err());
+
+        assert!(identity_state_signature_input_v7(
+            PROTOCOL_VERSION - 1,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            &payload.prekey_id,
+        )
+        .is_err());
+        assert!(identity_state_signature_input_v7(
+            PROTOCOL_VERSION,
+            0,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            &payload.prekey_id,
+        )
+        .is_err());
+        assert!(identity_state_signature_input_v7(
+            PROTOCOL_VERSION,
+            payload.state_revision,
+            &[IDENTITY_ENVELOPE_VERSION],
+            &payload.identity_public,
+            &payload.prekey_id,
+        )
+        .is_err());
+        assert!(identity_state_signature_input_v7(
+            PROTOCOL_VERSION,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &payload.identity_public[..IDENTITY_PUBLIC_BYTES - 1],
+            &payload.prekey_id,
+        )
+        .is_err());
+        assert!(identity_state_signature_input_v7(
+            PROTOCOL_VERSION,
+            payload.state_revision,
+            &payload.identity_envelope,
+            &payload.identity_public,
+            "",
+        )
+        .is_err());
+
+        let decrypted = decrypt_payload(
+            &bob,
+            &payload,
+            "dm_alice_bob",
+            "Alice",
+            alice.public_key(),
+            "Bob",
+        )
+        .expect("decrypt");
+        assert_eq!(decrypted.plaintext, b"signed state");
+        assert_eq!(
+            decrypted.state_signature.len(),
+            IDENTITY_STATE_SIGNATURE_BYTES
+        );
+        verify_identity_state_signature_v7(
+            PROTOCOL_VERSION,
+            decrypted.state_revision,
+            &decrypted.identity_envelope,
+            &decrypted.identity_public,
+            &decrypted.prekey_id,
+            &decrypted.state_signature,
+        )
+        .expect("valid decryption state signature");
+        let used_prekey_id = payload.envelopes[0].prekey_id.as_str();
+        let ack_signature = bob
+            .sign_acknowledgement(
+                "dm_alice_bob".to_string(),
+                "state-signature-message".to_string(),
+                "Alice".to_string(),
+                used_prekey_id.to_string(),
+            )
+            .expect("sign ACK");
+        assert_eq!(ack_signature.len(), IDENTITY_STATE_SIGNATURE_BYTES);
+        let verify_ack = |chat_id: &str,
+                          message_id: &str,
+                          sender_username: &str,
+                          used_prekey_id: &str,
+                          ack_signature: &[u8]| {
+            verify_ack_signature_v7(
+                PROTOCOL_VERSION,
+                chat_id,
+                message_id,
+                sender_username,
+                used_prekey_id,
+                &bob.public_key(),
+                ack_signature,
+            )
+        };
+        verify_ack(
+            "dm_alice_bob",
+            "state-signature-message",
+            "Alice",
+            used_prekey_id,
+            &ack_signature,
+        )
+        .expect("valid ACK signature");
+        assert!(verify_ack(
+            "dm_other",
+            "state-signature-message",
+            "Alice",
+            used_prekey_id,
+            &ack_signature,
+        )
+        .is_err());
+        assert!(verify_ack(
+            "dm_alice_bob",
+            "other-message",
+            "Alice",
+            used_prekey_id,
+            &ack_signature,
+        )
+        .is_err());
+        assert!(verify_ack(
+            "dm_alice_bob",
+            "state-signature-message",
+            "Mallory",
+            used_prekey_id,
+            &ack_signature,
+        )
+        .is_err());
+        assert!(verify_ack(
+            "dm_alice_bob",
+            "state-signature-message",
+            "Alice",
+            "wrong-prekey",
+            &ack_signature,
+        )
+        .is_err());
+        let mut tampered_ack = ack_signature.clone();
+        tampered_ack[0] ^= 1;
+        assert!(verify_ack(
+            "dm_alice_bob",
+            "state-signature-message",
+            "Alice",
+            used_prekey_id,
+            &tampered_ack,
+        )
+        .is_err());
+        // ACK signing is independent of ratchet state.  Advancing state does
+        // not change the action proof, so a duplicate can be acknowledged.
+        let duplicate_ack = bob
+            .sign_acknowledgement(
+                "dm_alice_bob".to_string(),
+                "state-signature-message".to_string(),
+                "Alice".to_string(),
+                used_prekey_id.to_string(),
+            )
+            .expect("sign duplicate ACK");
+        assert_eq!(duplicate_ack, ack_signature);
+        assert!(ack_signature_input_v7(
+            PROTOCOL_VERSION,
+            "dm_alice_bob",
+            "state-signature-message",
+            "Alice",
+            used_prekey_id,
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn ratchet_handles_reordering_replay_and_encrypted_state_recovery() {
         let alice = sealed_session(21);
         let bob_export = vec![22; 64];
@@ -2367,7 +2899,7 @@ mod tests {
         let mut tampered_ciphertext = first.clone();
         tampered_ciphertext.ciphertext[0] ^= 1;
         let aad = message_aad("dm_alice_bob", &tampered_ciphertext.message_id, "Alice");
-        let signature_input = signature_input_v6(
+        let signature_input = signature_input_v7(
             PROTOCOL_VERSION,
             &aad,
             &tampered_ciphertext.nonce,

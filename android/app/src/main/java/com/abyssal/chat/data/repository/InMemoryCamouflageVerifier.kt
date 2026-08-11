@@ -85,10 +85,20 @@ internal class InMemoryCamouflageVerifier(
     fun verifyDuress(pin: String): Boolean = synchronized(lock) {
         val expected = duressDigest ?: return false
         val salt = duressSalt ?: return false
-        if (nanoTime() < blockedUntilNanos) return false
-        val actual = derive(pin.trim(), salt) ?: return false
+        val now = nanoTime()
+        if (now < blockedUntilNanos) return false
+        val candidate = pin.trim()
+        if (!isValidCamouflagePin(candidate)) {
+            registerFailureLocked(now)
+            return false
+        }
+        val actual = derive(candidate, salt) ?: run {
+            registerFailureLocked(now)
+            return false
+        }
         val matched = MessageDigest.isEqual(expected, actual)
         actual.fill(0)
+        if (matched) resetThrottleLocked() else registerFailureLocked(now)
         matched
     }
 

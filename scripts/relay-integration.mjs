@@ -112,11 +112,29 @@ async function opaqueStartStatus(code, password) {
   return response.status;
 }
 
-function connect(token) {
+async function requestWsTicket(account) {
+  const response = await fetch(`${baseUrl}/v1/ws-ticket`, {
+    method: "POST",
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+    headers: { authorization: `Bearer ${account.token}` },
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("cache-control") ?? "", /no-store/);
+  const payload = await response.json();
+  assert.deepEqual(Object.keys(payload).sort(), ["expires_in_sec", "ticket"]);
+  assert.match(payload.ticket, /^[A-Za-z0-9_-]{43}$/);
+  assert.ok(Number.isInteger(payload.expires_in_sec));
+  assert.ok(payload.expires_in_sec >= 1 && payload.expires_in_sec <= 30);
+  return payload.ticket;
+}
+
+function connectWithTicket(ticket) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(
       `${baseUrl.replace(/^http/, "ws")}/v1/ws`,
-      ["abyssal-v1", `bearer.${token}`],
+      ["abyssal-v1", `ticket.${ticket}`],
     );
     const timeout = setTimeout(() => reject(new Error("WebSocket connection timed out")), 5_000);
     socket.addEventListener("open", () => {
@@ -127,6 +145,43 @@ function connect(token) {
       clearTimeout(timeout);
       reject(new Error("WebSocket connection failed"));
     }, { once: true });
+  });
+}
+
+async function connect(account) {
+  return connectWithTicket(await requestWsTicket(account));
+}
+
+function expectWebSocketRejected(protocols) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(
+      `${baseUrl.replace(/^http/, "ws")}/v1/ws`,
+      protocols,
+    );
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new Error("Expected WebSocket rejection timed out"));
+    }, 5_000);
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+      socket.removeEventListener("close", onClose);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onOpen = () => {
+      socket.close();
+      finish(new Error("WebSocket unexpectedly accepted"));
+    };
+    const onError = () => finish();
+    const onClose = () => finish();
+    socket.addEventListener("open", onOpen, { once: true });
+    socket.addEventListener("error", onError, { once: true });
+    socket.addEventListener("close", onClose, { once: true });
   });
 }
 
@@ -171,6 +226,7 @@ function encryptedFrame(sender, recipient, chatId, text) {
     identity_envelope_b64: encode(payload.identity_envelope),
     identity_public_b64: encode(payload.identity_public),
     prekey_id: payload.prekey_id,
+    state_signature_b64: encode(payload.state_signature),
     envelopes: payload.envelopes.map((envelope) => ({
       recipient_username: envelope.username,
       wrapped_key_b64: encode(envelope.wrapped_key),
@@ -203,10 +259,17 @@ function decryptFrame(recipient, frame) {
     identityEnvelope: new Uint8Array(decrypted.identity_envelope),
     identityPublic: new Uint8Array(decrypted.identity_public),
     prekeyId: decrypted.prekey_id,
+    stateSignature: new Uint8Array(decrypted.state_signature),
   };
 }
 
-function acknowledgeFrame(socket, frame, decrypted) {
+function acknowledgeFrame(recipient, socket, frame, decrypted) {
+  const ackSignature = recipient.identity.signAcknowledgement(
+    frame.chat_id,
+    frame.message_id,
+    frame.sender_username,
+    frame.prekey_id,
+  );
   socket.send(JSON.stringify({
     type: "message_ack",
     chat_id: frame.chat_id,
@@ -216,10 +279,14 @@ function acknowledgeFrame(socket, frame, decrypted) {
     identity_envelope_b64: encode(decrypted.identityEnvelope),
     identity_public_b64: encode(decrypted.identityPublic),
     prekey_id: decrypted.prekeyId,
+    state_signature_b64: encode(decrypted.stateSignature),
+    ack_signature_b64: encode(ackSignature),
     used_prekey_id: frame.prekey_id,
   }));
+  ackSignature.fill(0);
   decrypted.identityEnvelope.fill(0);
   decrypted.identityPublic.fill(0);
+  decrypted.stateSignature.fill(0);
 }
 
 const alice = await register(aliceCode, "alice-password");
@@ -227,8 +294,11 @@ const bob = await register(bobCode, "bob-password");
 assert.equal(await opaqueStartStatus(aliceCode, "alice-password"), 409);
 assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
 
-const aliceSocket = await connect(alice.token);
-let bobSocket = await connect(bob.token);
+const aliceTicket = await requestWsTicket(alice);
+await expectWebSocketRejected(["abyssal-v1", `bearer.${alice.token}`]);
+const aliceSocket = await connectWithTicket(aliceTicket);
+await expectWebSocketRejected(["abyssal-v1", `ticket.${aliceTicket}`]);
+let bobSocket = await connect(bob);
 let bobReconnect;
 try {
   const aliceDirect = waitForFrame(
@@ -435,7 +505,7 @@ try {
   const deliveredFrame = await delivered;
   const deliveredPlain = decryptFrame(bob, deliveredFrame);
   assert.equal(deliveredPlain.text, "live secret");
-  acknowledgeFrame(bobSocket, deliveredFrame, deliveredPlain);
+  acknowledgeFrame(bob, bobSocket, deliveredFrame, deliveredPlain);
 
   const bobDisconnected = waitForFrame(
     aliceSocket,
@@ -447,7 +517,7 @@ try {
   await bobDisconnected;
   aliceSocket.send(JSON.stringify(encryptedFrame(alice, bob, aliceOpened.direct.id, "offline secret")));
 
-  bobReconnect = await connect(bob.token);
+  bobReconnect = await connect(bob);
   const replayed = waitForFrame(
     bobReconnect,
     (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
@@ -456,7 +526,7 @@ try {
   const replayedFrame = await replayed;
   const replayedPlain = decryptFrame(bob, replayedFrame);
   assert.equal(replayedPlain.text, "offline secret");
-  acknowledgeFrame(bobReconnect, replayedFrame, replayedPlain);
+  acknowledgeFrame(bob, bobReconnect, replayedFrame, replayedPlain);
 
   const unauthorizedUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=dm_guessed&media_type=FILE`, {
     method: "POST",

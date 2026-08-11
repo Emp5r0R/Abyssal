@@ -61,7 +61,7 @@ class InMemoryCamouflageVerifierTest {
     }
 
     @Test
-    fun unlockAndDuressShareExponentialBackoffWithoutDoubleCounting() {
+    fun unlockAndDuressShareExponentialBackoff() {
         var now = 0L
         val verifier = testVerifier(
             nanoTime = { now },
@@ -73,7 +73,7 @@ class InMemoryCamouflageVerifierTest {
 
         assertFalse(verifier.verifyDuress("111111"))
         assertFalse(verifier.verifyUnlock("111111"))
-        assertEquals(1, verifier.stateSnapshot().failedUnlockAttempts)
+        assertEquals(2, verifier.stateSnapshot().failedUnlockAttempts)
 
         assertFalse(verifier.verifyDuress("111111"))
         assertFalse(verifier.verifyUnlock("111111"))
@@ -108,6 +108,35 @@ class InMemoryCamouflageVerifierTest {
         assertTrue(verifier.verifyUnlock("482613"))
         assertEquals(0, verifier.stateSnapshot().failedUnlockAttempts)
         assertEquals(0L, verifier.stateSnapshot().blockedUntilNanos)
+    }
+
+    @Test
+    fun duressRejectsInvalidInputBeforeDerivationAndAppliesBackoff() {
+        var now = 0L
+        var derivations = 0
+        val verifier = testVerifier(
+            nanoTime = { now },
+            maxUnlockFailures = 2,
+            keyDeriver = { password, salt ->
+                derivations++
+                fastDigest(password, salt)
+            }
+        )
+        assertTrue(verifier.configure("482613", "739102"))
+        val configuredDerivations = derivations
+
+        assertFalse(verifier.verifyDuress("bad pin"))
+        assertEquals(1, verifier.stateSnapshot().failedUnlockAttempts)
+        assertEquals(configuredDerivations, derivations)
+
+        now = 1L
+        assertFalse(verifier.verifyDuress("111111"))
+        assertEquals(2, verifier.stateSnapshot().failedUnlockAttempts)
+        assertTrue(verifier.stateSnapshot().blockedUntilNanos > now)
+
+        now = verifier.stateSnapshot().blockedUntilNanos
+        assertTrue(verifier.verifyDuress("739102"))
+        assertEquals(0, verifier.stateSnapshot().failedUnlockAttempts)
     }
 
     @Test

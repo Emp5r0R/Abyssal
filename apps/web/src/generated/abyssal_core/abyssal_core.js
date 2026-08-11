@@ -186,6 +186,30 @@ export class WasmE2eeSession {
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v3;
     }
+    /**
+     * @param {string} chat_id
+     * @param {string} message_id
+     * @param {string} original_sender_username
+     * @param {string} used_prekey_id
+     * @returns {Uint8Array}
+     */
+    signAcknowledgement(chat_id, message_id, original_sender_username, used_prekey_id) {
+        const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(original_sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(used_prekey_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.wasme2eesession_signAcknowledgement(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v5;
+    }
 }
 if (Symbol.dispose) WasmE2eeSession.prototype[Symbol.dispose] = WasmE2eeSession.prototype.free;
 

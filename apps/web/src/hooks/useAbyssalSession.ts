@@ -9,6 +9,11 @@ import {
   readRetention,
 } from "../domain/messagePolicy";
 import { mentionsUsername, replyTargetsCurrentUser } from "../domain/messageAttention";
+import {
+  appendBoundedMessage,
+  wipeEvictedMessage,
+  wipeMessageAttachmentKey as wipeMessageAttachment,
+} from "../domain/messageMemoryPolicy";
 import { reactionByShortcode } from "../domain/reactions";
 import type {
   AccountSession,
@@ -58,6 +63,27 @@ import {
 
 const ACTIVITY_SIGNAL_INTERVAL_MS = 20_000;
 const MAX_MESSAGE_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_ROOM_ID_BYTES = 128;
+const MAX_ROOM_NAME_LENGTH = 36;
+const MAX_ROOM_CATALOG = 1024;
+const MAX_DIRECT_CATALOG = 128;
+const MAX_PRESENCE_USERS = 128;
+const MAX_PINNED_IDENTITIES = 1024;
+const MAX_TIMER_SECONDS = 86_400;
+const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
+const ROOM_ID_PATTERN = /^forum_[A-Za-z0-9_-]{1,122}$/u;
+const ROOM_KEYS = new Set([
+  "id", "name", "owner_username", "self_destruct_timer_sec", "overall_expiry_sec",
+  "allow_images", "allow_videos", "allow_files", "enforce_text_absolute_expiry",
+  "image_read_timer_sec", "image_overall_expiry_sec", "enforce_image_absolute_expiry",
+  "video_read_timer_sec", "video_overall_expiry_sec", "enforce_video_absolute_expiry",
+  "file_read_timer_sec", "file_overall_expiry_sec", "enforce_file_absolute_expiry",
+  "conversation_type", "peer_username",
+]);
+const PRESENCE_KEYS = new Set([
+  "username", "connected", "identity_public_b64", "identity_prekey_id", "directory_digest",
+]);
+const DIRECT_KEYS = new Set(["id", "peer_username"]);
 // Browser downloads can outlive the click event, especially for large files.
 // Keep the explicit-download Blob URL alive briefly enough to avoid truncation,
 // then release it so an export cannot pin plaintext indefinitely.
@@ -236,7 +262,25 @@ export function useAbyssalSession() {
       return;
     }
     if (frame.type === "presence") {
-      const next = frame.users.filter(validPresence);
+      if (frame.users.length > MAX_PRESENCE_USERS || frame.users.some((user) => !validPresence(user))) {
+        return;
+      }
+      const usernames = new Set<string>();
+      const next = frame.users.filter((user) => {
+        const key = user.username.toLowerCase();
+        if (usernames.has(key)) return false;
+        usernames.add(key);
+        return true;
+      });
+      if (next.length !== frame.users.length) return;
+      const newPinCount = [...usernames].reduce(
+        (count, username) => count + Number(!identityPinsRef.current.has(username)),
+        0,
+      );
+      if (identityPinsRef.current.size + newPinCount > MAX_PINNED_IDENTITIES) {
+        clearMemory();
+        return;
+      }
       if (new Set(next.map((user) => user.directory_digest)).size > 1) {
         clearMemory();
         return;
@@ -258,18 +302,28 @@ export function useAbyssalSession() {
       return;
     }
     if (frame.type === "rooms") {
-      const next = frame.rooms.filter(validRoom);
-      setRooms(next);
-      next.forEach((room) => socketRef.current?.join(room.id));
+      if (!validRoomCatalog(frame.rooms)) return;
+      roomsRef.current = frame.rooms;
+      setRooms(frame.rooms);
+      frame.rooms.forEach((room) => socketRef.current?.join(room.id));
       return;
     }
     if (frame.type === "room_created" && validRoom(frame.room)) {
-      setRooms((current) => [...current.filter((room) => room.id !== frame.room.id), frame.room]);
+      const roomKey = frame.room.id.toLowerCase();
+      const existing = roomsRef.current.find((room) => room.id.toLowerCase() === roomKey);
+      if ((existing && existing.id !== frame.room.id) ||
+        (!existing && roomsRef.current.length >= MAX_ROOM_CATALOG)) return;
+      roomsRef.current = [
+        ...roomsRef.current.filter((room) => room.id.toLowerCase() !== roomKey),
+        frame.room,
+      ];
+      setRooms(roomsRef.current);
       socketRef.current?.join(frame.room.id);
       return;
     }
     if (frame.type === "room_deleted") {
-      setRooms((current) => current.filter((room) => room.id !== frame.chat_id));
+      roomsRef.current = roomsRef.current.filter((room) => room.id !== frame.chat_id);
+      setRooms(roomsRef.current);
       updateMessages((current) => {
         const next = { ...current };
         wipeMessageList(next[frame.chat_id]);
@@ -280,7 +334,8 @@ export function useAbyssalSession() {
       return;
     }
     if (frame.type === "directs") {
-      const next = frame.directs.filter(validDirect);
+      if (!validDirectCatalog(frame.directs)) return;
+      const next = frame.directs;
       directsRef.current = next;
       setDirects(next);
       next.forEach((direct) => socketRef.current?.join(direct.id));
@@ -288,8 +343,15 @@ export function useAbyssalSession() {
     }
     if (frame.type === "direct_opened" && validDirect(frame.direct)) {
       const direct = frame.direct;
+      const directId = direct.id.toLowerCase();
+      const peer = direct.peer_username.toLowerCase();
+      const idConflict = directsRef.current.find((current) => current.id.toLowerCase() === directId);
+      const peerConflict = directsRef.current.find((current) => current.peer_username.toLowerCase() === peer);
+      if ((idConflict && (idConflict.id !== direct.id || idConflict.peer_username.toLowerCase() !== peer)) ||
+        (peerConflict && peerConflict.id.toLowerCase() !== directId) ||
+        (!idConflict && directsRef.current.length >= MAX_DIRECT_CATALOG)) return;
       directsRef.current = [
-        ...directsRef.current.filter((current) => current.id !== direct.id),
+        ...directsRef.current.filter((current) => current.id.toLowerCase() !== directId),
         direct,
       ];
       setDirects(directsRef.current);
@@ -306,6 +368,17 @@ export function useAbyssalSession() {
     try {
       const currentSession = sessionRef.current;
       if (!currentSession) return;
+      const senderKey = frame.sender_username.toLowerCase();
+      if (!presenceRef.current.some((user) => user.username.toLowerCase() === senderKey)) return;
+      const pinnedFingerprint = identityPinsRef.current.get(senderKey);
+      if (!pinnedFingerprint) return;
+      let senderFingerprint = "";
+      try {
+        senderFingerprint = stableIdentityFingerprint(frame.sender_public_key_b64);
+      } catch {
+        return;
+      }
+      if (senderFingerprint !== pinnedFingerprint) return;
       const replayKey = `${frame.chat_id}\u0000${frame.sender_username}\u0000${frame.message_id}`;
       if (receivedFrameIdsRef.current.has(replayKey)) {
         const stateSnapshot = cipherRef.current.stateSnapshot();
@@ -313,14 +386,29 @@ export function useAbyssalSession() {
           clearMemory();
           return;
         }
-        const acknowledged = socketRef.current?.acknowledge(
-          frame.chat_id,
-          frame.message_id,
-          frame.sender_username,
-          stateSnapshot,
-          frame.prekey_id,
-        ) ?? false;
-        wipeBytes(stateSnapshot.envelope);
+        let acknowledged = false;
+        let ackSignature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+        try {
+          ackSignature = cipherRef.current.signAcknowledgement(
+            frame.chat_id,
+            frame.message_id,
+            frame.sender_username,
+            frame.prekey_id,
+          );
+          acknowledged = socketRef.current?.acknowledge(
+            frame.chat_id,
+            frame.message_id,
+            frame.sender_username,
+            stateSnapshot,
+            ackSignature,
+            frame.prekey_id,
+          ) ?? false;
+        } finally {
+          wipeBytes(stateSnapshot.envelope);
+          wipeBytes(stateSnapshot.identityPublicKey);
+          wipeBytes(stateSnapshot.stateSignature);
+          wipeBytes(ackSignature);
+        }
         if (!acknowledged) clearMemory();
         return;
       }
@@ -328,14 +416,20 @@ export function useAbyssalSession() {
         const oldest = receivedFrameIdsRef.current.values().next().value;
         if (oldest) receivedFrameIdsRef.current.delete(oldest);
       }
-      const senderPublicKey = base64ToBytes(frame.sender_public_key_b64);
-      const identityPublicKey = base64ToBytes(frame.identity_public_b64 ?? frame.sender_public_key_b64);
-      const nonce = base64ToBytes(frame.nonce_b64);
-      const ciphertext = base64ToBytes(frame.ciphertext_b64);
-      const signature = base64ToBytes(frame.signature_b64);
-      const wrappedKey = base64ToBytes(frame.wrapped_key_b64);
-      let decrypted: string;
+      let senderPublicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let identityPublicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let nonce: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let ciphertext: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let signature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let wrappedKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+      let decrypted = "";
       try {
+        senderPublicKey = base64ToBytes(frame.sender_public_key_b64);
+        identityPublicKey = base64ToBytes(frame.identity_public_b64 ?? frame.sender_public_key_b64);
+        nonce = base64ToBytes(frame.nonce_b64);
+        ciphertext = base64ToBytes(frame.ciphertext_b64);
+        signature = base64ToBytes(frame.signature_b64);
+        wrappedKey = base64ToBytes(frame.wrapped_key_b64);
         decrypted = cipherRef.current.decryptText(
           frame.chat_id,
           frame.message_id,
@@ -353,6 +447,35 @@ export function useAbyssalSession() {
           frame.is_prekey,
           currentSession.username,
         );
+        const stateSnapshot = cipherRef.current.stateSnapshot();
+        if (!stateSnapshot) throw new Error("Identity unavailable");
+        let acknowledged = false;
+        let ackSignature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+        try {
+          ackSignature = cipherRef.current.signAcknowledgement(
+            frame.chat_id,
+            frame.message_id,
+            frame.sender_username,
+            frame.prekey_id,
+          );
+          acknowledged = socketRef.current?.acknowledge(
+            frame.chat_id,
+            frame.message_id,
+            frame.sender_username,
+            stateSnapshot,
+            ackSignature,
+            frame.prekey_id,
+          ) ?? false;
+        } finally {
+          wipeBytes(stateSnapshot.envelope);
+          wipeBytes(stateSnapshot.identityPublicKey);
+          wipeBytes(stateSnapshot.stateSignature);
+          wipeBytes(ackSignature);
+        }
+        if (!acknowledged) {
+          clearMemory();
+          return;
+        }
       } finally {
         wipeBytes(senderPublicKey);
         wipeBytes(identityPublicKey);
@@ -360,20 +483,6 @@ export function useAbyssalSession() {
         wipeBytes(ciphertext);
         wipeBytes(signature);
         wipeBytes(wrappedKey);
-      }
-      const stateSnapshot = cipherRef.current.stateSnapshot();
-      if (!stateSnapshot) throw new Error("Identity unavailable");
-      const acknowledged = socketRef.current?.acknowledge(
-        frame.chat_id,
-        frame.message_id,
-        frame.sender_username,
-        stateSnapshot,
-        frame.prekey_id,
-      ) ?? false;
-      wipeBytes(stateSnapshot.envelope);
-      if (!acknowledged) {
-        clearMemory();
-        return;
       }
       receivedFrameIdsRef.current.add(replayKey);
       const payload = JSON.parse(decrypted) as Record<string, unknown>;
@@ -406,7 +515,7 @@ export function useAbyssalSession() {
       );
       if (!message) return;
       if (isExpired(message, Date.now())) {
-        wipeMessageAttachment(message);
+        wipeEvictedMessage(message);
         return;
       }
       if (message.mine) ownMessageIdsRef.current.add(message.id);
@@ -414,7 +523,7 @@ export function useAbyssalSession() {
         message.readAtMs = Date.now();
         sendReadReceiptRef.current(frame.chat_id, message.id);
       }
-      updateMessages((current) => appendUnique(current, message));
+      updateMessages((current) => appendBoundedMessage(current, message));
     } catch {
       // Authentication failure or malformed plaintext stays outside UI state.
     }
@@ -750,7 +859,7 @@ export function useAbyssalSession() {
     wipeEncryptedPayload(encrypted);
     if (accepted) {
       ownMessageIdsRef.current.add(message.id);
-      updateMessages((current) => appendUnique(current, message));
+      updateMessages((current) => appendBoundedMessage(current, message));
     }
     return accepted;
   }, [activeRoomId, connection, messages, recipientKeysFor, updateMessages]);
@@ -856,7 +965,7 @@ export function useAbyssalSession() {
       wipeEncryptedPayload(metadata);
       if (accepted) {
         ownMessageIdsRef.current.add(outgoingMessage.id);
-        updateMessages((current) => appendUnique(current, outgoingMessage));
+        updateMessages((current) => appendBoundedMessage(current, outgoingMessage));
         retainedMessage = outgoingMessage;
       }
       return accepted;
@@ -1071,43 +1180,119 @@ export function useAbyssalSession() {
 }
 
 function validRoom(value: unknown): value is RoomRecord {
-  if (!value || typeof value !== "object") return false;
+  if (!plainRecord(value) || Object.keys(value).some((key) => !ROOM_KEYS.has(key))) return false;
   const room = value as Partial<RoomRecord>;
-  return typeof room.id === "string" && room.id.startsWith("forum_") && typeof room.name === "string";
+  const timers = [
+    room.self_destruct_timer_sec,
+    room.overall_expiry_sec,
+    room.image_read_timer_sec,
+    room.image_overall_expiry_sec,
+    room.video_read_timer_sec,
+    room.video_overall_expiry_sec,
+    room.file_read_timer_sec,
+    room.file_overall_expiry_sec,
+  ];
+  const flags = [
+    room.allow_images,
+    room.allow_videos,
+    room.allow_files,
+    room.enforce_text_absolute_expiry,
+    room.enforce_image_absolute_expiry,
+    room.enforce_video_absolute_expiry,
+    room.enforce_file_absolute_expiry,
+  ];
+  return typeof room.id === "string" &&
+    room.id.length <= MAX_ROOM_ID_BYTES && ROOM_ID_PATTERN.test(room.id) &&
+    typeof room.name === "string" && room.name.length > 0 &&
+    room.name.length <= MAX_ROOM_NAME_LENGTH && ![...room.name].some((character) => /\p{Cc}/u.test(character)) &&
+    typeof room.owner_username === "string" && USERNAME_PATTERN.test(room.owner_username) &&
+    timers.every((timer) => typeof timer === "number" && Number.isSafeInteger(timer) && timer >= 0 && timer <= MAX_TIMER_SECONDS) &&
+    flags.every((flag) => typeof flag === "boolean") &&
+    (room.conversation_type === undefined || room.conversation_type === "room") &&
+    room.peer_username === undefined;
 }
 
 function validDirect(value: unknown): value is DirectRecord {
-  if (!value || typeof value !== "object") return false;
+  if (!plainRecord(value) || Object.keys(value).length !== DIRECT_KEYS.size ||
+    Object.keys(value).some((key) => !DIRECT_KEYS.has(key))) return false;
   const direct = value as Partial<DirectRecord>;
-  return typeof direct.id === "string" && /^dm_[A-Za-z0-9_-]{1,125}$/.test(direct.id) &&
-    typeof direct.peer_username === "string" && direct.peer_username.length > 0 && direct.peer_username.length <= 80;
+  return typeof direct.id === "string" && /^dm_[A-Za-z0-9_-]{1,125}$/u.test(direct.id) &&
+    typeof direct.peer_username === "string" && USERNAME_PATTERN.test(direct.peer_username);
+}
+
+function validRoomCatalog(rooms: unknown[]): rooms is RoomRecord[] {
+  if (rooms.length > MAX_ROOM_CATALOG) return false;
+  const ids = new Set<string>();
+  for (const value of rooms) {
+    if (!validRoom(value)) return false;
+    const room = value;
+    const key = room.id.toLowerCase();
+    if (ids.has(key)) return false;
+    ids.add(key);
+  }
+  return true;
+}
+
+function validDirectCatalog(directs: unknown[]): directs is DirectRecord[] {
+  if (directs.length > MAX_DIRECT_CATALOG) return false;
+  const ids = new Set<string>();
+  const peers = new Set<string>();
+  for (const value of directs) {
+    if (!validDirect(value)) return false;
+    const direct = value;
+    const id = direct.id.toLowerCase();
+    const peer = direct.peer_username.toLowerCase();
+    if (ids.has(id) || peers.has(peer)) return false;
+    ids.add(id);
+    peers.add(peer);
+  }
+  return true;
 }
 
 function validPresence(value: unknown): value is PresenceUser {
-  if (!value || typeof value !== "object") return false;
+  if (!plainRecord(value) || Object.keys(value).some((key) => !PRESENCE_KEYS.has(key))) return false;
   const user = value as Partial<PresenceUser>;
   if (
     typeof user.username !== "string" ||
-    user.username.length === 0 ||
-    user.username.length > 80 ||
+    !USERNAME_PATTERN.test(user.username) ||
     typeof user.connected !== "boolean" ||
     typeof user.identity_public_b64 !== "string" ||
+    typeof user.identity_prekey_id !== "string" ||
+    !/^[A-Za-z0-9_-]{1,32}$/u.test(user.identity_prekey_id) ||
     typeof user.directory_digest !== "string"
   ) {
     return false;
   }
+  return canonicalBase64Bytes(user.identity_public_b64, 128) &&
+    canonicalBase64Bytes(user.directory_digest, 32);
+}
+
+function canonicalBase64Bytes(value: string, expectedBytes: number): boolean {
+  const expectedLength = Math.floor(expectedBytes / 3) * 4 +
+    (expectedBytes % 3 === 0 ? 0 : expectedBytes % 3 === 1 ? 2 : 3);
+  if (value.length !== expectedLength || !/^[A-Za-z0-9_-]+$/u.test(value)) return false;
+  let decoded: Uint8Array | null = null;
   try {
-    return base64ToBytes(user.identity_public_b64).byteLength === 128 &&
-      typeof user.identity_prekey_id === "string" &&
-      /^[A-Za-z0-9_-]{1,32}$/.test(user.identity_prekey_id) &&
-      /^[A-Za-z0-9_-]{43}$/.test(user.directory_digest);
+    decoded = base64ToBytes(value);
+    return decoded.byteLength === expectedBytes && bytesToBase64(decoded) === value;
   } catch {
     return false;
+  } finally {
+    decoded?.fill(0);
   }
 }
 
 function stableIdentityFingerprint(publicKeyB64: string): string {
-  return bytesToBase64(base64ToBytes(publicKeyB64).subarray(0, 64));
+  let decoded: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  try {
+    decoded = base64ToBytes(publicKeyB64);
+    if (decoded.byteLength !== 128 || bytesToBase64(decoded) !== publicKeyB64) {
+      throw new Error("Identity unavailable");
+    }
+    return bytesToBase64(decoded.subarray(0, 64));
+  } finally {
+    wipeBytes(decoded);
+  }
 }
 
 function conversationForId(
@@ -1279,36 +1464,21 @@ function messagePayload(message: ChatMessage): Record<string, unknown> {
   };
 }
 
-function appendUnique(current: Record<string, ChatMessage[]>, message: ChatMessage): Record<string, ChatMessage[]> {
-  const list = current[message.chatId] ?? [];
-  if (list.some((candidate) => candidate.id === message.id)) {
-    wipeMessageAttachment(message);
-    return current;
-  }
-  const nextList = [...list, message];
-  const removed = nextList.length > 500 ? nextList.splice(0, nextList.length - 500) : [];
-  removed.forEach(wipeMessageAttachment);
-  return { ...current, [message.chatId]: nextList };
-}
-
 function pruneExpired(current: Record<string, ChatMessage[]>, now: number): Record<string, ChatMessage[]> {
   let changed = false;
   const next: Record<string, ChatMessage[]> = {};
   for (const [chatId, list] of Object.entries(current)) {
     const active = list.filter((message) => !isExpired(message, now));
-    list.filter((message) => isExpired(message, now)).forEach(wipeMessageAttachment);
-    next[chatId] = active;
+    list.filter((message) => isExpired(message, now)).forEach(wipeEvictedMessage);
+    if (active.length > 0) next[chatId] = active;
+    else if (list.length === 0) changed = true;
     if (active.length !== list.length) changed = true;
   }
   return changed ? next : current;
 }
 
-function wipeMessageAttachment(message: ChatMessage): void {
-  if (message.attachment) wipeBytes(message.attachment.encryptionKey);
-}
-
 function wipeMessageList(messages: ChatMessage[] | undefined): void {
-  messages?.forEach(wipeMessageAttachment);
+  messages?.forEach(wipeEvictedMessage);
 }
 
 function wipeMessageMap(messages: Record<string, ChatMessage[]>): void {
@@ -1344,6 +1514,11 @@ function safeTimestamp(value: unknown, fallback: number): number {
   return Math.min(upper, Math.max(lower, Math.floor(value)));
 }
 
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype;
+}
+
 function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   if (left.byteLength !== right.byteLength) return false;
   let difference = 0;
@@ -1362,4 +1537,5 @@ function wipeEncryptedPayload(payload: EncryptedPayload): void {
   });
   wipeBytes(payload.identityEnvelope);
   wipeBytes(payload.identityPublicKey);
+  wipeBytes(payload.stateSignature);
 }

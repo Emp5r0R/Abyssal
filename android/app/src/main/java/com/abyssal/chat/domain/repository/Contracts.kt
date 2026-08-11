@@ -77,7 +77,8 @@ interface IChatTransport {
         messageId: String,
         senderUsername: String,
         state: IdentityStateSnapshot,
-        usedPrekeyId: String
+        usedPrekeyId: String,
+        ackSignature: ByteArray
     ): Boolean
     suspend fun syncIdentityState(state: IdentityStateSnapshot): Boolean
     suspend fun signalUserActivity(): Boolean

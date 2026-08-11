@@ -10,6 +10,7 @@ import {
   InMemoryPayloadCipher,
   maxSerializedAttachmentBytes,
   payloadToFrame,
+  STATE_SIGNATURE_BYTES,
   startOpaque,
   wipeBytes,
 } from "./crypto";
@@ -88,9 +89,10 @@ describe("recipient E2EE", () => {
     ]);
     const envelope = payload.envelopes[0];
 
-    expect(payload.version).toBe(6);
+    expect(payload.version).toBe(7);
     expect(payload.stateRevision).toBe(1);
     expect(payload.identityEnvelope.byteLength).toBeGreaterThan(64);
+    expect(payload.stateSignature.byteLength).toBe(STATE_SIGNATURE_BYTES);
     expect(payload.ciphertext).not.toEqual(new TextEncoder().encode("classified"));
     expect(
       bob.decryptText(
@@ -109,10 +111,16 @@ describe("recipient E2EE", () => {
     const receiverState = bob.stateSnapshot();
     expect(receiverState?.revision).toBe(1);
     expect(receiverState?.envelope.byteLength).toBeGreaterThan(64);
+    const ackSignature = bob.signAcknowledgement(CHAT_ID, MESSAGE_ID, "Alice", envelope.prekeyId);
+    expect(ackSignature.byteLength).toBe(STATE_SIGNATURE_BYTES);
     const retryState = bob.stateSnapshot();
     expect(retryState?.revision).toBe(1);
     expect(retryState?.envelope).not.toBe(receiverState?.envelope);
     expect(retryState?.envelope).toEqual(receiverState?.envelope);
+    expect(retryState?.stateSignature).not.toBe(receiverState?.stateSignature);
+    expect(retryState?.stateSignature).toEqual(receiverState?.stateSignature);
+    const duplicateAck = bob.signAcknowledgement(CHAT_ID, MESSAGE_ID, "Alice", envelope.prekeyId);
+    expect(duplicateAck).toEqual(ackSignature);
     expect(() =>
       eve.decryptText(
         CHAT_ID,
@@ -365,12 +373,14 @@ describe("recipient E2EE", () => {
     framePayload.ciphertext.fill(0);
     framePayload.identityEnvelope.fill(0);
     framePayload.identityPublicKey.fill(0);
+    framePayload.stateSignature.fill(0);
     framePayload.envelopes.forEach((envelope) => {
       envelope.wrappedKey.fill(0);
       envelope.signature.fill(0);
     });
-    expect(frame.version).toBe(6);
+    expect(frame.version).toBe(7);
     expect(frame).not.toHaveProperty("signature_b64");
+    expect(frame.state_signature_b64).toBeTruthy();
     expect((frame.envelopes as Array<{ signature_b64: string }>)[0].signature_b64).toBeTruthy();
   });
 

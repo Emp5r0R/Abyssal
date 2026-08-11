@@ -23,23 +23,41 @@ class InMemoryPayloadCipherTest {
             listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
         )
 
-        val plain = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
-
-        assertEquals(6, payload.version)
-        assertTrue(payload.envelopes.single().isPrekey)
-        assertEquals(initialPrekey, payload.envelopes.single().prekeyId)
-        assertEquals(64, payload.envelopes.single().signature.size)
-        assertEquals(1UL, payload.stateRevision)
-        assertTrue(payload.identityEnvelope.size > 64)
-        assertEquals("hello from RAM", plain.decodeToString())
-        assertNotEquals(initialPrekey, receiver.prekeyId())
-        val state = receiver.stateSnapshot()
-        val retry = receiver.stateSnapshot()
-        assertEquals(1UL, state?.revision)
-        assertEquals(1UL, retry?.revision)
-        assertEquals(128, state?.identityPublicKey?.size)
-        assertTrue(state?.envelope !== retry?.envelope)
-        assertTrue(state!!.envelope.contentEquals(retry!!.envelope))
+        val decryption = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
+        try {
+            assertEquals(7, payload.version)
+            assertTrue(payload.envelopes.single().isPrekey)
+            assertEquals(initialPrekey, payload.envelopes.single().prekeyId)
+            assertEquals(64, payload.envelopes.single().signature.size)
+            assertEquals(64, payload.stateSignature.size)
+            assertEquals(1UL, payload.stateRevision)
+            assertTrue(payload.identityEnvelope.size > 64)
+            assertEquals("hello from RAM", decryption.plaintext.decodeToString())
+            val ack = receiver.signAcknowledgement(
+                CHAT_ID,
+                MESSAGE_ID,
+                "Alice",
+                payload.envelopes.single().prekeyId
+            )
+            assertEquals(64, ack.size)
+            ack.fill(0)
+            assertNotEquals(initialPrekey, receiver.prekeyId())
+            val state = receiver.stateSnapshot()
+            val retry = receiver.stateSnapshot()
+            assertEquals(1UL, state?.revision)
+            assertEquals(1UL, retry?.revision)
+            assertEquals(128, state?.identityPublicKey?.size)
+            assertTrue(state?.envelope !== retry?.envelope)
+            assertTrue(state!!.envelope.contentEquals(retry!!.envelope))
+            state.envelope.fill(0)
+            state.identityPublicKey.fill(0)
+            state.stateSignature.fill(0)
+            retry.envelope.fill(0)
+            retry.identityPublicKey.fill(0)
+            retry.stateSignature.fill(0)
+        } finally {
+            decryption.plaintext.fill(0)
+        }
     }
 
     @Test
@@ -105,8 +123,9 @@ class InMemoryPayloadCipherTest {
         )
         val serialized = sender.serialize(payload)
         val serializedJson = JSONObject(serialized.decodeToString())
-        assertEquals(6, serializedJson.optInt("version"))
+        assertEquals(7, serializedJson.optInt("version"))
         assertTrue(serializedJson.optString("identity_public_b64").isNotEmpty())
+        assertEquals(64, java.util.Base64.getUrlDecoder().decode(serializedJson.getString("state_signature_b64")).size)
         val serializedEnvelope = serializedJson.getJSONArray("envelopes").getJSONObject(0)
         assertTrue(serializedEnvelope.optString("signature_b64").isNotEmpty())
         assertFalse(serializedJson.has("state_revision"))
@@ -119,7 +138,12 @@ class InMemoryPayloadCipherTest {
             "Bob"
         )
 
-        assertTrue(byteArrayOf(9, 8, 7).contentEquals(receiver.decrypt(incoming, "Bob")))
+        val decryption = receiver.decrypt(incoming, "Bob")
+        try {
+            assertTrue(byteArrayOf(9, 8, 7).contentEquals(decryption.plaintext))
+        } finally {
+            decryption.plaintext.fill(0)
+        }
     }
 
     @Test
