@@ -44,6 +44,7 @@ class NetworkIdentityServiceTest {
             JSONObject(registration.toString()).put("handshake_id", "76f1b4b6-6dd8-1352-80b9-76fa0150484c"),
             JSONObject(registration.toString()).put("node_id", "node 1"),
             JSONObject(registration.toString()).put("response_b64", "AQID="),
+            JSONObject(registration.toString()).put("challenge_b64", "AQID"),
             JSONObject(registration.toString()).put("identity_public_b64", 7),
             JSONObject(login.toString()).put("identity_prekey_id", "bad prekey"),
             JSONObject(login.toString()).put("unexpected", true)
@@ -203,6 +204,10 @@ class NetworkIdentityServiceTest {
             .put("mode", mode)
             .put("handshake_id", "76f1b4b6-6dd8-4352-80b9-76fa0150484c")
             .put("response_b64", "AQID")
+            .put(
+                "challenge_b64",
+                if (mode == "registration") base64(ByteArray(32) { 1 }) else JSONObject.NULL
+            )
             .put("node_id", "node-1")
             .put("identity_public_b64", JSONObject.NULL)
             .put("identity_prekey_id", JSONObject.NULL)

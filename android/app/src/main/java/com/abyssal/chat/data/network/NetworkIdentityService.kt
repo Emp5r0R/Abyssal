@@ -27,6 +27,7 @@ internal data class ValidatedOpaqueStartResponse(
     val mode: String,
     val nodeId: String,
     val responseB64: String,
+    val challengeB64: String?,
     val identityPublicB64: String?,
     val identityPrekeyId: String?,
     val identityEnvelopeB64: String?
@@ -54,6 +55,7 @@ internal fun validateOpaqueStartResponse(json: JSONObject): ValidatedOpaqueStart
     val responseB64 = json.strictString("response_b64")
         ?.takeIf { isCanonicalBase64Url(it, 1, MAX_OPAQUE_RESPONSE_BYTES) }
         ?: return null
+    val challengeB64 = json.strictString("challenge_b64")
 
     var identityPublicB64: String? = null
     var identityPrekeyId: String? = null
@@ -62,9 +64,12 @@ internal fun validateOpaqueStartResponse(json: JSONObject): ValidatedOpaqueStart
         if (
             !json.isNullish("identity_public_b64") ||
             !json.isNullish("identity_prekey_id") ||
-            !json.isNullish("identity_envelope_b64")
+            !json.isNullish("identity_envelope_b64") ||
+            challengeB64 == null ||
+            !isCanonicalBase64Url(challengeB64, REGISTRATION_CHALLENGE_BYTES, REGISTRATION_CHALLENGE_BYTES)
         ) return null
     } else {
+        if (challengeB64 != null) return null
         identityPublicB64 = json.strictString("identity_public_b64")
         identityPrekeyId = json.strictString("identity_prekey_id")
         identityEnvelopeB64 = json.strictString("identity_envelope_b64")
@@ -81,6 +86,7 @@ internal fun validateOpaqueStartResponse(json: JSONObject): ValidatedOpaqueStart
         mode,
         nodeId,
         responseB64,
+        challengeB64,
         identityPublicB64,
         identityPrekeyId,
         identityEnvelopeB64
@@ -175,13 +181,30 @@ class NetworkIdentityService(
                     )
                     try {
                         val identity = payloadCipher.createIdentity(result.exportKey, context)
+                        var challenge = ByteArray(0)
+                        var identityProof = ByteArray(0)
                         try {
+                            challenge = decodeIdentityBase64(
+                                validatedStart.challengeB64 ?: return@withContext rejectedAndClear()
+                            )
+                            identityProof = payloadCipher.signRegistrationIdentityProof(
+                                nodeId = nodeId,
+                                handshakeId = handshakeId,
+                                challenge = challenge,
+                                registrationUpload = result.registrationUpload,
+                                identityPublic = identity.publicKey,
+                                prekeyId = identity.prekeyId,
+                                identityEnvelope = identity.envelope
+                            )
                             finishBody
                                 .put("registration_upload_b64", encode(result.registrationUpload))
                                 .put("identity_public_b64", encode(identity.publicKey))
                                 .put("identity_prekey_id", identity.prekeyId)
                                 .put("identity_envelope_b64", encode(identity.envelope))
+                                .put("identity_proof_b64", encode(identityProof))
                         } finally {
+                            challenge.fill(0)
+                            identityProof.fill(0)
                             identity.publicKey.fill(0)
                             identity.envelope.fill(0)
                         }
@@ -386,6 +409,7 @@ private const val MAX_SESSION_INACTIVITY_SEC = 24 * 60 * 60
 private const val MIN_MAX_ROOMS_PER_USER = 1
 private const val MAX_MAX_ROOMS_PER_USER = 100
 private const val IDENTITY_PUBLIC_KEY_BYTES = 128
+private const val REGISTRATION_CHALLENGE_BYTES = 32
 private const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
 private const val MAX_OPAQUE_RESPONSE_BYTES = 64 * 1024
 private val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
@@ -396,7 +420,7 @@ private val NODE_ID_REGEX = Regex("^[A-Za-z0-9._:-]{1,128}$")
 private val USERNAME_REGEX = Regex("^[A-Za-z0-9_-]{1,80}$")
 private val BASE64_URL_REGEX = Regex("^[A-Za-z0-9_-]+$")
 private val OPAQUE_START_RESPONSE_KEYS = setOf(
-    "accepted", "mode", "handshake_id", "response_b64", "node_id",
+    "accepted", "mode", "handshake_id", "response_b64", "challenge_b64", "node_id",
     "identity_public_b64", "identity_prekey_id", "identity_envelope_b64", "error"
 )
 private val ACCOUNT_RESPONSE_KEYS = setOf(

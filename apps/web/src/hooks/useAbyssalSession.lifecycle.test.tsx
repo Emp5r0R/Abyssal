@@ -11,7 +11,14 @@ const mocks = vi.hoisted(() => {
   };
   class FakeCipher {
     static failAcknowledgement = false;
+    static encryptError: Error | null = null;
+    static decryptError: Error | null = null;
     static decryptCount = 0;
+    static payloadIdOverride: string | null = null;
+    static plaintextOverride: Record<string, unknown> | null = null;
+    static lastAttachmentPlain: Uint8Array | null = null;
+    static lastAttachmentKey: Uint8Array | null = null;
+    static lastAttachmentBlob: Uint8Array | null = null;
     static lastSnapshot: {
       envelope: Uint8Array;
       identityPublicKey: Uint8Array;
@@ -55,9 +62,14 @@ const mocks = vi.hoisted(() => {
       return new Uint8Array(64).fill(8);
     }
 
+    signRegistrationIdentityProof(): Uint8Array {
+      return new Uint8Array(64).fill(9);
+    }
+
     encryptText() {
+      if (FakeCipher.encryptError) throw FakeCipher.encryptError;
       return {
-        version: 7,
+        version: 8,
         messageId: "message",
         nonce: new Uint8Array([1]),
         ciphertext: new Uint8Array([2]),
@@ -70,15 +82,33 @@ const mocks = vi.hoisted(() => {
       };
     }
 
-    decryptText() {
+    commitOutbound(): void {}
+    rollbackOutbound(): void {}
+
+    decryptText(_chatId: string, messageId: string) {
       FakeCipher.decryptCount += 1;
+      if (FakeCipher.decryptError) throw FakeCipher.decryptError;
+      if (FakeCipher.plaintextOverride) return JSON.stringify(FakeCipher.plaintextOverride);
       return JSON.stringify({
         kind: "text",
-        id: "incoming-message",
+        id: FakeCipher.payloadIdOverride ?? messageId,
         sender: "Bob",
         content: "incoming secret",
         timestamp_ms: Date.now(),
       });
+    }
+
+    encryptAttachment(_chatId: string, _messageId: string, _sender: string, _mediaType: string, plain: Uint8Array) {
+      const key = new Uint8Array(32).fill(9);
+      const blob = new Uint8Array(plain.byteLength + 41).fill(8);
+      FakeCipher.lastAttachmentPlain = plain;
+      FakeCipher.lastAttachmentKey = key;
+      FakeCipher.lastAttachmentBlob = blob;
+      return { version: 1, key, blob };
+    }
+
+    decryptAttachment(): Uint8Array {
+      return new Uint8Array([8, 9, 10]);
     }
 
     clear(): void {
@@ -89,6 +119,8 @@ const mocks = vi.hoisted(() => {
 
   class FakeRelay {
     static readonly instances: FakeRelay[] = [];
+    static encryptedOutcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS" = "ACCEPTED";
+    static acknowledgeResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
     private readonly frameHandler: (frame: IncomingFrame) => void;
     readonly session: AccountSession;
     connected = false;
@@ -123,13 +155,21 @@ const mocks = vi.hoisted(() => {
       return true;
     }
 
+    sendEncryptedPayload(_messageId: string, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
+      this.send(frame);
+      return Promise.resolve(FakeRelay.encryptedOutcome);
+    }
+
     join(): boolean { return this.send({ type: "join" }); }
     openDirect(): boolean { return this.send({ type: "open_direct" }); }
     createRoom(): boolean { return this.send({ type: "create_room" }); }
     deleteRoom(): boolean { return this.send({ type: "delete_room" }); }
     wipe(): boolean { return this.send({ type: "global_wipe" }); }
     activity(): boolean { return this.send({ type: "activity" }); }
-    acknowledge(...args: unknown[]): boolean { return this.send({ type: "message_ack", args }); }
+    acknowledge(...args: unknown[]): Promise<typeof FakeRelay.encryptedOutcome> {
+      this.send({ type: "message_ack", args });
+      return FakeRelay.acknowledgeResult ?? Promise.resolve(FakeRelay.encryptedOutcome);
+    }
 
     emit(frame: IncomingFrame): void {
       this.frameHandler(frame);
@@ -157,8 +197,17 @@ const mocks = vi.hoisted(() => {
     getLastRelay: () => FakeRelay.instances.at(-1) ?? null,
     reset: () => {
       FakeRelay.instances.length = 0;
+      FakeRelay.encryptedOutcome = "ACCEPTED";
+      FakeRelay.acknowledgeResult = null;
       FakeCipher.failAcknowledgement = false;
+      FakeCipher.encryptError = null;
+      FakeCipher.decryptError = null;
       FakeCipher.decryptCount = 0;
+      FakeCipher.payloadIdOverride = null;
+      FakeCipher.plaintextOverride = null;
+      FakeCipher.lastAttachmentPlain = null;
+      FakeCipher.lastAttachmentKey = null;
+      FakeCipher.lastAttachmentBlob = null;
       FakeCipher.lastSnapshot = null;
     },
     startOpaqueAccount: vi.fn(async () => ({
@@ -166,6 +215,7 @@ const mocks = vi.hoisted(() => {
       mode: "registration" as const,
       handshake_id: "handshake-one",
       response_b64: "AQ",
+      challenge_b64: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
       node_id: "node-one",
     })),
     finishOpaqueAccount: vi.fn(async () => ({
@@ -175,6 +225,8 @@ const mocks = vi.hoisted(() => {
     revokeSession: vi.fn(async () => undefined),
     downloadEncryptedAttachment: vi.fn(async () => ({ bytes: new Uint8Array([1, 2, 3]) })),
     decryptAndCompleteAttachment: vi.fn(async () => new Uint8Array([8, 9, 10])),
+    uploadEncryptedAttachment: vi.fn(async () => "123e4567-e89b-42d3-a456-426614174000"),
+    deleteUploadedAttachment: vi.fn(async () => undefined),
   };
 });
 
@@ -194,7 +246,7 @@ vi.mock("../security/crypto", async () => {
     })),
     InMemoryPayloadCipher: mocks.FakeCipher,
     payloadToFrame: vi.fn(() => ({
-      version: 7,
+      version: 8,
       message_id: "message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -216,10 +268,13 @@ vi.mock("../transport/nodeClient", async () => {
     revokeSession: mocks.revokeSession,
     downloadEncryptedAttachment: mocks.downloadEncryptedAttachment,
     decryptAndCompleteAttachment: mocks.decryptAndCompleteAttachment,
+    uploadEncryptedAttachment: mocks.uploadEncryptedAttachment,
+    deleteUploadedAttachment: mocks.deleteUploadedAttachment,
   };
 });
 
-import { useAbyssalSession } from "./useAbyssalSession";
+import { FatalCipherError } from "../security/crypto";
+import { rememberBoundedId, useAbyssalSession } from "./useAbyssalSession";
 
 const room: RoomRecord = {
   id: "forum_ops",
@@ -460,7 +515,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const frame: IncomingFrame = {
       type: "message",
       chat_id: room.id,
-      version: 7,
+      version: 8,
       message_id: "incoming-message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -493,6 +548,76 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
+  it("does not repopulate messages or receipts when an ACK resolves after logout", async () => {
+    let resolveAck: ((outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void) | undefined;
+    mocks.FakeRelay.acknowledgeResult = new Promise((resolve) => {
+      resolveAck = resolve;
+    });
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    const frame: IncomingFrame = {
+      type: "message",
+      chat_id: room.id,
+      version: 8,
+      message_id: "late-ack-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    };
+    await act(async () => relay?.emit(frame));
+    await waitFor(() => expect(resolveAck).toBeDefined());
+    expect(result.current.messages).toEqual({});
+
+    await act(async () => {
+      await result.current.logout();
+    });
+    expect(result.current.session).toBeNull();
+    expect(result.current.messages).toEqual({});
+    expect(result.current.rooms).toEqual([]);
+    expect(result.current.presence).toEqual([]);
+
+    await act(async () => {
+      resolveAck?.("ACCEPTED");
+      await Promise.resolve();
+    });
+    await act(async () => relay?.emit(frame));
+    await Promise.resolve();
+    expect(result.current.session).toBeNull();
+    expect(result.current.messages).toEqual({});
+    expect(result.current.rooms).toEqual([]);
+    expect(result.current.presence).toEqual([]);
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message")).toHaveLength(0);
+    unmount();
+  });
+
   it("decrypts only presence-pinned senders and accepts prekey rotation on the pinned identity", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
@@ -510,7 +635,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const baseFrame: IncomingFrame = {
       type: "message",
       chat_id: room.id,
-      version: 7,
+      version: 8,
       message_id: "identity-bound-message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -557,6 +682,231 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(result.current.messages[room.id]).toHaveLength(1);
     expect(result.current.session).not.toBeNull();
     unmount();
+  });
+
+  it("rejects unknown conversations and third-party senders before direct decrypt or ACK", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
+      relay?.emit({
+        type: "presence",
+        users: ["Bob", "Mallory"].map((username) => ({
+          username,
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        })),
+      });
+    });
+    const frame = (chatId: string, sender: string, messageId: string): IncomingFrame => ({
+      type: "message",
+      chat_id: chatId,
+      version: 8,
+      message_id: messageId,
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: sender,
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    });
+
+    await act(async () => {
+      relay?.emit(frame("dm_bob", "Mallory", "third-party"));
+      relay?.emit(frame("dm_unknown", "Bob", "unknown-chat"));
+    });
+    expect(mocks.FakeCipher.decryptCount).toBe(0);
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(0);
+    expect(result.current.messages).toEqual({});
+
+    await act(async () => relay?.emit(frame("dm_bob", "Bob", "peer-message")));
+    await waitFor(() => expect(mocks.FakeCipher.decryptCount).toBe(1));
+    expect(result.current.messages.dm_bob).toHaveLength(1);
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
+    unmount();
+  });
+
+  it("drops authenticated plaintext whose inner ID differs from the frame ID", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    mocks.FakeCipher.payloadIdOverride = "different-id";
+    await act(async () => relay?.emit({
+      type: "message",
+      chat_id: room.id,
+      version: 8,
+      message_id: "outer-id",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }));
+    await waitFor(() => expect(mocks.FakeCipher.decryptCount).toBe(1));
+    expect(result.current.messages[room.id]).toBeUndefined();
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
+    unmount();
+  });
+
+  it("drops ordinary decrypt failures but fails closed for fatal decrypt wrapper failures", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    const frame = (messageId: string): IncomingFrame => ({
+      type: "message",
+      chat_id: room.id,
+      version: 8,
+      message_id: messageId,
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    });
+
+    mocks.FakeCipher.decryptError = new Error("malformed ciphertext");
+    await act(async () => relay?.emit(frame("ordinary-decrypt-failure")));
+    await waitFor(() => expect(mocks.FakeCipher.decryptCount).toBe(1));
+    expect(result.current.session).not.toBeNull();
+    expect(result.current.messages).toEqual({});
+
+    mocks.FakeCipher.decryptError = new FatalCipherError();
+    await act(async () => relay?.emit(frame("fatal-decrypt-wrapper")));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.messages).toEqual({});
+    expect(mocks.revokeSession).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("applies a read receipt only when its inner ID matches the authenticated frame ID", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    act(() => result.current.openRoom(room.id));
+    await act(async () => expect(result.current.sendText("outgoing secret")).resolves.toBe(true));
+    const ownMessageId = result.current.messages[room.id]?.[0]?.id;
+    expect(ownMessageId).toBeDefined();
+
+    const receiptFrame = (messageId: string): IncomingFrame => ({
+      type: "message",
+      chat_id: room.id,
+      version: 8,
+      message_id: messageId,
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    });
+    mocks.FakeCipher.plaintextOverride = {
+      kind: "read_receipt",
+      id: "different-receipt-id",
+      message_id: ownMessageId,
+    };
+    await act(async () => relay?.emit(receiptFrame("outer-receipt-id")));
+    expect(result.current.messages[room.id]?.[0]?.readAtMs).toBeUndefined();
+
+    mocks.FakeCipher.plaintextOverride = {
+      kind: "read_receipt",
+      id: "matching-receipt-id",
+      message_id: ownMessageId,
+    };
+    await act(async () => relay?.emit(receiptFrame("matching-receipt-id")));
+    await waitFor(() => expect(result.current.messages[room.id]?.[0]?.readAtMs).toEqual(expect.any(Number)));
+    unmount();
+  });
+
+  it("bounds sent-message IDs with deterministic oldest eviction", () => {
+    const ids = new Set(["first", "second", "third"]);
+    rememberBoundedId(ids, "fourth", 3);
+    expect([...ids]).toEqual(["second", "third", "fourth"]);
+    rememberBoundedId(ids, "third", 3);
+    expect([...ids]).toEqual(["second", "third", "fourth"]);
   });
 
   it("fails closed when repeated presence catalogs exceed the identity pin bound", async () => {
@@ -729,12 +1079,214 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
+  it("aborts an in-flight attachment upload and promptly wipes its plaintext and cipher buffers", async () => {
+    let uploadSignal: AbortSignal | undefined;
+    mocks.uploadEncryptedAttachment.mockImplementationOnce((...args: unknown[]) => new Promise<string>((_resolve, reject) => {
+      uploadSignal = args[6] as AbortSignal;
+      uploadSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    act(() => result.current.openRoom(room.id));
+    let pending: Promise<boolean> | undefined;
+    act(() => {
+      pending = result.current.sendAttachment({
+        file: new File([new Uint8Array([1, 2, 3])], "secret.bin", { type: "application/octet-stream" }),
+        options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
+      });
+    });
+    await waitFor(() => expect(uploadSignal).toBeDefined());
+
+    act(() => result.current.clearMemory());
+    await act(async () => expect(pending).resolves.toBe(false));
+
+    expect(uploadSignal?.aborted).toBe(true);
+    expect(mocks.FakeCipher.lastAttachmentPlain?.every((byte) => byte === 0)).toBe(true);
+    expect(mocks.FakeCipher.lastAttachmentKey?.every((byte) => byte === 0)).toBe(true);
+    expect(mocks.FakeCipher.lastAttachmentBlob?.every((byte) => byte === 0)).toBe(true);
+    expect(result.current.session).toBeNull();
+    expect(result.current.upload.active).toBe(false);
+    unmount();
+  });
+
+  it("does not delete an attachment when metadata delivery is ambiguous", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    act(() => result.current.openRoom(room.id));
+    mocks.FakeRelay.encryptedOutcome = "AMBIGUOUS";
+    await act(async () => expect(result.current.sendAttachment({
+      file: new File([new Uint8Array([1, 2, 3])], "secret.bin", { type: "application/octet-stream" }),
+      options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
+    })).resolves.toBe(false));
+    expect(mocks.deleteUploadedAttachment).not.toHaveBeenCalled();
+    expect(result.current.session).toBeNull();
+    unmount();
+  });
+
+  it("fails closed when outbound encryption reports an unrecoverable staged state", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({
+        type: "presence",
+        users: [{
+          username: "Bob",
+          connected: true,
+          identity_public_b64: validPublicKeyB64,
+          identity_prekey_id: "prekey-one",
+          directory_digest: "A".repeat(43),
+        }],
+      });
+    });
+    act(() => result.current.openRoom(room.id));
+    mocks.FakeCipher.encryptError = new FatalCipherError();
+
+    await act(async () => expect(result.current.sendText("must not publish")).resolves.toBe(false));
+
+    expect(result.current.session).toBeNull();
+    expect(result.current.messages[room.id]).toBeUndefined();
+    expect(mocks.revokeSession).toHaveBeenCalledOnce();
+    unmount();
+  });
+
+  it("aborts an in-flight attachment download, wipes the copied key, and revokes exports on purge", async () => {
+    let downloadSignal: AbortSignal | undefined;
+    mocks.downloadEncryptedAttachment.mockImplementationOnce((...args: unknown[]) => new Promise(( _resolve, reject) => {
+      downloadSignal = args[3] as AbortSignal;
+      downloadSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const attachmentMessage = {
+      id: "attachment-message",
+      chatId: room.id,
+      sender: "Bob",
+      content: "secret.txt",
+      kind: "attachment" as const,
+      createdAtMs: Date.now(),
+      receivedAtMs: Date.now(),
+      selfDestructSec: 0,
+      absoluteExpirySec: 0,
+      mine: false,
+      attachment: {
+        id: "123e4567-e89b-42d3-a456-426614174000",
+        encryptionVersion: 1,
+        encryptionKey: new Uint8Array(32).fill(9),
+        name: "secret.txt",
+        mediaType: "FILE" as const,
+        mimeType: "text/plain",
+        sizeBytes: 3,
+        oneTime: false,
+        deleteAfterDownload: false,
+      },
+    };
+    const originalSlice = Uint8Array.prototype.slice;
+    const copiedKeys: Uint8Array[] = [];
+    const sliceSpy = vi.spyOn(Uint8Array.prototype, "slice").mockImplementation(function (
+      this: Uint8Array,
+      start?: number,
+      end?: number,
+    ) {
+      const copy = originalSlice.call(this, start, end);
+      if (this === attachmentMessage.attachment.encryptionKey) copiedKeys.push(copy);
+      return copy;
+    });
+    let pending: Promise<void> | undefined;
+    act(() => { pending = result.current.viewAttachment(attachmentMessage); });
+    await waitFor(() => expect(downloadSignal).toBeDefined());
+
+    act(() => result.current.clearMemory());
+    await act(async () => pending);
+    sliceSpy.mockRestore();
+
+    expect(downloadSignal?.aborted).toBe(true);
+    expect(copiedKeys).toHaveLength(1);
+    expect(copiedKeys[0]?.every((byte) => byte === 0)).toBe(true);
+    expect(result.current.media).toBeNull();
+
+    mocks.downloadEncryptedAttachment.mockResolvedValueOnce({ bytes: new Uint8Array([1, 2, 3]) });
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    await act(async () => result.current.exportAttachment(attachmentMessage));
+    expect(URL.revokeObjectURL).not.toHaveBeenCalledWith("blob:decrypted-media");
+    act(() => result.current.clearMemory());
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:decrypted-media");
+    clickSpy.mockRestore();
+    unmount();
+  });
+
   it("rejects a finish response from a different node and revokes its candidate session", async () => {
     mocks.startOpaqueAccount.mockResolvedValueOnce({
       accepted: true,
       mode: "registration",
       handshake_id: "handshake-one",
       response_b64: "AQ",
+      challenge_b64: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
       node_id: "different-node",
     });
     const { result, unmount } = renderHook(() => useAbyssalSession());

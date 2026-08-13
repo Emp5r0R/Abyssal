@@ -38,6 +38,7 @@ export interface OpaqueAccountStartResponse {
   mode?: "registration" | "login" | null;
   handshake_id?: string | null;
   response_b64?: string | null;
+  challenge_b64?: string | null;
   node_id: string;
   identity_public_b64?: string | null;
   identity_prekey_id?: string | null;

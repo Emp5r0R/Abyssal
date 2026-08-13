@@ -7,7 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,13 +17,14 @@ use abyssal_core::secure_protocol::{
     opaque_server_finish_login, opaque_server_finish_registration,
     opaque_server_registration_response, opaque_server_setup, opaque_server_start_login,
     validate_identity_public_bundle as validate_core_identity_public_bundle,
-    verify_ack_signature_v7, verify_identity_state_signature_v7, verify_message_signature_v7,
+    verify_ack_signature_v8, verify_identity_state_signature_v8, verify_message_signature_v8,
+    verify_registration_identity_proof_v8, REGISTRATION_CHALLENGE_BYTES_V8,
 };
 use axum::{
     body::{Body, Bytes},
     extract::Request,
     extract::{
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
         DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
@@ -38,7 +39,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -73,9 +74,21 @@ const MAX_PENDING_MESSAGE_TTL_HOURS: usize = 7 * 24;
 const HOURS_TO_MILLISECONDS: u64 = 60 * 60 * 1000;
 const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_CONTROL_QUEUE_CAPACITY: usize = 1;
+const CLIENT_RESULT_QUEUE_CAPACITY: usize = 2;
+const CLIENT_OUTBOUND_BYTES: usize = 4 * 1024 * 1024;
+const GLOBAL_OUTBOUND_BYTES: usize = 64 * 1024 * 1024;
+// A fanout is assembled before its per-recipient frames enter either the
+// live client queues or pending queues. Keep that temporary allocation
+// bounded by the same global outbound budget.
+const MAX_TRANSIENT_FANOUT_BYTES: usize = GLOBAL_OUTBOUND_BYTES;
 const CLIENT_SINK_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_WIPE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const CLIENT_RESULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const PURGE_CLOSE_CODE: u16 = 4001;
+const PURGE_CLOSE_REASON: &str = "purge";
 const MAX_ROOM_CATALOG_ENTRIES: usize = 1_024;
+const MAX_DIRECT_CATALOG_ENTRIES: usize = 8_192;
+const MAX_DIRECT_CATALOG_PER_USER: usize = 128;
 const ACCOUNT_BODY_LIMIT_BYTES: usize = 16 * 1024;
 const MAX_CHAT_ID_BYTES: usize = 128;
 const MAX_USERNAME_BYTES: usize = 80;
@@ -99,7 +112,7 @@ const MAX_IDENTITY_ENVELOPE_BYTES: usize = 512 * 1024;
 const MESSAGE_NONCE_BYTES: usize = 12;
 const MESSAGE_SIGNATURE_BYTES: usize = 64;
 const MAX_WRAPPED_KEY_BYTES: usize = 4096;
-const E2EE_PROTOCOL_VERSION: u32 = 7;
+const E2EE_PROTOCOL_VERSION: u32 = 8;
 const MAX_STATE_REVISION_ADVANCE: u64 = 1_024;
 const IDENTITY_ENVELOPE_VERSION: u8 = 4;
 const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
@@ -118,6 +131,10 @@ const DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 2;
 const MAX_ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 16;
 const DEFAULT_ATTACHMENT_UPLOAD_CONCURRENCY: usize = 2;
 const MAX_ATTACHMENT_UPLOAD_CONCURRENCY: usize = 4;
+// A single account may hold only one upload permit at a time.  The global
+// upload semaphore remains configurable; this per-account bound prevents one
+// authenticated client from monopolising it.
+const MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT: usize = 1;
 const ATTACHMENT_DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const ATTACHMENT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // A client may upload a maximum-size attachment over a slow but legitimate
@@ -158,6 +175,8 @@ struct AppState {
     ws_tickets: Arc<Mutex<HashMap<WsTicketDigest, WsTicket>>>,
     active_connections: Arc<Mutex<HashMap<CodeId, Uuid>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
+    purge_epoch: watch::Sender<u64>,
+    outbound_bytes: Arc<AtomicUsize>,
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
     login_limits: Arc<Mutex<HashMap<CodeId, RateState>>>,
     replay_ids: Arc<Mutex<HashMap<ReplayKey, u64>>>,
@@ -185,11 +204,13 @@ struct Account {
     state_revision: u64,
     state_revision_window: u128,
     connected: bool,
+    attachment_uploads: Arc<Semaphore>,
 }
 
 enum OpaqueHandshake {
     Registration {
         code_id: CodeId,
+        challenge: Zeroizing<Vec<u8>>,
         created_at_ms: u64,
     },
     Login {
@@ -245,6 +266,13 @@ struct ClientHandle {
     username: String,
     tx: mpsc::Sender<OutboundFrame>,
     control_tx: mpsc::Sender<ClientControl>,
+    result_tx: mpsc::Sender<ClientResult>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+struct ClientResult {
+    frame: OutboundFrame,
+    delivered: oneshot::Sender<bool>,
 }
 
 enum ClientControl {
@@ -418,7 +446,12 @@ impl Drop for Account {
 impl Drop for OpaqueHandshake {
     fn drop(&mut self) {
         match self {
-            Self::Registration { code_id, .. } => code_id.zeroize(),
+            Self::Registration {
+                code_id, challenge, ..
+            } => {
+                code_id.zeroize();
+                challenge.zeroize();
+            }
             Self::Login {
                 code_id,
                 username,
@@ -468,6 +501,7 @@ enum ConversationAccess {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RoomRecord {
     id: String,
     name: String,
@@ -491,6 +525,7 @@ struct RoomRecord {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpaqueAccountStartRequest {
     code: String,
     registration_request_b64: String,
@@ -506,6 +541,7 @@ impl Drop for OpaqueAccountStartRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpaqueAccountFinishRequest {
     handshake_id: Uuid,
     registration_upload_b64: Option<String>,
@@ -513,6 +549,7 @@ struct OpaqueAccountFinishRequest {
     identity_public_b64: Option<String>,
     identity_prekey_id: Option<String>,
     identity_envelope_b64: Option<String>,
+    identity_proof_b64: Option<String>,
 }
 
 impl Drop for OpaqueAccountFinishRequest {
@@ -522,10 +559,12 @@ impl Drop for OpaqueAccountFinishRequest {
         self.identity_public_b64.zeroize();
         self.identity_prekey_id.zeroize();
         self.identity_envelope_b64.zeroize();
+        self.identity_proof_b64.zeroize();
     }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttachmentQuery {
     chat_id: String,
     media_type: Option<String>,
@@ -561,6 +600,7 @@ struct OpaqueAccountStartResponse {
     mode: Option<&'static str>,
     handshake_id: Option<Uuid>,
     response_b64: Option<String>,
+    challenge_b64: Option<String>,
     node_id: String,
     identity_public_b64: Option<String>,
     identity_prekey_id: Option<String>,
@@ -576,6 +616,7 @@ struct HealthResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type")]
 enum InboundFrame {
     #[serde(rename = "activity")]
@@ -635,6 +676,7 @@ enum InboundFrame {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InboundRecipientEnvelope {
     recipient_username: String,
     wrapped_key_b64: String,
@@ -684,6 +726,10 @@ enum OutboundFrame {
     Directs { directs: Vec<DirectRecord> },
     #[serde(rename = "direct_opened")]
     DirectOpened { direct: DirectRecord },
+    #[serde(rename = "message_result")]
+    MessageResult { message_id: String, accepted: bool },
+    #[serde(rename = "ack_result")]
+    AckResult { message_id: String, accepted: bool },
 }
 
 impl OutboundFrame {
@@ -710,6 +756,9 @@ impl OutboundFrame {
             sender_username.zeroize();
             sender_public_key_b64.zeroize();
             identity_public_b64.zeroize();
+        }
+        if let Self::MessageResult { message_id, .. } | Self::AckResult { message_id, .. } = self {
+            message_id.zeroize();
         }
     }
 }
@@ -885,6 +934,7 @@ async fn main() {
 
 impl AppState {
     fn from_env() -> Self {
+        let (purge_epoch, _) = watch::channel(0_u64);
         let node_id = env::var("ABYSSAL_NODE_ID")
             .or_else(|_| env::var("MIRAGE_NODE_ID"))
             .unwrap_or_else(|_| format!("abyssal-{}", Uuid::new_v4().simple()));
@@ -975,6 +1025,8 @@ impl AppState {
             ws_tickets: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            purge_epoch,
+            outbound_bytes: Arc::new(AtomicUsize::new(0)),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -1960,6 +2012,22 @@ fn acquire_attachment_upload_permit(
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)
 }
 
+async fn acquire_account_attachment_upload_permit(
+    state: &AppState,
+    code_id: &CodeId,
+) -> Result<OwnedSemaphorePermit, StatusCode> {
+    let uploads = state
+        .accounts
+        .lock()
+        .await
+        .get(code_id)
+        .map(|account| Arc::clone(&account.attachment_uploads))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    uploads
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)
+}
+
 fn acquire_attachment_memory_permit(
     memory: &Arc<Semaphore>,
     bytes: usize,
@@ -2231,7 +2299,6 @@ async fn start_opaque_account(
     State(state): State<AppState>,
     Json(request): Json<OpaqueAccountStartRequest>,
 ) -> impl IntoResponse {
-    touch_activity(&state).await;
     let _account_guard = state.account_ops.lock().await;
     prune_opaque_handshakes(&state).await;
     let code = match normalize_code(&request.code) {
@@ -2283,6 +2350,7 @@ async fn start_opaque_account(
         {
             return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
         }
+        touch_activity(&state).await;
         return (
             StatusCode::OK,
             Json(OpaqueAccountStartResponse {
@@ -2290,6 +2358,7 @@ async fn start_opaque_account(
                 mode: Some("login"),
                 handshake_id: Some(handshake_id),
                 response_b64: Some(URL_SAFE_NO_PAD.encode(response.as_slice())),
+                challenge_b64: None,
                 node_id: state.node_id.clone(),
                 identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&account.identity_public)),
                 identity_prekey_id: Some(account.prekey_id.clone()),
@@ -2313,11 +2382,14 @@ async fn start_opaque_account(
         Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
     };
     let response = Zeroizing::new(response);
+    let mut challenge = Zeroizing::new(vec![0_u8; REGISTRATION_CHALLENGE_BYTES_V8]);
+    OsRng.fill_bytes(&mut challenge);
     if !store_opaque_handshake(
         &state,
         handshake_id,
         OpaqueHandshake::Registration {
             code_id,
+            challenge: challenge.clone(),
             created_at_ms: now_ms(),
         },
     )
@@ -2325,6 +2397,7 @@ async fn start_opaque_account(
     {
         return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
     }
+    touch_activity(&state).await;
     (
         StatusCode::OK,
         Json(OpaqueAccountStartResponse {
@@ -2332,6 +2405,7 @@ async fn start_opaque_account(
             mode: Some("registration"),
             handshake_id: Some(handshake_id),
             response_b64: Some(URL_SAFE_NO_PAD.encode(response.as_slice())),
+            challenge_b64: Some(URL_SAFE_NO_PAD.encode(challenge.as_slice())),
             node_id: state.node_id.clone(),
             identity_public_b64: None,
             identity_prekey_id: None,
@@ -2345,7 +2419,6 @@ async fn finish_opaque_account(
     State(state): State<AppState>,
     Json(request): Json<OpaqueAccountFinishRequest>,
 ) -> impl IntoResponse {
-    touch_activity(&state).await;
     let _account_guard = state.account_ops.lock().await;
     prune_opaque_handshakes(&state).await;
     let Some(handshake) = state
@@ -2358,7 +2431,12 @@ async fn finish_opaque_account(
     };
 
     match &handshake {
-        OpaqueHandshake::Registration { code_id, .. } => {
+        OpaqueHandshake::Registration {
+            code_id, challenge, ..
+        } => {
+            if !opaque_finish_request_is_registration(&request) {
+                return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await;
+            }
             if state.accounts.lock().await.contains_key(code_id)
                 || !state.available_codes.lock().await.contains(code_id)
             {
@@ -2411,6 +2489,34 @@ async fn finish_opaque_account(
                 Ok(value) if !value.is_empty() => value,
                 _ => return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await,
             };
+            let proof = match request
+                .identity_proof_b64
+                .as_deref()
+                .ok_or(())
+                .and_then(|value| {
+                    decode_exact(value, MESSAGE_SIGNATURE_BYTES)
+                        .map(Zeroizing::new)
+                        .map_err(|_| ())
+                }) {
+                Ok(value) => value,
+                Err(_) => {
+                    return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
+                }
+            };
+            if verify_registration_identity_proof_v8(
+                &state.node_id,
+                &request.handshake_id.to_string(),
+                challenge,
+                upload.as_slice(),
+                identity_public.as_slice(),
+                &prekey_id,
+                identity_envelope.as_slice(),
+                proof.as_slice(),
+            )
+            .is_err()
+            {
+                return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
+            }
             let password_file = match opaque_server_finish_registration(upload.as_slice()) {
                 Ok(value) => value,
                 Err(_) => {
@@ -2433,12 +2539,19 @@ async fn finish_opaque_account(
                     state_revision: 0,
                     state_revision_window: 1,
                     connected: false,
+                    attachment_uploads: Arc::new(Semaphore::new(
+                        MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT,
+                    )),
                 },
             );
             drop(accounts);
             clear_login_limit(&state, code_id).await;
             info!("opaque_account_created");
-            issue_session(&state, *code_id, username, true).await
+            let response = issue_session(&state, *code_id, username, true).await;
+            if response.0.is_success() {
+                touch_activity(&state).await;
+            }
+            response
         }
         OpaqueHandshake::Login {
             code_id,
@@ -2446,6 +2559,9 @@ async fn finish_opaque_account(
             server_state,
             ..
         } => {
+            if !opaque_finish_request_is_login(&request) {
+                return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await;
+            }
             let finalization = match request
                 .credential_finalization_b64
                 .as_deref()
@@ -2468,9 +2584,31 @@ async fn finish_opaque_account(
             }
             clear_login_limit(&state, code_id).await;
             info!("opaque_account_login");
-            issue_session(&state, *code_id, username.clone(), false).await
+            let response = issue_session(&state, *code_id, username.clone(), false).await;
+            if response.0.is_success() {
+                touch_activity(&state).await;
+            }
+            response
         }
     }
+}
+
+fn opaque_finish_request_is_registration(request: &OpaqueAccountFinishRequest) -> bool {
+    request.registration_upload_b64.is_some()
+        && request.credential_finalization_b64.is_none()
+        && request.identity_public_b64.is_some()
+        && request.identity_prekey_id.is_some()
+        && request.identity_envelope_b64.is_some()
+        && request.identity_proof_b64.is_some()
+}
+
+fn opaque_finish_request_is_login(request: &OpaqueAccountFinishRequest) -> bool {
+    request.registration_upload_b64.is_none()
+        && request.credential_finalization_b64.is_some()
+        && request.identity_public_b64.is_none()
+        && request.identity_prekey_id.is_none()
+        && request.identity_envelope_b64.is_none()
+        && request.identity_proof_b64.is_none()
 }
 
 fn opaque_start_error(
@@ -2484,6 +2622,7 @@ fn opaque_start_error(
             mode: None,
             handshake_id: None,
             response_b64: None,
+            challenge_b64: None,
             node_id: state.node_id.clone(),
             identity_public_b64: None,
             identity_prekey_id: None,
@@ -2706,7 +2845,7 @@ async fn issue_ws_ticket(State(state): State<AppState>, headers: HeaderMap) -> R
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let _account_guard = state.account_ops.lock().await;
-    if active_session(&state, session_token.as_str(), true)
+    if active_session(&state, session_token.as_str(), false)
         .await
         .is_none()
     {
@@ -2830,7 +2969,11 @@ async fn upload_attachment(
         Ok(length) => length,
         Err(status) => return status.into_response(),
     };
-    touch_activity(&state).await;
+    let _account_upload_permit =
+        match acquire_account_attachment_upload_permit(&state, &initial_auth.code_id).await {
+            Ok(permit) => permit,
+            Err(status) => return status.into_response(),
+        };
     let memory_permit =
         match acquire_attachment_memory_permit(&state.attachment_memory, declared_length) {
             Ok(permit) => permit,
@@ -2927,6 +3070,7 @@ async fn upload_attachment(
     usage.insert(auth.code_id, account_used.saturating_add(encrypted_len));
     drop(attachments);
     drop(usage);
+    touch_activity(&state).await;
 
     Json(serde_json::json!({
         "accepted": true,
@@ -2946,7 +3090,6 @@ async fn download_attachment(
         Err(status) => return status.into_response(),
     };
     let _conversation_guard = state.conversation_ops.lock().await;
-    touch_activity(&state).await;
     let download_permit = match acquire_attachment_download_permit(&state.attachment_downloads) {
         Ok(permit) => permit,
         Err(status) => return status.into_response(),
@@ -2974,6 +3117,7 @@ async fn download_attachment(
         "attachment_downloaded bytes={}",
         reservation.blob.bytes.len()
     );
+    touch_activity(&state).await;
 
     attachment_download_response_with_epoch(
         Arc::clone(&reservation.blob),
@@ -3007,9 +3151,11 @@ async fn complete_attachment_claim(
         Err(status) => return status,
     };
     let _conversation_guard = state.conversation_ops.lock().await;
-    touch_activity(&state).await;
     match complete_attachment_download_claim(&state, id, &auth.code_id, claim_id).await {
-        Ok(()) => StatusCode::NO_CONTENT,
+        Ok(()) => {
+            touch_activity(&state).await;
+            StatusCode::NO_CONTENT
+        }
         Err(status) => status,
     }
 }
@@ -3028,9 +3174,11 @@ async fn release_attachment_claim(
         Err(status) => return status,
     };
     let _conversation_guard = state.conversation_ops.lock().await;
-    touch_activity(&state).await;
     match release_attachment_download_claim(&state, id, &auth.code_id, claim_id).await {
-        Ok(()) => StatusCode::NO_CONTENT,
+        Ok(()) => {
+            touch_activity(&state).await;
+            StatusCode::NO_CONTENT
+        }
         Err(status) => status,
     }
 }
@@ -3045,9 +3193,11 @@ async fn delete_attachment(
         Err(status) => return status,
     };
     let _conversation_guard = state.conversation_ops.lock().await;
-    touch_activity(&state).await;
-
-    delete_owned_attachment(&state, id, &auth.code_id).await
+    let status = delete_owned_attachment(&state, id, &auth.code_id).await;
+    if status == StatusCode::NO_CONTENT {
+        touch_activity(&state).await;
+    }
+    status
 }
 
 async fn delete_owned_attachment(state: &AppState, id: Uuid, owner_code_id: &CodeId) -> StatusCode {
@@ -3247,7 +3397,7 @@ async fn socket_loop(
     client_id: Uuid,
     socket: WebSocket,
 ) {
-    let connection_epoch = state.attachment_epoch.load(Ordering::Acquire);
+    let mut purge_rx = state.purge_epoch.subscribe();
     if active_session(&state, session_token.as_str(), false)
         .await
         .is_none()
@@ -3258,6 +3408,8 @@ async fn socket_loop(
     let (mut sink, mut stream) = socket.split();
     let (tx, rx) = mpsc::channel::<OutboundFrame>(CLIENT_OUTBOUND_QUEUE_CAPACITY);
     let (control_tx, control_rx) = mpsc::channel::<ClientControl>(CLIENT_CONTROL_QUEUE_CAPACITY);
+    let (result_tx, result_rx) = mpsc::channel::<ClientResult>(CLIENT_RESULT_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
 
     state.clients.lock().await.insert(
         client_id,
@@ -3266,6 +3418,8 @@ async fn socket_loop(
             username: auth.username.clone(),
             tx,
             control_tx,
+            result_tx,
+            queued_bytes: Arc::clone(&queued_bytes),
         },
     );
     if let Some(account) = state.accounts.lock().await.get_mut(&auth.code_id) {
@@ -3276,12 +3430,57 @@ async fn socket_loop(
     send_room_catalog(&state, client_id).await;
     send_direct_catalog(&state, client_id, &auth.username).await;
 
+    let global_outbound_bytes = Arc::clone(&state.outbound_bytes);
     let writer = tokio::spawn(async move {
         let mut rx = rx;
         let mut control_rx = control_rx;
+        let mut result_rx = result_rx;
         loop {
             tokio::select! {
                 biased;
+                changed = purge_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let serialized = serialize_outbound_frame(&OutboundFrame::GlobalWipe);
+                    if let Some(serialized) = serialized {
+                        let _ = tokio::time::timeout(
+                            CLIENT_WIPE_SEND_TIMEOUT,
+                            sink.send(Message::Text(serialized)),
+                        ).await;
+                    }
+                    let _ = tokio::time::timeout(
+                        CLIENT_WIPE_SEND_TIMEOUT,
+                        sink.send(Message::Close(Some(CloseFrame {
+                            code: PURGE_CLOSE_CODE,
+                            reason: PURGE_CLOSE_REASON.into(),
+                        }))),
+                    ).await;
+                    break;
+                }
+                result = result_rx.recv() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    let delivered = serialize_outbound_frame(&result.frame)
+                        .map(|serialized| async {
+                            matches!(
+                                tokio::time::timeout(
+                                    CLIENT_RESULT_SEND_TIMEOUT,
+                                    sink.send(Message::Text(serialized)),
+                                ).await,
+                                Ok(Ok(()))
+                            )
+                        });
+                    let delivered = match delivered {
+                        Some(future) => future.await,
+                        None => false,
+                    };
+                    let _ = result.delivered.send(delivered);
+                    if !delivered {
+                        break;
+                    }
+                }
                 control = control_rx.recv() => {
                     match control {
                         Some(ClientControl::GlobalWipe) => {
@@ -3291,6 +3490,13 @@ async fn socket_loop(
                             let _ = tokio::time::timeout(
                                 CLIENT_WIPE_SEND_TIMEOUT,
                                 sink.send(Message::Text(serialized)),
+                            ).await;
+                            let _ = tokio::time::timeout(
+                                CLIENT_WIPE_SEND_TIMEOUT,
+                                sink.send(Message::Close(Some(CloseFrame {
+                                    code: PURGE_CLOSE_CODE,
+                                    reason: PURGE_CLOSE_REASON.into(),
+                                }))),
                             ).await;
                         }
                         Some(ClientControl::Close) => {
@@ -3309,17 +3515,25 @@ async fn socket_loop(
                     };
                     let Some(serialized) = serialize_outbound_frame(&frame) else {
                         warn!("dropping invalid or oversized outbound frame");
+                        release_client_outbound_bytes(&global_outbound_bytes, &queued_bytes, &frame);
                         continue;
                     };
                     let sent = tokio::time::timeout(
                         CLIENT_SINK_SEND_TIMEOUT,
                         sink.send(Message::Text(serialized)),
                     ).await;
+                    release_client_outbound_bytes(&global_outbound_bytes, &queued_bytes, &frame);
                     if !matches!(sent, Ok(Ok(()))) {
                         break;
                     }
                 }
             }
+        }
+        while let Ok(frame) = rx.try_recv() {
+            release_client_outbound_bytes(&global_outbound_bytes, &queued_bytes, &frame);
+        }
+        while let Ok(result) = result_rx.try_recv() {
+            let _ = result.delivered.send(false);
         }
     });
 
@@ -3337,7 +3551,9 @@ async fn socket_loop(
                 match result {
                     Some(Ok(Message::Text(text))) => {
                         let text = Zeroizing::new(text);
-                        if active_session(&state, session_token.as_str(), true).await.is_none() {
+                        // Validation and authorization happen in handle_frame;
+                        // do not refresh the dead-man timer for rejected text.
+                        if active_session(&state, session_token.as_str(), false).await.is_none() {
                             break;
                         }
                         if let Err(err) = check_ws_frame_allowed(&state, client_id, text.len()).await {
@@ -3365,11 +3581,10 @@ async fn socket_loop(
     }
 
     cleanup_client(&state, client_id).await;
-    if state.attachment_epoch.load(Ordering::Acquire) != connection_epoch {
-        let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, writer).await;
-    } else {
-        writer.abort();
-    }
+    // Dropping the client handle closes every writer input channel. Let the
+    // writer drain and release its weighted queue accounting before falling
+    // back to aborting a wedged sink.
+    let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, writer).await;
 }
 
 async fn check_ws_frame_allowed(
@@ -3423,12 +3638,10 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             Ok(())
         }
         InboundFrame::Join { chat_id } => {
-            touch_activity(state).await;
-            join_room(state, sender_id, chat_id).await
+            touch_activity_on_success(state, join_room(state, sender_id, chat_id).await).await
         }
         InboundFrame::Leave { chat_id } => {
-            touch_activity(state).await;
-            leave_room(state, sender_id, &chat_id).await
+            touch_activity_on_success(state, leave_room(state, sender_id, &chat_id).await).await
         }
         InboundFrame::Message {
             chat_id,
@@ -3443,13 +3656,13 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             prekey_id,
             state_signature_b64,
         } => {
-            touch_activity(state).await;
-            route_encrypted_message(
+            let message_id_is_safe = valid_chat_id(&message_id);
+            let route_result = route_encrypted_message(
                 state,
                 sender_id,
                 chat_id,
                 version,
-                message_id,
+                message_id.clone(),
                 nonce_b64,
                 ciphertext_b64,
                 envelopes,
@@ -3459,7 +3672,15 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 prekey_id,
                 state_signature_b64,
             )
-            .await
+            .await;
+            if message_id_is_safe {
+                let accepted = route_result.is_ok();
+                send_message_result(state, sender_id, &message_id, accepted).await?;
+            }
+            if route_result.is_ok() {
+                touch_activity(state).await;
+            }
+            route_result
         }
         InboundFrame::MessageAck {
             chat_id,
@@ -3473,8 +3694,8 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             ack_signature_b64,
             used_prekey_id,
         } => {
-            touch_activity(state).await;
-            acknowledge_message(
+            let message_id_is_safe = valid_chat_id(&message_id);
+            let acknowledgement_result = acknowledge_message(
                 state,
                 sender_id,
                 &chat_id,
@@ -3488,7 +3709,15 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 &ack_signature_b64,
                 &used_prekey_id,
             )
-            .await
+            .await;
+            if message_id_is_safe {
+                let accepted = acknowledgement_result.is_ok();
+                send_ack_result(state, sender_id, &message_id, accepted).await?;
+            }
+            if acknowledgement_result.is_ok() {
+                touch_activity(state).await;
+            }
+            acknowledgement_result
         }
         InboundFrame::IdentityState {
             state_revision,
@@ -3497,35 +3726,45 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             prekey_id,
             state_signature_b64,
         } => {
-            touch_activity(state).await;
-            update_identity_state(
+            touch_activity_on_success(
                 state,
-                sender_id,
-                state_revision,
-                &identity_envelope_b64,
-                &identity_public_b64,
-                &prekey_id,
-                &state_signature_b64,
+                update_identity_state(
+                    state,
+                    sender_id,
+                    state_revision,
+                    &identity_envelope_b64,
+                    &identity_public_b64,
+                    &prekey_id,
+                    &state_signature_b64,
+                )
+                .await,
             )
             .await
         }
         InboundFrame::GlobalWipe => {
-            touch_activity(state).await;
-            broadcast_wipe(state, sender_id).await
+            touch_activity_on_success(state, broadcast_wipe(state, sender_id).await).await
         }
         InboundFrame::CreateRoom { room } => {
-            touch_activity(state).await;
-            create_room(state, sender_id, room).await
+            touch_activity_on_success(state, create_room(state, sender_id, room).await).await
         }
         InboundFrame::DeleteRoom { chat_id } => {
-            touch_activity(state).await;
-            delete_room(state, sender_id, &chat_id).await
+            touch_activity_on_success(state, delete_room(state, sender_id, &chat_id).await).await
         }
         InboundFrame::OpenDirect { peer_username } => {
-            touch_activity(state).await;
-            open_direct(state, sender_id, &peer_username).await
+            touch_activity_on_success(state, open_direct(state, sender_id, &peer_username).await)
+                .await
         }
     }
+}
+
+async fn touch_activity_on_success(
+    state: &AppState,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    if result.is_ok() {
+        touch_activity(state).await;
+    }
+    result
 }
 
 async fn join_room(state: &AppState, client_id: Uuid, chat_id: String) -> Result<(), String> {
@@ -3672,7 +3911,7 @@ async fn route_encrypted_message(
             &envelope.signature_b64,
             MESSAGE_SIGNATURE_BYTES,
         )?);
-        verify_message_signature_v7(
+        verify_message_signature_v8(
             version,
             &chat_id,
             &message_id,
@@ -3695,7 +3934,46 @@ async fn route_encrypted_message(
         return Err("recipient envelope set rejected".to_string());
     }
 
-    claim_prekeys(
+    let sender_public_key_b64 = state
+        .accounts
+        .lock()
+        .await
+        .get(&sender_code_id)
+        .map(|account| URL_SAFE_NO_PAD.encode(&account.identity_public))
+        .ok_or_else(|| "authenticated identity required".to_string())?;
+    let mut prepared_frames = Vec::with_capacity(expected_recipients.len());
+    let mut transient_fanout_bytes = 0usize;
+    for recipient_username in &expected_recipients {
+        let envelope = envelope_map
+            .get(recipient_username)
+            .ok_or_else(|| "recipient envelope rejected".to_string())?;
+        let frame = OutboundFrame::Message {
+            chat_id: chat_id.clone(),
+            version,
+            message_id: message_id.clone(),
+            nonce_b64: nonce_b64.clone(),
+            ciphertext_b64: ciphertext_b64.clone(),
+            signature_b64: envelope.signature_b64.clone(),
+            wrapped_key_b64: envelope.wrapped_key_b64.clone(),
+            prekey_id: envelope.prekey_id.clone(),
+            is_prekey: envelope.is_prekey,
+            sender_username: sender_username.clone(),
+            sender_public_key_b64: sender_public_key_b64.clone(),
+            identity_public_b64: sender_public_key_b64.clone(),
+        };
+        let frame_bytes = outbound_frame_bytes(&frame);
+        transient_fanout_bytes = transient_fanout_bytes
+            .checked_add(frame_bytes.saturating_add(recipient_username.len()))
+            .ok_or_else(|| "fanout preparation budget full".to_string())?;
+        if transient_fanout_bytes > MAX_TRANSIENT_FANOUT_BYTES {
+            return Err("fanout preparation budget full".to_string());
+        }
+        prepared_frames.push((recipient_username.clone(), frame));
+    }
+    let mut pending_plan = preflight_pending_frames(state, &prepared_frames).await?;
+    commit_pending_frames(state, &prepared_frames, &mut pending_plan).await?;
+
+    if let Err(error) = claim_prekeys(
         state,
         &expected_recipients,
         &envelope_map,
@@ -3703,9 +3981,14 @@ async fn route_encrypted_message(
         &message_id,
         &sender_username,
     )
-    .await?;
+    .await
+    {
+        rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
+        return Err(error);
+    }
     if let Err(error) = register_message_id(state, &chat_id, &sender_username, &message_id).await {
         release_prekey_claims(state, &chat_id, &message_id, &sender_username).await;
+        rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
         return Err(error);
     }
     if let Err(error) = apply_identity_state(
@@ -3722,15 +4005,9 @@ async fn route_encrypted_message(
     {
         unregister_message_id(state, &chat_id, &sender_username, &message_id).await;
         release_prekey_claims(state, &chat_id, &message_id, &sender_username).await;
+        rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
         return Err(error);
     }
-    let sender_public_key_b64 = state
-        .accounts
-        .lock()
-        .await
-        .get(&sender_code_id)
-        .map(|account| URL_SAFE_NO_PAD.encode(&account.identity_public))
-        .ok_or_else(|| "authenticated identity required".to_string())?;
 
     let joined = state
         .rooms
@@ -3740,24 +4017,7 @@ async fn route_encrypted_message(
         .cloned()
         .unwrap_or_default();
     let clients = state.clients.lock().await.clone();
-    for recipient_username in expected_recipients {
-        let envelope = envelope_map
-            .remove(&recipient_username)
-            .ok_or_else(|| "recipient envelope rejected".to_string())?;
-        let frame = OutboundFrame::Message {
-            chat_id: chat_id.clone(),
-            version,
-            message_id: message_id.clone(),
-            nonce_b64: nonce_b64.clone(),
-            ciphertext_b64: ciphertext_b64.clone(),
-            signature_b64: envelope.signature_b64.clone(),
-            wrapped_key_b64: envelope.wrapped_key_b64.clone(),
-            prekey_id: envelope.prekey_id.clone(),
-            is_prekey: envelope.is_prekey,
-            sender_username: sender_username.clone(),
-            sender_public_key_b64: sender_public_key_b64.clone(),
-            identity_public_b64: sender_public_key_b64.clone(),
-        };
+    for (recipient_username, frame) in prepared_frames {
         let recipient_ids = clients
             .iter()
             .filter_map(|(client_id, client)| {
@@ -3765,7 +4025,6 @@ async fn route_encrypted_message(
                     .then_some(*client_id)
             })
             .collect::<Vec<_>>();
-        queue_pending_frame(state, &chat_id, recipient_username, frame.clone()).await;
         if !recipient_ids.is_empty() {
             for recipient_id in recipient_ids {
                 send_to_client(state, recipient_id, &frame).await;
@@ -3965,80 +4224,228 @@ fn outbound_frame_bytes(frame: &OutboundFrame) -> usize {
     }
 }
 
-async fn queue_pending_frame(
-    state: &AppState,
-    chat_id: &str,
-    recipient_username: String,
-    mut frame: OutboundFrame,
-) {
-    // The caller normally holds conversation_ops. This also keeps direct test
-    // and maintenance calls from counting expired frames against the caps.
-    prune_pending_queues(state, now_ms()).await;
-    let mut dropped_claim = None;
-    let mut enqueue = true;
-    let mut pending = state.pending.lock().await;
-    let mut pending_bytes = state.pending_bytes.lock().await;
-    let key = PendingKey {
-        chat_id: chat_id.to_string(),
-        recipient_username,
-    };
-    let mut queue = pending.remove(&key).unwrap_or_default();
-    let incoming_bytes = outbound_frame_bytes(&frame);
-    let previous_queue_bytes = queue
-        .iter()
-        .map(|pending_frame| outbound_frame_bytes(&pending_frame.frame))
-        .sum::<usize>();
-    *pending_bytes = (*pending_bytes).saturating_sub(previous_queue_bytes);
-    if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
-        if let Some(eviction_index) = queue
-            .iter()
-            .position(|candidate| !is_prekey_frame(&candidate.frame))
-        {
-            let mut evicted = queue.remove(eviction_index);
-            evicted.zeroize_sensitive();
-        } else {
-            dropped_claim = prekey_claim_details(&frame);
-            enqueue = false;
-            frame.zeroize_sensitive();
-        }
-    }
+struct PendingQueuePlan {
+    key: PendingKey,
+    eviction_index: Option<usize>,
+    evicted: Option<PendingFrame>,
+}
 
-    let queue_bytes = queue
-        .iter()
-        .map(|pending_frame| outbound_frame_bytes(&pending_frame.frame))
-        .sum::<usize>();
-    let fits_global_budget = enqueue
-        && (*pending_bytes)
-            .saturating_add(queue_bytes)
-            .saturating_add(incoming_bytes)
-            <= MAX_PENDING_BYTES;
-    if fits_global_budget {
-        *pending_bytes = (*pending_bytes)
-            .saturating_add(queue_bytes)
-            .saturating_add(incoming_bytes);
-        queue.push(PendingFrame::new(frame, now_ms()));
-    } else {
-        *pending_bytes = (*pending_bytes).saturating_add(queue_bytes);
-        if enqueue && dropped_claim.is_none() {
-            dropped_claim = prekey_claim_details(&frame);
+impl Drop for PendingQueuePlan {
+    fn drop(&mut self) {
+        if let Some(evicted) = self.evicted.as_mut() {
+            evicted.zeroize_sensitive();
         }
-        frame.zeroize_sensitive();
     }
-    if !queue.is_empty() {
-        pending.insert(key, queue);
+}
+
+async fn preflight_pending_frames(
+    state: &AppState,
+    frames: &[(String, OutboundFrame)],
+) -> Result<Vec<PendingQueuePlan>, String> {
+    // The caller holds conversation_ops. Prune before taking the snapshot so
+    // expired frames and their prekey claims cannot consume admission budget.
+    let transient_fanout_bytes = frames
+        .iter()
+        .try_fold(0usize, |total, (recipient, frame)| {
+            total
+                .checked_add(outbound_frame_bytes(frame).saturating_add(recipient.len()))
+                .filter(|bytes| *bytes <= MAX_TRANSIENT_FANOUT_BYTES)
+                .ok_or_else(|| "fanout preparation budget full".to_string())
+        })?;
+    let _ = transient_fanout_bytes;
+    prune_pending_queues(state, now_ms()).await;
+    let pending = state.pending.lock().await;
+    let pending_bytes = state.pending_bytes.lock().await;
+    let mut projected_bytes = *pending_bytes;
+    let mut simulated = HashMap::<PendingKey, Vec<(usize, bool)>>::new();
+    for (key, queue) in pending.iter() {
+        simulated.insert(
+            key.clone(),
+            queue
+                .iter()
+                .map(|pending_frame| {
+                    (
+                        outbound_frame_bytes(&pending_frame.frame),
+                        is_prekey_frame(&pending_frame.frame),
+                    )
+                })
+                .collect(),
+        );
+    }
+    let mut plan = Vec::with_capacity(frames.len());
+    for (recipient_username, frame) in frames {
+        let key = PendingKey {
+            chat_id: match frame {
+                OutboundFrame::Message { chat_id, .. } => chat_id.clone(),
+                _ => return Err("pending frame rejected".to_string()),
+            },
+            recipient_username: recipient_username.clone(),
+        };
+        let queue = simulated.entry(key.clone()).or_default();
+        let eviction_index = if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
+            let Some(index) = queue.iter().position(|(_, is_prekey)| !*is_prekey) else {
+                return Err("recipient pending queue full".to_string());
+            };
+            let (evicted_bytes, _) = queue.remove(index);
+            projected_bytes = projected_bytes.saturating_sub(evicted_bytes);
+            Some(index)
+        } else {
+            None
+        };
+        let incoming_bytes = outbound_frame_bytes(frame);
+        if projected_bytes.saturating_add(incoming_bytes) > MAX_PENDING_BYTES {
+            return Err("pending message budget full".to_string());
+        }
+        projected_bytes = projected_bytes.saturating_add(incoming_bytes);
+        queue.push((incoming_bytes, is_prekey_frame(frame)));
+        plan.push(PendingQueuePlan {
+            key,
+            eviction_index,
+            evicted: None,
+        });
     }
     drop(pending_bytes);
     drop(pending);
-    if let Some((chat_id, message_id, sender_username, prekey_id)) = dropped_claim {
-        release_prekey_claim(
-            state,
-            &chat_id,
-            &message_id,
-            &sender_username,
-            Some(&prekey_id),
-        )
-        .await;
+    Ok(plan)
+}
+
+async fn commit_pending_frames(
+    state: &AppState,
+    frames: &[(String, OutboundFrame)],
+    plan: &mut [PendingQueuePlan],
+) -> Result<(), String> {
+    if frames.len() != plan.len() {
+        return Err("pending frame plan mismatch".to_string());
     }
+    let mut pending = state.pending.lock().await;
+    let mut pending_bytes = state.pending_bytes.lock().await;
+    let now = now_ms();
+
+    // Validate the complete plan against the live queues before mutating
+    // anything. conversation_ops normally makes this snapshot stable, but
+    // keeping the validation transactional also protects maintenance/tests
+    // that call this helper directly.
+    let mut projected_bytes = *pending_bytes;
+    let mut simulated = HashMap::<PendingKey, Vec<(usize, bool)>>::new();
+    for (key, queue) in pending.iter() {
+        simulated.insert(
+            key.clone(),
+            queue
+                .iter()
+                .map(|pending_frame| {
+                    (
+                        outbound_frame_bytes(&pending_frame.frame),
+                        is_prekey_frame(&pending_frame.frame),
+                    )
+                })
+                .collect(),
+        );
+    }
+    for ((_, frame), queue_plan) in frames.iter().zip(plan.iter()) {
+        let queue = simulated.entry(queue_plan.key.clone()).or_default();
+        let expected_eviction = if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
+            let Some(index) = queue.iter().position(|(_, is_prekey)| !*is_prekey) else {
+                return Err("pending queue changed during commit".to_string());
+            };
+            let (evicted_bytes, _) = queue.remove(index);
+            projected_bytes = projected_bytes.saturating_sub(evicted_bytes);
+            Some(index)
+        } else {
+            None
+        };
+        if expected_eviction != queue_plan.eviction_index {
+            return Err("pending queue changed during commit".to_string());
+        }
+        if queue_plan.evicted.is_some() {
+            return Err("pending frame plan already committed".to_string());
+        }
+        let incoming_bytes = outbound_frame_bytes(frame);
+        if projected_bytes.saturating_add(incoming_bytes) > MAX_PENDING_BYTES {
+            return Err("pending message budget changed during commit".to_string());
+        }
+        projected_bytes = projected_bytes.saturating_add(incoming_bytes);
+        queue.push((incoming_bytes, is_prekey_frame(frame)));
+    }
+
+    for ((_, frame), queue_plan) in frames.iter().zip(plan.iter_mut()) {
+        let queue = pending.entry(queue_plan.key.clone()).or_default();
+        if queue.len() >= MAX_PENDING_FRAMES_PER_ROOM {
+            let Some(eviction_index) = queue_plan.eviction_index else {
+                return Err("pending queue changed during commit".to_string());
+            };
+            if eviction_index >= queue.len() || is_prekey_frame(&queue[eviction_index].frame) {
+                return Err("pending queue changed during commit".to_string());
+            }
+            let evicted = queue.remove(eviction_index);
+            *pending_bytes = pending_bytes.saturating_sub(outbound_frame_bytes(&evicted.frame));
+            queue_plan.evicted = Some(evicted);
+        } else if queue_plan.eviction_index.is_some() {
+            return Err("pending queue changed during commit".to_string());
+        }
+        let incoming_bytes = outbound_frame_bytes(frame);
+        queue.push(PendingFrame::new(frame.clone(), now));
+        *pending_bytes = pending_bytes.saturating_add(incoming_bytes);
+    }
+    Ok(())
+}
+
+async fn rollback_pending_frames(
+    state: &AppState,
+    frames: &[(String, OutboundFrame)],
+    plan: &mut [PendingQueuePlan],
+) {
+    let mut pending = state.pending.lock().await;
+    let mut pending_bytes = state.pending_bytes.lock().await;
+    for ((_, frame), queue_plan) in frames.iter().zip(plan.iter_mut()) {
+        let Some(queue) = pending.get_mut(&queue_plan.key) else {
+            continue;
+        };
+        let Some((message_id, sender_username)) = (match frame {
+            OutboundFrame::Message {
+                message_id,
+                sender_username,
+                ..
+            } => Some((message_id, sender_username)),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if let Some(index) = queue.iter().rposition(|pending_frame| {
+            matches!(
+                &pending_frame.frame,
+                OutboundFrame::Message {
+                    message_id: pending_id,
+                    sender_username: pending_sender,
+                    ..
+                } if pending_id == message_id && pending_sender == sender_username
+            )
+        }) {
+            let mut removed = queue.remove(index);
+            *pending_bytes = pending_bytes.saturating_sub(outbound_frame_bytes(&removed.frame));
+            removed.zeroize_sensitive();
+        }
+        if let Some(evicted) = queue_plan.evicted.take() {
+            let insertion_index = queue_plan
+                .eviction_index
+                .unwrap_or(queue.len())
+                .min(queue.len());
+            *pending_bytes = pending_bytes.saturating_add(outbound_frame_bytes(&evicted.frame));
+            queue.insert(insertion_index, evicted);
+        }
+    }
+    pending.retain(|_, queue| !queue.is_empty());
+}
+
+#[cfg(test)]
+async fn queue_pending_frame(
+    state: &AppState,
+    _chat_id: &str,
+    recipient_username: String,
+    frame: OutboundFrame,
+) -> Result<(), String> {
+    let frames = vec![(recipient_username, frame)];
+    let mut plan = preflight_pending_frames(state, &frames).await?;
+    commit_pending_frames(state, &frames, &mut plan).await
 }
 
 async fn update_identity_state(
@@ -4075,6 +4482,30 @@ async fn apply_identity_state(
     state_signature_b64: &str,
     allow_reuse: bool,
 ) -> Result<(), String> {
+    let mut accounts = state.accounts.lock().await;
+    apply_identity_state_locked(
+        &mut accounts,
+        code_id,
+        revision,
+        envelope_b64,
+        identity_public_b64,
+        prekey_id,
+        state_signature_b64,
+        allow_reuse,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_identity_state_locked(
+    accounts: &mut HashMap<CodeId, Account>,
+    code_id: &CodeId,
+    revision: u64,
+    envelope_b64: &str,
+    identity_public_b64: &str,
+    prekey_id: &str,
+    state_signature_b64: &str,
+    allow_reuse: bool,
+) -> Result<(), String> {
     let mut envelope = decode_bounded(envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
     let mut identity_public = decode_exact(identity_public_b64, IDENTITY_PUBLIC_BYTES)?;
     let state_signature =
@@ -4087,7 +4518,6 @@ async fn apply_identity_state(
         identity_public.zeroize();
         return Err("identity state rejected".to_string());
     }
-    let mut accounts = state.accounts.lock().await;
     let account = accounts.get_mut(code_id).ok_or_else(|| {
         envelope.zeroize();
         identity_public.zeroize();
@@ -4101,7 +4531,7 @@ async fn apply_identity_state(
         identity_public.zeroize();
         return Err("identity state rejected".to_string());
     }
-    if verify_identity_state_signature_v7(
+    if verify_identity_state_signature_v8(
         E2EE_PROTOCOL_VERSION,
         revision,
         &envelope,
@@ -4172,37 +4602,33 @@ async fn apply_identity_state(
     Ok(())
 }
 
-async fn validate_prekey_ack_claim(
-    state: &AppState,
-    code_id: CodeId,
+fn pending_frame_matches_ack(
+    frame: &OutboundFrame,
     chat_id: &str,
     message_id: &str,
     original_sender: &str,
     used_prekey_id: &str,
-) -> Result<(), String> {
-    if used_prekey_id.is_empty() {
-        return Ok(());
-    }
+) -> bool {
+    let OutboundFrame::Message {
+        chat_id: frame_chat_id,
+        message_id: frame_message_id,
+        prekey_id: frame_prekey_id,
+        is_prekey,
+        sender_username: frame_sender,
+        ..
+    } = frame
+    else {
+        return false;
+    };
 
-    // The caller holds conversation_ops. Keep the same pending -> bytes ->
-    // claims order used by queue pruning and acknowledgement removal.
-    let _pending = state.pending.lock().await;
-    let _pending_bytes = state.pending_bytes.lock().await;
-    let claims = state.prekey_claims.lock().await;
-    let key = PrekeyClaimKey {
-        code_id,
-        prekey_id: used_prekey_id.to_string(),
-    };
-    let Some(claim) = claims.get(&key) else {
-        return Err("message acknowledgement rejected".to_string());
-    };
-    if claim.chat_id != chat_id
-        || claim.message_id != message_id
-        || claim.sender_username != original_sender
-    {
-        return Err("message acknowledgement rejected".to_string());
-    }
-    Ok(())
+    frame_chat_id == chat_id
+        && frame_message_id == message_id
+        && frame_sender == original_sender
+        && if used_prekey_id.is_empty() {
+            !is_prekey && frame_prekey_id.is_empty()
+        } else {
+            *is_prekey && frame_prekey_id == used_prekey_id
+        }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4254,7 +4680,7 @@ async fn acknowledge_message(
     }
     let identity_public = Zeroizing::new(decode_exact(identity_public_b64, IDENTITY_PUBLIC_BYTES)?);
     let ack_signature = Zeroizing::new(decode_exact(ack_signature_b64, MESSAGE_SIGNATURE_BYTES)?);
-    verify_ack_signature_v7(
+    verify_ack_signature_v8(
         E2EE_PROTOCOL_VERSION,
         chat_id,
         message_id,
@@ -4263,18 +4689,67 @@ async fn acknowledge_message(
         &identity_public,
         &ack_signature,
     )?;
-    validate_prekey_ack_claim(
-        state,
-        code_id,
-        chat_id,
-        message_id,
-        original_sender,
-        used_prekey_id,
-    )
-    .await?;
 
-    apply_identity_state(
-        state,
+    let key = PendingKey {
+        chat_id: chat_id.to_string(),
+        recipient_username: username.clone(),
+    };
+    // Keep the lock order used by message admission and claim maintenance:
+    // accounts -> pending -> pending_bytes -> prekey_claims.  Every
+    // precondition is checked while these guards are held, then the signed
+    // state and queue/claim consumption commit as one conversation operation.
+    let mut accounts = state.accounts.lock().await;
+    let mut pending = state.pending.lock().await;
+    let mut pending_bytes = state.pending_bytes.lock().await;
+    let mut claims = state.prekey_claims.lock().await;
+
+    let (matching_index, matching_bytes) = {
+        let queue = pending
+            .get(&key)
+            .ok_or_else(|| "message acknowledgement rejected".to_string())?;
+        let mut matching_index = None;
+        for (index, pending_frame) in queue.iter().enumerate() {
+            if pending_frame_matches_ack(
+                &pending_frame.frame,
+                chat_id,
+                message_id,
+                original_sender,
+                used_prekey_id,
+            ) && matching_index.replace(index).is_some()
+            {
+                return Err("message acknowledgement rejected".to_string());
+            }
+        }
+        let matching_index =
+            matching_index.ok_or_else(|| "message acknowledgement rejected".to_string())?;
+        (
+            matching_index,
+            outbound_frame_bytes(&queue[matching_index].frame),
+        )
+    };
+    if *pending_bytes < matching_bytes {
+        return Err("message acknowledgement rejected".to_string());
+    }
+
+    if !used_prekey_id.is_empty() {
+        let claim_key = PrekeyClaimKey {
+            code_id,
+            prekey_id: used_prekey_id.to_string(),
+        };
+        let Some(claim) = claims.get(&claim_key) else {
+            return Err("message acknowledgement rejected".to_string());
+        };
+        if claim.chat_id != chat_id
+            || claim.message_id != message_id
+            || claim.sender_username != original_sender
+            || claim.recipient_username != username
+        {
+            return Err("message acknowledgement rejected".to_string());
+        }
+    }
+
+    apply_identity_state_locked(
+        &mut accounts,
         &code_id,
         revision,
         envelope_b64,
@@ -4282,63 +4757,24 @@ async fn acknowledge_message(
         current_prekey_id,
         state_signature_b64,
         true,
-    )
-    .await?;
+    )?;
 
-    let key = PendingKey {
-        chat_id: chat_id.to_string(),
-        recipient_username: username,
-    };
-    let mut pending = state.pending.lock().await;
-    let mut pending_bytes = state.pending_bytes.lock().await;
-    let mut claims = state.prekey_claims.lock().await;
-    if !used_prekey_id.is_empty() {
-        let claim_key = PrekeyClaimKey {
-            code_id,
-            prekey_id: used_prekey_id.to_string(),
-        };
-        if let Some(claim) = claims.get(&claim_key) {
-            if claim.chat_id != chat_id
-                || claim.message_id != message_id
-                || claim.sender_username != original_sender
-            {
-                return Err("message acknowledgement rejected".to_string());
-            }
-        }
-        claims.remove(&claim_key);
-    }
-    let mut removed_bytes = 0usize;
-    if let Some(queue) = pending.get_mut(&key) {
-        let mut remaining = Vec::with_capacity(queue.len());
-        for mut pending_frame in queue.drain(..) {
-            let matches_message = matches!(
-                &pending_frame.frame,
-                OutboundFrame::Message {
-                    message_id: pending_id,
-                    sender_username: pending_sender,
-                    ..
-                } if pending_id == message_id && pending_sender == original_sender
-            );
-            if matches_message {
-                removed_bytes =
-                    removed_bytes.saturating_add(outbound_frame_bytes(&pending_frame.frame));
-                pending_frame.zeroize_sensitive();
-            } else {
-                remaining.push(pending_frame);
-            }
-        }
-        *queue = remaining;
-    }
-    let remove_queue = pending.get(&key).is_some_and(Vec::is_empty);
-    if remove_queue {
+    let queue = pending
+        .get_mut(&key)
+        .expect("validated pending acknowledgement queue");
+    let mut removed = queue.remove(matching_index);
+    *pending_bytes -= matching_bytes;
+    removed.zeroize_sensitive();
+    let queue_is_empty = queue.is_empty();
+    if queue_is_empty {
         pending.remove(&key);
     }
-    if removed_bytes > 0 {
-        *pending_bytes = (*pending_bytes).saturating_sub(removed_bytes);
+    if !used_prekey_id.is_empty() {
+        claims.remove(&PrekeyClaimKey {
+            code_id,
+            prekey_id: used_prekey_id.to_string(),
+        });
     }
-    drop(claims);
-    drop(pending_bytes);
-    drop(pending);
     Ok(())
 }
 
@@ -4357,6 +4793,9 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     let _account_guard = state.account_ops.lock().await;
     let _conversation_guard = state.conversation_ops.lock().await;
     state.attachment_epoch.fetch_add(1, Ordering::AcqRel);
+    state
+        .purge_epoch
+        .send_modify(|epoch| *epoch = epoch.saturating_add(1));
     let clients = state
         .clients
         .lock()
@@ -4581,6 +5020,22 @@ async fn open_direct(state: &AppState, sender_id: Uuid, peer_username: &str) -> 
         {
             existing
         } else {
+            if catalog.len() >= MAX_DIRECT_CATALOG_ENTRIES {
+                return Err("direct catalog unavailable".to_string());
+            }
+            let sender_direct_count = catalog
+                .values()
+                .filter(|direct| direct.contains(&sender_username))
+                .count();
+            let peer_direct_count = catalog
+                .values()
+                .filter(|direct| direct.contains(&peer_username))
+                .count();
+            if sender_direct_count >= MAX_DIRECT_CATALOG_PER_USER
+                || peer_direct_count >= MAX_DIRECT_CATALOG_PER_USER
+            {
+                return Err("direct catalog unavailable".to_string());
+            }
             let direct = DirectEntry {
                 id: format!("dm_{}", Uuid::new_v4().simple()),
                 user_a: sender_username.clone(),
@@ -4620,6 +5075,7 @@ async fn send_direct_catalog(state: &AppState, client_id: Uuid, username: &str) 
         .await
         .values()
         .filter_map(|direct| direct.record_for(username))
+        .take(MAX_DIRECT_CATALOG_PER_USER)
         .collect::<Vec<_>>();
     send_to_client(state, client_id, &OutboundFrame::Directs { directs }).await;
 }
@@ -4742,17 +5198,173 @@ fn serialize_outbound_frame(frame: &OutboundFrame) -> Option<String> {
     (serialized.len() <= WS_MAX_FRAME_BYTES).then_some(serialized)
 }
 
-async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame) {
-    let tx = state
+fn outbound_queue_bytes(frame: &OutboundFrame) -> usize {
+    serialize_outbound_frame(frame)
+        .map(|serialized| serialized.len())
+        .unwrap_or(WS_MAX_FRAME_BYTES.saturating_add(1))
+}
+
+fn reserve_outbound_bytes(global: &AtomicUsize, local: &AtomicUsize, bytes: usize) -> bool {
+    let bytes = bytes.max(1);
+    let mut local_current = local.load(Ordering::Acquire);
+    loop {
+        let Some(local_next) = local_current.checked_add(bytes) else {
+            return false;
+        };
+        if local_next > CLIENT_OUTBOUND_BYTES {
+            return false;
+        }
+        match local.compare_exchange_weak(
+            local_current,
+            local_next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => local_current = observed,
+        }
+    }
+
+    let mut global_current = global.load(Ordering::Acquire);
+    loop {
+        let Some(global_next) = global_current.checked_add(bytes) else {
+            local.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        };
+        if global_next > GLOBAL_OUTBOUND_BYTES {
+            local.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
+        match global.compare_exchange_weak(
+            global_current,
+            global_next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => global_current = observed,
+        }
+    }
+}
+
+fn release_client_outbound_bytes(global: &AtomicUsize, local: &AtomicUsize, frame: &OutboundFrame) {
+    let bytes = outbound_queue_bytes(frame).max(1);
+    global.fetch_sub(bytes, Ordering::AcqRel);
+    local.fetch_sub(bytes, Ordering::AcqRel);
+}
+
+async fn invalidate_client_connection(state: &AppState, client_id: Uuid) {
+    let Some((code_id, control_tx)) = state
         .clients
         .lock()
         .await
         .get(&client_id)
-        .map(|client| client.tx.clone());
-    if let Some(tx) = tx {
-        if tx.try_send(frame.clone()).is_err() {
-            warn!("dropping frame for slow or closed client {client_id}");
-        }
+        .map(|client| (client.code_id, client.control_tx.clone()))
+    else {
+        return;
+    };
+    let _ = control_tx.try_send(ClientControl::Close);
+    let _account_guard = state.account_ops.lock().await;
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, session| session.code_id != code_id);
+    drop(sessions);
+    replace_connected_clients_for_code(state, &code_id).await;
+}
+
+async fn send_message_result(
+    state: &AppState,
+    client_id: Uuid,
+    message_id: &str,
+    accepted: bool,
+) -> Result<(), String> {
+    send_client_result(
+        state,
+        client_id,
+        OutboundFrame::MessageResult {
+            message_id: message_id.to_string(),
+            accepted,
+        },
+    )
+    .await
+}
+
+async fn send_ack_result(
+    state: &AppState,
+    client_id: Uuid,
+    message_id: &str,
+    accepted: bool,
+) -> Result<(), String> {
+    send_client_result(
+        state,
+        client_id,
+        OutboundFrame::AckResult {
+            message_id: message_id.to_string(),
+            accepted,
+        },
+    )
+    .await
+}
+
+async fn send_client_result(
+    state: &AppState,
+    client_id: Uuid,
+    frame: OutboundFrame,
+) -> Result<(), String> {
+    let Some(result_tx) = state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| client.result_tx.clone())
+    else {
+        invalidate_client_connection(state, client_id).await;
+        return Err("client connection unavailable".to_string());
+    };
+    let (completion, delivered) = oneshot::channel();
+    if result_tx
+        .try_send(ClientResult {
+            frame,
+            delivered: completion,
+        })
+        .is_err()
+    {
+        invalidate_client_connection(state, client_id).await;
+        return Err("client result channel unavailable".to_string());
+    }
+    let delivered = tokio::time::timeout(CLIENT_RESULT_SEND_TIMEOUT, delivered)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false);
+    if !delivered {
+        invalidate_client_connection(state, client_id).await;
+        return Err("client result delivery failed".to_string());
+    }
+    Ok(())
+}
+
+async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame) {
+    let client = state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| (client.tx.clone(), Arc::clone(&client.queued_bytes)));
+    let Some((tx, queued_bytes)) = client else {
+        return;
+    };
+    let bytes = outbound_queue_bytes(frame);
+    if bytes > WS_MAX_FRAME_BYTES
+        || !reserve_outbound_bytes(&state.outbound_bytes, &queued_bytes, bytes)
+    {
+        warn!("closing slow or over-budget client {client_id}");
+        send_control_to_client(state, client_id, ClientControl::Close).await;
+        return;
+    }
+    if tx.try_send(frame.clone()).is_err() {
+        release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, frame);
+        warn!("closing slow or closed client {client_id}");
+        send_control_to_client(state, client_id, ClientControl::Close).await;
     }
 }
 
@@ -5009,6 +5621,7 @@ mod tests {
                     id,
                     OpaqueHandshake::Registration {
                         code_id: test_code_id("handshake"),
+                        challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
                         created_at_ms: now_ms(),
                     },
                 )
@@ -5021,6 +5634,7 @@ mod tests {
                 Uuid::new_v4(),
                 OpaqueHandshake::Registration {
                     code_id: test_code_id("overflow-handshake"),
+                    challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
                     created_at_ms: now_ms(),
                 },
             )
@@ -5104,6 +5718,7 @@ mod tests {
             handshake_id,
             OpaqueHandshake::Registration {
                 code_id,
+                challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
                 created_at_ms: now_ms(),
             },
         );
@@ -5118,6 +5733,7 @@ mod tests {
                 envelope[0] = IDENTITY_ENVELOPE_VERSION;
                 envelope
             })),
+            identity_proof_b64: None,
         };
 
         let account_guard = state.account_ops.lock().await;
@@ -5588,6 +6204,7 @@ mod tests {
         let client_id = Uuid::new_v4();
         let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
         let (control_tx, mut control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, _result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
         state.clients.lock().await.insert(
             client_id,
             ClientHandle {
@@ -5595,6 +6212,8 @@ mod tests {
                 username: "Alice".to_string(),
                 tx,
                 control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
         );
         let frame = test_message_frame("dm_queue", "queued-secret", "Alice", "", false);
@@ -6111,6 +6730,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_account_handshakes_do_not_refresh_dead_man_activity() {
+        let state = test_state();
+        *state.last_activity_ms.lock().await = 123;
+        let _ = start_opaque_account(
+            State(state.clone()),
+            Json(OpaqueAccountStartRequest {
+                code: "not-a-code".to_string(),
+                registration_request_b64: String::new(),
+                credential_request_b64: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
+
+        let _ = finish_opaque_account(
+            State(state.clone()),
+            Json(OpaqueAccountFinishRequest {
+                handshake_id: Uuid::new_v4(),
+                registration_upload_b64: None,
+                credential_finalization_b64: None,
+                identity_public_b64: None,
+                identity_prekey_id: None,
+                identity_envelope_b64: None,
+                identity_proof_b64: None,
+            }),
+        )
+        .await;
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
+    }
+
+    #[tokio::test]
+    async fn rejected_ws_operations_do_not_refresh_dead_man_activity() {
+        let state = test_state();
+        add_test_account(&state, "activity-a", "Alice").await;
+        let (client_id, _receiver) = add_test_client(&state, "activity-a", "Alice").await;
+        let room = test_room("activity-room");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room,
+                owner_code_id: test_code_id("activity-a"),
+            },
+        );
+
+        *state.last_activity_ms.lock().await = 123;
+        assert!(handle_frame(
+            &state,
+            client_id,
+            r#"{"type":"message","chat_id":"activity-room","version":0,"message_id":"","nonce_b64":"","ciphertext_b64":"","envelopes":[],"state_revision":0,"identity_envelope_b64":"","identity_public_b64":"","prekey_id":"","state_signature_b64":""}"#,
+        )
+        .await
+        .is_err());
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
+
+        *state.last_activity_ms.lock().await = 123;
+        assert!(handle_frame(
+            &state,
+            client_id,
+            r#"{"type":"message_ack","chat_id":"activity-room","message_id":"","sender_username":"","state_revision":0,"identity_envelope_b64":"","identity_public_b64":"","prekey_id":"","state_signature_b64":"","ack_signature_b64":"","used_prekey_id":""}"#,
+        )
+        .await
+        .is_err());
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
+
+        assert!(handle_frame(
+            &state,
+            client_id,
+            r#"{"type":"join","chat_id":"activity-room"}"#,
+        )
+        .await
+        .is_ok());
+        assert!(*state.last_activity_ms.lock().await > 123);
+
+        *state.last_activity_ms.lock().await = 123;
+        assert!(handle_frame(&state, client_id, r#"{"type":"activity"}"#)
+            .await
+            .is_ok());
+        assert!(*state.last_activity_ms.lock().await > 123);
+    }
+
+    #[tokio::test]
     async fn destructive_attachment_upload_requires_an_eligible_recipient() {
         let state = test_state();
         add_test_account(&state, "solo-owner", "Alice").await;
@@ -6160,6 +6860,26 @@ mod tests {
         assert!(acquire_attachment_upload_permit(&uploads).is_err());
         drop(permit);
         assert!(acquire_attachment_upload_permit(&uploads).is_ok());
+    }
+
+    #[tokio::test]
+    async fn account_attachment_upload_permit_isolated_and_bounded() {
+        let state = test_state();
+        add_test_account(&state, "upload-account", "Alice").await;
+        let code_id = test_code_id("upload-account");
+        let first = acquire_account_attachment_upload_permit(&state, &code_id)
+            .await
+            .expect("first account upload");
+        let second = acquire_account_attachment_upload_permit(&state, &code_id).await;
+        assert!(matches!(second, Err(StatusCode::TOO_MANY_REQUESTS)));
+        drop(first);
+        assert!(acquire_account_attachment_upload_permit(&state, &code_id)
+            .await
+            .is_ok());
+        assert!(matches!(
+            acquire_account_attachment_upload_permit(&state, &test_code_id("missing")).await,
+            Err(StatusCode::UNAUTHORIZED)
+        ));
     }
 
     #[test]
@@ -6873,7 +7593,7 @@ mod tests {
             frames,
         );
 
-        queue_pending_frame(
+        let _ = queue_pending_frame(
             &state,
             "dm_alice_bob",
             "Bob".to_string(),
@@ -6899,6 +7619,520 @@ mod tests {
                 } if message_id == "first-contact"
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn pending_preflight_is_all_or_none_when_one_recipient_is_full() {
+        let state = test_state();
+        let prekey_id = test_prekey_id(b'B');
+        let key = PendingKey {
+            chat_id: "room_atomic".to_string(),
+            recipient_username: "Bob".to_string(),
+        };
+        let queue = (0..MAX_PENDING_FRAMES_PER_ROOM)
+            .map(|index| {
+                PendingFrame::new(
+                    test_message_frame(
+                        "room_atomic",
+                        &format!("prekey-{index}"),
+                        "Alice",
+                        &prekey_id,
+                        true,
+                    ),
+                    now_ms(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let queue_bytes = queue
+            .iter()
+            .map(|pending_frame| outbound_frame_bytes(&pending_frame.frame))
+            .sum::<usize>();
+        state.pending.lock().await.insert(key.clone(), queue);
+        *state.pending_bytes.lock().await = queue_bytes;
+        let frames = vec![
+            (
+                "Bob".to_string(),
+                test_message_frame("room_atomic", "rejected-bob", "Alice", "", false),
+            ),
+            (
+                "Carol".to_string(),
+                test_message_frame("room_atomic", "rejected-carol", "Alice", "", false),
+            ),
+        ];
+
+        assert!(preflight_pending_frames(&state, &frames).await.is_err());
+        assert_eq!(
+            state.pending.lock().await[&key].len(),
+            MAX_PENDING_FRAMES_PER_ROOM
+        );
+        assert!(!state.pending.lock().await.contains_key(&PendingKey {
+            chat_id: "room_atomic".to_string(),
+            recipient_username: "Carol".to_string(),
+        }));
+        assert!(state.prekey_claims.lock().await.is_empty());
+        assert!(state.replay_ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_preflight_rejects_transient_fanout_above_global_budget() {
+        let state = test_state();
+        let payload = "x".repeat(1024 * 1024);
+        let frame_count = MAX_TRANSIENT_FANOUT_BYTES / payload.len() + 1;
+        let frames = (0..frame_count)
+            .map(|index| {
+                let mut frame = test_message_frame(
+                    "transient_fanout",
+                    &format!("message-{index}"),
+                    "Alice",
+                    "",
+                    false,
+                );
+                if let OutboundFrame::Message { ciphertext_b64, .. } = &mut frame {
+                    *ciphertext_b64 = payload.clone();
+                }
+                (format!("recipient-{index}"), frame)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(preflight_pending_frames(&state, &frames)
+            .await
+            .is_err_and(|error| error == "fanout preparation budget full"));
+        assert!(state.pending.lock().await.is_empty());
+        assert_eq!(*state.pending_bytes.lock().await, 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_removes_newest_duplicate_and_restores_evicted_frame() {
+        let state = test_state();
+        let key = PendingKey {
+            chat_id: "rollback_duplicate".to_string(),
+            recipient_username: "Bob".to_string(),
+        };
+        let mut old_duplicate =
+            test_message_frame("rollback_duplicate", "same-message-id", "Alice", "", false);
+        if let OutboundFrame::Message { nonce_b64, .. } = &mut old_duplicate {
+            *nonce_b64 = "old-frame".to_string();
+        }
+        let mut queue = vec![PendingFrame::new(old_duplicate, now_ms())];
+        queue.extend((0..MAX_PENDING_FRAMES_PER_ROOM - 1).map(|index| {
+            PendingFrame::new(
+                test_message_frame(
+                    "rollback_duplicate",
+                    &format!("other-{index}"),
+                    "Alice",
+                    "",
+                    false,
+                ),
+                now_ms(),
+            )
+        }));
+        let original_bytes = queue
+            .iter()
+            .map(|pending_frame| outbound_frame_bytes(&pending_frame.frame))
+            .sum::<usize>();
+        state.pending.lock().await.insert(key.clone(), queue);
+        *state.pending_bytes.lock().await = original_bytes;
+
+        let mut new_duplicate =
+            test_message_frame("rollback_duplicate", "same-message-id", "Alice", "", false);
+        if let OutboundFrame::Message { nonce_b64, .. } = &mut new_duplicate {
+            *nonce_b64 = "new-frame".to_string();
+        }
+        let frames = vec![("Bob".to_string(), new_duplicate)];
+        let mut plan = preflight_pending_frames(&state, &frames)
+            .await
+            .expect("duplicate admission preflight");
+        commit_pending_frames(&state, &frames, &mut plan)
+            .await
+            .expect("duplicate admission commit");
+        assert_eq!(
+            state.pending.lock().await[&key].len(),
+            MAX_PENDING_FRAMES_PER_ROOM
+        );
+        rollback_pending_frames(&state, &frames, &mut plan).await;
+
+        let pending = state.pending.lock().await;
+        let queue = pending.get(&key).expect("restored queue");
+        assert_eq!(queue.len(), MAX_PENDING_FRAMES_PER_ROOM);
+        assert_eq!(*state.pending_bytes.lock().await, original_bytes);
+        assert!(queue.iter().any(|pending_frame| {
+            matches!(
+                &pending_frame.frame,
+                OutboundFrame::Message { nonce_b64, .. } if nonce_b64 == "old-frame"
+            )
+        }));
+        assert!(!queue.iter().any(|pending_frame| {
+            matches!(
+                &pending_frame.frame,
+                OutboundFrame::Message { nonce_b64, .. } if nonce_b64 == "new-frame"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn message_result_uses_dedicated_channel_and_waits_for_sink_delivery() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id: test_code_id("result-client"),
+                username: "Alice".to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        let result_task = tokio::spawn({
+            let state = state.clone();
+            async move { send_message_result(&state, client_id, "message-1", true).await }
+        });
+        let result = result_rx.recv().await.expect("dedicated result");
+        assert!(matches!(
+            result.frame,
+            OutboundFrame::MessageResult {
+                ref message_id,
+                accepted: true
+            } if message_id == "message-1"
+        ));
+        assert!(result.delivered.send(true).is_ok());
+        assert!(result_task.await.expect("result task").is_ok());
+    }
+
+    #[tokio::test]
+    async fn ack_result_reports_success_and_rejection_on_the_dedicated_channel() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id: test_code_id("ack-result-client"),
+                username: "Alice".to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        for (message_id, accepted) in [("ack-success", true), ("ack-rejected", false)] {
+            let result_task = tokio::spawn({
+                let state = state.clone();
+                async move { send_ack_result(&state, client_id, message_id, accepted).await }
+            });
+            let result = result_rx.recv().await.expect("dedicated ack result");
+            assert_eq!(
+                serde_json::to_value(&result.frame).expect("ack result JSON"),
+                serde_json::json!({
+                    "type": "ack_result",
+                    "message_id": message_id,
+                    "accepted": accepted,
+                })
+            );
+            assert!(result.delivered.send(true).is_ok());
+            assert!(result_task.await.expect("ack result task").is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_result_sink_failure_invalidates_the_authenticated_connection() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        let code_id = test_code_id("ack-sink-failure");
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, mut control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id,
+                username: "Alice".to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        state.sessions.lock().await.insert(
+            SessionToken::new("ack-sink-token".to_string()),
+            AuthSession {
+                code_id,
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+
+        let result_task = tokio::spawn({
+            let state = state.clone();
+            async move { send_ack_result(&state, client_id, "ack-sink", true).await }
+        });
+        let result = result_rx.recv().await.expect("dedicated ack result");
+        assert!(result.delivered.send(false).is_ok());
+        assert!(result_task.await.expect("ack result task").is_err());
+        assert!(state.sessions.lock().await.is_empty());
+        assert!(matches!(control_rx.try_recv(), Ok(ClientControl::Close)));
+    }
+
+    #[tokio::test]
+    async fn rejected_safe_ack_reports_false_without_refreshing_activity() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id: test_code_id("ack-activity"),
+                username: "Alice".to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        *state.last_activity_ms.lock().await = 123;
+        let frame = serde_json::json!({
+            "type": "message_ack",
+            "chat_id": "",
+            "message_id": "ack-rejected",
+            "sender_username": "",
+            "state_revision": 0,
+            "identity_envelope_b64": "",
+            "identity_public_b64": "",
+            "prekey_id": "",
+            "state_signature_b64": "",
+            "ack_signature_b64": "",
+            "used_prekey_id": "",
+        });
+        let handle_task = tokio::spawn({
+            let state = state.clone();
+            async move { handle_frame(&state, client_id, &frame.to_string()).await }
+        });
+        let result = result_rx.recv().await.expect("rejected ack result");
+        assert!(matches!(
+            result.frame,
+            OutboundFrame::AckResult {
+                ref message_id,
+                accepted: false
+            } if message_id == "ack-rejected"
+        ));
+        assert!(result.delivered.send(true).is_ok());
+        assert!(handle_task.await.expect("frame task").is_err());
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
+    }
+
+    #[tokio::test]
+    async fn unsafe_ack_id_does_not_emit_a_result_or_refresh_activity() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id: test_code_id("unsafe-ack"),
+                username: "Alice".to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        *state.last_activity_ms.lock().await = 123;
+        let frame = serde_json::json!({
+            "type": "message_ack",
+            "chat_id": "",
+            "message_id": "",
+            "sender_username": "",
+            "state_revision": 0,
+            "identity_envelope_b64": "",
+            "identity_public_b64": "",
+            "prekey_id": "",
+            "state_signature_b64": "",
+            "ack_signature_b64": "",
+            "used_prekey_id": "",
+        });
+        assert!(handle_frame(&state, client_id, &frame.to_string())
+            .await
+            .is_err());
+        assert!(result_rx.try_recv().is_err());
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
+    }
+
+    #[tokio::test]
+    async fn accepted_ack_result_follows_atomic_state_and_pending_mutation() {
+        let state = test_state();
+        add_test_account(&state, "ack-atomic-sender", "Alice").await;
+        add_test_account(&state, "ack-atomic-recipient", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "ack-atomic-sender", "Alice").await;
+        let bob_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            bob_id,
+            ClientHandle {
+                code_id: test_code_id("ack-atomic-recipient"),
+                username: "Bob".to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        let room = test_room("ack_result_atomic");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room: room.clone(),
+                owner_code_id: test_code_id("ack-atomic-sender"),
+            },
+        );
+        join_room(&state, alice_id, room.id.clone())
+            .await
+            .expect("Alice joins room");
+        join_room(&state, bob_id, room.id.clone())
+            .await
+            .expect("Bob joins room");
+
+        let message_id = "ack-atomic-message";
+        route_test_message_with_id(&state, alice_id, &room.id, &["Bob"], message_id)
+            .await
+            .expect("message queues");
+        assert!(state.pending.lock().await.contains_key(&PendingKey {
+            chat_id: room.id.clone(),
+            recipient_username: "Bob".to_string(),
+        }));
+        *state.last_activity_ms.lock().await = 123;
+
+        let identity_envelope_b64 = test_identity_envelope_b64(0);
+        let identity_public_b64 = test_identity_public_b64(b'B');
+        let prekey_id = test_prekey_id(b'B');
+        let frame = serde_json::json!({
+            "type": "message_ack",
+            "chat_id": room.id,
+            "message_id": message_id,
+            "sender_username": "Alice",
+            "state_revision": 1,
+            "identity_envelope_b64": identity_envelope_b64,
+            "identity_public_b64": identity_public_b64,
+            "prekey_id": prekey_id,
+            "state_signature_b64": test_valid_state_signature_b64(
+                b'B',
+                1,
+                &test_identity_envelope_b64(0),
+                &test_identity_public_b64(b'B'),
+                &test_prekey_id(b'B'),
+            ),
+            "ack_signature_b64": test_valid_ack_signature_b64(
+                b'B',
+                "ack_result_atomic",
+                message_id,
+                "Alice",
+                "",
+            ),
+            "used_prekey_id": "",
+        });
+        let handle_task = tokio::spawn({
+            let state = state.clone();
+            async move { handle_frame(&state, bob_id, &frame.to_string()).await }
+        });
+        let result = result_rx.recv().await.expect("ack result");
+        assert_eq!(
+            serde_json::to_value(&result.frame).expect("ack result JSON"),
+            serde_json::json!({
+                "type": "ack_result",
+                "message_id": message_id,
+                "accepted": true,
+            })
+        );
+        // The result is not enqueued until acknowledge_message has committed
+        // both the signed state and pending-frame removal.
+        assert!(state.pending.lock().await.is_empty());
+        assert_eq!(*state.pending_bytes.lock().await, 0);
+        assert_eq!(
+            state
+                .accounts
+                .lock()
+                .await
+                .get(&test_code_id("ack-atomic-recipient"))
+                .expect("Bob account")
+                .state_revision,
+            1
+        );
+        assert!(result.delivered.send(true).is_ok());
+        assert!(handle_task.await.expect("ACK handler").is_ok());
+        assert!(*state.last_activity_ms.lock().await > 123);
+    }
+
+    #[tokio::test]
+    async fn ack_result_queue_overflow_invalidates_the_authenticated_connection() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        let code_id = test_code_id("ack-queue-overflow");
+        let (tx, _rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, mut control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id,
+                username: "Alice".to_string(),
+                tx,
+                control_tx,
+                result_tx: result_tx.clone(),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        state.sessions.lock().await.insert(
+            SessionToken::new("ack-queue-token".to_string()),
+            AuthSession {
+                code_id,
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+        for index in 0..CLIENT_RESULT_QUEUE_CAPACITY {
+            let (delivered, _completion) = oneshot::channel();
+            result_tx
+                .try_send(ClientResult {
+                    frame: OutboundFrame::AckResult {
+                        message_id: format!("queued-{index}"),
+                        accepted: false,
+                    },
+                    delivered,
+                })
+                .expect("result queue capacity");
+        }
+
+        let error = send_ack_result(&state, client_id, "overflow", true)
+            .await
+            .expect_err("full result queue must fail closed");
+        assert_eq!(error, "client result channel unavailable");
+        assert_eq!(result_rx.len(), CLIENT_RESULT_QUEUE_CAPACITY);
+        assert!(state.sessions.lock().await.is_empty());
+        assert!(matches!(control_rx.try_recv(), Ok(ClientControl::Close)));
+    }
+
+    #[tokio::test]
+    async fn purge_epoch_changes_even_when_no_control_slot_is_available() {
+        let state = test_state();
+        let mut purge_rx = state.purge_epoch.subscribe();
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let _ = control_tx.try_send(ClientControl::Close);
+        wipe_relay_state(&state, false).await;
+        assert!(purge_rx.changed().await.is_ok());
+        assert_eq!(*purge_rx.borrow(), 1);
     }
 
     #[tokio::test]
@@ -7043,6 +8277,7 @@ mod tests {
             handshake_id,
             OpaqueHandshake::Registration {
                 code_id,
+                challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
                 created_at_ms: now_ms(),
             },
         );
@@ -7060,6 +8295,10 @@ mod tests {
                     envelope[0] = IDENTITY_ENVELOPE_VERSION;
                     envelope
                 })),
+                // The proof only needs to satisfy the mode-exclusive request
+                // shape here. The malformed fallback key must be rejected
+                // before proof verification, without consuming the code.
+                identity_proof_b64: Some(URL_SAFE_NO_PAD.encode([0_u8; MESSAGE_SIGNATURE_BYTES])),
             }),
         )
         .await
@@ -7067,6 +8306,158 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(state.accounts.lock().await.is_empty());
         assert!(state.available_codes.lock().await.contains(&code_id));
+    }
+
+    #[tokio::test]
+    async fn registration_identity_proof_rejects_copied_key_and_tampering() {
+        let state = test_state();
+        let code = "ABCD-12345678";
+        let code_id = test_code_id(code);
+        state.available_codes.lock().await.insert(code_id);
+        let password = b"correct horse battery staple".to_vec();
+        let start = abyssal_core::secure_protocol::opaque_client_start(password.clone())
+            .expect("OPAQUE client start");
+        let response = opaque_server_registration_response(
+            &state.opaque_setup,
+            &start.registration_request,
+            code.as_bytes(),
+        )
+        .expect("OPAQUE server response");
+        let finish = abyssal_core::secure_protocol::opaque_client_finish_registration(
+            password,
+            start.registration_state,
+            response,
+        )
+        .expect("OPAQUE client finish");
+        let owner = abyssal_core::secure_protocol::E2eeSession::create(vec![71; 64])
+            .expect("owner identity");
+        let attacker = abyssal_core::secure_protocol::E2eeSession::create(vec![72; 64])
+            .expect("attacker identity");
+        let owner_public = owner.public_key();
+        let owner_prekey = owner.prekey_id();
+        let owner_envelope = owner
+            .seal_identity(vec![71; 64], b"registration-context".to_vec())
+            .expect("owner envelope");
+        let challenge = vec![17; REGISTRATION_CHALLENGE_BYTES_V8];
+        let handshake_id = Uuid::new_v4();
+        state.opaque_handshakes.lock().await.insert(
+            handshake_id,
+            OpaqueHandshake::Registration {
+                code_id,
+                challenge: Zeroizing::new(challenge.clone()),
+                created_at_ms: now_ms(),
+            },
+        );
+        let copied_proof = attacker
+            .sign_registration_identity_proof(
+                state.node_id.clone(),
+                handshake_id.to_string(),
+                challenge,
+                finish.registration_upload.clone(),
+                owner_public.clone(),
+                owner_prekey.clone(),
+                owner_envelope.clone(),
+            )
+            .expect("copied-key proof");
+        let response = finish_opaque_account(
+            State(state.clone()),
+            Json(OpaqueAccountFinishRequest {
+                handshake_id,
+                registration_upload_b64: Some(URL_SAFE_NO_PAD.encode(&finish.registration_upload)),
+                credential_finalization_b64: None,
+                identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&owner_public)),
+                identity_prekey_id: Some(owner_prekey),
+                identity_envelope_b64: Some(URL_SAFE_NO_PAD.encode(&owner_envelope)),
+                identity_proof_b64: Some(URL_SAFE_NO_PAD.encode(copied_proof)),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(state.accounts.lock().await.is_empty());
+        assert!(state.available_codes.lock().await.contains(&code_id));
+    }
+
+    #[tokio::test]
+    async fn registration_identity_proof_accepts_once_and_replay_fails() {
+        let state = test_state();
+        let code = "ABCD-12345678";
+        let code_id = test_code_id(code);
+        state.available_codes.lock().await.insert(code_id);
+        let password = b"correct horse battery staple".to_vec();
+        let start = abyssal_core::secure_protocol::opaque_client_start(password.clone())
+            .expect("OPAQUE client start");
+        let response = opaque_server_registration_response(
+            &state.opaque_setup,
+            &start.registration_request,
+            code.as_bytes(),
+        )
+        .expect("OPAQUE server response");
+        let finish = abyssal_core::secure_protocol::opaque_client_finish_registration(
+            password,
+            start.registration_state,
+            response,
+        )
+        .expect("OPAQUE client finish");
+        let session =
+            abyssal_core::secure_protocol::E2eeSession::create(vec![73; 64]).expect("identity");
+        let public = session.public_key();
+        let prekey_id = session.prekey_id();
+        let envelope = session
+            .seal_identity(vec![73; 64], b"registration-context".to_vec())
+            .expect("identity envelope");
+        let challenge = vec![18; REGISTRATION_CHALLENGE_BYTES_V8];
+        let handshake_id = Uuid::new_v4();
+        state.opaque_handshakes.lock().await.insert(
+            handshake_id,
+            OpaqueHandshake::Registration {
+                code_id,
+                challenge: Zeroizing::new(challenge.clone()),
+                created_at_ms: now_ms(),
+            },
+        );
+        let proof = session
+            .sign_registration_identity_proof(
+                state.node_id.clone(),
+                handshake_id.to_string(),
+                challenge,
+                finish.registration_upload.clone(),
+                public.clone(),
+                prekey_id.clone(),
+                envelope.clone(),
+            )
+            .expect("identity proof");
+        let request = OpaqueAccountFinishRequest {
+            handshake_id,
+            registration_upload_b64: Some(URL_SAFE_NO_PAD.encode(&finish.registration_upload)),
+            credential_finalization_b64: None,
+            identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&public)),
+            identity_prekey_id: Some(prekey_id),
+            identity_envelope_b64: Some(URL_SAFE_NO_PAD.encode(&envelope)),
+            identity_proof_b64: Some(URL_SAFE_NO_PAD.encode(&proof)),
+        };
+        let response = finish_opaque_account(State(state.clone()), Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.accounts.lock().await.contains_key(&code_id));
+        assert!(!state.available_codes.lock().await.contains(&code_id));
+
+        let replay = finish_opaque_account(
+            State(state.clone()),
+            Json(OpaqueAccountFinishRequest {
+                handshake_id,
+                registration_upload_b64: None,
+                credential_finalization_b64: None,
+                identity_public_b64: None,
+                identity_prekey_id: None,
+                identity_envelope_b64: None,
+                identity_proof_b64: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -7412,6 +8803,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_catalog_enforces_global_and_per_user_caps() {
+        let state = test_state();
+        add_test_account(&state, "direct-owner", "Alice").await;
+        add_test_account(&state, "direct-peer", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "direct-owner", "Alice").await;
+
+        for index in 0..MAX_DIRECT_CATALOG_PER_USER {
+            add_test_account(
+                &state,
+                &format!("direct-peer-{index}"),
+                &format!("Peer{index}"),
+            )
+            .await;
+            open_direct(&state, alice_id, &format!("Peer{index}"))
+                .await
+                .expect("direct should fit per-user cap");
+        }
+        assert!(open_direct(&state, alice_id, "Bob").await.is_err());
+
+        let global_state = test_state();
+        add_test_account(&global_state, "global-owner", "Alice").await;
+        add_test_account(&global_state, "global-peer", "Bob").await;
+        let (global_alice_id, _) = add_test_client(&global_state, "global-owner", "Alice").await;
+        {
+            let mut catalog = global_state.direct_catalog.lock().await;
+            for index in 0..MAX_DIRECT_CATALOG_ENTRIES {
+                catalog.insert(
+                    format!("dm_filled_{index}"),
+                    DirectEntry {
+                        id: format!("dm_filled_{index}"),
+                        user_a: format!("UserA{index}"),
+                        user_b: format!("UserB{index}"),
+                    },
+                );
+            }
+        }
+        assert!(open_direct(&global_state, global_alice_id, "Bob")
+            .await
+            .is_err());
+
+        let victim_state = test_state();
+        add_test_account(&victim_state, "victim-owner", "Alice").await;
+        add_test_account(&victim_state, "victim-peer", "Victim").await;
+        let (victim_alice_id, _) = add_test_client(&victim_state, "victim-owner", "Alice").await;
+        {
+            let mut catalog = victim_state.direct_catalog.lock().await;
+            for index in 0..MAX_DIRECT_CATALOG_PER_USER {
+                catalog.insert(
+                    format!("dm_victim_{index}"),
+                    DirectEntry {
+                        id: format!("dm_victim_{index}"),
+                        user_a: "Victim".to_string(),
+                        user_b: format!("ExistingPeer{index}"),
+                    },
+                );
+            }
+        }
+        assert!(open_direct(&victim_state, victim_alice_id, "Victim")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn opaque_finish_request_shape_is_exclusive_to_handshake_mode() {
+        let registration = OpaqueAccountFinishRequest {
+            handshake_id: Uuid::new_v4(),
+            registration_upload_b64: Some("upload".to_string()),
+            credential_finalization_b64: None,
+            identity_public_b64: Some("public".to_string()),
+            identity_prekey_id: Some("prekey".to_string()),
+            identity_envelope_b64: Some("envelope".to_string()),
+            identity_proof_b64: Some("proof".to_string()),
+        };
+        assert!(opaque_finish_request_is_registration(&registration));
+
+        let mut registration_with_login_field = registration;
+        registration_with_login_field.credential_finalization_b64 =
+            Some("finalization".to_string());
+        assert!(!opaque_finish_request_is_registration(
+            &registration_with_login_field
+        ));
+
+        let login = OpaqueAccountFinishRequest {
+            handshake_id: Uuid::new_v4(),
+            registration_upload_b64: None,
+            credential_finalization_b64: Some("finalization".to_string()),
+            identity_public_b64: None,
+            identity_prekey_id: None,
+            identity_envelope_b64: None,
+            identity_proof_b64: None,
+        };
+        assert!(opaque_finish_request_is_login(&login));
+
+        let mut login_with_identity_field = login;
+        login_with_identity_field.identity_proof_b64 = Some("proof".to_string());
+        assert!(!opaque_finish_request_is_login(&login_with_identity_field));
+    }
+
+    #[tokio::test]
     async fn relay_rejects_missing_duplicate_and_unauthorized_recipient_envelopes() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
@@ -7445,7 +8935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_requires_v7_signature_on_each_recipient_envelope() {
+    async fn relay_requires_v8_signature_on_each_recipient_envelope() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         add_test_account(&state, "code-b", "Bob").await;
@@ -7556,13 +9046,13 @@ mod tests {
             }],
         )
         .await
-        .expect("valid v7 message should route");
+        .expect("valid v8 message should route");
         let OutboundFrame::Message {
             signature_b64,
             identity_public_b64,
             sender_public_key_b64,
             ..
-        } = &bob_rx.try_recv().expect("Bob receives v7 message")
+        } = &bob_rx.try_recv().expect("Bob receives v8 message")
         else {
             panic!("expected text frame");
         };
@@ -7674,6 +9164,303 @@ mod tests {
             "prekey_id": "fallback"
         });
         assert!(serde_json::from_value::<InboundFrame>(frame).is_err());
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_without_pending_frame_does_not_mutate_state() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (bob_id, _) = add_test_client(&state, "code-b", "Bob").await;
+        let room = test_room("ack_without_pending");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room: room.clone(),
+                owner_code_id: test_code_id("code-a"),
+            },
+        );
+
+        let envelope_b64 = test_identity_envelope_b64(3);
+        let identity_public_b64 = test_identity_public_b64(b'B');
+        let prekey_id = test_prekey_id(b'B');
+        let state_signature_b64 = test_valid_state_signature_b64(
+            b'B',
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+        );
+        let ack_signature_b64 =
+            test_valid_ack_signature_b64(b'B', &room.id, "missing-message", "Alice", "");
+        let before = state
+            .accounts
+            .lock()
+            .await
+            .get(&test_code_id("code-b"))
+            .map(|account| {
+                (
+                    account.state_revision,
+                    account.state_revision_window,
+                    account.identity_envelope.clone(),
+                    account.identity_public.clone(),
+                    account.prekey_id.clone(),
+                )
+            })
+            .expect("Bob account");
+        let pending_bytes_before = *state.pending_bytes.lock().await;
+        let replay_before = state.replay_ids.lock().await.len();
+        let claims_before = state.prekey_claims.lock().await.len();
+
+        let result = acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            "missing-message",
+            "Alice",
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+            &state_signature_b64,
+            &ack_signature_b64,
+            "",
+        )
+        .await;
+        assert!(result.is_err());
+
+        let after = state
+            .accounts
+            .lock()
+            .await
+            .get(&test_code_id("code-b"))
+            .map(|account| {
+                (
+                    account.state_revision,
+                    account.state_revision_window,
+                    account.identity_envelope.clone(),
+                    account.identity_public.clone(),
+                    account.prekey_id.clone(),
+                )
+            })
+            .expect("Bob account");
+        assert_eq!(after, before);
+        assert_eq!(*state.pending_bytes.lock().await, pending_bytes_before);
+        assert_eq!(state.replay_ids.lock().await.len(), replay_before);
+        assert_eq!(state.prekey_claims.lock().await.len(), claims_before);
+        assert!(state.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_requires_exact_pending_tuple_and_rejects_duplicate() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, _) = add_test_client(&state, "code-b", "Bob").await;
+        let room = test_room("ack_exact_pending");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room: room.clone(),
+                owner_code_id: test_code_id("code-a"),
+            },
+        );
+        let wrong_chat = test_room("ack_exact_other");
+        state.room_catalog.lock().await.insert(
+            wrong_chat.id.clone(),
+            RoomEntry {
+                room: wrong_chat.clone(),
+                owner_code_id: test_code_id("code-a"),
+            },
+        );
+        let message_id = "exact-message";
+        let prekey_id = test_prekey_id(b'B');
+        let wrapped_key = [4_u8; 256];
+        route_test_message_with_envelopes(
+            &state,
+            alice_id,
+            &room.id,
+            E2EE_PROTOCOL_VERSION,
+            message_id,
+            vec![InboundRecipientEnvelope {
+                recipient_username: "Bob".to_string(),
+                wrapped_key_b64: URL_SAFE_NO_PAD.encode(wrapped_key),
+                prekey_id: prekey_id.clone(),
+                is_prekey: true,
+                signature_b64: test_valid_message_signature_b64(
+                    b'A',
+                    &room.id,
+                    message_id,
+                    "Alice",
+                    &test_identity_public(b'A'),
+                    "Bob",
+                    &wrapped_key,
+                    &prekey_id,
+                    true,
+                ),
+            }],
+        )
+        .await
+        .expect("prekey message queues");
+
+        let envelope_b64 = test_identity_envelope_b64(4);
+        let identity_public_b64 = test_identity_public_b64(b'B');
+        let state_signature_b64 = test_valid_state_signature_b64(
+            b'B',
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+        );
+        let pending_key = PendingKey {
+            chat_id: room.id.clone(),
+            recipient_username: "Bob".to_string(),
+        };
+        let before = ack_test_snapshot(&state, &test_code_id("code-b"), &pending_key).await;
+        assert!(!before.3.is_empty(), "prekey claim should be pending");
+
+        let wrong_chat_ack_signature_b64 =
+            test_valid_ack_signature_b64(b'B', &wrong_chat.id, message_id, "Alice", &prekey_id);
+        assert!(acknowledge_message(
+            &state,
+            bob_id,
+            &wrong_chat.id,
+            message_id,
+            "Alice",
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+            &state_signature_b64,
+            &wrong_chat_ack_signature_b64,
+            &prekey_id,
+        )
+        .await
+        .is_err());
+        let after_wrong_chat =
+            ack_test_snapshot(&state, &test_code_id("code-b"), &pending_key).await;
+        assert_eq!(after_wrong_chat, before);
+
+        let wrong_prekey_id = test_prekey_id(b'X');
+        let wrong_prekey_ack_signature_b64 =
+            test_valid_ack_signature_b64(b'B', &room.id, message_id, "Alice", &wrong_prekey_id);
+        assert!(acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            message_id,
+            "Alice",
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+            &state_signature_b64,
+            &wrong_prekey_ack_signature_b64,
+            &wrong_prekey_id,
+        )
+        .await
+        .is_err());
+        let after_wrong_prekey =
+            ack_test_snapshot(&state, &test_code_id("code-b"), &pending_key).await;
+        assert_eq!(after_wrong_prekey, before);
+
+        let wrong_message_id = "wrong-message";
+        let wrong_ack_signature_b64 =
+            test_valid_ack_signature_b64(b'B', &room.id, wrong_message_id, "Alice", &prekey_id);
+        assert!(acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            wrong_message_id,
+            "Alice",
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+            &state_signature_b64,
+            &wrong_ack_signature_b64,
+            &prekey_id,
+        )
+        .await
+        .is_err());
+        let after_wrong = ack_test_snapshot(&state, &test_code_id("code-b"), &pending_key).await;
+        assert_eq!(after_wrong, before);
+
+        let ack_signature_b64 =
+            test_valid_ack_signature_b64(b'B', &room.id, message_id, "Alice", &prekey_id);
+        acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            message_id,
+            "Alice",
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+            &state_signature_b64,
+            &ack_signature_b64,
+            &prekey_id,
+        )
+        .await
+        .expect("matching acknowledgement");
+        let after_matching = state
+            .accounts
+            .lock()
+            .await
+            .get(&test_code_id("code-b"))
+            .map(|account| {
+                (
+                    account.state_revision,
+                    account.state_revision_window,
+                    account.identity_envelope.clone(),
+                    account.identity_public.clone(),
+                    account.prekey_id.clone(),
+                )
+            })
+            .expect("Bob account");
+        let pending_bytes_after_matching = *state.pending_bytes.lock().await;
+        assert_eq!(pending_bytes_after_matching, 0);
+
+        assert!(acknowledge_message(
+            &state,
+            bob_id,
+            &room.id,
+            message_id,
+            "Alice",
+            1,
+            &envelope_b64,
+            &identity_public_b64,
+            &prekey_id,
+            &state_signature_b64,
+            &ack_signature_b64,
+            &prekey_id,
+        )
+        .await
+        .is_err());
+        let after_duplicate = state
+            .accounts
+            .lock()
+            .await
+            .get(&test_code_id("code-b"))
+            .map(|account| {
+                (
+                    account.state_revision,
+                    account.state_revision_window,
+                    account.identity_envelope.clone(),
+                    account.identity_public.clone(),
+                    account.prekey_id.clone(),
+                )
+            })
+            .expect("Bob account");
+        assert_eq!(after_duplicate, after_matching);
+        assert_eq!(
+            *state.pending_bytes.lock().await,
+            pending_bytes_after_matching
+        );
+        assert!(state.pending.lock().await.is_empty());
+        assert!(state.prekey_claims.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -8635,6 +10422,8 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ws_tickets: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            purge_epoch: watch::channel(0_u64).0,
+            outbound_bytes: Arc::new(AtomicUsize::new(0)),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -8647,7 +10436,7 @@ mod tests {
             attachments: Arc::new(Mutex::new(HashMap::new())),
             attachment_bytes_by_code: Arc::new(Mutex::new(HashMap::new())),
             attachment_downloads: Arc::new(Semaphore::new(DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY)),
-            attachment_uploads: Arc::new(Semaphore::new(DEFAULT_ATTACHMENT_UPLOAD_CONCURRENCY)),
+            attachment_uploads: Arc::new(Semaphore::new(1)),
             attachment_memory: Arc::new(Semaphore::new(8 * 1024 * 1024)),
             attachment_epoch: Arc::new(AtomicU64::new(0)),
             prekey_claims: Arc::new(Mutex::new(HashMap::new())),
@@ -8669,8 +10458,74 @@ mod tests {
                 state_revision: 0,
                 state_revision_window: 1,
                 connected: true,
+                attachment_uploads: Arc::new(Semaphore::new(1)),
             },
         );
+    }
+
+    type AckTestAccountState = (u64, u128, Vec<u8>, Vec<u8>, String);
+    type AckTestFrameState = (u64, serde_json::Value);
+    type AckTestClaimState = ([u8; 32], String, String, String, String, String, u64);
+
+    async fn ack_test_snapshot(
+        state: &AppState,
+        code_id: &CodeId,
+        pending_key: &PendingKey,
+    ) -> (
+        AckTestAccountState,
+        usize,
+        Vec<AckTestFrameState>,
+        Vec<AckTestClaimState>,
+    ) {
+        let account = state
+            .accounts
+            .lock()
+            .await
+            .get(code_id)
+            .map(|account| {
+                (
+                    account.state_revision,
+                    account.state_revision_window,
+                    account.identity_envelope.clone(),
+                    account.identity_public.clone(),
+                    account.prekey_id.clone(),
+                )
+            })
+            .expect("ack test account");
+        let pending_bytes = *state.pending_bytes.lock().await;
+        let pending_frames = state
+            .pending
+            .lock()
+            .await
+            .get(pending_key)
+            .expect("ack test pending queue")
+            .iter()
+            .map(|pending_frame| {
+                (
+                    pending_frame.enqueued_at_ms,
+                    serde_json::to_value(&pending_frame.frame).expect("ack test frame JSON"),
+                )
+            })
+            .collect();
+        let mut claims = state
+            .prekey_claims
+            .lock()
+            .await
+            .iter()
+            .map(|(key, claim)| {
+                (
+                    key.code_id,
+                    key.prekey_id.clone(),
+                    claim.chat_id.clone(),
+                    claim.message_id.clone(),
+                    claim.sender_username.clone(),
+                    claim.recipient_username.clone(),
+                    claim.created_at_ms,
+                )
+            })
+            .collect::<Vec<_>>();
+        claims.sort_by(|left, right| left.1.cmp(&right.1));
+        (account, pending_bytes, pending_frames, claims)
     }
 
     async fn route_test_message(
@@ -8821,6 +10676,7 @@ mod tests {
         let client_id = Uuid::new_v4();
         let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
         let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, _result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
         state.clients.lock().await.insert(
             client_id,
             ClientHandle {
@@ -8828,6 +10684,8 @@ mod tests {
                 username: username.to_string(),
                 tx,
                 control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
         );
         (client_id, rx)
@@ -8887,7 +10745,7 @@ mod tests {
         let identity_public = URL_SAFE_NO_PAD
             .decode(identity_public_b64)
             .expect("test identity public");
-        let transcript = abyssal_core::secure_protocol::identity_state_signature_input_v7(
+        let transcript = abyssal_core::secure_protocol::identity_state_signature_input_v8(
             E2EE_PROTOCOL_VERSION,
             revision,
             &envelope,
@@ -8906,7 +10764,7 @@ mod tests {
         sender_username: &str,
         used_prekey_id: &str,
     ) -> String {
-        let transcript = abyssal_core::secure_protocol::ack_signature_input_v7(
+        let transcript = abyssal_core::secure_protocol::ack_signature_input_v8(
             E2EE_PROTOCOL_VERSION,
             chat_id,
             message_id,
@@ -8930,7 +10788,7 @@ mod tests {
         prekey_id: &str,
         is_prekey: bool,
     ) -> String {
-        let transcript = abyssal_core::secure_protocol::message_signature_input_v7(
+        let transcript = abyssal_core::secure_protocol::message_signature_input_v8(
             E2EE_PROTOCOL_VERSION,
             chat_id,
             message_id,

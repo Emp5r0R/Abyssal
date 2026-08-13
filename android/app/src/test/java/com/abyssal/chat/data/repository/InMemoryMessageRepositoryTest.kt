@@ -72,6 +72,52 @@ class InMemoryMessageRepositoryTest {
     }
 
     @Test
+    fun repositoryEpochRejectsEveryStaleGuardedMutationButAcceptsCurrentEpoch() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val room = testRoom(timer = 30)
+        val message = testMessage("epoch-message")
+        val capturedEpoch = repository.currentEpoch()
+
+        assertTrue(repository.createForumSessionIfCurrent(capturedEpoch, room))
+        assertTrue(repository.saveMessageIfCurrent(capturedEpoch, room.id, message))
+        assertTrue(repository.markAsReadIfCurrent(capturedEpoch, room.id, message.id))
+
+        repository.clearAllDataNow()
+        val currentEpoch = repository.currentEpoch()
+        assertEquals(capturedEpoch + 1uL, currentEpoch)
+
+        assertFalse(repository.saveMessageIfCurrent(capturedEpoch, room.id, message))
+        assertFalse(repository.markAsReadIfCurrent(capturedEpoch, room.id, message.id))
+        assertFalse(repository.createForumSessionIfCurrent(capturedEpoch, room))
+        assertFalse(repository.deleteChatSessionIfCurrent(capturedEpoch, room.id))
+        assertTrue(repository.getChatSessions().first().isEmpty())
+        assertTrue(repository.getMessages(room.id).first().isEmpty())
+
+        assertTrue(repository.createForumSessionIfCurrent(currentEpoch, room))
+        assertTrue(repository.saveMessageIfCurrent(currentEpoch, room.id, message))
+        assertTrue(repository.markAsReadIfCurrent(currentEpoch, room.id, message.id))
+        assertTrue(repository.deleteChatSessionIfCurrent(currentEpoch, room.id))
+        assertTrue(repository.getChatSessions().first().isEmpty())
+    }
+
+    @Test
+    fun clearBetweenEpochCaptureAndMutationRejectsTheStaleOperation() = runBlocking {
+        val repository = InMemoryMessageRepository()
+        val room = testRoom(timer = 30)
+        val capturedEpoch = repository.currentEpoch()
+        assertTrue(repository.createForumSessionIfCurrent(capturedEpoch, room))
+
+        repository.clearAllDataNow()
+        val staleKey = ByteArray(32) { 8 }
+        val staleMessage = testMessage("stale-after-clear").copy(senderPublicKey = staleKey)
+
+        assertFalse(repository.saveMessageIfCurrent(capturedEpoch, room.id, staleMessage))
+        assertArrayEquals(ByteArray(32) { 8 }, staleKey)
+        assertTrue(repository.getMessages(room.id).first().isEmpty())
+        assertTrue(repository.getChatSessions().first().isEmpty())
+    }
+
+    @Test
     fun zeroReadTimerKeepsMessageAfterRead() = runBlocking {
         val repository = InMemoryMessageRepository()
         val message = testMessage("kept").copy(selfDestructDurationSec = 0)

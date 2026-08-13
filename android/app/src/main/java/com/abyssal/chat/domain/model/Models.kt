@@ -149,7 +149,8 @@ data class IncomingTransportPayload(
     val senderUsername: String,
     val senderPublicKey: ByteArray,
     val prekeyId: String = "",
-    val isPrekey: Boolean = false
+    val isPrekey: Boolean = false,
+    val connectionGeneration: Long = 0L
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -165,7 +166,8 @@ data class IncomingTransportPayload(
             wrappedKey.contentEquals(other.wrappedKey) &&
             senderPublicKey.contentEquals(other.senderPublicKey) &&
             prekeyId == other.prekeyId &&
-            isPrekey == other.isPrekey
+            isPrekey == other.isPrekey &&
+            connectionGeneration == other.connectionGeneration
     }
 
     override fun hashCode(): Int {
@@ -181,6 +183,7 @@ data class IncomingTransportPayload(
         result = 31 * result + senderPublicKey.contentHashCode()
         result = 31 * result + prekeyId.hashCode()
         result = 31 * result + isPrekey.hashCode()
+        result = 31 * result + connectionGeneration.hashCode()
         return result
     }
 }
@@ -223,7 +226,8 @@ data class RecipientIdentity(
 data class RoomChange(
     val action: String,
     val session: ChatSession? = null,
-    val chatId: String? = null
+    val chatId: String? = null,
+    val connectionGeneration: Long = 0L
 )
 
 data class DisguiseSettings(

@@ -56,6 +56,8 @@ const ATTACHMENT_SECONDARY = "123e4567-e89b-42d3-a456-426614174001";
 const ATTACHMENT_TERTIARY = "123e4567-e89b-42d3-a456-426614174002";
 const ATTACHMENT_EMPTY = "123e4567-e89b-42d3-a456-426614174003";
 const ATTACHMENT_EXACT = "123e4567-e89b-42d3-a456-426614174004";
+const FILE_THREE_BYTE_POLICY = { mediaType: "FILE" as const, expectedPlaintextBytes: 3 };
+const OPAQUE_CHALLENGE_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -68,6 +70,7 @@ describe("account transport", () => {
       mode: "login",
       handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
       response_b64: "AQID",
+      challenge_b64: null,
       node_id: "node-1",
       identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
       identity_prekey_id: "test-prekey",
@@ -114,6 +117,7 @@ describe("account transport", () => {
       mode: "registration",
       handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
       response_b64,
+      challenge_b64: OPAQUE_CHALLENGE_B64,
       node_id: "node-1",
       identity_public_b64: null,
       identity_prekey_id: null,
@@ -205,6 +209,7 @@ describe("account transport", () => {
       mode: "registration",
       handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
       response_b64: "AQID",
+      challenge_b64: OPAQUE_CHALLENGE_B64,
       node_id: "node-1",
       identity_public_b64: null,
       identity_prekey_id: null,
@@ -351,12 +356,17 @@ describe("account transport", () => {
   });
 
   it("streams bounded attachment bodies and rejects an oversized declaration", async () => {
+    const encrypted = new Uint8Array(44).fill(7);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
-      new Uint8Array([1, 2, 3, 4]),
-      { status: 200, headers: { "content-length": "4" } },
+      encrypted.slice(),
+      { status: 200, headers: { "content-length": "44" } },
     ));
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_PRIMARY)).resolves.toEqual(
-      { bytes: new Uint8Array([1, 2, 3, 4]) },
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_PRIMARY,
+      FILE_THREE_BYTE_POLICY,
+    )).resolves.toEqual(
+      { bytes: encrypted },
     );
     expect(fetchMock).toHaveBeenCalledWith(
       `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}`,
@@ -367,12 +377,41 @@ describe("account transport", () => {
       status: 200,
       headers: { "content-length": "999999999999999999999" },
     }));
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_SECONDARY)).rejects.toThrow(
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_SECONDARY,
+      FILE_THREE_BYTE_POLICY,
+    )).rejects.toThrow(
       "Attachment unavailable",
     );
   });
 
-  it("requires Content-Length and rejects truncated or extra encrypted bytes", async () => {
+  it("accepts an exact chunked body without Content-Length and rejects FILE-sized IMAGE metadata before fetch", async () => {
+    const exact = new Uint8Array(44).fill(6);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(exact.slice(0, 13));
+        controller.enqueue(exact.slice(13));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(stream, { status: 200 }));
+
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_PRIMARY,
+      FILE_THREE_BYTE_POLICY,
+    )).resolves.toEqual({ bytes: exact });
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_SECONDARY,
+      { mediaType: "IMAGE", expectedPlaintextBytes: 200 * 1024 * 1024 },
+    )).rejects.toThrow("Attachment unavailable");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects truncated bodies and mismatched encrypted Content-Length values", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(new Uint8Array([1]), { status: 200 }))
       .mockResolvedValueOnce(new Response(new Uint8Array([1, 2]), {
@@ -392,13 +431,25 @@ describe("account transport", () => {
       }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
 
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_PRIMARY)).rejects.toThrow(
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_PRIMARY,
+      FILE_THREE_BYTE_POLICY,
+    )).rejects.toThrow(
       "Attachment unavailable",
     );
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_SECONDARY)).rejects.toThrow(
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_SECONDARY,
+      FILE_THREE_BYTE_POLICY,
+    )).rejects.toThrow(
       "Attachment unavailable",
     );
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_TERTIARY)).rejects.toThrow(
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_TERTIARY,
+      FILE_THREE_BYTE_POLICY,
+    )).rejects.toThrow(
       "Attachment unavailable",
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -424,7 +475,11 @@ describe("account transport", () => {
       }))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
 
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_EMPTY)).rejects.toThrow(
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_EMPTY,
+      FILE_THREE_BYTE_POLICY,
+    )).rejects.toThrow(
       "Attachment unavailable",
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -444,19 +499,24 @@ describe("account transport", () => {
   });
 
   it("returns an optional claim without changing exact encrypted bytes", async () => {
+    const encrypted = new Uint8Array(44).fill(5);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
-      new Uint8Array([0, 1, 2, 255]),
+      encrypted.slice(),
       {
         status: 200,
         headers: {
-          "content-length": "4",
+          "content-length": "44",
           "X-Abyssal-Attachment-Claim": CLAIM_PRIMARY,
         },
       },
     ));
 
-    await expect(downloadEncryptedAttachment(session, ATTACHMENT_PRIMARY)).resolves.toEqual({
-      bytes: new Uint8Array([0, 1, 2, 255]),
+    await expect(downloadEncryptedAttachment(
+      session,
+      ATTACHMENT_PRIMARY,
+      FILE_THREE_BYTE_POLICY,
+    )).resolves.toEqual({
+      bytes: encrypted,
       claim: CLAIM_PRIMARY,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -603,7 +663,7 @@ describe("account transport", () => {
       readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
       responseType = "";
       status = 201;
-      response: unknown = { attachment_id: ATTACHMENT_PRIMARY };
+      responseText = JSON.stringify({ attachment_id: ATTACHMENT_PRIMARY });
       onerror: (() => void) | null = null;
       onabort: (() => void) | null = null;
       onload: (() => void) | null = null;
@@ -611,6 +671,8 @@ describe("account transport", () => {
       open(): void {}
 
       setRequestHeader(): void {}
+
+      getResponseHeader(): string | null { return null; }
 
       send(body: unknown): void {
         sent = body;
@@ -629,6 +691,116 @@ describe("account transport", () => {
         () => undefined,
       )).resolves.toBe(ATTACHMENT_PRIMARY);
       expect(sent).toBe(encrypted);
+    } finally {
+      globalThis.XMLHttpRequest = original;
+    }
+  });
+
+  it("aborts attachment uploads through the supplied signal", async () => {
+    const original = globalThis.XMLHttpRequest;
+    let aborted = false;
+    class TestXmlHttpRequest {
+      static readonly HEADERS_RECEIVED = 2;
+      readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
+      responseType = "";
+      responseText = "";
+      readyState = 1;
+      status = 0;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      onload: (() => void) | null = null;
+      onprogress: ((event: ProgressEvent) => void) | null = null;
+      onreadystatechange: (() => void) | null = null;
+
+      open(): void {}
+      setRequestHeader(): void {}
+      getResponseHeader(): string | null { return null; }
+      send(): void {}
+      abort(): void {
+        aborted = true;
+        this.onabort?.();
+      }
+    }
+    globalThis.XMLHttpRequest = TestXmlHttpRequest as unknown as typeof XMLHttpRequest;
+    const controller = new AbortController();
+    try {
+      const pending = uploadEncryptedAttachment(
+        session,
+        "dm_Alice_Bob",
+        "FILE",
+        new Uint8Array([1, 2, 3]),
+        { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
+        () => undefined,
+        controller.signal,
+      );
+      controller.abort();
+      await expect(pending).rejects.toThrow("Upload aborted");
+      expect(aborted).toBe(true);
+    } finally {
+      globalThis.XMLHttpRequest = original;
+    }
+  });
+
+  it("rejects oversized or non-exact attachment upload responses", async () => {
+    const original = globalThis.XMLHttpRequest;
+    class TestXmlHttpRequest {
+      static readonly HEADERS_RECEIVED = 2;
+      static responseText = "";
+      static declaredLength: string | null = null;
+      static responseProgressBytes: number | null = null;
+      readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
+      responseType = "";
+      responseText = TestXmlHttpRequest.responseText;
+      readyState = 1;
+      status = 201;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      onload: (() => void) | null = null;
+      onprogress: ((event: ProgressEvent) => void) | null = null;
+      onreadystatechange: (() => void) | null = null;
+
+      open(): void {}
+      setRequestHeader(): void {}
+      getResponseHeader(name: string): string | null {
+        return name.toLowerCase() === "content-length" ? TestXmlHttpRequest.declaredLength : null;
+      }
+      send(): void {
+        if (TestXmlHttpRequest.responseProgressBytes !== null) {
+          this.onprogress?.({ loaded: TestXmlHttpRequest.responseProgressBytes } as ProgressEvent);
+          if (this.readyState === 0) return;
+        }
+        this.readyState = TestXmlHttpRequest.HEADERS_RECEIVED;
+        this.onreadystatechange?.();
+        if (this.readyState === TestXmlHttpRequest.HEADERS_RECEIVED) this.onload?.();
+      }
+      abort(): void {
+        this.readyState = 0;
+        this.onabort?.();
+      }
+    }
+    globalThis.XMLHttpRequest = TestXmlHttpRequest as unknown as typeof XMLHttpRequest;
+    const upload = () => uploadEncryptedAttachment(
+      session,
+      "dm_Alice_Bob",
+      "FILE",
+      new Uint8Array([1, 2, 3]),
+      { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
+      () => undefined,
+    );
+    try {
+      TestXmlHttpRequest.responseText = JSON.stringify({
+        attachment_id: ATTACHMENT_PRIMARY,
+        unexpected: true,
+      });
+      await expect(upload()).rejects.toThrow("Upload rejected");
+
+      TestXmlHttpRequest.responseText = JSON.stringify({ attachment_id: ATTACHMENT_PRIMARY });
+      TestXmlHttpRequest.declaredLength = String(4 * 1024 + 1);
+      await expect(upload()).rejects.toThrow("Upload rejected");
+
+      TestXmlHttpRequest.declaredLength = null;
+      TestXmlHttpRequest.responseProgressBytes = 4 * 1024 + 1;
+      await expect(upload()).rejects.toThrow("Upload rejected");
     } finally {
       globalThis.XMLHttpRequest = original;
     }
@@ -698,13 +870,13 @@ describe("RelaySocket", () => {
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
       expect(relay.openDirect("Bob")).toBe(true);
-      expect(relay.acknowledge("dm_123", "message_1", "Alice", {
+      const pendingAck = relay.acknowledge("dm_123", "message_1", "Alice", {
         revision: 2,
         envelope: new Uint8Array([2, 3, 4]),
         identityPublicKey: new Uint8Array(128).fill(7),
         prekeyId: "test-prekey",
         stateSignature: new Uint8Array(64).fill(8),
-      }, ACK_SIGNATURE, "used-prekey")).toBe(true);
+      }, ACK_SIGNATURE, "used-prekey");
       expect(socket.sent).toEqual([
         JSON.stringify({ type: "open_direct", peer_username: "Bob" }),
         JSON.stringify({
@@ -721,6 +893,12 @@ describe("RelaySocket", () => {
           used_prekey_id: "used-prekey",
         }),
       ]);
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "message_1",
+        accepted: true,
+      }) }));
+      await expect(pendingAck).resolves.toBe("ACCEPTED");
 
       const parseSpy = vi.spyOn(JSON, "parse");
       socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
@@ -854,6 +1032,538 @@ describe("RelaySocket", () => {
       globalThis.WebSocket = original;
     }
   });
+
+  it("commits encrypted sends only after a strict accepted result", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+    const frames: IncomingFrame[] = [];
+
+    try {
+      const relay = new RelaySocket(session, (frame) => frames.push(frame), () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const socket = sockets[0];
+      socket.readyState = 1;
+      socket.onopen?.(new Event("open"));
+      const pending = relay.sendEncryptedPayload("message-1", {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: "message-1",
+      });
+      socket.onmessage?.(new MessageEvent("message", {
+        data: JSON.stringify({ type: "message_result", message_id: "message-1", accepted: true }),
+      }));
+      await expect(pending).resolves.toBe("ACCEPTED");
+      expect(frames).toHaveLength(0);
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("surfaces an explicit relay rejection without treating it as ambiguous", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const socket = sockets[0];
+      socket.readyState = 1;
+      socket.onopen?.(new Event("open"));
+      const pending = relay.sendEncryptedPayload("message-rejected", {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: "message-rejected",
+      });
+      socket.onmessage?.(new MessageEvent("message", {
+        data: JSON.stringify({ type: "message_result", message_id: "message-rejected", accepted: false }),
+      }));
+      await expect(pending).resolves.toBe("REJECTED");
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("fails closed on malformed or unknown message results", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const socket = sockets[0];
+      socket.readyState = 1;
+      socket.onopen?.(new Event("open"));
+      const pending = relay.sendEncryptedPayload("message-2", {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: "message-2",
+      });
+      socket.onmessage?.(new MessageEvent("message", {
+        data: JSON.stringify({
+          type: "message_result",
+          message_id: "message-2",
+          accepted: true,
+          unexpected: true,
+        }),
+      }));
+      await expect(pending).resolves.toBe("AMBIGUOUS");
+      expect(socket.readyState).toBe(3);
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("marks a sent message ambiguous when the authenticated socket closes", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const socket = sockets[0];
+      socket.readyState = 1;
+      socket.onopen?.(new Event("open"));
+      const pending = relay.sendEncryptedPayload("message-3", {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: "message-3",
+      });
+      socket.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
+      await expect(pending).resolves.toBe("AMBIGUOUS");
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("ignores callbacks from a superseded socket generation", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+    const frames: IncomingFrame[] = [];
+
+    try {
+      const relay = new RelaySocket(session, (frame) => frames.push(frame), () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const first = sockets[0];
+      first.readyState = 1;
+      first.onopen?.(new Event("open"));
+      first.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
+      await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 3_000 });
+      const second = sockets[1];
+      second.readyState = 1;
+      second.onopen?.(new Event("open"));
+      first.onopen?.(new Event("open"));
+      first.onmessage?.(new MessageEvent("message", {
+        data: JSON.stringify({ type: "direct_opened", direct: { id: "dm_stale", peer_username: "Stale" } }),
+      }));
+      expect(frames).toHaveLength(0);
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("bounds pending encrypted sends", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const socket = sockets[0];
+      socket.readyState = 1;
+      socket.onopen?.(new Event("open"));
+      const pending = Array.from({ length: 257 }, (_, index) => relay.sendEncryptedPayload(`message-${index}`, {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: `message-${index}`,
+      }));
+      await expect(pending.at(-1)).resolves.toBe("NOT_SENT");
+      relay.close();
+      await expect(pending[0]).resolves.toBe("AMBIGUOUS");
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
+  it("resolves accepted and rejected ACK results without publishing inbound frames", async () => {
+    const context = await connectRelay();
+    const { relay, socket, frames, originalWebSocket } = context;
+    try {
+      const accepted = relay.acknowledge(
+        "dm_123",
+        "ack-accepted",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-accepted",
+        accepted: true,
+      }) }));
+      await expect(accepted).resolves.toBe("ACCEPTED");
+
+      const rejected = relay.acknowledge(
+        "dm_123",
+        "ack-rejected",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-rejected",
+        accepted: false,
+      }) }));
+      await expect(rejected).resolves.toBe("REJECTED");
+      expect(frames).toEqual([]);
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("returns NOT_SENT for an unavailable socket and invalid or duplicate ACK tickets", async () => {
+    const disconnected = new RelaySocket(session, () => undefined, () => undefined);
+    await expect(disconnected.acknowledge(
+      "dm_123",
+      "ack-offline",
+      "Bob",
+      ackState(),
+      ACK_SIGNATURE,
+      "used-prekey",
+    )).resolves.toBe("NOT_SENT");
+
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      await expect(relay.acknowledge(
+        "dm_123",
+        "not valid!",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      )).resolves.toBe("NOT_SENT");
+      const pending = relay.acknowledge(
+        "dm_123",
+        "ack-duplicate",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      await expect(relay.acknowledge(
+        "dm_123",
+        "ack-duplicate",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      )).resolves.toBe("NOT_SENT");
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-duplicate",
+        accepted: true,
+      }) }));
+      await expect(pending).resolves.toBe("ACCEPTED");
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("fails closed on a non-exact ACK result and settles the pending ticket", async () => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      const pending = relay.acknowledge(
+        "dm_123",
+        "ack-malformed",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-malformed",
+        accepted: true,
+        unexpected: true,
+      }) }));
+      await expect(pending).resolves.toBe("AMBIGUOUS");
+      expect(socket.readyState).toBe(3);
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("fails closed on unknown and duplicate ACK results", async () => {
+    const unknownContext = await connectRelay();
+    try {
+      const pending = unknownContext.relay.acknowledge(
+        "dm_123",
+        "ack-pending",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      unknownContext.socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-unknown",
+        accepted: true,
+      }) }));
+      await expect(pending).resolves.toBe("AMBIGUOUS");
+      expect(unknownContext.socket.readyState).toBe(3);
+    } finally {
+      unknownContext.relay.close();
+      globalThis.WebSocket = unknownContext.originalWebSocket;
+    }
+
+    const duplicateContext = await connectRelay();
+    try {
+      const pending = duplicateContext.relay.acknowledge(
+        "dm_123",
+        "ack-once",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      const result = JSON.stringify({ type: "ack_result", message_id: "ack-once", accepted: true });
+      duplicateContext.socket.onmessage?.(new MessageEvent("message", { data: result }));
+      await expect(pending).resolves.toBe("ACCEPTED");
+      duplicateContext.socket.onmessage?.(new MessageEvent("message", { data: result }));
+      expect(duplicateContext.socket.readyState).toBe(3);
+    } finally {
+      duplicateContext.relay.close();
+      globalThis.WebSocket = duplicateContext.originalWebSocket;
+    }
+  });
+
+  it("marks an ACK ambiguous on timeout", async () => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    vi.useFakeTimers();
+    try {
+      const pending = relay.acknowledge(
+        "dm_123",
+        "ack-timeout",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(pending).resolves.toBe("AMBIGUOUS");
+      expect(socket.readyState).toBe(3);
+    } finally {
+      vi.useRealTimers();
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it.each([
+    ["socket close", (socket: FakeWebSocket) => socket.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent)],
+    ["socket error", (socket: FakeWebSocket) => socket.onerror?.(new Event("error"))],
+    ["manual close", (socket: FakeWebSocket, relay: RelaySocket) => relay.close()],
+  ])("settles both message and ACK operations on %s", async (_label, trigger) => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      const message = relay.sendEncryptedPayload("message-close", {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: "message-close",
+      });
+      const ack = relay.acknowledge(
+        "dm_123",
+        "ack-close",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      trigger(socket, relay);
+      await expect(message).resolves.toBe("AMBIGUOUS");
+      await expect(ack).resolves.toBe("AMBIGUOUS");
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("settles both pending maps and invokes purge once on a purge close", async () => {
+    let purges = 0;
+    const context = await connectRelay(() => undefined, () => { purges += 1; });
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      const message = relay.sendEncryptedPayload("message-purge", {
+        type: "message",
+        chat_id: "dm_123",
+        message_id: "message-purge",
+      });
+      const ack = relay.acknowledge(
+        "dm_123",
+        "ack-purge",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      socket.onclose?.({ code: 4001, reason: "purge", wasClean: true } as CloseEvent);
+      await expect(message).resolves.toBe("AMBIGUOUS");
+      await expect(ack).resolves.toBe("AMBIGUOUS");
+      expect(purges).toBe(1);
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-purge",
+        accepted: true,
+      }) }));
+      expect(purges).toBe(1);
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("bounds pending ACK operations independently from encrypted messages", async () => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      const pending = Array.from({ length: 257 }, (_, index) => relay.acknowledge(
+        "dm_123",
+        `ack-${index}`,
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      ));
+      await expect(pending.at(-1)).resolves.toBe("NOT_SENT");
+      expect(socket.sent.filter((value) => JSON.parse(value).type === "message_ack")).toHaveLength(256);
+      relay.close();
+      await expect(Promise.all(pending.slice(0, 256))).resolves.toEqual(
+        Array.from({ length: 256 }, () => "AMBIGUOUS"),
+      );
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("ignores a late ACK result from a superseded socket generation", async () => {
+    const originalWebSocket = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class TestWebSocket extends FakeWebSocket {
+      constructor(url: string, protocols: string[]) {
+        super(url, [...protocols]);
+        sockets.push(this);
+      }
+    }
+    Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+    globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+    const frames: IncomingFrame[] = [];
+    try {
+      const relay = new RelaySocket(session, (frame) => frames.push(frame), () => undefined);
+      relay.connect();
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      const first = sockets[0];
+      first.readyState = 1;
+      first.onopen?.(new Event("open"));
+      const pending = relay.acknowledge(
+        "dm_123",
+        "ack-stale",
+        "Bob",
+        ackState(),
+        ACK_SIGNATURE,
+        "used-prekey",
+      );
+      first.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
+      await expect(pending).resolves.toBe("AMBIGUOUS");
+      await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 3_000 });
+      const second = sockets[1];
+      second.readyState = 1;
+      second.onopen?.(new Event("open"));
+      first.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-stale",
+        accepted: true,
+      }) }));
+      expect(frames).toEqual([]);
+      relay.close();
+    } finally {
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
 });
 
 class FakeWebSocket {
@@ -874,4 +1584,47 @@ class FakeWebSocket {
   close(): void {
     this.readyState = 3;
   }
+}
+
+function ackState() {
+  return {
+    revision: 2,
+    envelope: new Uint8Array([2, 3, 4]),
+    identityPublicKey: new Uint8Array(128).fill(7),
+    prekeyId: "test-prekey",
+    stateSignature: new Uint8Array(64).fill(8),
+  };
+}
+
+async function connectRelay(
+  onFrame: (frame: IncomingFrame) => void = () => undefined,
+  onPurge: () => void = () => undefined,
+): Promise<{
+  relay: RelaySocket;
+  socket: FakeWebSocket;
+  frames: IncomingFrame[];
+  originalWebSocket: typeof WebSocket;
+}> {
+  const originalWebSocket = globalThis.WebSocket;
+  const sockets: FakeWebSocket[] = [];
+  class TestWebSocket extends FakeWebSocket {
+    constructor(url: string, protocols: string[]) {
+      super(url, [...protocols]);
+      sockets.push(this);
+    }
+  }
+  Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
+  globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
+  vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+  const frames: IncomingFrame[] = [];
+  const relay = new RelaySocket(session, (frame) => {
+    frames.push(frame);
+    onFrame(frame);
+  }, () => undefined, onPurge);
+  relay.connect();
+  await vi.waitFor(() => expect(sockets).toHaveLength(1));
+  const socket = sockets[0];
+  socket.readyState = 1;
+  socket.onopen?.(new Event("open"));
+  return { relay, socket, frames, originalWebSocket };
 }

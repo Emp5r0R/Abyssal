@@ -13,9 +13,17 @@ import org.json.JSONObject
 import uniffi.abyssal_core.E2eeSession
 import uniffi.abyssal_core.RecipientPublicKey
 
+internal class FatalPayloadCipherException(cause: Throwable) :
+    IllegalStateException("Identity unavailable", cause)
+
 class InMemoryPayloadCipher {
     private var session: E2eeSession? = null
+    /** State visible after the last committed encrypt/decrypt operation. */
+    private var committedState: IdentityStateSnapshot? = null
+    /** State emitted by the one outbound operation awaiting relay admission. */
     private var pendingState: IdentityStateSnapshot? = null
+    /** Snapshot to restore if that outbound operation is explicitly rejected. */
+    private var pendingPreviousState: IdentityStateSnapshot? = null
 
     data class DecryptionResult(
         val plaintext: ByteArray
@@ -56,7 +64,7 @@ class InMemoryPayloadCipher {
     fun prekeyId(): String = requireSession().prekeyId()
 
     @Synchronized
-    fun stateSnapshot(): IdentityStateSnapshot? = pendingState?.let {
+    fun stateSnapshot(): IdentityStateSnapshot? = (pendingState ?: committedState)?.let {
         IdentityStateSnapshot(
             revision = it.revision,
             envelope = it.envelope.clone(),
@@ -74,41 +82,69 @@ class InMemoryPayloadCipher {
         plainBytes: ByteArray,
         recipients: List<RecipientIdentity>
     ): EncryptedTransportPayload {
+        check(pendingState == null) { "Outbound operation already pending" }
+        wipeState(pendingPreviousState)
+        pendingPreviousState = copyState(committedState)
         val uniqueRecipients = recipients
             .distinctBy { it.username.lowercase(Locale.ROOT) }
             .map { RecipientPublicKey(it.username, it.publicKey, it.prekeyId) }
-        val encrypted = requireSession().encrypt(
-            chatId,
-            messageId,
-            senderUsername,
-            plainBytes,
-            uniqueRecipients
-        )
-        rememberState(
-            encrypted.stateRevision,
-            encrypted.identityEnvelope,
-            encrypted.identityPublic,
-            encrypted.prekeyId,
-            encrypted.stateSignature
-        )
-        return EncryptedTransportPayload(
-            version = encrypted.version.toInt(),
-            messageId = encrypted.messageId,
-            nonce = encrypted.nonce,
-            ciphertext = encrypted.ciphertext,
-            envelopes = encrypted.envelopes.map {
-                RecipientEnvelope(it.username, it.wrappedKey, it.prekeyId, it.isPrekey, it.signature)
-            },
-            stateRevision = encrypted.stateRevision,
-            identityEnvelope = encrypted.identityEnvelope,
-            identityPublicKey = encrypted.identityPublic,
-            prekeyId = encrypted.prekeyId,
-            stateSignature = encrypted.stateSignature
-        )
+        var encrypted: uniffi.abyssal_core.E2eePayload? = null
+        return try {
+            encrypted = requireSession().encrypt(
+                chatId,
+                messageId,
+                senderUsername,
+                plainBytes,
+                uniqueRecipients
+            )
+            val native = requireNotNull(encrypted)
+            pendingState = state(
+                native.stateRevision,
+                native.identityEnvelope,
+                native.identityPublic,
+                native.prekeyId,
+                native.stateSignature
+            )
+            EncryptedTransportPayload(
+                version = native.version.toInt(),
+                messageId = native.messageId,
+                nonce = native.nonce,
+                ciphertext = native.ciphertext,
+                envelopes = native.envelopes.map {
+                    RecipientEnvelope(it.username, it.wrappedKey, it.prekeyId, it.isPrekey, it.signature)
+                },
+                stateRevision = native.stateRevision,
+                identityEnvelope = native.identityEnvelope,
+                identityPublicKey = native.identityPublic,
+                prekeyId = native.prekeyId,
+                stateSignature = native.stateSignature
+            )
+        } catch (error: Throwable) {
+            val native = encrypted
+            var rollbackFailure: Throwable? = null
+            if (native != null) {
+                try {
+                    requireSession().rollbackOutbound(native.messageId, native.stateRevision)
+                } catch (rollbackError: Throwable) {
+                    rollbackFailure = rollbackError
+                }
+                wipeNativePayload(native)
+            }
+            wipeState(pendingState)
+            pendingState = null
+            wipeState(pendingPreviousState)
+            pendingPreviousState = null
+            if (rollbackFailure != null) {
+                clear()
+                throw FatalPayloadCipherException(requireNotNull(rollbackFailure))
+            }
+            throw error
+        }
     }
 
     @Synchronized
     fun decrypt(payload: IncomingTransportPayload, recipientUsername: String): DecryptionResult {
+        check(pendingState == null) { "Outbound operation already pending" }
         val decrypted = requireSession().decrypt(
             payload.chatId,
             payload.messageId,
@@ -126,13 +162,22 @@ class InMemoryPayloadCipher {
         )
         var result: DecryptionResult? = null
         return try {
-            rememberState(
-                decrypted.stateRevision,
-                decrypted.identityEnvelope,
-                decrypted.identityPublic,
-                decrypted.prekeyId,
-                decrypted.stateSignature
-            )
+            try {
+                replaceCommittedState(
+                    decrypted.stateRevision,
+                    decrypted.identityEnvelope,
+                    decrypted.identityPublic,
+                    decrypted.prekeyId,
+                    decrypted.stateSignature
+                )
+            } catch (error: Throwable) {
+                // Native decryption has already advanced the ratchet. If the
+                // JVM wrapper cannot install that state, retaining this
+                // session would make the next operation use an unknown state.
+                // Clear all native/session material and make the failure
+                // distinguishable from an ordinary authentication rejection.
+                clearAfterFatalStateInstall(error)
+            }
             result = DecryptionResult(plaintext = decrypted.plaintext)
             result
         } finally {
@@ -155,6 +200,29 @@ class InMemoryPayloadCipher {
             messageId,
             senderUsername,
             usedPrekeyId
+        )
+        require(signature.size == ACK_SIGNATURE_BYTES)
+        return signature
+    }
+
+    @Synchronized
+    fun signRegistrationIdentityProof(
+        nodeId: String,
+        handshakeId: String,
+        challenge: ByteArray,
+        registrationUpload: ByteArray,
+        identityPublic: ByteArray,
+        prekeyId: String,
+        identityEnvelope: ByteArray
+    ): ByteArray {
+        val signature = requireSession().signRegistrationIdentityProof(
+            nodeId,
+            handshakeId,
+            challenge,
+            registrationUpload,
+            identityPublic,
+            prekeyId,
+            identityEnvelope
         )
         require(signature.size == ACK_SIGNATURE_BYTES)
         return signature
@@ -264,19 +332,54 @@ class InMemoryPayloadCipher {
     }
 
     @Synchronized
-    fun clear() {
-        pendingState?.envelope?.fill(0)
-        pendingState?.identityPublicKey?.fill(0)
-        pendingState?.stateSignature?.fill(0)
+    fun commitOutbound(messageId: String, revision: ULong) {
+        val staged = pendingState ?: throw IllegalStateException("Outbound operation unavailable")
+        require(staged.revision == revision) { "Outbound operation unavailable" }
+        requireSession().commitOutbound(messageId, revision)
+        wipeState(committedState)
+        committedState = staged
         pendingState = null
-        session?.close()
+        wipeState(pendingPreviousState)
+        pendingPreviousState = null
+    }
+
+    @Synchronized
+    fun rollbackOutbound(messageId: String, revision: ULong) {
+        val staged = pendingState ?: throw IllegalStateException("Outbound operation unavailable")
+        require(staged.revision == revision) { "Outbound operation unavailable" }
+        requireSession().rollbackOutbound(messageId, revision)
+        wipeState(staged)
+        pendingState = null
+        wipeState(committedState)
+        committedState = pendingPreviousState
+        pendingPreviousState = null
+    }
+
+    @Synchronized
+    fun clear() {
+        wipeState(committedState)
+        wipeState(pendingState)
+        wipeState(pendingPreviousState)
+        committedState = null
+        pendingState = null
+        pendingPreviousState = null
+        val activeSession = session
         session = null
+        // Detach the session before closing it so even a native close failure
+        // cannot leave this wrapper looking usable after a fatal transition.
+        activeSession?.close()
     }
 
     private fun requireSession(): E2eeSession =
         session ?: throw IllegalStateException("Identity unavailable")
 
-    private fun rememberState(
+    private fun clearAfterFatalStateInstall(error: Throwable): Nothing {
+        runCatching { clear() }
+            .onFailure(error::addSuppressed)
+        throw FatalPayloadCipherException(error)
+    }
+
+    private fun replaceCommittedState(
         revision: ULong,
         envelope: ByteArray,
         identityPublicKey: ByteArray,
@@ -284,16 +387,59 @@ class InMemoryPayloadCipher {
         stateSignature: ByteArray
     ) {
         require(stateSignature.size == STATE_SIGNATURE_BYTES)
-        pendingState?.envelope?.fill(0)
-        pendingState?.identityPublicKey?.fill(0)
-        pendingState?.stateSignature?.fill(0)
-        pendingState = IdentityStateSnapshot(
+        wipeState(committedState)
+        committedState = state(
             revision = revision,
             envelope = envelope.clone(),
             identityPublicKey = identityPublicKey.clone(),
             prekeyId = prekeyId,
             stateSignature = stateSignature.clone()
         )
+    }
+
+    private fun state(
+        revision: ULong,
+        envelope: ByteArray,
+        identityPublicKey: ByteArray,
+        prekeyId: String,
+        stateSignature: ByteArray
+    ): IdentityStateSnapshot {
+        require(stateSignature.size == STATE_SIGNATURE_BYTES)
+        return IdentityStateSnapshot(
+            revision = revision,
+            envelope = envelope.clone(),
+            identityPublicKey = identityPublicKey.clone(),
+            prekeyId = prekeyId,
+            stateSignature = stateSignature.clone()
+        )
+    }
+
+    private fun copyState(value: IdentityStateSnapshot?): IdentityStateSnapshot? = value?.let {
+        IdentityStateSnapshot(
+            revision = it.revision,
+            envelope = it.envelope.clone(),
+            identityPublicKey = it.identityPublicKey.clone(),
+            prekeyId = it.prekeyId,
+            stateSignature = it.stateSignature.clone()
+        )
+    }
+
+    private fun wipeState(value: IdentityStateSnapshot?) {
+        value?.envelope?.fill(0)
+        value?.identityPublicKey?.fill(0)
+        value?.stateSignature?.fill(0)
+    }
+
+    private fun wipeNativePayload(value: uniffi.abyssal_core.E2eePayload) {
+        value.nonce.fill(0)
+        value.ciphertext.fill(0)
+        value.identityEnvelope.fill(0)
+        value.identityPublic.fill(0)
+        value.stateSignature.fill(0)
+        value.envelopes.forEach {
+            it.wrappedKey.fill(0)
+            it.signature.fill(0)
+        }
     }
 
     data class IdentityMaterial(
@@ -303,7 +449,7 @@ class InMemoryPayloadCipher {
     )
 
     private companion object {
-        const val PROTOCOL_VERSION = 7
+        const val PROTOCOL_VERSION = 8
         const val MESSAGE_NONCE_BYTES = 12
         const val MESSAGE_SIGNATURE_BYTES = 64
         const val STATE_SIGNATURE_BYTES = 64
@@ -311,7 +457,7 @@ class InMemoryPayloadCipher {
         const val IDENTITY_PUBLIC_KEY_BYTES = 128
         const val MAX_WRAPPED_KEY_BYTES = 4096
         const val MAX_METADATA_SERIALIZED_BYTES = 1 * 1024 * 1024
-        const val MAX_METADATA_CIPHERTEXT_BYTES = 1 * 1024 * 1024
+        const val MAX_METADATA_CIPHERTEXT_BYTES = 1_048_848
         const val MAX_RECIPIENT_ENVELOPES = 256
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
 

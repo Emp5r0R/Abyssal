@@ -107,6 +107,7 @@ import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.data.network.BoundedInputReader
+import com.abyssal.chat.data.network.attachmentSelectionLimitBytes
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.DeepBlack
@@ -887,7 +888,7 @@ private fun AttachmentDialog(
         scope.launch {
             try {
                 val picked = withContext(Dispatchers.IO) {
-                    context.readPickedAttachment(uri, mediaType, attachmentLimitBytes(mediaType))
+                    context.readPickedAttachment(uri, mediaType, attachmentSelectionLimitBytes(mediaType))
                 }
                 if (picked == null) {
                     localError = "Wrong information."
@@ -1260,7 +1261,11 @@ private fun BundledEmojiPreview(
     }
 
     val bytes = remember(assetPath) {
-        runCatching { context.assets.open(assetPath).use { it.readBytes() } }.getOrNull()
+        runCatching {
+            context.assets.open(assetPath).use {
+                BoundedInputReader.read(it, attachmentSelectionLimitBytes("IMAGE"))
+            }
+        }.getOrNull()
     }
     val bitmap = remember(bytes) { bytes?.let(::decodeBoundedPreviewBitmap) }
     if (bitmap != null) {
@@ -1984,7 +1989,7 @@ private fun Context.listBundledEmojiAssets(): List<BundledEmojiAsset> {
 private fun Context.readBundledEmoji(asset: BundledEmojiAsset): BundledEmojiPayload? {
     return runCatching {
         val bytes = assets.open(asset.path).use {
-            BoundedInputReader.read(it, attachmentLimitBytes("IMAGE"))
+            BoundedInputReader.read(it, attachmentSelectionLimitBytes("IMAGE"))
         } ?: return null
         if (bytes.isEmpty()) return null
         BundledEmojiPayload(
@@ -2022,14 +2027,6 @@ private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: 
             bytes = bytes
         )
     }.getOrNull()
-}
-
-private fun attachmentLimitBytes(mediaType: String): Long {
-    return when (mediaType.uppercase()) {
-        "IMAGE" -> 20L * 1024L * 1024L
-        "VIDEO" -> 100L * 1024L * 1024L
-        else -> 200L * 1024L * 1024L
-    }
 }
 
 private const val MAX_PREVIEW_DIMENSION = 4096

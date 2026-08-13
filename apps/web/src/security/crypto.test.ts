@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { WasmE2eeSession } from "../generated/abyssal_core/abyssal_core";
 import {
   base64ToBytes,
   base64NoPaddingLength,
@@ -6,6 +7,7 @@ import {
   conversationSafetyNumber,
   finishOpaqueLogin,
   finishOpaqueRegistration,
+  FatalCipherError,
   identityContext,
   InMemoryPayloadCipher,
   maxSerializedAttachmentBytes,
@@ -15,6 +17,8 @@ import {
   wipeBytes,
 } from "./crypto";
 
+afterEach(() => vi.restoreAllMocks());
+
 const CHAT_ID = "forum_security";
 const MESSAGE_ID = "message_1";
 const CONTEXT = new TextEncoder().encode("ABYSSAL_IDENTITY_V2:test:CODE-1234567");
@@ -23,6 +27,10 @@ function identity(fill: number): InMemoryPayloadCipher {
   const cipher = new InMemoryPayloadCipher();
   cipher.createIdentity(new Uint8Array(64).fill(fill), CONTEXT);
   return cipher;
+}
+
+function commit(cipher: InMemoryPayloadCipher, payload: { messageId: string; stateRevision: number }): void {
+  cipher.commitOutbound(payload.messageId, payload.stateRevision);
 }
 
 describe("OPAQUE client bindings", () => {
@@ -80,6 +88,221 @@ describe("conversation safety numbers", () => {
 });
 
 describe("recipient E2EE", () => {
+  it("rolls back malformed staged output exactly and invalidates unparseable native output", () => {
+    const alice = identity(17);
+    const bob = identity(18);
+    const recipients = [{ username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() }];
+    const originalEncrypt = WasmE2eeSession.prototype.encrypt;
+    vi.spyOn(WasmE2eeSession.prototype, "encrypt").mockImplementationOnce(function (
+      this: WasmE2eeSession,
+      ...args: Parameters<WasmE2eeSession["encrypt"]>
+    ) {
+      const result = JSON.parse(originalEncrypt.apply(this, args)) as {
+        envelopes: Array<{ prekey_id: string }>;
+      };
+      result.envelopes[0].prekey_id = "";
+      return JSON.stringify(result);
+    });
+
+    let stagedError: unknown;
+    try {
+      alice.encryptText(CHAT_ID, "malformed-staged", "Alice", "first", recipients);
+    } catch (error) {
+      stagedError = error;
+    }
+    expect(stagedError).toBeInstanceOf(Error);
+    expect(stagedError).not.toBeInstanceOf(FatalCipherError);
+
+    const retry = alice.encryptText(CHAT_ID, "malformed-staged", "Alice", "retry", recipients);
+    commit(alice, retry);
+
+    vi.spyOn(WasmE2eeSession.prototype, "encrypt").mockReturnValueOnce("{");
+    expect(() => alice.encryptText(CHAT_ID, "unparseable-staged", "Alice", "fatal", recipients))
+      .toThrow(FatalCipherError);
+    expect(() => alice.publicKey()).toThrow("Identity unavailable");
+  });
+
+  it("preserves the session when native encryption throws before returning staged output", () => {
+    const alice = identity(15);
+    const bob = identity(16);
+    const recipients = [{ username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() }];
+    vi.spyOn(WasmE2eeSession.prototype, "encrypt").mockImplementationOnce(() => {
+      throw new Error("native rejected before returning");
+    });
+
+    expect(() => alice.encryptText(CHAT_ID, "native-rejected", "Alice", "first", recipients))
+      .toThrow("Payload unavailable");
+    expect(alice.publicKey()).toHaveLength(128);
+    const retry = alice.encryptText(CHAT_ID, "native-retry", "Alice", "retry", recipients);
+    commit(alice, retry);
+  });
+
+  it("keeps the identity for native authentication failures but fails closed after native return", () => {
+    const alice = identity(25);
+    const bob = identity(26);
+    const payload = alice.encryptText(CHAT_ID, "decrypt-phase", "Alice", "classified", [
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
+    ]);
+    commit(alice, payload);
+    const envelope = payload.envelopes[0];
+    const decryptArgs = () => bob.decryptText(
+      CHAT_ID,
+      payload.messageId,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      envelope.signature,
+      envelope.wrappedKey,
+      envelope.prekeyId,
+      envelope.isPrekey,
+      "Bob",
+    );
+
+    vi.spyOn(WasmE2eeSession.prototype, "decrypt").mockImplementationOnce(() => {
+      throw new Error("authentication rejected before native return");
+    });
+    let nativeError: unknown;
+    try {
+      decryptArgs();
+    } catch (error) {
+      nativeError = error;
+    }
+    expect(nativeError).toBeInstanceOf(Error);
+    expect(nativeError).not.toBeInstanceOf(FatalCipherError);
+    expect(bob.publicKey()).toHaveLength(128);
+    expect(decryptArgs()).toBe("classified");
+  });
+
+  it("invalidates the identity when native decrypt returns unparseable output", () => {
+    const alice = identity(29);
+    const bob = identity(30);
+    const payload = alice.encryptText(CHAT_ID, "unparseable-decrypt", "Alice", "classified", [
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
+    ]);
+    commit(alice, payload);
+    const envelope = payload.envelopes[0];
+    vi.spyOn(WasmE2eeSession.prototype, "decrypt").mockReturnValueOnce("{");
+
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      payload.messageId,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      envelope.signature,
+      envelope.wrappedKey,
+      envelope.prekeyId,
+      envelope.isPrekey,
+      "Bob",
+    )).toThrow(FatalCipherError);
+    expect(() => bob.publicKey()).toThrow("Identity unavailable");
+  });
+
+  it("invalidates the identity when native decrypt returns malformed wrapper state", () => {
+    const alice = identity(27);
+    const bob = identity(28);
+    const payload = alice.encryptText(CHAT_ID, "malformed-decrypt", "Alice", "classified", [
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
+    ]);
+    commit(alice, payload);
+    const envelope = payload.envelopes[0];
+    const originalDecrypt = WasmE2eeSession.prototype.decrypt;
+    vi.spyOn(WasmE2eeSession.prototype, "decrypt").mockImplementationOnce(function (
+      this: WasmE2eeSession,
+      ...args: Parameters<WasmE2eeSession["decrypt"]>
+    ) {
+      const result = JSON.parse(originalDecrypt.apply(this, args)) as { state_revision: number };
+      result.state_revision = 0;
+      return JSON.stringify(result);
+    });
+
+    expect(() => bob.decryptText(
+      CHAT_ID,
+      payload.messageId,
+      "Alice",
+      alice.publicKey(),
+      payload,
+      envelope.signature,
+      envelope.wrappedKey,
+      envelope.prekeyId,
+      envelope.isPrekey,
+      "Bob",
+    )).toThrow(FatalCipherError);
+    expect(() => bob.publicKey()).toThrow("Identity unavailable");
+  });
+
+  it("accepts an empty prekey id when a reply uses the established session", () => {
+    const alice = identity(19);
+    const bob = identity(20);
+    const recipients = [{ username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() }];
+
+    const first = alice.encryptText(CHAT_ID, "prekey-first", "Alice", "first", recipients);
+    expect(first.envelopes[0].isPrekey).toBe(true);
+    expect(first.envelopes[0].prekeyId).toMatch(/^[A-Za-z0-9_-]{1,32}$/u);
+    commit(alice, first);
+    expect(bob.decryptText(
+      CHAT_ID,
+      first.messageId,
+      "Alice",
+      alice.publicKey(),
+      first,
+      first.envelopes[0].signature,
+      first.envelopes[0].wrappedKey,
+      first.envelopes[0].prekeyId,
+      first.envelopes[0].isPrekey,
+      "Bob",
+    )).toBe("first");
+
+    const second = bob.encryptText(CHAT_ID, "prekey-established", "Bob", "second", [{
+      username: "Alice",
+      publicKey: alice.publicKey(),
+      prekeyId: alice.prekeyId(),
+    }]);
+    expect(second.envelopes[0].isPrekey).toBe(false);
+    expect(second.envelopes[0].prekeyId).toBe("");
+    commit(bob, second);
+    expect(alice.decryptText(
+      CHAT_ID,
+      second.messageId,
+      "Bob",
+      bob.publicKey(),
+      second,
+      second.envelopes[0].signature,
+      second.envelopes[0].wrappedKey,
+      second.envelopes[0].prekeyId,
+      second.envelopes[0].isPrekey,
+      "Alice",
+    )).toBe("second");
+  });
+
+  it("requires an exact outbound commit or rollback before another ratchet operation", () => {
+    const alice = identity(21);
+    const bob = identity(22);
+    const recipients = [{ username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() }];
+    const first = alice.encryptText(CHAT_ID, "transaction-one", "Alice", "one", recipients);
+    expect(alice.stateSnapshot()?.revision).toBe(first.stateRevision);
+    expect(() => alice.encryptText(CHAT_ID, "transaction-two", "Alice", "two", recipients)).toThrow();
+    expect(() => alice.commitOutbound(first.messageId, first.stateRevision + 1)).toThrow();
+    alice.rollbackOutbound(first.messageId, first.stateRevision);
+    expect(alice.stateSnapshot()).toBeNull();
+    const retry = alice.encryptText(CHAT_ID, "transaction-two", "Alice", "two", recipients);
+    alice.commitOutbound(retry.messageId, retry.stateRevision);
+    expect(() => alice.rollbackOutbound(retry.messageId, retry.stateRevision)).toThrow();
+  });
+
+  it("uses canonical padded ciphertext buckets and rejects malformed wire payloads", () => {
+    const alice = identity(23);
+    const bob = identity(24);
+    const payload = alice.encryptText(CHAT_ID, "padding-one", "Alice", "padded", [
+      { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
+    ]);
+    alice.commitOutbound(payload.messageId, payload.stateRevision);
+    expect(payload.ciphertext.byteLength).toBeGreaterThanOrEqual(272);
+    expect((payload.ciphertext.byteLength - 16) % 256).toBe(0);
+    const malformed = { ...payload, ciphertext: new Uint8Array(17) };
+    expect(() => payloadToFrame(malformed)).toThrow();
+  });
+
   it("decrypts only for intended recipient and verifies sender signature", () => {
     const alice = identity(1);
     const bob = identity(2);
@@ -87,9 +310,10 @@ describe("recipient E2EE", () => {
     const payload = alice.encryptText(CHAT_ID, MESSAGE_ID, "Alice", "classified", [
       { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
+    commit(alice, payload);
     const envelope = payload.envelopes[0];
 
-    expect(payload.version).toBe(7);
+    expect(payload.version).toBe(8);
     expect(payload.stateRevision).toBe(1);
     expect(payload.identityEnvelope.byteLength).toBeGreaterThan(64);
     expect(payload.stateSignature.byteLength).toBe(STATE_SIGNATURE_BYTES);
@@ -144,7 +368,9 @@ describe("recipient E2EE", () => {
     bob.createIdentity(bobExport, CONTEXT);
     const recipients = [{ username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() }];
     const first = alice.encryptText(CHAT_ID, "message_early", "Alice", "early", recipients);
+    commit(alice, first);
     const second = alice.encryptText(CHAT_ID, "message_late", "Alice", "late", recipients);
+    commit(alice, second);
 
     expect(bob.decryptText(
       CHAT_ID,
@@ -188,6 +414,7 @@ describe("recipient E2EE", () => {
     const restored = new InMemoryPayloadCipher();
     restored.recoverIdentity(bobExport, CONTEXT, latest!.envelope, bob.publicKey());
     const third = alice.encryptText(CHAT_ID, "message_after_restore", "Alice", "restored", recipients);
+    commit(alice, third);
     expect(restored.decryptText(
       CHAT_ID,
       third.messageId,
@@ -208,6 +435,7 @@ describe("recipient E2EE", () => {
     const payload = alice.encryptText(CHAT_ID, MESSAGE_ID, "Alice", "secret", [
       { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
+    commit(alice, payload);
     const decrypt = () => bob.decryptText(
       CHAT_ID,
       MESSAGE_ID,
@@ -368,6 +596,7 @@ describe("recipient E2EE", () => {
     const framePayload = alice.encryptText(CHAT_ID, "frame_1", "Alice", "frame", [
       { username: "Bob", publicKey: bob.publicKey(), prekeyId: bob.prekeyId() },
     ]);
+    commit(alice, framePayload);
     const frame = payloadToFrame(framePayload);
     framePayload.nonce.fill(0);
     framePayload.ciphertext.fill(0);
@@ -378,7 +607,7 @@ describe("recipient E2EE", () => {
       envelope.wrappedKey.fill(0);
       envelope.signature.fill(0);
     });
-    expect(frame.version).toBe(7);
+    expect(frame.version).toBe(8);
     expect(frame).not.toHaveProperty("signature_b64");
     expect(frame.state_signature_b64).toBeTruthy();
     expect((frame.envelopes as Array<{ signature_b64: string }>)[0].signature_b64).toBeTruthy();

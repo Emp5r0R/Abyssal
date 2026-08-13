@@ -157,6 +157,7 @@ describe("Abyssal System Security & Feature Suite", () => {
         plainText,
         [{ username: "Bob", publicKey: receiverCipher.publicKey(), prekeyId: receiverCipher.prekeyId() }],
       );
+      senderCipher.commitOutbound(encrypted.messageId, encrypted.stateRevision);
       expect(encrypted.ciphertext).not.toEqual(new TextEncoder().encode(plainText));
 
       const decrypted = receiverCipher.decryptText(
@@ -225,6 +226,7 @@ describe("Abyssal System Security & Feature Suite", () => {
         }),
         [{ username: "Bob", publicKey: recipient.publicKey(), prekeyId: recipient.prekeyId() }],
       );
+      sender.commitOutbound(metadata.messageId, metadata.stateRevision);
       const metadataPlaintext = recipient.decryptText(
         "forum_media",
         "message_media",

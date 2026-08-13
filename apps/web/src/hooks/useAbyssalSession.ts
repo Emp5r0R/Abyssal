@@ -35,6 +35,7 @@ import {
   ATTACHMENT_CIPHER_VERSION,
   finishOpaqueLogin,
   finishOpaqueRegistration,
+  FatalCipherError,
   identityContext,
   InMemoryPayloadCipher,
   payloadToFrame,
@@ -57,6 +58,7 @@ import {
   revokeSession,
   startOpaqueAccount,
   uploadEncryptedAttachment,
+  type EncryptedSendOutcome,
   type AttachmentPlaintextPolicy,
   type DownloadedEncryptedAttachment,
 } from "../transport/nodeClient";
@@ -69,6 +71,7 @@ const MAX_ROOM_CATALOG = 1024;
 const MAX_DIRECT_CATALOG = 128;
 const MAX_PRESENCE_USERS = 128;
 const MAX_PINNED_IDENTITIES = 1024;
+const MAX_OWN_MESSAGE_IDS = 10_000;
 const MAX_TIMER_SECONDS = 86_400;
 const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
 const ROOM_ID_PATTERN = /^forum_[A-Za-z0-9_-]{1,122}$/u;
@@ -108,7 +111,24 @@ interface UploadState extends UploadProgress {
   name: string;
 }
 
+interface AttachmentOperation {
+  controller: AbortController;
+  generation: number;
+  wipe: () => void;
+}
+
 const EMPTY_UPLOAD: UploadState = { active: false, name: "", loaded: 0, total: 0 };
+
+class AsyncCryptoGate {
+  #tail: Promise<void> = Promise.resolve();
+
+  run<T>(operation: () => T | Promise<T>): Promise<T> {
+    const ready = this.#tail.catch(() => undefined);
+    let release!: () => void;
+    this.#tail = new Promise<void>((resolve) => { release = resolve; });
+    return ready.then(operation).finally(() => release());
+  }
+}
 
 function attachmentPlaintextPolicy(
   attachment: NonNullable<ChatMessage["attachment"]>,
@@ -149,6 +169,10 @@ export function useAbyssalSession() {
   const receivedFrameIdsRef = useRef(new Set<string>());
   const identityPinsRef = useRef(new Map<string, string>());
   const sendReadReceiptRef = useRef<(chatId: string, messageId: string) => void>(() => undefined);
+  const sessionGenerationRef = useRef(0);
+  const cryptoGateRef = useRef(new AsyncCryptoGate());
+  const attachmentOperationsRef = useRef(new Set<AttachmentOperation>());
+  const exportUrlsRef = useRef(new Map<string, number | null>());
 
   useEffect(() => {
     sessionRef.current = session;
@@ -180,6 +204,48 @@ export function useAbyssalSession() {
     setMessages(next);
   }, []);
 
+  const cancelAttachmentOperations = useCallback(() => {
+    const operations = [...attachmentOperationsRef.current];
+    attachmentOperationsRef.current.clear();
+    operations.forEach((operation) => {
+      operation.controller.abort();
+      operation.wipe();
+    });
+  }, []);
+
+  const revokeExportUrl = useCallback((url: string) => {
+    const timer = exportUrlsRef.current.get(url);
+    if (timer === undefined) return;
+    exportUrlsRef.current.delete(url);
+    if (timer !== null) window.clearTimeout(timer);
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const clearExportUrls = useCallback(() => {
+    [...exportUrlsRef.current.keys()].forEach(revokeExportUrl);
+  }, [revokeExportUrl]);
+
+  const startAttachmentOperation = useCallback((wipe: () => void): AttachmentOperation => {
+    const operation = {
+      controller: new AbortController(),
+      generation: sessionGenerationRef.current,
+      wipe,
+    };
+    attachmentOperationsRef.current.add(operation);
+    return operation;
+  }, []);
+
+  const finishAttachmentOperation = useCallback((operation: AttachmentOperation) => {
+    attachmentOperationsRef.current.delete(operation);
+    operation.wipe();
+  }, []);
+
+  const attachmentOperationActive = useCallback((operation: AttachmentOperation, token: string): boolean => (
+    !operation.controller.signal.aborted &&
+    operation.generation === sessionGenerationRef.current &&
+    sessionRef.current?.token === token
+  ), []);
+
   const clearMedia = useCallback(() => {
     const current = mediaRef.current;
     mediaRef.current = null;
@@ -189,13 +255,18 @@ export function useAbyssalSession() {
 
   useEffect(() => {
     return () => {
+      cancelAttachmentOperations();
+      clearExportUrls();
       const current = mediaRef.current;
       mediaRef.current = null;
       if (current) URL.revokeObjectURL(current.objectUrl);
     };
-  }, []);
+  }, [cancelAttachmentOperations, clearExportUrls]);
 
   const clearMemory = useCallback(() => {
+    sessionGenerationRef.current += 1;
+    cancelAttachmentOperations();
+    clearExportUrls();
     loginAbortRef.current?.abort();
     loginAbortRef.current = null;
     const currentSession = sessionRef.current;
@@ -229,7 +300,7 @@ export function useAbyssalSession() {
     retainWhenHiddenRef.current = false;
     lastActivityRef.current = 0;
     lastActivitySignalRef.current = 0;
-  }, [clearMedia]);
+  }, [cancelAttachmentOperations, clearExportUrls, clearMedia]);
 
   const clearPrivateView = useCallback(() => {
     clearMedia();
@@ -242,6 +313,11 @@ export function useAbyssalSession() {
     const current = sessionRef.current;
     clearMemory();
     if (current) await revokeSession(current);
+  }, [clearMemory]);
+
+  const failClosed = useCallback((candidate: AccountSession | null = sessionRef.current) => {
+    clearMemory();
+    if (candidate) void revokeSession(candidate);
   }, [clearMemory]);
 
   const touchActivity = useCallback(() => {
@@ -365,10 +441,21 @@ export function useAbyssalSession() {
     }
     if (frame.type !== "message" || frame.version !== PROTOCOL_VERSION) return;
 
-    try {
+    const operationGeneration = sessionGenerationRef.current;
+    const operationToken = sessionRef.current?.token;
+    await cryptoGateRef.current.run(async () => {
+      if (
+        operationGeneration !== sessionGenerationRef.current ||
+        !operationToken ||
+        sessionRef.current?.token !== operationToken
+      ) return;
       const currentSession = sessionRef.current;
       if (!currentSession) return;
+      try {
       const senderKey = frame.sender_username.toLowerCase();
+      const conversation = conversationForId(roomsRef.current, directsRef.current, frame.chat_id);
+      if (!conversation || (conversation.conversation_type === "direct" &&
+        conversation.peer_username?.toLowerCase() !== senderKey)) return;
       if (!presenceRef.current.some((user) => user.username.toLowerCase() === senderKey)) return;
       const pinnedFingerprint = identityPinsRef.current.get(senderKey);
       if (!pinnedFingerprint) return;
@@ -386,7 +473,7 @@ export function useAbyssalSession() {
           clearMemory();
           return;
         }
-        let acknowledged = false;
+        let ackOutcome: EncryptedSendOutcome = "NOT_SENT";
         let ackSignature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
         try {
           ackSignature = cipherRef.current.signAcknowledgement(
@@ -395,21 +482,27 @@ export function useAbyssalSession() {
             frame.sender_username,
             frame.prekey_id,
           );
-          acknowledged = socketRef.current?.acknowledge(
+          ackOutcome = await (socketRef.current?.acknowledge(
             frame.chat_id,
             frame.message_id,
             frame.sender_username,
             stateSnapshot,
             ackSignature,
             frame.prekey_id,
-          ) ?? false;
+          ) ?? Promise.resolve("NOT_SENT"));
+        } catch {
+          ackOutcome = "NOT_SENT";
         } finally {
           wipeBytes(stateSnapshot.envelope);
           wipeBytes(stateSnapshot.identityPublicKey);
           wipeBytes(stateSnapshot.stateSignature);
           wipeBytes(ackSignature);
         }
-        if (!acknowledged) clearMemory();
+        if (
+          operationGeneration !== sessionGenerationRef.current ||
+          sessionRef.current?.token !== operationToken
+        ) return;
+        if (ackOutcome !== "ACCEPTED") failClosed(currentSession);
         return;
       }
       if (receivedFrameIdsRef.current.size >= 10_000) {
@@ -449,7 +542,7 @@ export function useAbyssalSession() {
         );
         const stateSnapshot = cipherRef.current.stateSnapshot();
         if (!stateSnapshot) throw new Error("Identity unavailable");
-        let acknowledged = false;
+        let ackOutcome: EncryptedSendOutcome = "NOT_SENT";
         let ackSignature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
         try {
           ackSignature = cipherRef.current.signAcknowledgement(
@@ -458,22 +551,28 @@ export function useAbyssalSession() {
             frame.sender_username,
             frame.prekey_id,
           );
-          acknowledged = socketRef.current?.acknowledge(
+          ackOutcome = await (socketRef.current?.acknowledge(
             frame.chat_id,
             frame.message_id,
             frame.sender_username,
             stateSnapshot,
             ackSignature,
             frame.prekey_id,
-          ) ?? false;
+          ) ?? Promise.resolve("NOT_SENT"));
+        } catch {
+          ackOutcome = "NOT_SENT";
         } finally {
           wipeBytes(stateSnapshot.envelope);
           wipeBytes(stateSnapshot.identityPublicKey);
           wipeBytes(stateSnapshot.stateSignature);
           wipeBytes(ackSignature);
         }
-        if (!acknowledged) {
-          clearMemory();
+        if (
+          operationGeneration !== sessionGenerationRef.current ||
+          sessionRef.current?.token !== operationToken
+        ) return;
+        if (ackOutcome !== "ACCEPTED") {
+          failClosed(currentSession);
           return;
         }
       } finally {
@@ -484,9 +583,14 @@ export function useAbyssalSession() {
         wipeBytes(signature);
         wipeBytes(wrappedKey);
       }
+      if (
+        operationGeneration !== sessionGenerationRef.current ||
+        sessionRef.current?.token !== operationToken
+      ) return;
       receivedFrameIdsRef.current.add(replayKey);
       const payload = JSON.parse(decrypted) as Record<string, unknown>;
       if (payload.kind === "read_receipt") {
+        if (payload.id !== frame.message_id) return;
         const targetId = typeof payload.message_id === "string" ? payload.message_id : "";
         if (!ownMessageIdsRef.current.has(targetId)) return;
         const readAtMs = Date.now();
@@ -503,11 +607,11 @@ export function useAbyssalSession() {
         });
         return;
       }
-      const room = conversationForId(roomsRef.current, directsRef.current, frame.chat_id);
       const message = parsePayload(
         frame.chat_id,
+        frame.message_id,
         payload,
-        room,
+        conversation,
         currentSession.username,
         frame.sender_username,
         frame.sender_public_key_b64,
@@ -518,16 +622,24 @@ export function useAbyssalSession() {
         wipeEvictedMessage(message);
         return;
       }
-      if (message.mine) ownMessageIdsRef.current.add(message.id);
+      if (message.mine) rememberBoundedId(ownMessageIdsRef.current, message.id, MAX_OWN_MESSAGE_IDS);
       if (activeRoomRef.current === frame.chat_id) {
         message.readAtMs = Date.now();
         sendReadReceiptRef.current(frame.chat_id, message.id);
       }
       updateMessages((current) => appendBoundedMessage(current, message));
-    } catch {
-      // Authentication failure or malformed plaintext stays outside UI state.
-    }
-  }, [clearMemory, updateMessages]);
+      } catch (error) {
+        if (
+          error instanceof FatalCipherError &&
+          operationGeneration === sessionGenerationRef.current &&
+          sessionRef.current?.token === operationToken
+        ) {
+          failClosed(currentSession);
+        }
+        // Authentication failure or malformed plaintext stays outside UI state.
+      }
+    });
+  }, [clearMemory, failClosed, updateMessages]);
 
   const login = useCallback(async (input: LoginInput): Promise<AccountSession> => {
     if (sessionRef.current || loginAbortRef.current) throw new Error("Action unavailable");
@@ -567,17 +679,31 @@ export function useAbyssalSession() {
             const result = await finishOpaqueRegistration(input.password, opaque, response);
             try {
               const identity = cipherRef.current.createIdentity(result.exportKey, context);
+              const challenge = base64ToBytes(start.challenge_b64!);
+              let identityProof: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
               try {
                 ensureLoginActive();
+                identityProof = cipherRef.current.signRegistrationIdentityProof(
+                  start.node_id,
+                  start.handshake_id!,
+                  challenge,
+                  result.registrationUpload,
+                  identity.publicKey,
+                  identity.prekeyId,
+                  identity.envelope,
+                );
                 nextSession = await finishOpaqueAccount(endpoint, {
                   handshakeId: start.handshake_id!,
                   registrationUpload: result.registrationUpload,
                   identityPublicKey: identity.publicKey,
                   identityPrekeyId: identity.prekeyId,
                   identityEnvelope: identity.envelope,
+                  identityProof,
                 }, loginAbort.signal);
                 ensureLoginActive();
               } finally {
+                wipeBytes(challenge);
+                wipeBytes(identityProof);
                 wipeBytes(identity.publicKey);
                 wipeBytes(identity.envelope);
               }
@@ -649,11 +775,27 @@ export function useAbyssalSession() {
         throw new Error("Wrong information");
       }
       retainWhenHiddenRef.current = input.retainWhenHidden;
+      const relayGeneration = sessionGenerationRef.current;
       lastActivityRef.current = Date.now();
       lastActivitySignalRef.current = Date.now();
       setRemainingSessionSec(nextSession.sessionInactivitySec);
       const candidate = nextSession;
-      candidateRelay = new RelaySocket(candidate, (frame) => void applyFrame(frame), setConnection);
+      candidateRelay = new RelaySocket(
+        candidate,
+        (frame) => {
+          if (sessionGenerationRef.current !== relayGeneration || sessionRef.current?.token !== candidate.token) return;
+          void applyFrame(frame);
+        },
+        (state) => {
+          if (sessionRef.current && sessionRef.current.token !== candidate.token) return;
+          setConnection(state);
+        },
+        () => {
+          if (sessionGenerationRef.current === relayGeneration && sessionRef.current?.token === candidate.token) {
+            failClosed(candidate);
+          }
+        },
+      );
       // Connect before publishing the session. WebSocket construction can
       // throw synchronously for a malformed endpoint; no partial session/ref
       // should be visible if that happens.
@@ -686,7 +828,7 @@ export function useAbyssalSession() {
     } finally {
       if (loginAbortRef.current === loginAbort) loginAbortRef.current = null;
     }
-  }, [applyFrame]);
+  }, [applyFrame, failClosed]);
 
   useEffect(() => {
     if (connection !== "connected") return;
@@ -727,6 +869,7 @@ export function useAbyssalSession() {
 
   const markRoomRead = useCallback((chatId: string) => {
     const now = Date.now();
+    const receipts: string[] = [];
     updateMessages((current) => {
       const roomMessages = current[chatId];
       if (!roomMessages) return current;
@@ -734,11 +877,12 @@ export function useAbyssalSession() {
       const nextMessages = roomMessages.map((message) => {
         if (message.mine || message.readAtMs !== undefined) return message;
         changed = true;
-        sendReadReceiptRef.current(chatId, message.id);
+        receipts.push(message.id);
         return { ...message, readAtMs: now };
       });
       return changed ? { ...current, [chatId]: nextMessages } : current;
     });
+    receipts.forEach((messageId) => sendReadReceiptRef.current(chatId, messageId));
   }, [updateMessages]);
 
   const openRoom = useCallback((chatId: string | null) => {
@@ -795,26 +939,99 @@ export function useAbyssalSession() {
     return recipients;
   }, []);
 
+  const runOutboundTransaction = useCallback(async (
+    currentSession: AccountSession,
+    generation: number,
+    chatId: string,
+    messageId: string,
+    recipients: Array<{ username: string; publicKey: Uint8Array; prekeyId: string }>,
+    createPayload: () => EncryptedPayload,
+  ): Promise<EncryptedSendOutcome> => {
+    let encrypted: EncryptedPayload | null = null;
+    let staged = false;
+    const active = () => generation === sessionGenerationRef.current &&
+      sessionRef.current?.token === currentSession.token;
+    try {
+      const outcome = await cryptoGateRef.current.run(async () => {
+        if (!active()) return "NOT_SENT" as const;
+        try {
+          encrypted = createPayload();
+          staged = true;
+          const stagedPayload = encrypted;
+          const sent = await (socketRef.current?.sendEncryptedPayload(
+            messageId,
+            {
+              type: "message",
+              chat_id: chatId,
+              ...payloadToFrame(stagedPayload),
+            },
+          ) ?? Promise.resolve("NOT_SENT" as const));
+          if (!active()) return sent;
+          if (sent === "ACCEPTED") {
+            try {
+              cipherRef.current.commitOutbound(messageId, stagedPayload.stateRevision);
+            } catch {
+              failClosed(currentSession);
+              return "AMBIGUOUS" as const;
+            }
+            return sent;
+          }
+          if (sent === "REJECTED" || sent === "NOT_SENT") {
+            try {
+              cipherRef.current.rollbackOutbound(messageId, stagedPayload.stateRevision);
+            } catch {
+              failClosed(currentSession);
+              return "AMBIGUOUS" as const;
+            }
+            return sent;
+          }
+          failClosed(currentSession);
+          return sent;
+        } catch (error) {
+          if (error instanceof FatalCipherError) {
+            if (active()) failClosed(currentSession);
+            return "AMBIGUOUS" as const;
+          }
+          if (staged && active() && encrypted) {
+            try {
+              cipherRef.current.rollbackOutbound(messageId, encrypted.stateRevision);
+            } catch {
+              failClosed(currentSession);
+              return "AMBIGUOUS" as const;
+            }
+          }
+          return "NOT_SENT" as const;
+        }
+      });
+      return outcome;
+    } finally {
+      if (encrypted) wipeEncryptedPayload(encrypted);
+      recipients.forEach((recipient) => wipeBytes(recipient.publicKey));
+    }
+  }, [failClosed]);
+
   const sendReadReceipt = useCallback((chatId: string, messageId: string) => {
     const currentSession = sessionRef.current;
     if (!currentSession || !validControlId(messageId)) return;
     const recipients = recipientKeysFor(chatId);
     if (recipients.length === 0) return;
+    const generation = sessionGenerationRef.current;
     const receiptId = crypto.randomUUID();
-    const encrypted = cipherRef.current.encryptText(
+    void runOutboundTransaction(
+      currentSession,
+      generation,
       chatId,
       receiptId,
-      currentSession.username,
-      JSON.stringify({ kind: "read_receipt", message_id: messageId }),
       recipients,
+      () => cipherRef.current.encryptText(
+        chatId,
+        receiptId,
+        currentSession.username,
+        JSON.stringify({ kind: "read_receipt", id: receiptId, message_id: messageId }),
+        recipients,
+      ),
     );
-    socketRef.current?.send({
-      type: "message",
-      chat_id: chatId,
-      ...payloadToFrame(encrypted),
-    });
-    wipeEncryptedPayload(encrypted);
-  }, [recipientKeysFor]);
+  }, [recipientKeysFor, runOutboundTransaction]);
 
   useEffect(() => {
     sendReadReceiptRef.current = sendReadReceipt;
@@ -828,6 +1045,7 @@ export function useAbyssalSession() {
     if (!currentSession || !chatId || !room || !clean || connection !== "connected") return false;
     const recipients = recipientKeysFor(chatId);
     if (recipients.length === 0) return false;
+    const generation = sessionGenerationRef.current;
     const now = Date.now();
     const message: ChatMessage = {
       id: crypto.randomUUID(),
@@ -844,25 +1062,26 @@ export function useAbyssalSession() {
       replyToId: validReplyId(messages[chatId], replyToId),
       mine: true,
     };
-    const encrypted = cipherRef.current.encryptText(
+    const outcome = await runOutboundTransaction(
+      currentSession,
+      generation,
       chatId,
       message.id,
-      currentSession.username,
-      JSON.stringify(messagePayload(message)),
       recipients,
+      () => cipherRef.current.encryptText(
+        chatId,
+        message.id,
+        currentSession.username,
+        JSON.stringify(messagePayload(message)),
+        recipients,
+      ),
     );
-    const accepted = socketRef.current?.send({
-      type: "message",
-      chat_id: chatId,
-      ...payloadToFrame(encrypted),
-    }) ?? false;
-    wipeEncryptedPayload(encrypted);
-    if (accepted) {
-      ownMessageIdsRef.current.add(message.id);
+    if (outcome === "ACCEPTED") {
+      rememberBoundedId(ownMessageIdsRef.current, message.id, MAX_OWN_MESSAGE_IDS);
       updateMessages((current) => appendBoundedMessage(current, message));
     }
-    return accepted;
-  }, [activeRoomId, connection, messages, recipientKeysFor, updateMessages]);
+    return outcome === "ACCEPTED";
+  }, [activeRoomId, connection, messages, recipientKeysFor, runOutboundTransaction, updateMessages]);
 
   const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
@@ -898,10 +1117,22 @@ export function useAbyssalSession() {
     let message: ChatMessage | null = null;
     let retainedMessage: ChatMessage | null = null;
     let uploadedAttachmentId: string | null = null;
+    let metadataAmbiguous = false;
+    const operation = startAttachmentOperation(() => {
+      wipeBytes(plain);
+      if (encrypted) {
+        wipeBytes(encrypted.key);
+        wipeBytes(encrypted.blob);
+      }
+      if (!retainedMessage?.attachment && message?.attachment) {
+        wipeBytes(message.attachment.encryptionKey);
+      }
+    });
     try {
       setUpload({ active: true, name: file.name || "attachment", loaded: 0, total: file.size });
       const fileBuffer = await file.arrayBuffer();
       plain = new Uint8Array(fileBuffer);
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const messageId = crypto.randomUUID();
       encrypted = cipherRef.current.encryptAttachment(
         chatId,
@@ -917,9 +1148,15 @@ export function useAbyssalSession() {
         mediaType,
         encrypted.blob,
         { ...options, ttlSec },
-        (progress) => setUpload({ active: true, name: file.name || "attachment", ...progress }),
+        (progress) => {
+          if (attachmentOperationActive(operation, currentSession.token)) {
+            setUpload({ active: true, name: file.name || "attachment", ...progress });
+          }
+        },
+        operation.controller.signal,
       );
       uploadedAttachmentId = attachmentId;
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const now = Date.now();
       const outgoingMessage: ChatMessage = {
         id: messageId,
@@ -950,46 +1187,49 @@ export function useAbyssalSession() {
         },
       };
       message = outgoingMessage;
-      const metadata = cipherRef.current.encryptText(
+      const outcome = await runOutboundTransaction(
+        currentSession,
+        operation.generation,
         chatId,
         outgoingMessage.id,
-        currentSession.username,
-        JSON.stringify(messagePayload(outgoingMessage)),
         recipients,
+        () => cipherRef.current.encryptText(
+          chatId,
+          outgoingMessage.id,
+          currentSession.username,
+          JSON.stringify(messagePayload(outgoingMessage)),
+          recipients,
+        ),
       );
-      const accepted = socketRef.current?.send({
-        type: "message",
-        chat_id: chatId,
-        ...payloadToFrame(metadata),
-      }) ?? false;
-      wipeEncryptedPayload(metadata);
-      if (accepted) {
-        ownMessageIdsRef.current.add(outgoingMessage.id);
+      metadataAmbiguous = outcome === "AMBIGUOUS";
+      if (outcome === "ACCEPTED") {
+        rememberBoundedId(ownMessageIdsRef.current, outgoingMessage.id, MAX_OWN_MESSAGE_IDS);
         updateMessages((current) => appendBoundedMessage(current, outgoingMessage));
         retainedMessage = outgoingMessage;
       }
-      return accepted;
+      return outcome === "ACCEPTED";
     } catch {
-      setNotice("Action unavailable.");
+      if (attachmentOperationActive(operation, currentSession.token)) setNotice("Action unavailable.");
       return false;
     } finally {
-      wipeBytes(plain);
-      if (encrypted) {
-        wipeBytes(encrypted.key);
-        wipeBytes(encrypted.blob);
-      }
-      if (!retainedMessage?.attachment && message?.attachment) {
-        // The key copy is only retained by state after an accepted send.
-        // Failed uploads, metadata encryption, and rejected socket sends must
-        // not leave the content key reachable from this stack frame.
-        wipeBytes(message.attachment.encryptionKey);
-      }
-      if (uploadedAttachmentId && !retainedMessage) {
+      finishAttachmentOperation(operation);
+      recipients.forEach((recipient) => wipeBytes(recipient.publicKey));
+      if (uploadedAttachmentId && !retainedMessage && !metadataAmbiguous) {
         await deleteUploadedAttachment(currentSession, uploadedAttachmentId).catch(() => undefined);
       }
-      setUpload(EMPTY_UPLOAD);
+      if (operation.generation === sessionGenerationRef.current) setUpload(EMPTY_UPLOAD);
     }
-  }, [activeRoomId, connection, messages, recipientKeysFor, updateMessages]);
+  }, [
+    activeRoomId,
+    attachmentOperationActive,
+    connection,
+    finishAttachmentOperation,
+    messages,
+    recipientKeysFor,
+    runOutboundTransaction,
+    startAttachmentOperation,
+    updateMessages,
+  ]);
 
   const viewAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
@@ -1001,15 +1241,26 @@ export function useAbyssalSession() {
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let downloaded: DownloadedEncryptedAttachment | null = null;
     let claimHandled = false;
+    let objectUrl: string | null = null;
+    const operation = startAttachmentOperation(() => {
+      wipeBytes(key);
+      wipeBytes(encrypted);
+      wipeBytes(plain);
+    });
     try {
       if (
         attachment.encryptionVersion !== ATTACHMENT_CIPHER_VERSION ||
         attachment.encryptionKey.byteLength !== 32
       ) throw new Error("Payload unavailable");
       key = attachment.encryptionKey.slice();
-      downloaded = await downloadEncryptedAttachment(currentSession, attachment.id);
+      downloaded = await downloadEncryptedAttachment(
+        currentSession,
+        attachment.id,
+        { mediaType: attachment.mediaType, expectedPlaintextBytes: attachment.sizeBytes },
+        operation.controller.signal,
+      );
       encrypted = downloaded.bytes;
-      if (sessionRef.current?.token !== currentSession.token) throw new Error("Action unavailable");
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       try {
         plain = await decryptAndCompleteAttachment(
           currentSession,
@@ -1024,35 +1275,44 @@ export function useAbyssalSession() {
             encrypted,
           ),
           attachmentPlaintextPolicy(attachment),
+          operation.controller.signal,
         );
       } finally {
         claimHandled = downloaded.claim !== undefined;
       }
-      if (sessionRef.current?.token !== currentSession.token) throw new Error("Action unavailable");
-      const blob = new Blob([plain.slice().buffer], { type: attachment.mimeType });
+      if (downloaded.claim) wipeMessageAttachment(message);
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
+      const blob = attachmentDownloadBlob(plain, attachment.mimeType);
+      objectUrl = URL.createObjectURL(blob);
       const nextMedia: DecryptedMedia = {
         messageId: message.id,
         name: attachment.name,
         mediaType: attachment.mediaType,
         mimeType: attachment.mimeType,
-        objectUrl: URL.createObjectURL(blob),
+        objectUrl,
         oneTime: attachment.oneTime,
       };
       mediaRef.current = nextMedia;
       setMedia(nextMedia);
+      objectUrl = null;
       markRoomRead(message.chatId);
       if (attachment.oneTime) wipeMessageAttachment(message);
     } catch {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
       if (downloaded?.claim && !claimHandled) {
         await releaseAttachmentDownloadClaim(currentSession, attachment.id, downloaded.claim).catch(() => undefined);
       }
-      if (sessionRef.current?.token === currentSession.token) setNotice("Action unavailable.");
+      if (attachmentOperationActive(operation, currentSession.token)) setNotice("Action unavailable.");
     } finally {
-      wipeBytes(key);
-      wipeBytes(encrypted);
-      wipeBytes(plain);
+      finishAttachmentOperation(operation);
     }
-  }, [clearMedia, markRoomRead]);
+  }, [
+    attachmentOperationActive,
+    clearMedia,
+    finishAttachmentOperation,
+    markRoomRead,
+    startAttachmentOperation,
+  ]);
 
   const exportAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
@@ -1063,15 +1323,26 @@ export function useAbyssalSession() {
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let downloaded: DownloadedEncryptedAttachment | null = null;
     let claimHandled = false;
+    let exportUrl: string | null = null;
+    const operation = startAttachmentOperation(() => {
+      wipeBytes(key);
+      wipeBytes(encrypted);
+      wipeBytes(plain);
+    });
     try {
       if (
         attachment.encryptionVersion !== ATTACHMENT_CIPHER_VERSION ||
         attachment.encryptionKey.byteLength !== 32
       ) throw new Error("Payload unavailable");
       key = attachment.encryptionKey.slice();
-      downloaded = await downloadEncryptedAttachment(currentSession, attachment.id);
+      downloaded = await downloadEncryptedAttachment(
+        currentSession,
+        attachment.id,
+        { mediaType: attachment.mediaType, expectedPlaintextBytes: attachment.sizeBytes },
+        operation.controller.signal,
+      );
       encrypted = downloaded.bytes;
-      if (sessionRef.current?.token !== currentSession.token) throw new Error("Action unavailable");
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       try {
         plain = await decryptAndCompleteAttachment(
           currentSession,
@@ -1086,33 +1357,44 @@ export function useAbyssalSession() {
             encrypted,
           ),
           attachmentPlaintextPolicy(attachment),
+          operation.controller.signal,
         );
       } finally {
         claimHandled = downloaded.claim !== undefined;
       }
-      if (sessionRef.current?.token !== currentSession.token) throw new Error("Action unavailable");
-      const url = URL.createObjectURL(attachmentDownloadBlob(plain, attachment.mimeType));
+      if (downloaded.claim) wipeMessageAttachment(message);
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
+      exportUrl = URL.createObjectURL(attachmentDownloadBlob(plain, attachment.mimeType));
+      exportUrlsRef.current.set(exportUrl, null);
       const link = document.createElement("a");
-      link.href = url;
+      link.href = exportUrl;
       link.download = attachmentDownloadName(attachment.name);
       link.rel = "noopener";
       link.style.display = "none";
       document.body.append(link);
       link.click();
       link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_CLEANUP_DELAY_MS);
+      const completedUrl = exportUrl;
+      const timer = window.setTimeout(() => revokeExportUrl(completedUrl), DOWNLOAD_URL_CLEANUP_DELAY_MS);
+      exportUrlsRef.current.set(completedUrl, timer);
+      exportUrl = null;
       markRoomRead(message.chatId);
     } catch {
+      if (exportUrl) revokeExportUrl(exportUrl);
       if (downloaded?.claim && !claimHandled) {
         await releaseAttachmentDownloadClaim(currentSession, attachment.id, downloaded.claim).catch(() => undefined);
       }
-      if (sessionRef.current?.token === currentSession.token) setNotice("Action unavailable.");
+      if (attachmentOperationActive(operation, currentSession.token)) setNotice("Action unavailable.");
     } finally {
-      wipeBytes(key);
-      wipeBytes(encrypted);
-      wipeBytes(plain);
+      finishAttachmentOperation(operation);
     }
-  }, [markRoomRead]);
+  }, [
+    attachmentOperationActive,
+    finishAttachmentOperation,
+    markRoomRead,
+    revokeExportUrl,
+    startAttachmentOperation,
+  ]);
 
   const createRoom = useCallback((room: RoomRecord): boolean => {
     if (connection !== "connected") return false;
@@ -1335,6 +1617,7 @@ function clampDirectRetention(value: number | undefined): number {
 
 function parsePayload(
   chatId: string,
+  authoritativeMessageId: string,
   payload: Record<string, unknown>,
   room: RoomRecord | undefined,
   currentUsername: string,
@@ -1345,7 +1628,8 @@ function parsePayload(
   const kind = payload.kind;
   const id = cleanString(payload.id, 128);
   const sender = cleanString(authoritativeSender, 80) || cleanString(payload.sender, 80);
-  if ((kind !== "text" && kind !== "attachment") || !id || !sender) return null;
+  if ((kind !== "text" && kind !== "attachment") ||
+    !validControlId(authoritativeMessageId) || id !== authoritativeMessageId || !sender) return null;
   const receivedAtMs = Date.now();
   const sentAt = safeTimestamp(payload.timestamp_ms, receivedAtMs);
   const replyToId = cleanString(payload.reply_to_id, 128) || undefined;
@@ -1492,6 +1776,16 @@ function validReplyId(messages: ChatMessage[] | undefined, value?: string): stri
 
 function validControlId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+export function rememberBoundedId(ids: Set<string>, value: string, maxSize: number): void {
+  if (ids.has(value)) return;
+  while (ids.size >= maxSize) {
+    const oldest = ids.values().next().value;
+    if (oldest === undefined) break;
+    ids.delete(oldest);
+  }
+  ids.add(value);
 }
 
 function normalizeMediaType(value: unknown): MediaType | null {

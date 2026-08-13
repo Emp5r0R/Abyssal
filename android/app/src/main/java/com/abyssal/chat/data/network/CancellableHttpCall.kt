@@ -18,6 +18,7 @@ import okhttp3.Response
 internal suspend fun <T> awaitHttpResponse(
     call: Call,
     onCancellation: (T) -> Unit = {},
+    onLateResponse: (Response) -> Unit = {},
     consume: (Response) -> T
 ): T = suspendCancellableCoroutine { continuation ->
     val settled = AtomicBoolean(false)
@@ -31,7 +32,7 @@ internal suspend fun <T> awaitHttpResponse(
 
             override fun onResponse(call: Call, response: Response) {
                 if (!continuation.isActive || !settled.compareAndSet(false, true)) {
-                    response.close()
+                    response.use { runCatching { onLateResponse(it) } }
                     return
                 }
                 val result = try {

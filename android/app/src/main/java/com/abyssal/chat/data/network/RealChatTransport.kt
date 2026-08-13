@@ -11,6 +11,7 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.INodeConfigService
+import com.abyssal.chat.domain.repository.OutboundSendResult
 import java.util.Collections
 import java.util.Base64
 import java.util.LinkedHashMap
@@ -21,10 +22,12 @@ import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import org.json.JSONArray
@@ -66,8 +69,36 @@ internal fun exceedsUtf8ByteLimit(value: String, maxBytes: Int): Boolean {
 internal data class WsTicket(val value: String, val expiresInSec: Int)
 
 internal const val WS_TICKET_MAX_RESPONSE_BYTES = 4 * 1024
+internal const val PURGE_CLOSE_CODE = 4001
+internal const val PURGE_CLOSE_REASON = "purge"
 private const val WS_TICKET_B64_LENGTH = 43
 private val WS_TICKET_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
+private const val OUTBOUND_RESULT_TIMEOUT_MS = 15_000L
+
+internal fun JSONObject.toOutboundMessageResult(): Pair<String, Boolean>? {
+    if (keys().asSequence().toSet() != setOf("type", "message_id", "accepted")) return null
+    if ((get("type") as? String) != "message_result") return null
+    val messageId = get("message_id") as? String ?: return null
+    if (messageId.isEmpty() || messageId.length > 128 ||
+        !messageId.all { it.isLetterOrDigit() || it == '_' || it == '-' }
+    ) return null
+    val accepted = get("accepted") as? Boolean ?: return null
+    return messageId to accepted
+}
+
+internal fun JSONObject.toAcknowledgementResult(): Pair<String, Boolean>? {
+    if (keys().asSequence().toSet() != setOf("type", "message_id", "accepted")) return null
+    if ((get("type") as? String) != "ack_result") return null
+    val messageId = get("message_id") as? String ?: return null
+    if (messageId.isEmpty() || messageId.length > 128 ||
+        !messageId.all { it.isLetterOrDigit() || it == '_' || it == '-' }
+    ) return null
+    val accepted = get("accepted") as? Boolean ?: return null
+    return messageId to accepted
+}
+
+internal fun isPurgeClose(code: Int, reason: String): Boolean =
+    code == PURGE_CLOSE_CODE && reason == PURGE_CLOSE_REASON
 
 /** Strict relay ticket schema. Caller owns and must wipe [raw] after this call. */
 internal fun parseWsTicketResponseBody(raw: ByteArray): WsTicket? {
@@ -113,16 +144,38 @@ class RealChatTransport(
     private val client: OkHttpClient,
     private val callFactory: Call.Factory = client
 ) : IChatTransport {
-    private val _wipeCommands = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    private data class PendingOperation(
+        val generation: Long,
+        val result: CompletableDeferred<OutboundSendResult>
+    )
+
+    private data class DrainedPendingOperations(
+        val outbound: List<CompletableDeferred<OutboundSendResult>>,
+        val acknowledgements: List<CompletableDeferred<OutboundSendResult>>
+    )
+
+    private data class SocketSnapshot(
+        val socket: WebSocket,
+        val generation: Long
+    )
+
+    // A wipe must survive until the ViewModel collector is scheduled. A bounded
+    // channel keeps this durable without allowing repeated relay frames to grow
+    // memory; the atomic gate also coalesces GLOBAL_WIPE + purge close pairs.
+    private val _wipeCommands = Channel<Long>(
+        capacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     private val _incomingPayloads = Channel<IncomingTransportPayload>(
         capacity = 32,
         onUndeliveredElement = ::wipeIncomingPayload
     )
-    private val _roomChanges = MutableSharedFlow<RoomChange>(extraBufferCapacity = 32)
+    private val _roomChanges = Channel<RoomChange>(capacity = ROOM_CHANGE_BUFFER_CAPACITY)
     private val _presence = MutableStateFlow<List<UserPresence>>(emptyList())
     private val _serverStatus = MutableStateFlow(ServerStatus("DISCONNECTED", "No node", 0))
     private val connecting = AtomicBoolean(false)
     private val connectionGeneration = AtomicLong(0L)
+    private val purgeSignaled = AtomicBoolean(false)
     private val connectionLock = Any()
     private val identityPins = Collections.synchronizedMap(
         LinkedHashMap<String, String>(MAX_PINNED_IDENTITIES, 0.75f, true)
@@ -131,12 +184,17 @@ class RealChatTransport(
     private val roomCatalogIds = LinkedHashMap<String, String>()
     private val directCatalogIds = LinkedHashMap<String, String>()
     private val directCatalogPeers = LinkedHashMap<String, String>()
+    /** Canonical direct-chat id to the peer identity authorized to send on it. */
+    private val directCatalogPeerById = LinkedHashMap<String, String>()
 
     @Volatile
     private var webSocket: WebSocket? = null
     @Volatile
     private var ticketCall: Call? = null
     private val joinedChatIds = Collections.synchronizedSet(LinkedHashSet<String>())
+    private val pendingOutbound = LinkedHashMap<String, PendingOperation>()
+    private val pendingAcknowledgements =
+        LinkedHashMap<String, PendingOperation>()
 
     override fun connect() {
         val session = nodeConfigService.getActiveSession()
@@ -150,6 +208,10 @@ class RealChatTransport(
             if (webSocket != null || connecting.get()) return
             connecting.set(true)
             generation = connectionGeneration.incrementAndGet()
+            if (purgeSignaled.get()) {
+                while (_wipeCommands.tryReceive().isSuccess) Unit
+                signalPurgeLocked(generation, force = true)
+            }
             _serverStatus.value = ServerStatus("CONNECTING", session.nodeId, 0)
         }
         val request = Request.Builder()
@@ -220,45 +282,70 @@ class RealChatTransport(
     override fun disconnect() {
         val pendingCall: Call?
         val socket: WebSocket?
+        val drainedPending: DrainedPendingOperations
         synchronized(connectionLock) {
-            connectionGeneration.incrementAndGet()
+            drainedPending = advanceConnectionEpochAndDrainRoomChangesLocked()
             connecting.set(false)
             pendingCall = ticketCall
             ticketCall = null
             socket = webSocket
             webSocket = null
+            clearAuthorizationStateLocked()
+            clearPresence()
+            _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
         }
         pendingCall?.cancel()
         socket?.close(1000, "client disconnect")
-        joinedChatIds.clear()
-        identityPins.clear()
-        synchronized(catalogLock) {
-            roomCatalogIds.clear()
-            directCatalogIds.clear()
-            directCatalogPeers.clear()
-        }
-        while (true) {
-            val payload = _incomingPayloads.tryReceive().getOrNull() ?: break
-            wipeIncomingPayload(payload)
-        }
-        clearPresence()
-        _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
+        // Resolve before clearing local cryptographic state. Callers must treat
+        // every in-flight frame as ambiguous and fail closed.
+        completeDrainedPendingOperations(drainedPending, OutboundSendResult.AMBIGUOUS)
     }
 
     override fun getServerStatus(): Flow<ServerStatus> = _serverStatus.asStateFlow()
 
-    override fun getIncomingWipeCommands(): Flow<Unit> = _wipeCommands.asSharedFlow()
+    override fun getIncomingWipeCommands(): Flow<Long> = _wipeCommands.receiveAsFlow()
 
     override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.receiveAsFlow()
 
-    override fun getRoomChanges(): Flow<RoomChange> = _roomChanges.asSharedFlow()
+    override fun currentConnectionGeneration(): Long = connectionGeneration.get()
+
+    override fun runIfConnectionCurrent(
+        expectedConnectionGeneration: Long,
+        mutation: () -> Boolean
+    ): Boolean = synchronized(connectionLock) {
+        if (connectionGeneration.get() != expectedConnectionGeneration) false else mutation()
+    }
+
+    override fun getRoomChanges(): Flow<RoomChange> = _roomChanges.receiveAsFlow()
 
     override fun getPresence(): Flow<List<UserPresence>> = _presence.asStateFlow()
 
     override suspend fun joinChat(chatId: String) {
+        joinChatInternal(chatId, expectedConnectionGeneration = null)
+    }
+
+    override suspend fun joinChat(chatId: String, expectedConnectionGeneration: Long) {
+        joinChatInternal(chatId, expectedConnectionGeneration)
+    }
+
+    private fun joinChatInternal(chatId: String, expectedConnectionGeneration: Long?) {
         if (!isSafeIdentifier(chatId)) return
-        rememberJoinedChat(chatId)
-        sendJoinFrame(chatId)
+        val frame = JSONObject()
+            .put("type", "join")
+            .put("chat_id", chatId)
+            .toString()
+        synchronized(connectionLock) {
+            val generation = connectionGeneration.get()
+            if (expectedConnectionGeneration != null &&
+                generation != expectedConnectionGeneration
+            ) {
+                return
+            }
+            rememberJoinedChat(chatId)
+            // Keep capture and send in one critical section. Invalidation cannot
+            // advance the epoch between the check and writing the frame.
+            webSocket?.send(frame)
+        }
     }
 
     private fun rememberJoinedChat(chatId: String) {
@@ -271,6 +358,36 @@ class RealChatTransport(
                 iterator.next()
                 iterator.remove()
             }
+        }
+    }
+
+    /** Prevent an old catalog callback from repopulating a new socket's joins. */
+    private fun rememberJoinedChatForSocket(
+        socket: WebSocket,
+        generation: Long,
+        chatId: String
+    ): Boolean = synchronized(connectionLock) {
+        if (!isCurrentSocket(socket, generation)) {
+            false
+        } else {
+            rememberJoinedChat(chatId)
+            true
+        }
+    }
+
+    private fun removeJoinedChatForSocket(
+        socket: WebSocket,
+        generation: Long,
+        chatId: String
+    ): Boolean = synchronized(connectionLock) {
+        if (!isCurrentSocket(socket, generation)) {
+            false
+        } else {
+            synchronized(joinedChatIds) { joinedChatIds.remove(chatId) }
+            synchronized(catalogLock) {
+                roomCatalogIds.remove(chatId.lowercase(Locale.ROOT))
+            }
+            true
         }
     }
 
@@ -294,6 +411,118 @@ class RealChatTransport(
 
     private fun isCurrentSocket(socket: WebSocket, generation: Long): Boolean =
         generation == connectionGeneration.get() && webSocket === socket
+
+    /** Must be called under [connectionLock]. Registration also takes this lock. */
+    private fun advanceConnectionEpochAndDrainRoomChangesLocked(): DrainedPendingOperations {
+        connectionGeneration.incrementAndGet()
+        val currentGeneration = connectionGeneration.get()
+        while (_roomChanges.tryReceive().isSuccess) {
+            // Catalog changes are scoped to the invalidated connection epoch.
+        }
+        drainIncomingPayloadsLocked()
+        while (_wipeCommands.tryReceive().isSuccess) {
+            // Purge commands from the invalidated epoch cannot be applied to a
+            // replacement session. A purge close publishes a fresh command
+            // after this drain with [currentGeneration].
+        }
+        purgeSignaled.set(false)
+        // Remove only entries that predate the newly published generation while
+        // holding the same lock used by send registration. A reconnect may
+        // register new entries immediately after this method returns; those
+        // entries must never be included in the old invalidation result.
+        val outbound = synchronized(pendingOutbound) {
+            drainPendingResultsLocked(pendingOutbound, currentGeneration)
+        }
+        val acknowledgements = synchronized(pendingAcknowledgements) {
+            drainPendingResultsLocked(pendingAcknowledgements, currentGeneration)
+        }
+        return DrainedPendingOperations(outbound, acknowledgements)
+    }
+
+    /** Must be called under [connectionLock]. */
+    private fun drainIncomingPayloadsLocked() {
+        while (true) {
+            val payload = _incomingPayloads.tryReceive().getOrNull() ?: return
+            wipeIncomingPayload(payload)
+        }
+    }
+
+    private fun drainPendingResultsLocked(
+        pending: LinkedHashMap<String, PendingOperation>,
+        currentGeneration: Long
+    ): List<CompletableDeferred<OutboundSendResult>> {
+        val drained = ArrayList<CompletableDeferred<OutboundSendResult>>(pending.size)
+        val iterator = pending.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.value.generation != currentGeneration) {
+                drained += entry.value.result
+                iterator.remove()
+            }
+        }
+        return drained
+    }
+
+    private fun emitRoomChange(socket: WebSocket, generation: Long, change: RoomChange) {
+        val overflowed = synchronized(connectionLock) {
+            if (!isCurrentSocket(socket, generation)) return
+            !_roomChanges.trySend(change.copy(connectionGeneration = generation)).isSuccess
+        }
+        if (overflowed) {
+            // Never silently lose a catalog mutation. Reconnect to obtain a fresh,
+            // authoritative snapshot if the bounded consumer queue is exhausted.
+            closeCurrentSocket(socket, _serverStatus.value.nodeId, "catalog consumer stalled")
+        }
+    }
+
+    /**
+     * The initial callback check is only an optimization: invalidation may
+     * happen while a frame is being parsed. Recheck and enqueue under the
+     * connection lock so an old callback cannot publish ciphertext after its
+     * socket epoch has been invalidated.
+     */
+    private fun enqueueIncomingPayload(
+        socket: WebSocket,
+        generation: Long,
+        payload: IncomingTransportPayload
+    ) {
+        var overflowed = false
+        val enqueued = synchronized(connectionLock) {
+            if (!isCurrentSocket(socket, generation)) {
+                false
+            } else if (_incomingPayloads.trySend(payload).isSuccess) {
+                true
+            } else {
+                overflowed = true
+                false
+            }
+        }
+        if (!enqueued) wipeIncomingPayload(payload)
+        if (overflowed) {
+            closeCurrentSocket(socket, _serverStatus.value.nodeId, "incoming consumer stalled")
+        }
+    }
+
+    private fun takePendingResult(
+        socket: WebSocket,
+        generation: Long,
+        messageId: String,
+        pending: LinkedHashMap<String, PendingOperation>
+    ): CompletableDeferred<OutboundSendResult>? = synchronized(connectionLock) {
+        if (!isCurrentSocket(socket, generation)) {
+            null
+        } else {
+            synchronized(pending) {
+                val operation = pending[messageId]
+                if (operation == null || operation.generation != generation) {
+                    null
+                } else {
+                    pending.remove(messageId)
+                    operation.result
+                }
+            }
+        }
+    }
 
     private fun parseWsTicket(response: Response): WsTicket? {
         if (!response.isSuccessful) return null
@@ -319,46 +548,107 @@ class RealChatTransport(
             actual.endpoint.apiBaseUrl == expected.endpoint.apiBaseUrl &&
             actual.endpoint.wsBaseUrl == expected.endpoint.wsBaseUrl
 
+    private fun captureSocketSnapshot(expectedGeneration: Long?): SocketSnapshot? =
+        synchronized(connectionLock) {
+            val generation = connectionGeneration.get()
+            val socket = webSocket ?: return@synchronized null
+            if (expectedGeneration != null && expectedGeneration != generation) {
+                return@synchronized null
+            }
+            SocketSnapshot(socket, generation)
+        }
+
+    private fun sendCommandFrame(frame: String, expectedGeneration: Long?): Boolean {
+        return synchronized(connectionLock) {
+            val snapshot = captureSocketSnapshot(expectedGeneration) ?: return@synchronized false
+            // The socket snapshot and write are atomic with invalidation. This
+            // prevents a queued command from reaching a socket after its epoch
+            // has been purged.
+            val sent = runCatching { snapshot.socket.send(frame) }.getOrDefault(false)
+            if (!sent && isCurrentSocket(snapshot.socket, snapshot.generation)) {
+                _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+            }
+            sent
+        }
+    }
+
     override suspend fun createForum(session: ChatSession) {
+        createForumInternal(session, expectedGeneration = null)
+    }
+
+    override suspend fun createForum(
+        session: ChatSession,
+        expectedConnectionGeneration: Long
+    ) {
+        createForumInternal(session, expectedConnectionGeneration)
+    }
+
+    private fun createForumInternal(session: ChatSession, expectedGeneration: Long?) {
         val frame = JSONObject()
             .put("type", "create_room")
             .put("room", session.toRoomJson())
             .toString()
-
-        if (webSocket?.send(frame) != true) {
-            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        }
+        sendCommandFrame(frame, expectedGeneration)
     }
 
     override suspend fun deleteForum(chatId: String) {
+        deleteForumInternal(chatId, expectedGeneration = null)
+    }
+
+    override suspend fun deleteForum(chatId: String, expectedConnectionGeneration: Long) {
+        deleteForumInternal(chatId, expectedConnectionGeneration)
+    }
+
+    private fun deleteForumInternal(chatId: String, expectedGeneration: Long?) {
         val frame = JSONObject()
             .put("type", "delete_room")
             .put("chat_id", chatId)
             .toString()
-
-        if (webSocket?.send(frame) != true) {
-            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        }
+        sendCommandFrame(frame, expectedGeneration)
     }
 
     override suspend fun openDirect(peerUsername: String) {
+        openDirectInternal(peerUsername, expectedGeneration = null)
+    }
+
+    override suspend fun openDirect(peerUsername: String, expectedConnectionGeneration: Long) {
+        openDirectInternal(peerUsername, expectedConnectionGeneration)
+    }
+
+    private fun openDirectInternal(peerUsername: String, expectedGeneration: Long?) {
         val frame = JSONObject()
             .put("type", "open_direct")
             .put("peer_username", peerUsername)
             .toString()
-
-        if (webSocket?.send(frame) != true) {
-            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        }
+        sendCommandFrame(frame, expectedGeneration)
     }
 
     override suspend fun sendEncryptedPayload(
         chatId: String,
         payload: EncryptedTransportPayload
-    ): Boolean {
+    ): OutboundSendResult = sendEncryptedPayloadInternal(chatId, payload, null)
+
+    override suspend fun sendEncryptedPayload(
+        chatId: String,
+        payload: EncryptedTransportPayload,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult = sendEncryptedPayloadInternal(
+        chatId,
+        payload,
+        expectedConnectionGeneration
+    )
+
+    private suspend fun sendEncryptedPayloadInternal(
+        chatId: String,
+        payload: EncryptedTransportPayload,
+        expectedGeneration: Long?
+    ): OutboundSendResult {
+        var registered = false
+        lateinit var socket: WebSocket
+        var generation = 0L
         return try {
             if (payload.version != PROTOCOL_VERSION || payload.stateSignature.size != STATE_SIGNATURE_BYTES) {
-                return false
+                return OutboundSendResult.NOT_SENT
             }
             val frame = JSONObject()
                 .put("type", "message")
@@ -388,14 +678,67 @@ class RealChatTransport(
             // Outbound encrypted frames contain ASCII JSON and base64url only, so
             // character count equals wire bytes here.
             if (frame.length > MAX_WEBSOCKET_FRAME_BYTES) {
-                _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-                false
-            } else {
-                val accepted = webSocket?.send(frame) == true
-                if (!accepted) {
-                    _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
+                return OutboundSendResult.NOT_SENT
+            }
+            val result = CompletableDeferred<OutboundSendResult>()
+            synchronized(connectionLock) {
+                socket = webSocket ?: return OutboundSendResult.NOT_SENT
+                generation = connectionGeneration.get()
+                if (expectedGeneration != null && generation != expectedGeneration) {
+                    return OutboundSendResult.NOT_SENT
                 }
-                accepted
+                synchronized(pendingOutbound) {
+                    if (pendingOutbound.size >= MAX_PENDING_OUTBOUND &&
+                        !pendingOutbound.containsKey(payload.messageId)
+                    ) return OutboundSendResult.NOT_SENT
+                    if (pendingOutbound.containsKey(payload.messageId)) {
+                        return OutboundSendResult.NOT_SENT
+                    }
+                    pendingOutbound[payload.messageId] = PendingOperation(generation, result)
+                    registered = true
+                }
+            }
+            val sent = synchronized(connectionLock) {
+                if (!isCurrentSocket(socket, generation)) {
+                    false
+                } else {
+                    // Registration, epoch validation, and the socket write are
+                    // one critical section; invalidation either drains this
+                    // operation first or observes the already-sent frame.
+                    runCatching { socket.send(frame) }.getOrDefault(false)
+                }
+            }
+            if (!sent) {
+                synchronized(pendingOutbound) {
+                    val pending = pendingOutbound[payload.messageId]
+                    if (pending?.generation == generation && pending.result === result) {
+                        pendingOutbound.remove(payload.messageId)
+                    }
+                }
+                if (isCurrentSocket(socket, generation)) {
+                    closeCurrentSocket(socket, _serverStatus.value.nodeId, "message send failed")
+                }
+                return OutboundSendResult.NOT_SENT
+            }
+            try {
+                withTimeout(OUTBOUND_RESULT_TIMEOUT_MS) { result.await() }
+            } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+                abortPendingOutbound(socket, generation, payload.messageId, result, "message result timeout")
+                OutboundSendResult.AMBIGUOUS
+            } catch (_: CancellationException) {
+                abortPendingOutbound(socket, generation, payload.messageId, result, "message send cancelled")
+                OutboundSendResult.AMBIGUOUS
+            }
+        } catch (error: CancellationException) {
+            if (!registered) throw error
+            abortPendingOutbound(socket, generation, payload.messageId, null, "message send cancelled")
+            OutboundSendResult.AMBIGUOUS
+        } catch (_: Exception) {
+            if (registered) {
+                abortPendingOutbound(socket, generation, payload.messageId, null, "message send failed")
+                OutboundSendResult.AMBIGUOUS
+            } else {
+                OutboundSendResult.NOT_SENT
             }
         } finally {
             wipeEncryptedPayload(payload)
@@ -409,12 +752,51 @@ class RealChatTransport(
         state: IdentityStateSnapshot,
         usedPrekeyId: String,
         ackSignature: ByteArray
-    ): Boolean {
-        if (state.stateSignature.size != STATE_SIGNATURE_BYTES ||
-            state.identityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
-            ackSignature.size != ACK_SIGNATURE_BYTES
-        ) return false
-        val accepted = webSocket?.send(
+    ): OutboundSendResult = acknowledgeMessageInternal(
+        chatId,
+        messageId,
+        senderUsername,
+        state,
+        usedPrekeyId,
+        ackSignature,
+        null
+    )
+
+    override suspend fun acknowledgeMessage(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        state: IdentityStateSnapshot,
+        usedPrekeyId: String,
+        ackSignature: ByteArray,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult = acknowledgeMessageInternal(
+        chatId,
+        messageId,
+        senderUsername,
+        state,
+        usedPrekeyId,
+        ackSignature,
+        expectedConnectionGeneration
+    )
+
+    private suspend fun acknowledgeMessageInternal(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        state: IdentityStateSnapshot,
+        usedPrekeyId: String,
+        ackSignature: ByteArray,
+        expectedGeneration: Long?
+    ): OutboundSendResult {
+        val frame = try {
+            if (!isSafeIdentifier(chatId) || !isSafeIdentifier(messageId) ||
+                !isSafeUsername(senderUsername) ||
+                (usedPrekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(usedPrekeyId)) ||
+                state.stateSignature.size != STATE_SIGNATURE_BYTES ||
+                state.identityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
+                ackSignature.size != ACK_SIGNATURE_BYTES
+            ) return OutboundSendResult.NOT_SENT
             JSONObject()
                 .put("type", "message_ack")
                 .put("chat_id", chatId)
@@ -428,14 +810,80 @@ class RealChatTransport(
                 .put("ack_signature_b64", encode(ackSignature))
                 .put("used_prekey_id", usedPrekeyId)
                 .toString()
-        ) == true
-        if (!accepted) _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        return accepted
+        } catch (_: Exception) {
+            return OutboundSendResult.NOT_SENT
+        }
+        if (frame.length > MAX_WEBSOCKET_FRAME_BYTES) return OutboundSendResult.NOT_SENT
+        val result = CompletableDeferred<OutboundSendResult>()
+        lateinit var socket: WebSocket
+        val generation: Long
+        synchronized(connectionLock) {
+            socket = webSocket ?: return OutboundSendResult.NOT_SENT
+            generation = connectionGeneration.get()
+            if (expectedGeneration != null && generation != expectedGeneration) {
+                return OutboundSendResult.NOT_SENT
+            }
+            synchronized(pendingAcknowledgements) {
+                if (pendingAcknowledgements.size >= MAX_PENDING_ACKNOWLEDGEMENTS ||
+                    pendingAcknowledgements.containsKey(messageId)
+                ) return OutboundSendResult.NOT_SENT
+                pendingAcknowledgements[messageId] = PendingOperation(generation, result)
+            }
+        }
+        val sent = synchronized(connectionLock) {
+            if (!isCurrentSocket(socket, generation)) {
+                false
+            } else {
+                try {
+                    // See sendEncryptedPayloadInternal: do not let invalidation
+                    // race between registration and the write.
+                    socket.send(frame)
+                } catch (_: Exception) {
+                    false
+                }
+            }
+        }
+        if (!sent) {
+            synchronized(pendingAcknowledgements) {
+                val pending = pendingAcknowledgements[messageId]
+                if (pending?.generation == generation && pending.result === result) {
+                    pendingAcknowledgements.remove(messageId)
+                }
+            }
+            if (isCurrentSocket(socket, generation)) {
+                closeCurrentSocket(socket, _serverStatus.value.nodeId, "ack send failed")
+            }
+            return OutboundSendResult.NOT_SENT
+        }
+        return try {
+            withTimeout(OUTBOUND_RESULT_TIMEOUT_MS) { result.await() }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            abortPendingAcknowledgement(socket, generation, messageId, result, "ack result timeout")
+            OutboundSendResult.AMBIGUOUS
+        } catch (_: CancellationException) {
+            abortPendingAcknowledgement(socket, generation, messageId, result, "ack send cancelled")
+            OutboundSendResult.AMBIGUOUS
+        } catch (_: Exception) {
+            abortPendingAcknowledgement(socket, generation, messageId, result, "ack result failed")
+            OutboundSendResult.AMBIGUOUS
+        }
     }
 
     override suspend fun syncIdentityState(state: IdentityStateSnapshot): Boolean {
+        return syncIdentityStateInternal(state, expectedGeneration = null)
+    }
+
+    override suspend fun syncIdentityState(
+        state: IdentityStateSnapshot,
+        expectedConnectionGeneration: Long
+    ): Boolean = syncIdentityStateInternal(state, expectedConnectionGeneration)
+
+    private fun syncIdentityStateInternal(
+        state: IdentityStateSnapshot,
+        expectedGeneration: Long?
+    ): Boolean {
         if (state.stateSignature.size != STATE_SIGNATURE_BYTES) return false
-        val accepted = webSocket?.send(
+        return sendCommandFrame(
             JSONObject()
                 .put("type", "identity_state")
                 .put("state_revision", state.revision.toLong())
@@ -443,41 +891,58 @@ class RealChatTransport(
                 .put("identity_public_b64", encode(state.identityPublicKey))
                 .put("prekey_id", state.prekeyId)
                 .put("state_signature_b64", encode(state.stateSignature))
-                .toString()
-        ) == true
-        if (!accepted) _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        return accepted
+                .toString(),
+            expectedGeneration
+        )
     }
 
     override suspend fun signalUserActivity(): Boolean {
-        val accepted = webSocket?.send(JSONObject().put("type", "activity").toString()) == true
-        if (!accepted) {
-            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        }
-        return accepted
+        return signalUserActivityInternal(expectedGeneration = null)
     }
 
+    override suspend fun signalUserActivity(expectedConnectionGeneration: Long): Boolean =
+        signalUserActivityInternal(expectedConnectionGeneration)
+
+    private fun signalUserActivityInternal(expectedGeneration: Long?): Boolean =
+        sendCommandFrame(JSONObject().put("type", "activity").toString(), expectedGeneration)
+
     override suspend fun broadcastGlobalWipe() {
+        broadcastGlobalWipeInternal(expectedGeneration = null)
+    }
+
+    override suspend fun broadcastGlobalWipe(expectedConnectionGeneration: Long) {
+        broadcastGlobalWipeInternal(expectedConnectionGeneration)
+    }
+
+    private fun broadcastGlobalWipeInternal(expectedGeneration: Long?) {
         val frame = JSONObject()
             .put("type", "global_wipe")
             .toString()
-
-        if (webSocket?.send(frame) != true) {
-            _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
-        }
+        sendCommandFrame(frame, expectedGeneration)
     }
 
     private fun listener(nodeId: String, generation: Long): WebSocketListener {
         return object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (!isCurrentSocket(webSocket, generation)) {
+                val chatsToJoin = synchronized(connectionLock) {
+                    if (!isCurrentSocket(webSocket, generation)) {
+                        null
+                    } else {
+                        // Collections.synchronizedSet still requires its
+                        // monitor while iterating. Keep the snapshot under
+                        // connectionLock as well, matching invalidation's
+                        // connectionLock -> joinedChatIds lock order.
+                        connecting.set(false)
+                        _serverStatus.value = ServerStatus("CONNECTED", nodeId, 0)
+                        synchronized(joinedChatIds) { joinedChatIds.toList() }
+                    }
+                }
+                if (chatsToJoin == null) {
                     webSocket.close(1000, "stale connection")
                     return
                 }
-                connecting.set(false)
-                _serverStatus.value = ServerStatus("CONNECTED", nodeId, 0)
-                joinedChatIds.toList().forEach { chatId ->
-                    sendJoinFrame(chatId)
+                chatsToJoin.forEach { chatId ->
+                    sendJoinFrameForSocket(webSocket, generation, chatId)
                 }
             }
 
@@ -487,17 +952,65 @@ class RealChatTransport(
                 runCatching {
                     val json = JSONObject(text)
                     when (json.optString("type")) {
-                        "GLOBAL_WIPE", "global_wipe" -> _wipeCommands.tryEmit(Unit)
+                        "GLOBAL_WIPE", "global_wipe" -> signalPurgeForSocket(webSocket, generation)
                         "message" -> {
                             if (json.optInt("version") != PROTOCOL_VERSION) return
-                            json.toIncomingPayload()?.let { payload ->
-                                if (!_incomingPayloads.trySend(payload).isSuccess) wipeIncomingPayload(payload)
+                            json.toIncomingPayload(generation)?.let { payload ->
+                                if (!isAuthorizedIncomingPayload(payload)) {
+                                    wipeIncomingPayload(payload)
+                                    return@let
+                                }
+                                enqueueIncomingPayload(webSocket, generation, payload)
                             }
+                        }
+                        "message_result" -> {
+                            val parsed = json.toOutboundMessageResult()
+                            if (parsed == null) {
+                                closeCurrentSocket(webSocket, nodeId, "invalid message result")
+                                return
+                            }
+                            val (messageId, accepted) = parsed
+                            val pending = takePendingResult(
+                                webSocket,
+                                generation,
+                                messageId,
+                                pendingOutbound
+                            )
+                            if (pending == null) {
+                                closeCurrentSocket(webSocket, nodeId, "unexpected message result")
+                                return
+                            }
+                            pending.complete(
+                                if (accepted) OutboundSendResult.ACCEPTED
+                                else OutboundSendResult.REJECTED
+                            )
+                        }
+                        "ack_result" -> {
+                            val parsed = json.toAcknowledgementResult()
+                            if (parsed == null) {
+                                closeCurrentSocket(webSocket, nodeId, "invalid ack result")
+                                return
+                            }
+                            val (messageId, accepted) = parsed
+                            val pending = takePendingResult(
+                                webSocket,
+                                generation,
+                                messageId,
+                                pendingAcknowledgements
+                            )
+                            if (pending == null) {
+                                closeCurrentSocket(webSocket, nodeId, "unexpected ack result")
+                                return
+                            }
+                            pending.complete(
+                                if (accepted) OutboundSendResult.ACCEPTED
+                                else OutboundSendResult.REJECTED
+                            )
                         }
                         "presence" -> {
                             val users = json.optJSONArray("users") ?: return
                             val catalog = users.toPresenceCatalog() ?: return
-                            if (!acceptPresenceCatalog(catalog)) {
+                            if (!acceptPresenceCatalogForSocket(webSocket, generation, catalog)) {
                                 wipePresence(catalog.entries)
                                 closeCurrentSocket(webSocket, nodeId, "directory changed")
                                 return
@@ -507,44 +1020,47 @@ class RealChatTransport(
                         "rooms" -> {
                             val rooms = json.optJSONArray("rooms") ?: return
                             val sessions = rooms.toChatSessions(MAX_ROOM_CATALOG_ENTRIES) ?: return
-                            installRoomCatalog(sessions)
+                            if (!installRoomCatalogForSocket(webSocket, generation, sessions)) return
                             sessions.forEach { session ->
-                                rememberJoinedChat(session.id)
-                                _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                                if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
+                                    emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
+                                }
                             }
                         }
                         "room_created" -> {
                             json.optJSONObject("room")?.toChatSession()
-                                ?.takeIf(::acceptDynamicRoom)
+                                ?.takeIf { acceptDynamicRoomForSocket(webSocket, generation, it) }
                                 ?.let { session ->
-                                    rememberJoinedChat(session.id)
-                                    _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                                    if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
+                                        emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
+                                    }
                                 }
                         }
                         "room_deleted" -> {
                             val chatId = json.optString("chat_id")
                                 .takeIf { it.startsWith("forum_") && isSafeIdentifier(it) } ?: return
-                            joinedChatIds.remove(chatId)
-                            synchronized(catalogLock) {
-                                roomCatalogIds.remove(chatId.lowercase(Locale.ROOT))
+                            if (removeJoinedChatForSocket(webSocket, generation, chatId)) {
+                                emitRoomChange(webSocket, generation, RoomChange("delete", chatId = chatId))
                             }
-                            _roomChanges.tryEmit(RoomChange("delete", chatId = chatId))
+                            Unit
                         }
                         "directs" -> {
                             val directs = json.optJSONArray("directs") ?: return
                             val sessions = directs.toDirectSessions() ?: return
-                            installDirectCatalog(sessions)
+                            if (!installDirectCatalogForSocket(webSocket, generation, sessions)) return
                             sessions.forEach { session ->
-                                rememberJoinedChat(session.id)
-                                _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                                if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
+                                    emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
+                                }
                             }
                         }
                         "direct_opened" -> {
                             json.optJSONObject("direct")?.toDirectSession()
-                                ?.takeIf(::acceptDynamicDirect)
+                                ?.takeIf { acceptDynamicDirectForSocket(webSocket, generation, it) }
                                 ?.let { session ->
-                                    rememberJoinedChat(session.id)
-                                    _roomChanges.tryEmit(RoomChange("upsert", session = session))
+                                    if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
+                                        emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
+                                    }
                                 }
                         }
                         else -> Unit
@@ -553,20 +1069,97 @@ class RealChatTransport(
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (!isCurrentSocket(webSocket, generation)) return
-                connecting.set(false)
-                this@RealChatTransport.webSocket = null
-                clearPresence()
-                _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+                invalidateCurrentSocket(
+                    socket = webSocket,
+                    nodeId = nodeId,
+                    closeCode = null,
+                    reason = reason,
+                    signalPurge = isPurgeClose(code, reason)
+                )
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!isCurrentSocket(webSocket, generation)) return
-                connecting.set(false)
-                this@RealChatTransport.webSocket = null
-                clearPresence()
-                _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+                invalidateCurrentSocket(
+                    socket = webSocket,
+                    nodeId = nodeId,
+                    closeCode = null,
+                    reason = "socket failure"
+                )
             }
+        }
+    }
+
+    internal fun signalPurge() {
+        synchronized(connectionLock) {
+            signalPurgeLocked(connectionGeneration.get(), force = false)
+        }
+    }
+
+    private fun signalPurgeForSocket(socket: WebSocket, generation: Long) {
+        synchronized(connectionLock) {
+            if (isCurrentSocket(socket, generation)) {
+                signalPurgeLocked(generation, force = false)
+            }
+        }
+    }
+
+    /** Must be called under [connectionLock]. */
+    private fun signalPurgeLocked(generation: Long, force: Boolean) {
+        if (force) {
+            purgeSignaled.set(true)
+            _wipeCommands.trySend(generation)
+        } else if (purgeSignaled.compareAndSet(false, true)) {
+            _wipeCommands.trySend(generation)
+        }
+    }
+
+    private fun completeDrainedPendingOperations(
+        drained: DrainedPendingOperations,
+        result: OutboundSendResult
+    ) {
+        drained.outbound.forEach { it.complete(result) }
+        drained.acknowledgements.forEach { it.complete(result) }
+    }
+
+    private fun abortPendingOutbound(
+        socket: WebSocket,
+        generation: Long,
+        messageId: String,
+        expected: CompletableDeferred<OutboundSendResult>?,
+        reason: String
+    ) {
+        synchronized(pendingOutbound) {
+            val actual = pendingOutbound[messageId]
+            if (actual?.generation == generation &&
+                (expected == null || actual.result === expected)
+            ) {
+                pendingOutbound.remove(messageId)
+            }
+        }
+        if (isCurrentSocket(socket, generation)) {
+            closeCurrentSocket(socket, _serverStatus.value.nodeId, reason, closeCode = 1001)
+        }
+    }
+
+    private fun abortPendingAcknowledgement(
+        socket: WebSocket,
+        generation: Long,
+        messageId: String,
+        expected: CompletableDeferred<OutboundSendResult>,
+        reason: String
+    ) {
+        val removed = synchronized(pendingAcknowledgements) {
+            val actual = pendingAcknowledgements[messageId]
+            if (actual?.generation != generation || actual.result !== expected) {
+                false
+            } else {
+                pendingAcknowledgements.remove(messageId)
+                true
+            }
+        }
+        if (!removed) return
+        if (isCurrentSocket(socket, generation)) {
+            closeCurrentSocket(socket, _serverStatus.value.nodeId, reason)
         }
     }
 
@@ -576,29 +1169,85 @@ class RealChatTransport(
         nodeId: String
     ): Boolean {
         if (!exceedsUtf8ByteLimit(text, MAX_WEBSOCKET_FRAME_BYTES)) return false
-        connecting.set(false)
-        if (!socket.close(1009, "message too big")) socket.cancel()
-        if (webSocket === socket) webSocket = null
-        clearPresence()
-        _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+        closeCurrentSocket(socket, nodeId, "message too big", closeCode = 1009)
         return true
     }
 
-    private fun closeCurrentSocket(socket: WebSocket, nodeId: String, reason: String) {
-        if (this.webSocket === socket) this.webSocket = null
-        if (!socket.close(1008, reason)) socket.cancel()
-        connecting.set(false)
-        clearPresence()
-        _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+    private fun closeCurrentSocket(
+        socket: WebSocket,
+        nodeId: String,
+        reason: String,
+        closeCode: Int = 1008
+    ) {
+        invalidateCurrentSocket(socket, nodeId, closeCode, reason)
     }
 
-    private fun sendJoinFrame(chatId: String) {
+    private fun invalidateCurrentSocket(
+        socket: WebSocket,
+        nodeId: String,
+        closeCode: Int?,
+        reason: String,
+        signalPurge: Boolean = false
+    ) {
+        val drainedPending: DrainedPendingOperations
+        synchronized(connectionLock) {
+            if (webSocket !== socket) return
+            // A GLOBAL_WIPE frame can be queued immediately before the socket
+            // fails. Carry that command into the post-invalidation generation
+            // instead of draining and silently losing it.
+            val carryPurge = signalPurge || purgeSignaled.get()
+            drainedPending = advanceConnectionEpochAndDrainRoomChangesLocked()
+            if (carryPurge) {
+                signalPurgeLocked(connectionGeneration.get(), force = true)
+            }
+            connecting.set(false)
+            webSocket = null
+            // Authorization is scoped to the authenticated socket. Keep this
+            // under the connection lock so a reconnect cannot install a new
+            // catalog between invalidation and the old catalog being purged.
+            clearAuthorizationStateLocked()
+            clearPresence()
+            _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+        }
+        completeDrainedPendingOperations(drainedPending, OutboundSendResult.AMBIGUOUS)
+        if (closeCode != null && !socket.close(closeCode, reason)) socket.cancel()
+    }
+
+    /**
+     * Clears all socket-scoped routing and identity authorization.
+     *
+     * Callers hold [connectionLock]. Child locks are always acquired in the
+     * order joined-chat set, identity pins, then catalog maps; no catalog
+     * operation acquires the connection lock while holding a child lock.
+     */
+    private fun clearAuthorizationStateLocked() {
+        synchronized(joinedChatIds) {
+            joinedChatIds.clear()
+        }
+        synchronized(identityPins) {
+            identityPins.clear()
+        }
+        synchronized(catalogLock) {
+            roomCatalogIds.clear()
+            directCatalogIds.clear()
+            directCatalogPeers.clear()
+            directCatalogPeerById.clear()
+        }
+    }
+
+    /** Replays a join only to the callback socket that received onOpen. */
+    private fun sendJoinFrameForSocket(
+        socket: WebSocket,
+        generation: Long,
+        chatId: String
+    ) {
         val frame = JSONObject()
             .put("type", "join")
             .put("chat_id", chatId)
             .toString()
-
-        webSocket?.send(frame)
+        synchronized(connectionLock) {
+            if (isCurrentSocket(socket, generation)) socket.send(frame)
+        }
     }
 
     private fun wipeIncomingPayload(payload: IncomingTransportPayload) {
@@ -637,6 +1286,14 @@ class RealChatTransport(
         return true
     }
 
+    private fun acceptPresenceCatalogForSocket(
+        socket: WebSocket,
+        generation: Long,
+        catalog: PresenceCatalog
+    ): Boolean = synchronized(connectionLock) {
+        isCurrentSocket(socket, generation) && acceptPresenceCatalog(catalog)
+    }
+
     private fun installRoomCatalog(sessions: List<ChatSession>) {
         synchronized(catalogLock) {
             roomCatalogIds.clear()
@@ -646,14 +1303,44 @@ class RealChatTransport(
         }
     }
 
+    private fun installRoomCatalogForSocket(
+        socket: WebSocket,
+        generation: Long,
+        sessions: List<ChatSession>
+    ): Boolean = synchronized(connectionLock) {
+        if (!isCurrentSocket(socket, generation)) {
+            false
+        } else {
+            installRoomCatalog(sessions)
+            true
+        }
+    }
+
     private fun installDirectCatalog(sessions: List<ChatSession>) {
         synchronized(catalogLock) {
             directCatalogIds.clear()
             directCatalogPeers.clear()
+            directCatalogPeerById.clear()
             sessions.forEach { session ->
-                directCatalogIds[session.id.lowercase(Locale.ROOT)] = session.id
-                directCatalogPeers[session.name.lowercase(Locale.ROOT)] = session.name
+                val idKey = session.id.lowercase(Locale.ROOT)
+                val peerKey = session.name.lowercase(Locale.ROOT)
+                directCatalogIds[idKey] = session.id
+                directCatalogPeers[peerKey] = session.name
+                directCatalogPeerById[idKey] = session.name
             }
+        }
+    }
+
+    private fun installDirectCatalogForSocket(
+        socket: WebSocket,
+        generation: Long,
+        sessions: List<ChatSession>
+    ): Boolean = synchronized(connectionLock) {
+        if (!isCurrentSocket(socket, generation)) {
+            false
+        } else {
+            installDirectCatalog(sessions)
+            true
         }
     }
 
@@ -670,6 +1357,14 @@ class RealChatTransport(
             roomCatalogIds[key] = session.id
             return true
         }
+    }
+
+    private fun acceptDynamicRoomForSocket(
+        socket: WebSocket,
+        generation: Long,
+        session: ChatSession
+    ): Boolean = synchronized(connectionLock) {
+        isCurrentSocket(socket, generation) && acceptDynamicRoom(session)
     }
 
     internal fun acceptDynamicDirect(session: ChatSession): Boolean {
@@ -690,7 +1385,33 @@ class RealChatTransport(
             if (existingId == null && directCatalogIds.size >= MAX_DIRECT_CATALOG_ENTRIES) return false
             directCatalogIds[idKey] = session.id
             directCatalogPeers[peerKey] = session.name
+            directCatalogPeerById[idKey] = session.name
             return true
+        }
+    }
+
+    private fun acceptDynamicDirectForSocket(
+        socket: WebSocket,
+        generation: Long,
+        session: ChatSession
+    ): Boolean = synchronized(connectionLock) {
+        isCurrentSocket(socket, generation) && acceptDynamicDirect(session)
+    }
+
+    /**
+     * A valid envelope is not sufficient authorization to enter the message
+     * collector. The relay's catalog is the local routing boundary: rooms must
+     * be known, and a direct envelope must name the peer bound to that direct id.
+     */
+    internal fun isAuthorizedIncomingPayload(payload: IncomingTransportPayload): Boolean {
+        val idKey = payload.chatId.lowercase(Locale.ROOT)
+        synchronized(catalogLock) {
+            return when {
+                idKey.startsWith("forum_") -> roomCatalogIds.containsKey(idKey)
+                idKey.startsWith("dm_") -> directCatalogPeerById[idKey]
+                    ?.equals(payload.senderUsername, ignoreCase = true) == true
+                else -> false
+            }
         }
     }
 
@@ -833,7 +1554,7 @@ class RealChatTransport(
         }
     }
 
-    internal fun JSONObject.toIncomingPayload(): IncomingTransportPayload? {
+    internal fun JSONObject.toIncomingPayload(connectionGeneration: Long = 0L): IncomingTransportPayload? {
         var nonce: ByteArray? = null
         var ciphertext: ByteArray? = null
         var signature: ByteArray? = null
@@ -888,7 +1609,8 @@ class RealChatTransport(
                 senderUsername = senderUsername,
                 senderPublicKey = decodedSenderPublicKey,
                 prekeyId = prekeyId,
-                isPrekey = isPrekey
+                isPrekey = isPrekey,
+                connectionGeneration = connectionGeneration
             )
             ownershipTransferred = true
             payload
@@ -988,9 +1710,11 @@ class RealChatTransport(
     }
 
     private companion object {
-        const val PROTOCOL_VERSION = 7
+        const val PROTOCOL_VERSION = 8
+        // Protocol-v8 ciphertext is padded to 256-byte buckets. Base64url and
+        // JSON framing add overhead, so this client keeps room below the relay cap.
         const val MAX_WEBSOCKET_FRAME_BYTES = 1 * 1024 * 1024
-        const val MAX_CIPHERTEXT_BYTES = 1 * 1024 * 1024
+        const val MAX_CIPHERTEXT_BYTES = 1_048_848
         const val MAX_WRAPPED_KEY_BYTES = 4096
         const val MESSAGE_NONCE_BYTES = 12
         const val MESSAGE_SIGNATURE_BYTES = 64
@@ -1003,8 +1727,12 @@ class RealChatTransport(
         const val MAX_PRESENCE_ENTRIES = 128
         const val MAX_ROOM_CATALOG_ENTRIES = 1024
         const val MAX_DIRECT_CATALOG_ENTRIES = 128
+        const val ROOM_CHANGE_BUFFER_CAPACITY =
+            MAX_ROOM_CATALOG_ENTRIES + MAX_DIRECT_CATALOG_ENTRIES
         const val MAX_PINNED_IDENTITIES = 1024
         const val MAX_JOINED_CHAT_IDS = 512
+        const val MAX_PENDING_OUTBOUND = 64
+        const val MAX_PENDING_ACKNOWLEDGEMENTS = 64
         const val DIRECTORY_DIGEST_BYTES = 32
         const val IDENTITY_FINGERPRINT_BYTES = 64
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")

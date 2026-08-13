@@ -34,6 +34,14 @@ const IDENTITY_PUBLIC_BYTES: usize = FALLBACK_KEY_OFFSET + 32;
 const NONCE_BYTES: usize = 12;
 const MAX_CONTEXT_BYTES: usize = 512;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const PAYLOAD_FORMAT_VERSION: u8 = 1;
+const PAYLOAD_HEADER_BYTES: usize = 1 + 4;
+const PAYLOAD_PADDING_BUCKET_BYTES: usize = 256;
+const PAYLOAD_TAG_BYTES: usize = 16;
+const MAX_PADDED_PAYLOAD_BYTES: usize = (MAX_PAYLOAD_BYTES + PAYLOAD_HEADER_BYTES)
+    .div_ceil(PAYLOAD_PADDING_BUCKET_BYTES)
+    * PAYLOAD_PADDING_BUCKET_BYTES;
+const MAX_PAYLOAD_CIPHERTEXT_BYTES: usize = MAX_PADDED_PAYLOAD_BYTES + PAYLOAD_TAG_BYTES;
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 200 * 1024 * 1024;
@@ -49,7 +57,8 @@ const MAX_RATCHET_ENVELOPE_BYTES: usize = 4096;
 const MAX_PEERS: usize = 256;
 const MAX_SESSIONS_PER_PEER: usize = 4;
 const IDENTITY_STATE_SIGNATURE_BYTES: usize = 64;
-const PROTOCOL_VERSION: u32 = 7;
+const REGISTRATION_CHALLENGE_BYTES: usize = 32;
+const PROTOCOL_VERSION: u32 = 8;
 const IDENTITY_ENVELOPE_VERSION: u8 = 4;
 const KEY_VALIDATION_SCALAR: [u8; 32] = [0x42; 32];
 
@@ -132,6 +141,8 @@ pub struct AttachmentCiphertext {
     pub blob: Vec<u8>,
 }
 
+pub const REGISTRATION_CHALLENGE_BYTES_V8: usize = REGISTRATION_CHALLENGE_BYTES;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredPeerSessions {
     peer: String,
@@ -149,6 +160,16 @@ struct StoredE2eeState {
     session_prekeys: HashMap<String, String>,
 }
 
+/// A serialized pre-send snapshot. The owned serialized bytes are wiped when
+/// the transaction finishes. Temporary pickle/serde values used to create or
+/// restore the snapshot are short-lived but cannot be guaranteed zeroized by
+/// this crate because their fields are owned by vodozemac/serde.
+struct PendingOutbound {
+    message_id: String,
+    revision: u64,
+    checkpoint: Zeroizing<Vec<u8>>,
+}
+
 struct E2eeState {
     revision: u64,
     fallback_public: [u8; 32],
@@ -157,6 +178,7 @@ struct E2eeState {
     account: Account,
     sessions: HashMap<String, Vec<Session>>,
     session_prekeys: HashMap<String, String>,
+    pending_outbound: Option<PendingOutbound>,
 }
 
 struct SealingMaterial {
@@ -473,6 +495,7 @@ impl E2eeSession {
                 account,
                 sessions: HashMap::new(),
                 session_prekeys: HashMap::new(),
+                pending_outbound: None,
             }),
             sealing: Mutex::new(None),
         }))
@@ -563,6 +586,7 @@ impl E2eeSession {
                 account: Account::from_pickle(stored.account),
                 sessions,
                 session_prekeys: stored.session_prekeys,
+                pending_outbound: None,
             }),
             sealing: Mutex::new(Some(SealingMaterial { key: *key, context })),
         });
@@ -610,7 +634,7 @@ impl E2eeSession {
         used_prekey_id: String,
     ) -> Result<Vec<u8>, AbyssalError> {
         let state = lock(&self.state, "Identity unavailable")?;
-        sign_ack_signature_v7(
+        sign_ack_signature_v8(
             PROTOCOL_VERSION,
             &chat_id,
             &message_id,
@@ -619,6 +643,36 @@ impl E2eeSession {
             &state.account,
         )
         .map_err(AbyssalError::from)
+    }
+
+    /// Prove possession of the Ed25519 identity key during account creation.
+    ///
+    /// The server-issued challenge and every registration input are bound into
+    /// one canonical transcript.  This prevents registering a copied public
+    /// identity without also controlling its private key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_registration_identity_proof(
+        &self,
+        node_id: String,
+        handshake_id: String,
+        challenge: Vec<u8>,
+        registration_upload: Vec<u8>,
+        identity_public: Vec<u8>,
+        prekey_id: String,
+        identity_envelope: Vec<u8>,
+    ) -> Result<Vec<u8>, AbyssalError> {
+        let transcript = registration_identity_proof_input_v8(
+            &node_id,
+            &handshake_id,
+            &challenge,
+            &registration_upload,
+            &identity_public,
+            &prekey_id,
+            &identity_envelope,
+        )
+        .map_err(AbyssalError::from)?;
+        let state = lock(&self.state, "Identity unavailable")?;
+        Ok(state.account.sign(&transcript).to_bytes().to_vec())
     }
 
     pub fn seal_identity(
@@ -631,11 +685,14 @@ impl E2eeSession {
         validate_context(&context)?;
         let key = Zeroizing::new(identity_wrap_key(&export_key, &context)?);
         let mut sealing = lock(&self.sealing, "Identity unavailable")?;
+        let state = lock(&self.state, "Identity unavailable")?;
+        if state.pending_outbound.is_some() {
+            return Err("Identity unavailable".to_string().into());
+        }
         *sealing = Some(SealingMaterial { key: *key, context });
         let sealing = sealing
             .as_ref()
             .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
-        let state = lock(&self.state, "Identity unavailable")?;
         seal_state(&state, sealing).map_err(AbyssalError::from)
     }
 
@@ -672,14 +729,16 @@ impl E2eeSession {
         OsRng.fill_bytes(&mut nonce);
         let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
             .map_err(|_| "Payload unavailable".to_string())?;
+        let padded_plaintext = pad_payload(&plaintext).map_err(AbyssalError::from)?;
         let ciphertext_result = cipher.encrypt(
             Nonce::from_slice(&nonce),
             Payload {
-                msg: &plaintext,
+                msg: &padded_plaintext,
                 aad: &aad,
             },
         );
         drop(plaintext);
+        drop(padded_plaintext);
         let ciphertext = ciphertext_result.map_err(|_| "Payload unavailable".to_string())?;
 
         let sealing = lock(&self.sealing, "Identity unavailable")?;
@@ -687,7 +746,8 @@ impl E2eeSession {
             .as_ref()
             .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
         let mut state = lock(&self.state, "Identity unavailable")?;
-        let checkpoint = checkpoint_state(&state);
+        let outbound_revision =
+            begin_outbound(&mut state, &message_id).map_err(AbyssalError::from)?;
         let result = (|| -> Result<E2eePayload, AbyssalError> {
             let mut envelopes = Vec::with_capacity(recipients.len());
             for recipient in recipients {
@@ -716,7 +776,7 @@ impl E2eeSession {
             let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
             let identity_public = public_key_from_state(&state);
             let prekey_id = state.one_time_key_id.clone();
-            let state_signature = sign_identity_state_v7(
+            let state_signature = sign_identity_state_v8(
                 PROTOCOL_VERSION,
                 state.revision,
                 &identity_envelope,
@@ -726,7 +786,7 @@ impl E2eeSession {
             )
             .map_err(AbyssalError::from)?;
             for envelope in &mut envelopes {
-                let signature_input = signature_input_v7(
+                let signature_input = signature_input_v8(
                     PROTOCOL_VERSION,
                     &aad,
                     &nonce,
@@ -751,9 +811,51 @@ impl E2eeSession {
             })
         })();
         if result.is_err() {
-            restore_state(&mut state, checkpoint);
+            rollback_pending_outbound(&mut state).map_err(AbyssalError::from)?;
+        } else if state.revision != outbound_revision {
+            rollback_pending_outbound(&mut state).map_err(AbyssalError::from)?;
+            return Err("Identity unavailable".to_string().into());
         }
         result
+    }
+
+    /// Commit the exact ratchet revision after the relay confirms admission.
+    /// Until this is called, all other stateful cryptographic operations are
+    /// rejected and the caller may roll the session back on an explicit NACK.
+    pub fn commit_outbound(&self, message_id: String, revision: u64) -> Result<(), AbyssalError> {
+        validate_outbound_message_id(&message_id).map_err(AbyssalError::from)?;
+        let mut state = lock(&self.state, "Identity unavailable")?;
+        let pending = state
+            .pending_outbound
+            .as_ref()
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        if pending.message_id != message_id
+            || pending.revision != revision
+            || state.revision != revision
+        {
+            return Err("Identity unavailable".to_string().into());
+        }
+        state.pending_outbound.take();
+        Ok(())
+    }
+
+    /// Restore the pre-send snapshot for an explicitly rejected message.
+    /// Revision matching is strict so a stale result cannot roll back a newer
+    /// transaction.
+    pub fn rollback_outbound(&self, message_id: String, revision: u64) -> Result<(), AbyssalError> {
+        validate_outbound_message_id(&message_id).map_err(AbyssalError::from)?;
+        let mut state = lock(&self.state, "Identity unavailable")?;
+        let pending = state
+            .pending_outbound
+            .as_ref()
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
+        if pending.message_id != message_id
+            || pending.revision != revision
+            || state.revision != revision
+        {
+            return Err("Identity unavailable".to_string().into());
+        }
+        rollback_pending_outbound(&mut state).map_err(AbyssalError::from)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -778,7 +880,8 @@ impl E2eeSession {
         if version != PROTOCOL_VERSION
             || identity_public.len() != IDENTITY_PUBLIC_BYTES
             || nonce.len() != NONCE_BYTES
-            || ciphertext.len() > MAX_PAYLOAD_BYTES + 16
+            || ciphertext.len() < PAYLOAD_TAG_BYTES
+            || ciphertext.len() > MAX_PAYLOAD_CIPHERTEXT_BYTES
             || signature.len() != 64
         {
             return Err("Payload unavailable".to_string().into());
@@ -797,7 +900,7 @@ impl E2eeSession {
         };
         validate_recipient_envelope(&envelope).map_err(AbyssalError::from)?;
         let aad = message_aad(&chat_id, &message_id, &sender_username);
-        let signature_input = signature_input_v7(
+        let signature_input = signature_input_v8(
             version,
             &aad,
             &nonce,
@@ -822,7 +925,10 @@ impl E2eeSession {
             .as_ref()
             .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
         let mut state = lock(&self.state, "Identity unavailable")?;
-        let checkpoint = checkpoint_state(&state);
+        if state.pending_outbound.is_some() {
+            return Err("Identity unavailable".to_string().into());
+        }
+        let checkpoint = checkpoint_state_bytes(&state).map_err(AbyssalError::from)?;
         let result = (|| -> Result<E2eeDecryption, AbyssalError> {
             let (content_key, used_prekey) = ratchet_unwrap_content_key(
                 &mut state,
@@ -840,7 +946,7 @@ impl E2eeSession {
             let content_key = Zeroizing::new(content_key);
             let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
                 .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
-            let mut plaintext = Zeroizing::new(
+            let padded_plaintext = Zeroizing::new(
                 cipher
                     .decrypt(
                         Nonce::from_slice(&nonce),
@@ -851,6 +957,7 @@ impl E2eeSession {
                     )
                     .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
             );
+            let plaintext = unpad_payload(&padded_plaintext).map_err(AbyssalError::from)?;
             if used_prekey {
                 rotate_one_time_key(&mut state).map_err(AbyssalError::from)?;
             }
@@ -861,7 +968,7 @@ impl E2eeSession {
             let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
             let identity_public = public_key_from_state(&state);
             let prekey_id = state.one_time_key_id.clone();
-            let state_signature = sign_identity_state_v7(
+            let state_signature = sign_identity_state_v8(
                 PROTOCOL_VERSION,
                 state.revision,
                 &identity_envelope,
@@ -870,7 +977,6 @@ impl E2eeSession {
                 &state.account,
             )
             .map_err(AbyssalError::from)?;
-            let plaintext = std::mem::take(&mut *plaintext);
             Ok(E2eeDecryption {
                 plaintext,
                 state_revision: state.revision,
@@ -881,7 +987,7 @@ impl E2eeSession {
             })
         })();
         if result.is_err() {
-            restore_state(&mut state, checkpoint);
+            restore_state_from_checkpoint(&mut state, &checkpoint).map_err(AbyssalError::from)?;
         }
         result
     }
@@ -1156,6 +1262,12 @@ fn checkpoint_state(state: &E2eeState) -> StoredE2eeState {
     }
 }
 
+fn checkpoint_state_bytes(state: &E2eeState) -> Result<Zeroizing<Vec<u8>>, String> {
+    serde_json::to_vec(&checkpoint_state(state))
+        .map(Zeroizing::new)
+        .map_err(|_| "Identity unavailable".to_string())
+}
+
 fn restore_state(state: &mut E2eeState, stored: StoredE2eeState) {
     state.revision = stored.revision;
     state.fallback_public = stored.fallback_public;
@@ -1176,6 +1288,109 @@ fn restore_state(state: &mut E2eeState, stored: StoredE2eeState) {
         })
         .collect();
     state.session_prekeys = stored.session_prekeys;
+}
+
+fn begin_outbound(state: &mut E2eeState, message_id: &str) -> Result<u64, String> {
+    if state.pending_outbound.is_some() {
+        return Err("Identity unavailable".to_string());
+    }
+    validate_outbound_message_id(message_id)?;
+    let revision = state
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "Identity unavailable".to_string())?;
+    let checkpoint = checkpoint_state_bytes(state)?;
+    state.pending_outbound = Some(PendingOutbound {
+        message_id: message_id.to_string(),
+        revision,
+        checkpoint,
+    });
+    Ok(revision)
+}
+
+fn validate_outbound_message_id(message_id: &str) -> Result<(), String> {
+    if valid_context_identifier(message_id) {
+        Ok(())
+    } else {
+        Err("Identity unavailable".to_string())
+    }
+}
+
+fn rollback_pending_outbound(state: &mut E2eeState) -> Result<(), String> {
+    let pending = state
+        .pending_outbound
+        .take()
+        .ok_or_else(|| "Identity unavailable".to_string())?;
+    // Take ownership to avoid cloning secret checkpoint bytes. Deserialization
+    // happens before ratchet state is mutated; on failure the same pending
+    // transaction is reinserted so the session stays fail closed.
+    match restore_state_from_checkpoint(state, &pending.checkpoint) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            state.pending_outbound = Some(pending);
+            Err(error)
+        }
+    }
+}
+
+fn restore_state_from_checkpoint(state: &mut E2eeState, checkpoint: &[u8]) -> Result<(), String> {
+    let stored: StoredE2eeState =
+        serde_json::from_slice(checkpoint).map_err(|_| "Identity unavailable".to_string())?;
+    restore_state(state, stored);
+    Ok(())
+}
+
+fn pad_payload(plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    if plaintext.is_empty() || plaintext.len() > MAX_PAYLOAD_BYTES {
+        return Err("Payload unavailable".to_string());
+    }
+    let required = PAYLOAD_HEADER_BYTES
+        .checked_add(plaintext.len())
+        .ok_or_else(|| "Payload unavailable".to_string())?;
+    let padded_len = required
+        .div_ceil(PAYLOAD_PADDING_BUCKET_BYTES)
+        .checked_mul(PAYLOAD_PADDING_BUCKET_BYTES)
+        .ok_or_else(|| "Payload unavailable".to_string())?;
+    if padded_len > MAX_PADDED_PAYLOAD_BYTES {
+        return Err("Payload unavailable".to_string());
+    }
+    let mut padded = Zeroizing::new(vec![0_u8; padded_len]);
+    padded[0] = PAYLOAD_FORMAT_VERSION;
+    padded[1..PAYLOAD_HEADER_BYTES].copy_from_slice(&(plaintext.len() as u32).to_be_bytes());
+    padded[PAYLOAD_HEADER_BYTES..required].copy_from_slice(plaintext);
+    if padded_len > required {
+        OsRng.fill_bytes(&mut padded[required..]);
+    }
+    Ok(padded)
+}
+
+fn unpad_payload(padded: &[u8]) -> Result<Vec<u8>, String> {
+    if padded.len() < PAYLOAD_HEADER_BYTES
+        || padded.len() > MAX_PADDED_PAYLOAD_BYTES
+        || !padded.len().is_multiple_of(PAYLOAD_PADDING_BUCKET_BYTES)
+        || padded[0] != PAYLOAD_FORMAT_VERSION
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    let original_len = u32::from_be_bytes(
+        padded[1..PAYLOAD_HEADER_BYTES]
+            .try_into()
+            .map_err(|_| "Payload unavailable".to_string())?,
+    ) as usize;
+    if original_len == 0 || original_len > MAX_PAYLOAD_BYTES {
+        return Err("Payload unavailable".to_string());
+    }
+    let required = PAYLOAD_HEADER_BYTES
+        .checked_add(original_len)
+        .ok_or_else(|| "Payload unavailable".to_string())?;
+    let canonical_len = required
+        .div_ceil(PAYLOAD_PADDING_BUCKET_BYTES)
+        .checked_mul(PAYLOAD_PADDING_BUCKET_BYTES)
+        .ok_or_else(|| "Payload unavailable".to_string())?;
+    if canonical_len != padded.len() {
+        return Err("Payload unavailable".to_string());
+    }
+    Ok(padded[PAYLOAD_HEADER_BYTES..required].to_vec())
 }
 
 fn public_key_from_state(state: &E2eeState) -> Vec<u8> {
@@ -1234,7 +1449,7 @@ fn identity_wrap_key(export_key: &[u8], context: &[u8]) -> Result<[u8; 32], Stri
 
 fn message_aad(chat_id: &str, message_id: &str, sender_username: &str) -> Vec<u8> {
     canonical_parts(&[
-        b"ABYSSAL_E2EE_PAYLOAD_V7",
+        b"ABYSSAL_E2EE_PAYLOAD_V8",
         chat_id.as_bytes(),
         message_id.as_bytes(),
         sender_username.as_bytes(),
@@ -1286,7 +1501,7 @@ fn attachment_aad(
     ])
 }
 
-fn sign_identity_state_v7(
+fn sign_identity_state_v8(
     version: u32,
     state_revision: u64,
     identity_envelope: &[u8],
@@ -1294,7 +1509,7 @@ fn sign_identity_state_v7(
     prekey_id: &str,
     account: &Account,
 ) -> Result<Vec<u8>, String> {
-    let transcript = Zeroizing::new(identity_state_signature_input_v7(
+    let transcript = Zeroizing::new(identity_state_signature_input_v8(
         version,
         state_revision,
         identity_envelope,
@@ -1304,12 +1519,12 @@ fn sign_identity_state_v7(
     Ok(account.sign(&transcript).to_bytes().to_vec())
 }
 
-/// Build the exact protocol-v7 signed identity-state transcript.
+/// Build the exact protocol-v8 signed identity-state transcript.
 ///
 /// The transcript covers the complete sealed state envelope and the public
 /// identity/prekey bundle returned with it.  The relay can use this helper to
 /// verify the state signature without decrypting the envelope.
-pub fn identity_state_signature_input_v7(
+pub fn identity_state_signature_input_v8(
     version: u32,
     state_revision: u64,
     identity_envelope: &[u8],
@@ -1326,7 +1541,7 @@ pub fn identity_state_signature_input_v7(
     let version = version.to_be_bytes();
     let revision = state_revision.to_be_bytes();
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_IDENTITY_STATE_SIGNATURE_V7",
+        b"ABYSSAL_E2EE_IDENTITY_STATE_SIGNATURE_V8",
         &version,
         &revision,
         identity_envelope,
@@ -1335,12 +1550,12 @@ pub fn identity_state_signature_input_v7(
     ]))
 }
 
-/// Verify a protocol-v7 signed identity-state snapshot.
+/// Verify a protocol-v8 signed identity-state snapshot.
 ///
 /// The caller must bind `identity_public` to the authenticated account before
 /// accepting the snapshot.  This function verifies the Ed25519 signature and
 /// validates every transcript field, including the prekey commitment.
-pub fn verify_identity_state_signature_v7(
+pub fn verify_identity_state_signature_v8(
     version: u32,
     state_revision: u64,
     identity_envelope: &[u8],
@@ -1351,7 +1566,7 @@ pub fn verify_identity_state_signature_v7(
     if state_signature.len() != IDENTITY_STATE_SIGNATURE_BYTES {
         return Err("Payload unavailable".to_string());
     }
-    let transcript = Zeroizing::new(identity_state_signature_input_v7(
+    let transcript = Zeroizing::new(identity_state_signature_input_v8(
         version,
         state_revision,
         identity_envelope,
@@ -1371,8 +1586,114 @@ pub fn verify_identity_state_signature_v7(
         .map_err(|_| "Payload unavailable".to_string())
 }
 
+/// Build the canonical protocol-v8 registration proof transcript.
+///
+/// Every variable-length field is length-prefixed with a big-endian u32. This
+/// avoids concatenation ambiguity while keeping the transcript deterministic
+/// across Rust, Kotlin, and WebAssembly clients.
+pub fn registration_identity_proof_input_v8(
+    node_id: &str,
+    handshake_id: &str,
+    challenge: &[u8],
+    registration_upload: &[u8],
+    identity_public: &[u8],
+    prekey_id: &str,
+    identity_envelope: &[u8],
+) -> Result<Vec<u8>, String> {
+    if node_id.is_empty()
+        || node_id.len() > 128
+        || !node_id.is_ascii()
+        || handshake_id.is_empty()
+        || handshake_id.len() > 128
+        || !handshake_id.is_ascii()
+        || challenge.len() != REGISTRATION_CHALLENGE_BYTES
+        || registration_upload.is_empty()
+        || registration_upload.len() > 16 * 1024
+        || identity_public.len() != IDENTITY_PUBLIC_BYTES
+        || !valid_prekey_id_for_protocol(prekey_id)
+        || identity_envelope.len() <= 1 + NONCE_BYTES + ATTACHMENT_TAG_BYTES
+        || identity_envelope.len() > MAX_IDENTITY_STATE_BYTES
+        || identity_envelope.first() != Some(&IDENTITY_ENVELOPE_VERSION)
+    {
+        return Err("Identity proof rejected".to_string());
+    }
+    validate_identity_public_bundle(identity_public, Some(prekey_id))?;
+
+    let mut transcript = Vec::with_capacity(
+        64 + node_id.len()
+            + handshake_id.len()
+            + challenge.len()
+            + registration_upload.len()
+            + identity_public.len()
+            + prekey_id.len()
+            + identity_envelope.len(),
+    );
+    transcript.extend_from_slice(b"ABYSSAL_REGISTRATION_IDENTITY_PROOF_V8");
+    transcript.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    append_transcript_field(&mut transcript, node_id.as_bytes());
+    append_transcript_field(&mut transcript, handshake_id.as_bytes());
+    append_transcript_field(&mut transcript, challenge);
+    append_transcript_field(&mut transcript, registration_upload);
+    append_transcript_field(&mut transcript, identity_public);
+    append_transcript_field(&mut transcript, prekey_id.as_bytes());
+    append_transcript_field(&mut transcript, identity_envelope);
+    Ok(transcript)
+}
+
+/// Verify a registration proof against the Ed25519 key embedded in the exact
+/// public identity bundle supplied by the client.
 #[allow(clippy::too_many_arguments)]
-fn sign_ack_signature_v7(
+pub fn verify_registration_identity_proof_v8(
+    node_id: &str,
+    handshake_id: &str,
+    challenge: &[u8],
+    registration_upload: &[u8],
+    identity_public: &[u8],
+    prekey_id: &str,
+    identity_envelope: &[u8],
+    proof: &[u8],
+) -> Result<(), String> {
+    if proof.len() != IDENTITY_STATE_SIGNATURE_BYTES {
+        return Err("Identity proof rejected".to_string());
+    }
+    let transcript = Zeroizing::new(registration_identity_proof_input_v8(
+        node_id,
+        handshake_id,
+        challenge,
+        registration_upload,
+        identity_public,
+        prekey_id,
+        identity_envelope,
+    )?);
+    let identity_ed: &[u8; 32] = identity_public
+        [IDENTITY_FINGERPRINT_BYTES - 32..IDENTITY_FINGERPRINT_BYTES]
+        .try_into()
+        .map_err(|_| "Identity proof rejected".to_string())?;
+    let verifying_key = Ed25519PublicKey::from_slice(identity_ed)
+        .map_err(|_| "Identity proof rejected".to_string())?;
+    let signature =
+        Ed25519Signature::from_slice(proof).map_err(|_| "Identity proof rejected".to_string())?;
+    verifying_key
+        .verify(&transcript, &signature)
+        .map_err(|_| "Identity proof rejected".to_string())
+}
+
+fn append_transcript_field(transcript: &mut Vec<u8>, field: &[u8]) {
+    transcript.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    transcript.extend_from_slice(field);
+}
+
+fn valid_prekey_id_for_protocol(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_ack_signature_v8(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1380,7 +1701,7 @@ fn sign_ack_signature_v7(
     used_prekey_id: &str,
     account: &Account,
 ) -> Result<Vec<u8>, String> {
-    let transcript = Zeroizing::new(ack_signature_input_v7(
+    let transcript = Zeroizing::new(ack_signature_input_v8(
         version,
         chat_id,
         message_id,
@@ -1390,13 +1711,13 @@ fn sign_ack_signature_v7(
     Ok(account.sign(&transcript).to_bytes().to_vec())
 }
 
-/// Build the exact protocol-v7 message acknowledgement transcript.
+/// Build the exact protocol-v8 message acknowledgement transcript.
 ///
 /// This proof covers only the acknowledgement action.  It intentionally does
 /// not include the current ratchet revision or state signature, because a
 /// duplicate delivery may be acknowledged after the recipient has advanced
 /// its ratchet state.  The relay verifies the signed state separately.
-pub fn ack_signature_input_v7(
+pub fn ack_signature_input_v8(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1412,7 +1733,7 @@ pub fn ack_signature_input_v7(
     )?;
     let version = version.to_be_bytes();
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_ACK_SIGNATURE_V7",
+        b"ABYSSAL_E2EE_ACK_SIGNATURE_V8",
         &version,
         chat_id.as_bytes(),
         message_id.as_bytes(),
@@ -1421,8 +1742,8 @@ pub fn ack_signature_input_v7(
     ]))
 }
 
-/// Verify a protocol-v7 message acknowledgement signature.
-pub fn verify_ack_signature_v7(
+/// Verify a protocol-v8 message acknowledgement signature.
+pub fn verify_ack_signature_v8(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1436,7 +1757,7 @@ pub fn verify_ack_signature_v7(
     {
         return Err("Payload unavailable".to_string());
     }
-    let transcript = Zeroizing::new(ack_signature_input_v7(
+    let transcript = Zeroizing::new(ack_signature_input_v8(
         version,
         chat_id,
         message_id,
@@ -1493,7 +1814,7 @@ fn validate_identity_state_signature_fields(
         .map_err(|_| "Payload unavailable".to_string())
 }
 
-fn signature_input_v7(
+fn signature_input_v8(
     version: u32,
     aad: &[u8],
     nonce: &[u8],
@@ -1505,7 +1826,7 @@ fn signature_input_v7(
     let version = version.to_be_bytes();
     let is_prekey = [u8::from(envelope.is_prekey)];
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_SIGNATURE_V7",
+        b"ABYSSAL_E2EE_SIGNATURE_V8",
         &version,
         aad,
         nonce,
@@ -1518,12 +1839,12 @@ fn signature_input_v7(
     ]))
 }
 
-/// Build the exact protocol-v7 recipient-envelope signature transcript.
+/// Build the exact protocol-v8 recipient-envelope signature transcript.
 ///
 /// This helper is intentionally kept outside the UniFFI surface. The relay
 /// and its adversarial tests use the same canonical construction as clients.
 #[allow(clippy::too_many_arguments)]
-pub fn message_signature_input_v7(
+pub fn message_signature_input_v8(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1550,7 +1871,7 @@ pub fn message_signature_input_v7(
         is_prekey,
         signature: Vec::new(),
     };
-    let result = signature_input_v7(
+    let result = signature_input_v8(
         version,
         &message_aad(chat_id, message_id, sender_username),
         nonce,
@@ -1564,13 +1885,13 @@ pub fn message_signature_input_v7(
     result
 }
 
-/// Verify the exact protocol-v7 recipient-envelope signature transcript.
+/// Verify the exact protocol-v8 recipient-envelope signature transcript.
 ///
 /// The relay must verify signatures with the same canonical transcript as the
 /// clients, while still binding the long-term signing key to the account
 /// identity authenticated by the relay before calling this helper.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_message_signature_v7(
+pub fn verify_message_signature_v8(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1591,7 +1912,7 @@ pub fn verify_message_signature_v7(
     {
         return Err("Payload unavailable".to_string());
     }
-    let signature_input = Zeroizing::new(message_signature_input_v7(
+    let signature_input = Zeroizing::new(message_signature_input_v8(
         version,
         chat_id,
         message_id,
@@ -1939,6 +2260,30 @@ impl WasmE2eeSession {
             .map_err(js_error)
     }
 
+    #[wasm_bindgen(js_name = signRegistrationIdentityProof)]
+    pub fn wasm_sign_registration_identity_proof(
+        &self,
+        node_id: String,
+        handshake_id: String,
+        challenge: Vec<u8>,
+        registration_upload: Vec<u8>,
+        identity_public: Vec<u8>,
+        prekey_id: String,
+        identity_envelope: Vec<u8>,
+    ) -> Result<Vec<u8>, JsValue> {
+        self.inner
+            .sign_registration_identity_proof(
+                node_id,
+                handshake_id,
+                challenge,
+                registration_upload,
+                identity_public,
+                prekey_id,
+                identity_envelope,
+            )
+            .map_err(js_error)
+    }
+
     #[wasm_bindgen(js_name = sealIdentity)]
     pub fn wasm_seal_identity(
         &self,
@@ -1947,6 +2292,20 @@ impl WasmE2eeSession {
     ) -> Result<Vec<u8>, JsValue> {
         self.inner
             .seal_identity(export_key, context)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = commitOutbound)]
+    pub fn wasm_commit_outbound(&self, message_id: String, revision: u64) -> Result<(), JsValue> {
+        self.inner
+            .commit_outbound(message_id, revision)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = rollbackOutbound)]
+    pub fn wasm_rollback_outbound(&self, message_id: String, revision: u64) -> Result<(), JsValue> {
+        self.inner
+            .rollback_outbound(message_id, revision)
             .map_err(js_error)
     }
 
@@ -2002,6 +2361,22 @@ impl WasmE2eeSession {
             )
             .map_err(js_error)?;
         serde_json::to_string(&result).map_err(|_| js_error("Payload unavailable".to_string()))
+    }
+}
+
+#[cfg(test)]
+impl E2eeSession {
+    fn encrypt_for_test(
+        &self,
+        chat_id: String,
+        message_id: String,
+        sender_username: String,
+        plaintext: Vec<u8>,
+        recipients: Vec<RecipientPublicKey>,
+    ) -> Result<E2eePayload, AbyssalError> {
+        let payload = self.encrypt(chat_id, message_id, sender_username, plaintext, recipients)?;
+        self.commit_outbound(payload.message_id.clone(), payload.state_revision)?;
+        Ok(payload)
     }
 }
 
@@ -2359,7 +2734,7 @@ mod tests {
         )
         .expect("attachment encrypt");
         let metadata = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-attachment-metadata".to_string(),
                 "Alice".to_string(),
@@ -2412,7 +2787,7 @@ mod tests {
         let safety_before = conversation_safety_number(alice.public_key(), bob.public_key())
             .expect("safety number");
         let payload = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-1".to_string(),
                 "Alice".to_string(),
@@ -2443,7 +2818,7 @@ mod tests {
         assert_ne!(bob.prekey_id(), bob_initial_prekey);
         let bob_rotated_prekey = bob.prekey_id();
         let follow_up = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-2".to_string(),
                 "Alice".to_string(),
@@ -2475,11 +2850,83 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v7_state_signatures_round_trip_and_reject_tampering() {
+    fn registration_identity_proof_binds_every_registration_field() {
+        let export_key = vec![91; 64];
+        let context = b"node:INVITE-CODE-1234".to_vec();
+        let session = E2eeSession::create(export_key.clone()).expect("identity");
+        let identity_envelope = session
+            .seal_identity(export_key, context)
+            .expect("identity envelope");
+        let identity_public = session.public_key();
+        let prekey_id = session.prekey_id();
+        let challenge = vec![7; REGISTRATION_CHALLENGE_BYTES];
+        let upload = vec![8; 64];
+        let proof = session
+            .sign_registration_identity_proof(
+                "node-1".to_string(),
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                challenge.clone(),
+                upload.clone(),
+                identity_public.clone(),
+                prekey_id.clone(),
+                identity_envelope.clone(),
+            )
+            .expect("registration proof");
+        verify_registration_identity_proof_v8(
+            "node-1",
+            "11111111-1111-4111-8111-111111111111",
+            &challenge,
+            &upload,
+            &identity_public,
+            &prekey_id,
+            &identity_envelope,
+            &proof,
+        )
+        .expect("valid proof");
+
+        let mut tampered_upload = upload.clone();
+        tampered_upload[0] ^= 1;
+        assert!(verify_registration_identity_proof_v8(
+            "node-1",
+            "11111111-1111-4111-8111-111111111111",
+            &challenge,
+            &tampered_upload,
+            &identity_public,
+            &prekey_id,
+            &identity_envelope,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_registration_identity_proof_v8(
+            "node-2",
+            "11111111-1111-4111-8111-111111111111",
+            &challenge,
+            &upload,
+            &identity_public,
+            &prekey_id,
+            &identity_envelope,
+            &proof,
+        )
+        .is_err());
+        assert!(verify_registration_identity_proof_v8(
+            "node-1",
+            "11111111-1111-4111-8111-111111111111",
+            &challenge,
+            &upload,
+            &identity_public,
+            &prekey_id,
+            &identity_envelope,
+            &proof[..proof.len() - 1],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn protocol_v8_state_signatures_round_trip_and_reject_tampering() {
         let alice = sealed_session(73);
         let bob = sealed_session(74);
         let payload = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "state-signature-message".to_string(),
                 "Alice".to_string(),
@@ -2496,7 +2943,7 @@ mod tests {
             payload.state_signature.len(),
             IDENTITY_STATE_SIGNATURE_BYTES
         );
-        verify_identity_state_signature_v7(
+        verify_identity_state_signature_v8(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2507,7 +2954,7 @@ mod tests {
         .expect("valid payload state signature");
 
         let tampered_revision = payload.state_revision + 1;
-        assert!(verify_identity_state_signature_v7(
+        assert!(verify_identity_state_signature_v8(
             payload.version,
             tampered_revision,
             &payload.identity_envelope,
@@ -2519,7 +2966,7 @@ mod tests {
 
         let mut tampered_envelope = payload.identity_envelope.clone();
         tampered_envelope[1] ^= 1;
-        assert!(verify_identity_state_signature_v7(
+        assert!(verify_identity_state_signature_v8(
             payload.version,
             payload.state_revision,
             &tampered_envelope,
@@ -2531,7 +2978,7 @@ mod tests {
 
         let mut tampered_public = payload.identity_public.clone();
         tampered_public[IDENTITY_FINGERPRINT_BYTES - 1] ^= 1;
-        assert!(verify_identity_state_signature_v7(
+        assert!(verify_identity_state_signature_v8(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2548,7 +2995,7 @@ mod tests {
             b'a'
         };
         let tampered_prekey = String::from_utf8(tampered_prekey).expect("ascii prekey");
-        assert!(verify_identity_state_signature_v7(
+        assert!(verify_identity_state_signature_v8(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2560,7 +3007,7 @@ mod tests {
 
         let mut tampered_signature = payload.state_signature.clone();
         tampered_signature[0] ^= 1;
-        assert!(verify_identity_state_signature_v7(
+        assert!(verify_identity_state_signature_v8(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2570,7 +3017,7 @@ mod tests {
         )
         .is_err());
 
-        assert!(identity_state_signature_input_v7(
+        assert!(identity_state_signature_input_v8(
             PROTOCOL_VERSION - 1,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2578,7 +3025,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v7(
+        assert!(identity_state_signature_input_v8(
             PROTOCOL_VERSION,
             0,
             &payload.identity_envelope,
@@ -2586,7 +3033,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v7(
+        assert!(identity_state_signature_input_v8(
             PROTOCOL_VERSION,
             payload.state_revision,
             &[IDENTITY_ENVELOPE_VERSION],
@@ -2594,7 +3041,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v7(
+        assert!(identity_state_signature_input_v8(
             PROTOCOL_VERSION,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2602,7 +3049,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v7(
+        assert!(identity_state_signature_input_v8(
             PROTOCOL_VERSION,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2625,7 +3072,7 @@ mod tests {
             decrypted.state_signature.len(),
             IDENTITY_STATE_SIGNATURE_BYTES
         );
-        verify_identity_state_signature_v7(
+        verify_identity_state_signature_v8(
             PROTOCOL_VERSION,
             decrypted.state_revision,
             &decrypted.identity_envelope,
@@ -2649,7 +3096,7 @@ mod tests {
                           sender_username: &str,
                           used_prekey_id: &str,
                           ack_signature: &[u8]| {
-            verify_ack_signature_v7(
+            verify_ack_signature_v8(
                 PROTOCOL_VERSION,
                 chat_id,
                 message_id,
@@ -2720,7 +3167,7 @@ mod tests {
             )
             .expect("sign duplicate ACK");
         assert_eq!(duplicate_ack, ack_signature);
-        assert!(ack_signature_input_v7(
+        assert!(ack_signature_input_v8(
             PROTOCOL_VERSION,
             "dm_alice_bob",
             "state-signature-message",
@@ -2744,7 +3191,7 @@ mod tests {
             prekey_id: bob.prekey_id(),
         };
         let first = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-early".to_string(),
                 "Alice".to_string(),
@@ -2753,7 +3200,7 @@ mod tests {
             )
             .expect("first encrypt");
         let second = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-late".to_string(),
                 "Alice".to_string(),
@@ -2808,7 +3255,7 @@ mod tests {
         .is_err());
 
         let reply = bob
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-reply".to_string(),
                 "Bob".to_string(),
@@ -2842,7 +3289,7 @@ mod tests {
         )
         .expect("restore ratchet state");
         let third = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "message-after-restore".to_string(),
                 "Alice".to_string(),
@@ -2878,7 +3325,7 @@ mod tests {
             prekey_id: initial_prekey.clone(),
         };
         let first = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "same-message-context".to_string(),
                 "Alice".to_string(),
@@ -2887,7 +3334,7 @@ mod tests {
             )
             .expect("first encrypt");
         let second = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "same-message-context".to_string(),
                 "Alice".to_string(),
@@ -2899,7 +3346,7 @@ mod tests {
         let mut tampered_ciphertext = first.clone();
         tampered_ciphertext.ciphertext[0] ^= 1;
         let aad = message_aad("dm_alice_bob", &tampered_ciphertext.message_id, "Alice");
-        let signature_input = signature_input_v7(
+        let signature_input = signature_input_v8(
             PROTOCOL_VERSION,
             &aad,
             &tampered_ciphertext.nonce,
@@ -2990,7 +3437,7 @@ mod tests {
             prekey_id: initial_prekey.clone(),
         };
         let first = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "binding-first".to_string(),
                 "Alice".to_string(),
@@ -2999,7 +3446,7 @@ mod tests {
             )
             .expect("first encrypt");
         let second = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "binding-second".to_string(),
                 "Alice".to_string(),
@@ -3070,7 +3517,7 @@ mod tests {
         };
 
         assert!(alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "sender-transaction".to_string(),
                 "Alice".to_string(),
@@ -3086,7 +3533,7 @@ mod tests {
         }
 
         let payload = alice
-            .encrypt(
+            .encrypt_for_test(
                 "dm_alice_bob".to_string(),
                 "sender-transaction-retry".to_string(),
                 "Alice".to_string(),
@@ -3116,7 +3563,7 @@ mod tests {
         // by Zeroizing at function entry, including malformed context and
         // oversized payload exits.
         assert!(alice
-            .encrypt(
+            .encrypt_for_test(
                 "invalid chat".to_string(),
                 "message-early-reject".to_string(),
                 "Alice".to_string(),
@@ -3125,7 +3572,7 @@ mod tests {
             )
             .is_err());
         assert!(alice
-            .encrypt(
+            .encrypt_for_test(
                 "forum_early_reject".to_string(),
                 "message-empty".to_string(),
                 "Alice".to_string(),
@@ -3134,7 +3581,7 @@ mod tests {
             )
             .is_err());
         assert!(alice
-            .encrypt(
+            .encrypt_for_test(
                 "forum_early_reject".to_string(),
                 "message-oversized".to_string(),
                 "Alice".to_string(),
@@ -3157,7 +3604,7 @@ mod tests {
         let bob = sealed_session(2);
         let eve = sealed_session(3);
         let payload = alice
-            .encrypt(
+            .encrypt_for_test(
                 "forum_one".to_string(),
                 "message-1".to_string(),
                 "Alice".to_string(),
@@ -3245,5 +3692,204 @@ mod tests {
             "Bob",
         )
         .is_err());
+    }
+
+    #[test]
+    fn outbound_ratchet_requires_exact_commit_or_rollback() {
+        let alice = sealed_session(71);
+        let bob = sealed_session(72);
+        let recipient = RecipientPublicKey {
+            username: "Bob".to_string(),
+            public_key: bob.public_key(),
+            prekey_id: bob.prekey_id(),
+        };
+        let bob_to_alice = bob
+            .encrypt_for_test(
+                "dm_alice_bob".to_string(),
+                "bob-before-alice".to_string(),
+                "Bob".to_string(),
+                b"incoming while pending".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Alice".to_string(),
+                    public_key: alice.public_key(),
+                    prekey_id: alice.prekey_id(),
+                }],
+            )
+            .expect("prepare incoming payload");
+
+        let staged = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "alice-pending".to_string(),
+                "Alice".to_string(),
+                b"pending".to_vec(),
+                vec![recipient.clone()],
+            )
+            .expect("stage outbound");
+        assert_eq!(staged.state_revision, 1);
+        assert!(alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "alice-second".to_string(),
+                "Alice".to_string(),
+                b"blocked".to_vec(),
+                vec![recipient.clone()],
+            )
+            .is_err());
+        assert!(decrypt_payload(
+            &alice,
+            &bob_to_alice,
+            "dm_alice_bob",
+            "Bob",
+            bob.public_key(),
+            "Alice",
+        )
+        .is_err());
+        assert!(alice
+            .seal_identity(vec![71; 64], b"node:INVITE-CODE-0071".to_vec(),)
+            .is_err());
+        assert!(alice
+            .commit_outbound("alice-pending".to_string(), 2)
+            .is_err());
+        assert!(alice
+            .rollback_outbound("alice-pending".to_string(), 2)
+            .is_err());
+        assert!(alice
+            .commit_outbound("wrong-message".to_string(), 1)
+            .is_err());
+        assert!(alice
+            .rollback_outbound("wrong-message".to_string(), 1)
+            .is_err());
+        assert!(alice.commit_outbound(String::new(), 1).is_err());
+        assert!(alice.rollback_outbound(String::new(), 1).is_err());
+        {
+            let state = alice.state.lock().expect("Alice state");
+            assert_eq!(state.revision, 1);
+            assert!(state.pending_outbound.is_some());
+        }
+
+        alice
+            .rollback_outbound("alice-pending".to_string(), 1)
+            .expect("rollback pending outbound");
+        {
+            let state = alice.state.lock().expect("Alice state");
+            assert_eq!(state.revision, 0);
+            assert!(state.pending_outbound.is_none());
+            assert!(state.sessions.is_empty());
+        }
+        let retry = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "alice-retry".to_string(),
+                "Alice".to_string(),
+                b"retry".to_vec(),
+                vec![recipient],
+            )
+            .expect("retry after rollback");
+        assert_eq!(retry.state_revision, 1);
+        alice
+            .commit_outbound(retry.message_id.clone(), retry.state_revision)
+            .expect("commit retry");
+        assert!(alice
+            .commit_outbound(retry.message_id.clone(), retry.state_revision)
+            .is_err());
+        let next = alice
+            .encrypt_for_test(
+                "dm_alice_bob".to_string(),
+                "alice-after-commit".to_string(),
+                "Alice".to_string(),
+                b"after commit".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Bob".to_string(),
+                    public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
+                }],
+            )
+            .expect("encrypt after commit");
+        assert_eq!(next.state_revision, 2);
+    }
+
+    #[test]
+    fn failed_checkpoint_restore_keeps_the_same_transaction_pending() {
+        let alice = sealed_session(81);
+        let bob = sealed_session(82);
+        let staged = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "alice-corrupt-checkpoint".to_string(),
+                "Alice".to_string(),
+                b"pending".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Bob".to_string(),
+                    public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
+                }],
+            )
+            .expect("stage outbound");
+        let expected_checkpoint_digest = {
+            let mut state = alice.state.lock().expect("Alice state");
+            let pending = state.pending_outbound.as_mut().expect("pending outbound");
+            pending.checkpoint[0] ^= 1;
+            Sha256::digest(&pending.checkpoint)
+        };
+
+        assert!(alice
+            .rollback_outbound(staged.message_id.clone(), staged.state_revision)
+            .is_err());
+        let state = alice.state.lock().expect("Alice state");
+        let pending = state.pending_outbound.as_ref().expect("pending retained");
+        assert_eq!(pending.message_id, staged.message_id);
+        assert_eq!(pending.revision, staged.state_revision);
+        assert_eq!(
+            Sha256::digest(&pending.checkpoint),
+            expected_checkpoint_digest
+        );
+        assert_eq!(state.revision, staged.state_revision);
+    }
+
+    #[test]
+    fn payload_padding_is_canonical_bucketed_and_randomized() {
+        let at_bucket = pad_payload(&vec![3_u8; 250]).expect("250-byte payload");
+        let bucket_boundary = pad_payload(&vec![3_u8; 251]).expect("251-byte payload");
+        let next_bucket = pad_payload(&vec![3_u8; 252]).expect("252-byte payload");
+        assert_eq!(at_bucket.len(), PAYLOAD_PADDING_BUCKET_BYTES);
+        assert_eq!(bucket_boundary.len(), PAYLOAD_PADDING_BUCKET_BYTES);
+        assert_eq!(next_bucket.len(), PAYLOAD_PADDING_BUCKET_BYTES * 2);
+        assert_eq!(unpad_payload(&at_bucket).expect("unpad 250").len(), 250);
+        assert_eq!(
+            unpad_payload(&bucket_boundary).expect("unpad 251").len(),
+            251
+        );
+        assert_eq!(unpad_payload(&next_bucket).expect("unpad 252").len(), 252);
+        // Use a large filler region so the randomization assertion cannot
+        // become a practical 1-in-256 test flake at the 251-byte boundary.
+        let randomized = pad_payload(&[3_u8]).expect("randomized payload");
+        let second = pad_payload(&[3_u8]).expect("second randomized payload");
+        assert_ne!(
+            &randomized[PAYLOAD_HEADER_BYTES..],
+            &second[PAYLOAD_HEADER_BYTES..]
+        );
+        assert!(pad_payload(&vec![4_u8; MAX_PAYLOAD_BYTES]).is_ok());
+        assert!(pad_payload(&vec![4_u8; MAX_PAYLOAD_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn payload_padding_rejects_version_length_and_noncanonical_size() {
+        let padded = pad_payload(b"strict payload").expect("pad payload");
+        let mut bad_version = padded.to_vec();
+        bad_version[0] ^= 1;
+        assert!(unpad_payload(&bad_version).is_err());
+
+        let mut bad_length = padded.to_vec();
+        bad_length[1..PAYLOAD_HEADER_BYTES].copy_from_slice(&0_u32.to_be_bytes());
+        assert!(unpad_payload(&bad_length).is_err());
+
+        let mut noncanonical = padded.to_vec();
+        noncanonical.extend_from_slice(&[0_u8; PAYLOAD_PADDING_BUCKET_BYTES]);
+        assert!(unpad_payload(&noncanonical).is_err());
+
+        let mut truncated = padded.to_vec();
+        truncated.truncate(PAYLOAD_HEADER_BYTES);
+        assert!(unpad_payload(&truncated).is_err());
     }
 }

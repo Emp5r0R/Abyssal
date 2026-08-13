@@ -25,7 +25,7 @@ class InMemoryPayloadCipherTest {
 
         val decryption = receiver.decrypt(incoming(payload, sender.publicKey(), "Alice", "Bob"), "Bob")
         try {
-            assertEquals(7, payload.version)
+            assertEquals(8, payload.version)
             assertTrue(payload.envelopes.single().isPrekey)
             assertEquals(initialPrekey, payload.envelopes.single().prekeyId)
             assertEquals(64, payload.envelopes.single().signature.size)
@@ -123,7 +123,7 @@ class InMemoryPayloadCipherTest {
         )
         val serialized = sender.serialize(payload)
         val serializedJson = JSONObject(serialized.decodeToString())
-        assertEquals(7, serializedJson.optInt("version"))
+        assertEquals(8, serializedJson.optInt("version"))
         assertTrue(serializedJson.optString("identity_public_b64").isNotEmpty())
         assertEquals(64, java.util.Base64.getUrlDecoder().decode(serializedJson.getString("state_signature_b64")).size)
         val serializedEnvelope = serializedJson.getJSONArray("envelopes").getJSONObject(0)
@@ -167,11 +167,71 @@ class InMemoryPayloadCipherTest {
     }
 
     @Test
+    fun outboundRatchetRequiresExplicitCommitOrRollback() {
+        val sender = identity(4)
+        val receiver = identity(5)
+        val initialPrekey = sender.prekeyId()
+        val first = sender.encrypt(
+            CHAT_ID,
+            MESSAGE_ID,
+            "Alice",
+            byteArrayOf(1),
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
+        )
+        assertTrue(runCatching {
+            sender.encrypt(
+                CHAT_ID,
+                "second-message",
+                "Alice",
+                byteArrayOf(2),
+                emptyList()
+            )
+        }.isFailure)
+        assertTrue(runCatching { sender.commitOutbound(first.messageId, first.stateRevision + 1UL) }.isFailure)
+        sender.rollbackOutbound(first.messageId, first.stateRevision)
+        assertEquals(initialPrekey, sender.prekeyId())
+        assertEquals(null, sender.stateSnapshot())
+
+        val retry = sender.encrypt(
+            CHAT_ID,
+            MESSAGE_ID,
+            "Alice",
+            byteArrayOf(3),
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
+        )
+        sender.commitOutbound(retry.messageId, retry.stateRevision)
+        assertEquals(1UL, sender.stateSnapshot()?.revision)
+    }
+
+    @Test
     fun clearDestroysActiveIdentity() {
         val cipher = identity(1)
         cipher.clear()
 
         assertTrue(runCatching { cipher.publicKey() }.isFailure)
+    }
+
+    @Test
+    fun clearDropsPendingRatchetAndLeavesCipherFailClosed() {
+        val sender = identity(1)
+        val receiver = identity(2)
+        val payload = sender.encrypt(
+            CHAT_ID,
+            MESSAGE_ID,
+            "Alice",
+            byteArrayOf(1, 2, 3),
+            listOf(RecipientIdentity("Bob", receiver.publicKey(), receiver.prekeyId()))
+        )
+
+        assertEquals(1UL, sender.stateSnapshot()?.revision)
+        sender.clear()
+
+        assertEquals(null, sender.stateSnapshot())
+        assertTrue(runCatching { sender.publicKey() }.isFailure)
+        assertTrue(
+            runCatching { sender.commitOutbound(payload.messageId, payload.stateRevision) }
+                .isFailure
+        )
     }
 
     private fun identity(fill: Int): InMemoryPayloadCipher = InMemoryPayloadCipher().also {

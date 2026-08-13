@@ -56,7 +56,7 @@ class AbyssalViewModelFactory(
         val identityService = NetworkIdentityService(nodeHttpClient, payloadCipher)
         val messageRepository = InMemoryMessageRepository()
         val chatTransport = RealChatTransport(nodeConfigService, nodeWebSocketClient)
-        val attachmentService = EncryptedAttachmentService(appContext, nodeConfigService, attachmentHttpClient)
+        val attachmentService = EncryptedAttachmentService(appContext, attachmentHttpClient)
         val disguiseManager = AndroidDisguiseManager(appContext)
         val appUpdateService = GitHubReleaseUpdateService(
             client = OkHttpClient.Builder()

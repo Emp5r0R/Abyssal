@@ -687,6 +687,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_func_opaque_client_start(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound(
+    ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_decrypt(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_encrypt(
@@ -695,9 +697,13 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_public_key(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_rollback_outbound(
+    ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_seal_identity(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_sign_acknowledgement(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_sign_registration_identity_proof(
     ): Int
     external fun uniffi_abyssal_core_checksum_constructor_e2eesession_create(
     ): Int
@@ -729,6 +735,8 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_abyssal_core_fn_constructor_e2eesession_recover(`exportKey`: RustBuffer.ByValue,`context`: RustBuffer.ByValue,`envelope`: RustBuffer.ByValue,`expectedPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Long
+    external fun uniffi_abyssal_core_fn_method_e2eesession_commit_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_abyssal_core_fn_method_e2eesession_decrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`senderPublicKey`: RustBuffer.ByValue,`version`: Int,`identityPublic`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,`wrappedKey`: RustBuffer.ByValue,`recipientPrekeyId`: RustBuffer.ByValue,`isPrekey`: Byte,`recipientUsername`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_encrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`recipients`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -737,9 +745,13 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_public_key(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_e2eesession_rollback_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_abyssal_core_fn_method_e2eesession_seal_identity(`ptr`: Long,`exportKey`: RustBuffer.ByValue,`context`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_sign_acknowledgement(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`originalSenderUsername`: RustBuffer.ByValue,`usedPrekeyId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_e2eesession_sign_registration_identity_proof(`ptr`: Long,`nodeId`: RustBuffer.ByValue,`handshakeId`: RustBuffer.ByValue,`challenge`: RustBuffer.ByValue,`registrationUpload`: RustBuffer.ByValue,`identityPublic`: RustBuffer.ByValue,`prekeyId`: RustBuffer.ByValue,`identityEnvelope`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_conversation_safety_number(`firstPublicKey`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -890,6 +902,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_opaque_client_start() != 26876) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound() != 39282) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_decrypt() != 7898) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -902,10 +917,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_public_key() != 3928) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_rollback_outbound() != 61837) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_seal_identity() != 32517) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_sign_acknowledgement() != 65231) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_sign_registration_identity_proof() != 18860) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_constructor_e2eesession_create() != 62344) {
@@ -1314,6 +1335,13 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 
 public interface E2eeSessionInterface {
 
+    /**
+     * Commit the exact ratchet revision after the relay confirms admission.
+     * Until this is called, all other stateful cryptographic operations are
+     * rejected and the caller may roll the session back on an explicit NACK.
+     */
+    fun `commitOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+
     fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `version`: kotlin.UInt, `identityPublic`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption
 
     fun `encrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `plaintext`: kotlin.ByteArray, `recipients`: List<RecipientPublicKey>): E2eePayload
@@ -1321,6 +1349,13 @@ public interface E2eeSessionInterface {
     fun `prekeyId`(): kotlin.String
 
     fun `publicKey`(): kotlin.ByteArray
+
+    /**
+     * Restore the pre-send snapshot for an explicitly rejected message.
+     * Revision matching is strict so a stale result cannot roll back a newer
+     * transaction.
+     */
+    fun `rollbackOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
 
     fun `sealIdentity`(`exportKey`: kotlin.ByteArray, `context`: kotlin.ByteArray): kotlin.ByteArray
 
@@ -1334,6 +1369,15 @@ public interface E2eeSessionInterface {
      * after the state has advanced.
      */
     fun `signAcknowledgement`(`chatId`: kotlin.String, `messageId`: kotlin.String, `originalSenderUsername`: kotlin.String, `usedPrekeyId`: kotlin.String): kotlin.ByteArray
+
+    /**
+     * Prove possession of the Ed25519 identity key during account creation.
+     *
+     * The server-issued challenge and every registration input are bound into
+     * one canonical transcript.  This prevents registering a copied public
+     * identity without also controlling its private key.
+     */
+    fun `signRegistrationIdentityProof`(`nodeId`: kotlin.String, `handshakeId`: kotlin.String, `challenge`: kotlin.ByteArray, `registrationUpload`: kotlin.ByteArray, `identityPublic`: kotlin.ByteArray, `prekeyId`: kotlin.String, `identityEnvelope`: kotlin.ByteArray): kotlin.ByteArray
 
     companion object
 }
@@ -1440,6 +1484,26 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
     }
 
 
+    /**
+     * Commit the exact ratchet revision after the relay confirms admission.
+     * Until this is called, all other stateful cryptographic operations are
+     * rejected and the caller may roll the session back on an explicit NACK.
+     */
+    @Throws(AbyssalException::class)override fun `commitOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_commit_outbound(
+        it,
+
+        FfiConverterString.lower(`messageId`),
+        FfiConverterULong.lower(`revision`),_status)
+}
+    }
+
+
+
+
     @Throws(AbyssalException::class)override fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `version`: kotlin.UInt, `identityPublic`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption {
             return FfiConverterTypeE2eeDecryption.lift(
     callWithHandle {
@@ -1512,6 +1576,26 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
 
 
 
+    /**
+     * Restore the pre-send snapshot for an explicitly rejected message.
+     * Revision matching is strict so a stale result cannot roll back a newer
+     * transaction.
+     */
+    @Throws(AbyssalException::class)override fun `rollbackOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_rollback_outbound(
+        it,
+
+        FfiConverterString.lower(`messageId`),
+        FfiConverterULong.lower(`revision`),_status)
+}
+    }
+
+
+
+
     @Throws(AbyssalException::class)override fun `sealIdentity`(`exportKey`: kotlin.ByteArray, `context`: kotlin.ByteArray): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     callWithHandle {
@@ -1548,6 +1632,34 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
         FfiConverterString.lower(`messageId`),
         FfiConverterString.lower(`originalSenderUsername`),
         FfiConverterString.lower(`usedPrekeyId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Prove possession of the Ed25519 identity key during account creation.
+     *
+     * The server-issued challenge and every registration input are bound into
+     * one canonical transcript.  This prevents registering a copied public
+     * identity without also controlling its private key.
+     */
+    @Throws(AbyssalException::class)override fun `signRegistrationIdentityProof`(`nodeId`: kotlin.String, `handshakeId`: kotlin.String, `challenge`: kotlin.ByteArray, `registrationUpload`: kotlin.ByteArray, `identityPublic`: kotlin.ByteArray, `prekeyId`: kotlin.String, `identityEnvelope`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_sign_registration_identity_proof(
+        it,
+
+        FfiConverterString.lower(`nodeId`),
+        FfiConverterString.lower(`handshakeId`),
+        FfiConverterByteArray.lower(`challenge`),
+        FfiConverterByteArray.lower(`registrationUpload`),
+        FfiConverterByteArray.lower(`identityPublic`),
+        FfiConverterString.lower(`prekeyId`),
+        FfiConverterByteArray.lower(`identityEnvelope`),_status)
 }
     }
     )

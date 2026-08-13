@@ -3,6 +3,7 @@ import type {
   AccountSession,
   AttachmentOptions,
   IncomingFrame,
+  MediaType,
   NodeEndpoint,
   OpaqueAccountStartResponse,
   RoomRecord,
@@ -30,7 +31,17 @@ const MAX_OPAQUE_JSON_BYTES = 768 * 1024;
 const MAX_OPAQUE_MESSAGE_BYTES = 16 * 1024;
 const MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024;
 export const MAX_RELAY_TEXT_BYTES = 1024 * 1024;
+export const PURGE_CLOSE_CODE = 4001;
+export const PURGE_CLOSE_REASON = "purge";
+const MESSAGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
+const MAX_PENDING_MESSAGE_RESULTS = 256;
+const MAX_PENDING_ACK_RESULTS = 256;
+const MESSAGE_RESULT_TIMEOUT_MS = 10_000;
+const ACK_RESULT_TIMEOUT_MS = 10_000;
 const MAX_WS_TICKET_JSON_BYTES = 4 * 1024;
+const MAX_ATTACHMENT_UPLOAD_JSON_BYTES = 4 * 1024;
+const ATTACHMENT_CLEANUP_TIMEOUT_MS = 5_000;
+const SESSION_REVOKE_TIMEOUT_MS = 5_000;
 const WS_TICKET_BYTES = 32;
 const WS_TICKET_LENGTH = 43;
 const WS_TICKET_MIN_EXPIRY_SEC = 1;
@@ -47,6 +58,32 @@ export interface DownloadedEncryptedAttachment {
 export interface AttachmentPlaintextPolicy {
   expectedBytes: number;
   maxBytes: number;
+}
+
+export interface AttachmentDownloadPolicy {
+  mediaType: MediaType;
+  expectedPlaintextBytes: number;
+}
+
+export type RelayOperationOutcome = "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS";
+export type EncryptedSendOutcome = RelayOperationOutcome;
+
+interface PendingMessageResult {
+  generation: number;
+  resolve: (outcome: EncryptedSendOutcome) => void;
+  timer: number;
+}
+
+interface MessageResultFrame {
+  type: "message_result";
+  message_id: string;
+  accepted: boolean;
+}
+
+interface AckResultFrame {
+  type: "ack_result";
+  message_id: string;
+  accepted: boolean;
 }
 
 export async function startOpaqueAccount(
@@ -83,6 +120,7 @@ interface FinishOpaqueAccountInput {
   identityPublicKey?: Uint8Array;
   identityPrekeyId?: string;
   identityEnvelope?: Uint8Array;
+  identityProof?: Uint8Array;
 }
 
 export async function finishOpaqueAccount(
@@ -111,6 +149,9 @@ export async function finishOpaqueAccount(
       identity_envelope_b64: input.identityEnvelope
         ? bytesToBase64(input.identityEnvelope)
         : undefined,
+      identity_proof_b64: input.identityProof
+        ? bytesToBase64(input.identityProof)
+        : undefined,
     }),
     signal,
   });
@@ -136,7 +177,7 @@ export async function finishOpaqueAccount(
   };
 }
 
-export async function revokeSession(session: AccountSession): Promise<void> {
+export async function revokeSession(session: AccountSession, signal?: AbortSignal): Promise<void> {
   await fetch(`${session.endpoint.apiBaseUrl}/v1/account/logout`, {
     method: "POST",
     cache: "no-store",
@@ -144,6 +185,7 @@ export async function revokeSession(session: AccountSession): Promise<void> {
     referrerPolicy: "no-referrer",
     keepalive: true,
     headers: { Authorization: `Bearer ${session.token}` },
+    signal: signal ?? AbortSignal.timeout(SESSION_REVOKE_TIMEOUT_MS),
   }).catch(() => undefined);
 }
 
@@ -168,22 +210,29 @@ async function requestWebSocketTicket(
 
 export class RelaySocket {
   #socket: WebSocket | null = null;
+  #socketGeneration = 0;
   #manualClose = false;
   #reconnectTimer: number | undefined;
   #attempt = 0;
   #connectGeneration = 0;
   #ticketAbort: AbortController | null = null;
   #connecting = false;
+  #purgeFrameSeen = false;
+  #purgeNotified = false;
+  #pendingResults = new Map<string, PendingMessageResult>();
+  #pendingAckResults = new Map<string, PendingMessageResult>();
 
   constructor(
     private readonly session: AccountSession,
     private readonly onFrame: (frame: IncomingFrame) => void,
     private readonly onState: (state: "connecting" | "connected" | "disconnected") => void,
+    private readonly onPurge?: () => void,
   ) {}
 
   connect(): void {
     if (this.#socket || this.#manualClose || this.#connecting) return;
     const generation = ++this.#connectGeneration;
+    this.#purgeFrameSeen = false;
     const ticketAbort = new AbortController();
     this.#ticketAbort = ticketAbort;
     this.#connecting = true;
@@ -192,18 +241,49 @@ export class RelaySocket {
   }
 
   send(frame: object): boolean {
-    if (this.#socket?.readyState !== WebSocket.OPEN) return false;
-    let serialized: string | undefined;
+    const serialized = serializeRelayFrame(frame);
+    if (serialized === null || this.#socket?.readyState !== WebSocket.OPEN) return false;
     try {
-      serialized = JSON.stringify(frame);
+      this.#socket.send(serialized);
+      return true;
     } catch {
       return false;
     }
-    if (typeof serialized !== "string" || !utf8LengthWithin(serialized, MAX_RELAY_TEXT_BYTES)) {
-      return false;
+  }
+
+  sendEncryptedPayload(messageId: string, frame: object): Promise<EncryptedSendOutcome> {
+    if (
+      !MESSAGE_ID_PATTERN.test(messageId) ||
+      !plainRecord(frame) ||
+      frame.type !== "message" ||
+      frame.message_id !== messageId ||
+      this.#socket?.readyState !== WebSocket.OPEN ||
+      this.#pendingResults.size >= MAX_PENDING_MESSAGE_RESULTS ||
+      this.#pendingResults.has(messageId)
+    ) {
+      return Promise.resolve("NOT_SENT");
     }
-    this.#socket.send(serialized);
-    return true;
+    const serialized = serializeRelayFrame(frame);
+    if (serialized === null) return Promise.resolve("NOT_SENT");
+    const socket = this.#socket;
+    const generation = this.#socketGeneration;
+    return new Promise<EncryptedSendOutcome>((resolve) => {
+      const timer = window.setTimeout(() => {
+        const pending = this.#pendingResults.get(messageId);
+        if (!pending || pending.generation !== generation) return;
+        this.#pendingResults.delete(messageId);
+        pending.resolve("AMBIGUOUS");
+        this.failClosed("message result timeout");
+      }, MESSAGE_RESULT_TIMEOUT_MS);
+      this.#pendingResults.set(messageId, { generation, resolve, timer });
+      try {
+        socket.send(serialized);
+      } catch {
+        window.clearTimeout(timer);
+        this.#pendingResults.delete(messageId);
+        resolve("NOT_SENT");
+      }
+    });
   }
 
   join(chatId: string): boolean {
@@ -241,12 +321,16 @@ export class RelaySocket {
     state: IdentityStateSnapshot,
     ackSignature: Uint8Array,
     usedPrekeyId: string,
-  ): boolean {
+  ): Promise<RelayOperationOutcome> {
     if (
+      !MESSAGE_ID_PATTERN.test(messageId) ||
       state.stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
-      ackSignature.byteLength !== STATE_SIGNATURE_BYTES
-    ) return false;
-    return this.send({
+      ackSignature.byteLength !== STATE_SIGNATURE_BYTES ||
+      this.#socket?.readyState !== WebSocket.OPEN ||
+      this.#pendingAckResults.size >= MAX_PENDING_ACK_RESULTS ||
+      this.#pendingAckResults.has(messageId)
+    ) return Promise.resolve("NOT_SENT");
+    const frame = {
       type: "message_ack",
       chat_id: chatId,
       message_id: messageId,
@@ -258,6 +342,27 @@ export class RelaySocket {
       state_signature_b64: bytesToBase64(state.stateSignature),
       ack_signature_b64: bytesToBase64(ackSignature),
       used_prekey_id: usedPrekeyId,
+    };
+    const serialized = serializeRelayFrame(frame);
+    if (serialized === null) return Promise.resolve("NOT_SENT");
+    const socket = this.#socket;
+    const generation = this.#socketGeneration;
+    return new Promise<RelayOperationOutcome>((resolve) => {
+      const timer = window.setTimeout(() => {
+        const pending = this.#pendingAckResults.get(messageId);
+        if (!pending || pending.generation !== generation) return;
+        this.#pendingAckResults.delete(messageId);
+        pending.resolve("AMBIGUOUS");
+        this.failClosed("ack result timeout");
+      }, ACK_RESULT_TIMEOUT_MS);
+      this.#pendingAckResults.set(messageId, { generation, resolve, timer });
+      try {
+        socket.send(serialized);
+      } catch {
+        window.clearTimeout(timer);
+        this.#pendingAckResults.delete(messageId);
+        resolve("NOT_SENT");
+      }
     });
   }
 
@@ -281,8 +386,11 @@ export class RelaySocket {
     this.#connecting = false;
     window.clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = undefined;
+    this.settlePending("AMBIGUOUS");
+    this.settleAckPending("AMBIGUOUS");
     this.#socket?.close(1000, "client disconnect");
     this.#socket = null;
+    this.#socketGeneration = 0;
     this.onState("disconnected");
   }
 
@@ -309,23 +417,58 @@ export class RelaySocket {
       const socket = new WebSocket(`${this.session.endpoint.wsBaseUrl}/v1/ws`, protocols);
       protocols[1] = "ticket.";
       this.#socket = socket;
+      this.#socketGeneration = generation;
       socket.onopen = () => {
+        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         this.#attempt = 0;
         this.onState("connected");
       };
       socket.onmessage = (event) => {
+        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         if (typeof event.data !== "string") return;
         if (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES)) {
           this.#manualClose = true;
           socket.close(1009, "frame too large");
           return;
         }
-        const frame = parseIncomingFrame(event.data);
-        if (frame) this.onFrame(frame);
+        const parsed = parseRelayFrame(event.data);
+        if (parsed.kind === "invalid-result") {
+          this.failClosed("invalid relay result");
+          return;
+        }
+        if (parsed.kind === "result") {
+          if (parsed.result.type === "message_result") {
+            this.resolveMessageResult(parsed.result);
+          } else {
+            this.resolveAckResult(parsed.result);
+          }
+          return;
+        }
+        if (parsed.kind !== "frame") return;
+        const frame = parsed.frame;
+        if (frame.type === "GLOBAL_WIPE" || frame.type === "global_wipe") {
+          // The text command remains the compatibility fallback. If the relay
+          // follows it with the purge close, do not invoke the callback twice.
+          this.#purgeFrameSeen = true;
+        }
+        this.onFrame(frame);
       };
-      socket.onerror = () => socket.close();
-      socket.onclose = () => {
+      socket.onerror = () => {
+        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
+        this.settlePending("AMBIGUOUS");
+        this.settleAckPending("AMBIGUOUS");
+        socket.close();
+      };
+      socket.onclose = (event) => {
+        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
+        if (event.code === PURGE_CLOSE_CODE && event.reason === PURGE_CLOSE_REASON) {
+          this.terminateForPurge();
+          return;
+        }
+        this.settlePending("AMBIGUOUS");
+        this.settleAckPending("AMBIGUOUS");
         this.#socket = null;
+        this.#socketGeneration = 0;
         this.onState("disconnected");
         if (!this.#manualClose) this.scheduleReconnect();
       };
@@ -352,6 +495,86 @@ export class RelaySocket {
       !ticketAbort.signal.aborted &&
       !this.#manualClose;
   }
+
+  private terminateForPurge(): void {
+    this.#manualClose = true;
+    this.#connectGeneration += 1;
+    this.#ticketAbort?.abort();
+    this.#ticketAbort = null;
+    this.#connecting = false;
+    window.clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+    this.settlePending("AMBIGUOUS");
+    this.settleAckPending("AMBIGUOUS");
+    this.#socket = null;
+    this.#socketGeneration = 0;
+    this.onState("disconnected");
+    if (!this.#purgeFrameSeen && !this.#purgeNotified) {
+      this.#purgeNotified = true;
+      this.onPurge?.();
+    }
+  }
+
+  private resolveMessageResult(result: MessageResultFrame): void {
+    const pending = this.#pendingResults.get(result.message_id);
+    if (!pending || pending.generation !== this.#socketGeneration) {
+      this.failClosed("unknown message result");
+      return;
+    }
+    this.#pendingResults.delete(result.message_id);
+    window.clearTimeout(pending.timer);
+    pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
+  }
+
+  private resolveAckResult(result: AckResultFrame): void {
+    const pending = this.#pendingAckResults.get(result.message_id);
+    if (!pending || pending.generation !== this.#socketGeneration) {
+      this.failClosed("unknown ack result");
+      return;
+    }
+    this.#pendingAckResults.delete(result.message_id);
+    window.clearTimeout(pending.timer);
+    pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
+  }
+
+  private settlePending(outcome: RelayOperationOutcome): void {
+    const pending = [...this.#pendingResults.values()];
+    this.#pendingResults.clear();
+    pending.forEach((entry) => {
+      window.clearTimeout(entry.timer);
+      entry.resolve(outcome);
+    });
+  }
+
+  private settleAckPending(outcome: RelayOperationOutcome): void {
+    const pending = [...this.#pendingAckResults.values()];
+    this.#pendingAckResults.clear();
+    pending.forEach((entry) => {
+      window.clearTimeout(entry.timer);
+      entry.resolve(outcome);
+    });
+  }
+
+  private failClosed(reason: string): void {
+    this.#manualClose = true;
+    this.#connectGeneration += 1;
+    this.#ticketAbort?.abort();
+    this.#ticketAbort = null;
+    this.#connecting = false;
+    window.clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+    this.settlePending("AMBIGUOUS");
+    this.settleAckPending("AMBIGUOUS");
+    const socket = this.#socket;
+    this.#socket = null;
+    this.#socketGeneration = 0;
+    try {
+      socket?.close(1002, reason);
+    } catch {
+      // The pending operations have already been failed closed.
+    }
+    this.onState("disconnected");
+  }
 }
 
 export function uploadEncryptedAttachment(
@@ -361,6 +584,7 @@ export function uploadEncryptedAttachment(
   encrypted: Uint8Array,
   options: AttachmentOptions,
   onProgress: (progress: UploadProgress) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const query = new URLSearchParams({
@@ -371,25 +595,57 @@ export function uploadEncryptedAttachment(
       ttl_sec: String(Math.max(0, options.ttlSec)),
     });
     const request = new XMLHttpRequest();
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", abort);
+      callback();
+    };
+    const fail = (message: string) => finish(() => reject(new Error(message)));
+    const abort = () => request.abort();
+    if (signal?.aborted) {
+      fail("Upload aborted");
+      return;
+    }
     request.open("POST", `${session.endpoint.apiBaseUrl}/v1/attachment?${query}`);
-    request.responseType = "json";
+    request.responseType = "text";
     request.setRequestHeader("Authorization", `Bearer ${session.token}`);
     request.setRequestHeader("Content-Type", "application/octet-stream");
     request.upload.onprogress = (event) => onProgress({ loaded: event.loaded, total: event.total || encrypted.byteLength });
-    request.onerror = () => reject(new Error("Upload failed"));
-    request.onabort = () => reject(new Error("Upload aborted"));
-    request.onload = () => {
-      const id = (request.response as { attachment_id?: unknown } | null)?.attachment_id;
-      if (request.status < 200 || request.status >= 300 || typeof id !== "string") {
-        reject(new Error("Upload rejected"));
-      } else {
-        try {
-          resolve(validateAttachmentId(id));
-        } catch {
-          reject(new Error("Upload rejected"));
-        }
+    request.onprogress = (event) => {
+      if (event.loaded > MAX_ATTACHMENT_UPLOAD_JSON_BYTES) {
+        fail("Upload rejected");
+        request.abort();
       }
     };
+    request.onreadystatechange = () => {
+      if (request.readyState !== XMLHttpRequest.HEADERS_RECEIVED) return;
+      const declared = request.getResponseHeader("content-length");
+      if (declared !== null && !validBoundedResponseLength(declared, MAX_ATTACHMENT_UPLOAD_JSON_BYTES)) {
+        fail("Upload rejected");
+        request.abort();
+      }
+    };
+    request.onerror = () => fail("Upload failed");
+    request.onabort = () => fail("Upload aborted");
+    request.onload = () => {
+      if (request.status < 200 || request.status >= 300 ||
+        !utf8LengthWithin(request.responseText, MAX_ATTACHMENT_UPLOAD_JSON_BYTES)) {
+        fail("Upload rejected");
+        return;
+      }
+      try {
+        const payload = JSON.parse(request.responseText) as unknown;
+        if (!plainObjectWithKeys(payload, ["attachment_id"]) ||
+          typeof payload.attachment_id !== "string") throw new Error("Upload rejected");
+        const id = validateAttachmentId(payload.attachment_id);
+        finish(() => resolve(id));
+      } catch {
+        fail("Upload rejected");
+      }
+    };
+    signal?.addEventListener("abort", abort, { once: true });
     // XMLHttpRequest accepts ArrayBufferView at runtime. TypeScript's DOM
     // declaration does not model the generic Uint8Array used here, so keep
     // the view intact through the boundary instead of copying 200 MiB.
@@ -400,8 +656,11 @@ export function uploadEncryptedAttachment(
 export async function downloadEncryptedAttachment(
   session: AccountSession,
   attachmentId: string,
+  policy: AttachmentDownloadPolicy,
+  signal?: AbortSignal,
 ): Promise<DownloadedEncryptedAttachment> {
   const validatedAttachmentId = validateAttachmentId(attachmentId);
+  const expectedEncryptedBytes = expectedAttachmentCiphertextBytes(policy);
   let claim: string | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let encrypted: Uint8Array | undefined;
@@ -411,13 +670,19 @@ export async function downloadEncryptedAttachment(
       credentials: "omit",
       referrerPolicy: "no-referrer",
       headers: { Authorization: `Bearer ${session.token}` },
+      signal,
     });
     claim = readAttachmentClaim(response.headers);
     if (!response.ok) throw new Error("Attachment unavailable");
-    const maxBytes = maxSerializedAttachmentBytes("FILE");
     const contentLength = response.headers.get("content-length");
-    const advertisedLength = parseAttachmentContentLength(contentLength, maxBytes);
-    encrypted = new Uint8Array(advertisedLength);
+    const advertisedLength = parseAttachmentContentLength(
+      contentLength,
+      maxSerializedAttachmentBytes(policy.mediaType),
+    );
+    if (advertisedLength !== undefined && advertisedLength !== expectedEncryptedBytes) {
+      throw new Error("Attachment unavailable");
+    }
+    encrypted = new Uint8Array(expectedEncryptedBytes);
     reader = response.body?.getReader();
     if (!reader) throw new Error("Attachment unavailable");
     let offset = 0;
@@ -426,7 +691,7 @@ export async function downloadEncryptedAttachment(
       if (result.done) break;
       const chunk = result.value;
       try {
-        if (offset > advertisedLength - chunk.byteLength) {
+        if (offset > expectedEncryptedBytes - chunk.byteLength) {
           throw new Error("Attachment unavailable");
         }
         encrypted.set(chunk, offset);
@@ -435,7 +700,7 @@ export async function downloadEncryptedAttachment(
         chunk.fill(0);
       }
     }
-    if (offset !== advertisedLength) {
+    if (offset !== expectedEncryptedBytes) {
       throw new Error("Attachment unavailable");
     }
     return claim ? { bytes: encrypted, claim } : { bytes: encrypted };
@@ -453,6 +718,7 @@ export async function completeAttachmentDownload(
   session: AccountSession,
   attachmentId: string,
   claim: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const validatedAttachmentId = validateAttachmentId(attachmentId);
   const validatedClaim = validateAttachmentClaim(claim);
@@ -464,6 +730,7 @@ export async function completeAttachmentDownload(
       credentials: "omit",
       referrerPolicy: "no-referrer",
       headers: attachmentClaimHeaders(session, validatedClaim),
+      signal,
     },
   );
   if (!response.ok) throw new Error("Attachment unavailable");
@@ -473,6 +740,7 @@ export async function releaseAttachmentDownloadClaim(
   session: AccountSession,
   attachmentId: string,
   claim: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const validatedAttachmentId = validateAttachmentId(attachmentId);
   const validatedClaim = validateAttachmentClaim(claim);
@@ -484,6 +752,7 @@ export async function releaseAttachmentDownloadClaim(
       credentials: "omit",
       referrerPolicy: "no-referrer",
       headers: attachmentClaimHeaders(session, validatedClaim),
+      signal: signal ?? AbortSignal.timeout(ATTACHMENT_CLEANUP_TIMEOUT_MS),
     },
   );
   if (!response.ok) throw new Error("Attachment unavailable");
@@ -492,6 +761,7 @@ export async function releaseAttachmentDownloadClaim(
 export async function deleteUploadedAttachment(
   session: AccountSession,
   attachmentId: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const validatedAttachmentId = validateAttachmentId(attachmentId);
   const response = await fetch(
@@ -502,6 +772,7 @@ export async function deleteUploadedAttachment(
       credentials: "omit",
       referrerPolicy: "no-referrer",
       headers: { Authorization: `Bearer ${session.token}` },
+      signal: signal ?? AbortSignal.timeout(ATTACHMENT_CLEANUP_TIMEOUT_MS),
     },
   );
   if (!response.ok && response.status !== 404) throw new Error("Attachment unavailable");
@@ -513,11 +784,14 @@ export async function decryptAndCompleteAttachment(
   downloaded: DownloadedEncryptedAttachment,
   decrypt: () => Uint8Array | Promise<Uint8Array>,
   policy?: AttachmentPlaintextPolicy,
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
   let plaintext: Uint8Array | undefined;
   let claimCompleted = false;
   try {
+    signal?.throwIfAborted();
     plaintext = await decrypt();
+    signal?.throwIfAborted();
     const maxBytes = policy?.maxBytes ?? MAX_ATTACHMENT_PLAINTEXT_BYTES;
     if (
       !Number.isSafeInteger(maxBytes) ||
@@ -534,9 +808,10 @@ export async function decryptAndCompleteAttachment(
       throw new Error("Attachment unavailable");
     }
     if (downloaded.claim) {
-      await completeAttachmentDownload(session, attachmentId, downloaded.claim);
+      await completeAttachmentDownload(session, attachmentId, downloaded.claim, signal);
       claimCompleted = true;
     }
+    signal?.throwIfAborted();
     return plaintext;
   } catch (error) {
     if (plaintext) plaintext.fill(0);
@@ -547,20 +822,41 @@ export async function decryptAndCompleteAttachment(
   }
 }
 
+function validBoundedResponseLength(value: string, maxBytes: number): boolean {
+  const normalized = value.trim();
+  if (!/^\d+$/u.test(normalized)) return false;
+  const length = Number(normalized);
+  return Number.isSafeInteger(length) && length > 0 && length <= maxBytes;
+}
+
 function readAttachmentClaim(headers: Headers): string | undefined {
   const value = headers.get(ATTACHMENT_CLAIM_HEADER);
   if (value === null) return undefined;
   return validateAttachmentClaim(value);
 }
 
-function parseAttachmentContentLength(value: string | null, maxBytes: number): number {
-  const normalized = value?.trim() ?? "";
+function parseAttachmentContentLength(value: string | null, maxBytes: number): number | undefined {
+  if (value === null) return undefined;
+  const normalized = value.trim();
   if (!/^\d+$/.test(normalized)) throw new Error("Attachment unavailable");
   const length = Number(normalized);
   if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
     throw new Error("Attachment unavailable");
   }
   return length;
+}
+
+function expectedAttachmentCiphertextBytes(policy: AttachmentDownloadPolicy): number {
+  if (policy.mediaType !== "IMAGE" && policy.mediaType !== "VIDEO" && policy.mediaType !== "FILE") {
+    throw new Error("Attachment unavailable");
+  }
+  const maxBytes = maxSerializedAttachmentBytes(policy.mediaType);
+  if (!Number.isSafeInteger(policy.expectedPlaintextBytes) ||
+    policy.expectedPlaintextBytes <= 0 ||
+    policy.expectedPlaintextBytes > maxBytes - ATTACHMENT_BLOB_OVERHEAD_BYTES) {
+    throw new Error("Attachment unavailable");
+  }
+  return policy.expectedPlaintextBytes + ATTACHMENT_BLOB_OVERHEAD_BYTES;
 }
 
 function validateAttachmentClaim(claim: string): string {
@@ -643,7 +939,7 @@ function parseBoundedContentLength(value: string | null, maxBytes: number): numb
 
 function validOpaqueStartResponse(value: unknown): value is OpaqueAccountStartResponse {
   if (!plainObjectWithKeys(value, [
-    "accepted", "mode", "handshake_id", "response_b64", "node_id",
+    "accepted", "mode", "handshake_id", "response_b64", "challenge_b64", "node_id",
     "identity_public_b64", "identity_prekey_id", "identity_envelope_b64", "error",
   ])) return false;
   const payload = value as Record<string, unknown>;
@@ -658,9 +954,11 @@ function validOpaqueStartResponse(value: unknown): value is OpaqueAccountStartRe
   if (payload.mode === "registration") {
     return nullish(payload.identity_public_b64) &&
       nullish(payload.identity_prekey_id) &&
-      nullish(payload.identity_envelope_b64);
+      nullish(payload.identity_envelope_b64) &&
+      validBase64Url(payload.challenge_b64, 32, 32);
   }
-  return validBase64Url(payload.identity_public_b64, 128, 128) &&
+  return nullish(payload.challenge_b64) &&
+    validBase64Url(payload.identity_public_b64, 128, 128) &&
     typeof payload.identity_prekey_id === "string" &&
     /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
     validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES);
@@ -754,16 +1052,59 @@ function nullish(value: unknown): boolean {
   return value === undefined || value === null;
 }
 
-function parseIncomingFrame(text: string): IncomingFrame | null {
-  if (!utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES)) return null;
+type ParsedRelayFrame =
+  | { kind: "frame"; frame: IncomingFrame }
+  | { kind: "result"; result: MessageResultFrame | AckResultFrame }
+  | { kind: "invalid-result" }
+  | { kind: "ignored" };
+
+function parseRelayFrame(text: string): ParsedRelayFrame {
+  if (!utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES)) return { kind: "ignored" };
   let value: unknown;
   try {
     value = JSON.parse(text) as unknown;
   } catch {
-    return null;
+    return { kind: "ignored" };
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "ignored" };
   const frame = value as Record<string, unknown>;
+  if (frame.type === "message_result") {
+    if (!exactObjectKeys(frame, ["type", "message_id", "accepted"]) ||
+      typeof frame.message_id !== "string" ||
+      !MESSAGE_ID_PATTERN.test(frame.message_id) ||
+      typeof frame.accepted !== "boolean") {
+      return { kind: "invalid-result" };
+    }
+    return {
+      kind: "result",
+      result: {
+        type: "message_result",
+        message_id: frame.message_id,
+        accepted: frame.accepted,
+      },
+    };
+  }
+  if (frame.type === "ack_result") {
+    if (!exactObjectKeys(frame, ["type", "message_id", "accepted"]) ||
+      typeof frame.message_id !== "string" ||
+      !MESSAGE_ID_PATTERN.test(frame.message_id) ||
+      typeof frame.accepted !== "boolean") {
+      return { kind: "invalid-result" };
+    }
+    return {
+      kind: "result",
+      result: {
+        type: "ack_result",
+        message_id: frame.message_id,
+        accepted: frame.accepted,
+      },
+    };
+  }
+  const parsed = parseIncomingFrameValue(frame);
+  return parsed ? { kind: "frame", frame: parsed } : { kind: "ignored" };
+}
+
+function parseIncomingFrameValue(frame: Record<string, unknown>): IncomingFrame | null {
   switch (frame.type) {
     case "GLOBAL_WIPE":
     case "global_wipe":
@@ -798,6 +1139,24 @@ function parseIncomingFrame(text: string): IncomingFrame | null {
     default:
       return null;
   }
+}
+
+function serializeRelayFrame(frame: object): string | null {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(frame);
+  } catch {
+    return null;
+  }
+  return typeof serialized === "string" && utf8LengthWithin(serialized, MAX_RELAY_TEXT_BYTES)
+    ? serialized
+    : null;
+}
+
+function exactObjectKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const expected = new Set(keys);
+  const actual = Object.keys(value);
+  return actual.length === expected.size && actual.every((key) => expected.has(key));
 }
 
 function plainRecord(value: unknown): value is Record<string, unknown> {

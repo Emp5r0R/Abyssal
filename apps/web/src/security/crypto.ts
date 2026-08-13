@@ -13,11 +13,18 @@ const DECODER = new TextDecoder("utf-8", { fatal: true });
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const USERNAME_PATTERN = /^[\x20-\x7e]{1,80}$/;
 const CHACHA20_POLY1305_TAG_BYTES = 16;
+const PAYLOAD_PADDING_BUCKET_BYTES = 256;
+const PAYLOAD_HEADER_BYTES = 5;
+const MAX_PAYLOAD_BYTES = 1024 * 1024;
+const MAX_PADDED_PAYLOAD_BYTES = Math.ceil(
+  (MAX_PAYLOAD_BYTES + PAYLOAD_HEADER_BYTES) / PAYLOAD_PADDING_BUCKET_BYTES,
+) * PAYLOAD_PADDING_BUCKET_BYTES;
+export const MAX_PAYLOAD_CIPHERTEXT_BYTES = MAX_PADDED_PAYLOAD_BYTES + CHACHA20_POLY1305_TAG_BYTES;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES = 200 * 1024 * 1024;
 const IDENTITY_PUBLIC_KEY_BYTES = 128;
 export const STATE_SIGNATURE_BYTES = 64;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 export const ATTACHMENT_CIPHER_VERSION = 1;
 const ATTACHMENT_KEY_BYTES = 32;
 const ATTACHMENT_NONCE_BYTES = 24;
@@ -25,6 +32,13 @@ const ATTACHMENT_BLOB_MIN_BYTES = 1 + ATTACHMENT_NONCE_BYTES + CHACHA20_POLY1305
 const MAX_ATTACHMENT_BLOB_BYTES = ATTACHMENT_BLOB_MIN_BYTES + MAX_ATTACHMENT_PLAINTEXT_BYTES;
 
 let wasmReady: Promise<unknown> | null = null;
+
+export class FatalCipherError extends Error {
+  constructor() {
+    super("Payload unavailable");
+    this.name = "FatalCipherError";
+  }
+}
 
 export interface OpaqueStartState {
   registrationState: Uint8Array;
@@ -213,7 +227,9 @@ export function conversationSafetyNumber(firstPublicKey: Uint8Array, secondPubli
 
 export class InMemoryPayloadCipher {
   #session: WasmE2eeSession | null = null;
+  #committedState: IdentityStateSnapshot | null = null;
   #pendingState: IdentityStateSnapshot | null = null;
+  #pendingPreviousState: IdentityStateSnapshot | null = null;
 
   createIdentity(exportKey: Uint8Array, context: Uint8Array): {
     publicKey: Uint8Array;
@@ -251,14 +267,31 @@ export class InMemoryPayloadCipher {
   }
 
   stateSnapshot(): IdentityStateSnapshot | null {
-    if (!this.#pendingState) return null;
-    return {
-      revision: this.#pendingState.revision,
-      envelope: this.#pendingState.envelope.slice(),
-      identityPublicKey: this.#pendingState.identityPublicKey.slice(),
-      prekeyId: this.#pendingState.prekeyId,
-      stateSignature: this.#pendingState.stateSignature.slice(),
-    };
+    return cloneState(this.#pendingState ?? this.#committedState);
+  }
+
+  commitOutbound(messageId: string, revision: number): void {
+    const session = this.#session;
+    const pending = this.#pendingState;
+    if (!session || !pending || pending.revision !== revision) throw new Error("Identity unavailable");
+    session.commitOutbound(messageId, toRevisionBigInt(revision));
+    wipeState(this.#pendingPreviousState);
+    this.#pendingPreviousState = null;
+    wipeState(this.#committedState);
+    this.#committedState = pending;
+    this.#pendingState = null;
+  }
+
+  rollbackOutbound(messageId: string, revision: number): void {
+    const session = this.#session;
+    const pending = this.#pendingState;
+    if (!session || !pending || pending.revision !== revision) throw new Error("Identity unavailable");
+    session.rollbackOutbound(messageId, toRevisionBigInt(revision));
+    wipeState(this.#pendingState);
+    this.#pendingState = null;
+    wipeState(this.#committedState);
+    this.#committedState = this.#pendingPreviousState;
+    this.#pendingPreviousState = null;
   }
 
   signAcknowledgement(
@@ -277,6 +310,32 @@ export class InMemoryPayloadCipher {
     if (signature.byteLength !== STATE_SIGNATURE_BYTES) {
       signature.fill(0);
       throw new Error("Payload unavailable");
+    }
+    return signature;
+  }
+
+  signRegistrationIdentityProof(
+    nodeId: string,
+    handshakeId: string,
+    challenge: Uint8Array,
+    registrationUpload: Uint8Array,
+    identityPublic: Uint8Array,
+    prekeyId: string,
+    identityEnvelope: Uint8Array,
+  ): Uint8Array {
+    if (!this.#session) throw new Error("Identity unavailable");
+    const signature = this.#session.signRegistrationIdentityProof(
+      nodeId,
+      handshakeId,
+      challenge,
+      registrationUpload,
+      identityPublic,
+      prekeyId,
+      identityEnvelope,
+    );
+    if (signature.byteLength !== STATE_SIGNATURE_BYTES) {
+      signature.fill(0);
+      throw new Error("Identity proof rejected");
     }
     return signature;
   }
@@ -322,6 +381,11 @@ export class InMemoryPayloadCipher {
     );
     try {
       return DECODER.decode(plain);
+    } catch {
+      // Native decryption has already advanced the ratchet by this point. A
+      // plaintext wrapper failure therefore cannot be treated as a dropped
+      // ciphertext: discard the identity before exposing another operation.
+      this.throwFatalCipherError();
     } finally {
       plain.fill(0);
     }
@@ -375,14 +439,20 @@ export class InMemoryPayloadCipher {
   }
 
   clear(): void {
-    if (this.#pendingState) {
-      wipeBytes(this.#pendingState.envelope);
-      wipeBytes(this.#pendingState.identityPublicKey);
-      wipeBytes(this.#pendingState.stateSignature);
-    }
+    wipeState(this.#committedState);
+    wipeState(this.#pendingState);
+    wipeState(this.#pendingPreviousState);
+    this.#committedState = null;
     this.#pendingState = null;
-    this.#session?.free();
+    this.#pendingPreviousState = null;
+    const session = this.#session;
     this.#session = null;
+    try {
+      session?.free();
+    } catch {
+      // The native handle is detached above, so a cleanup failure cannot
+      // leave this cipher reusable with partially released state.
+    }
   }
 
   private encryptPayload(
@@ -393,90 +463,153 @@ export class InMemoryPayloadCipher {
     recipients: RecipientKey[],
   ): EncryptedPayload {
     if (!this.#session) throw new Error("Payload cipher unavailable");
+    if (this.#pendingState) throw new Error("Identity unavailable");
     normalizeContext(chatId, messageId, senderUsername);
     const seen = new Set<string>();
-    const rustRecipients = recipients.map((recipient) => {
-      if (
-        !USERNAME_PATTERN.test(recipient.username) ||
-        recipient.publicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
-        !PREKEY_ID_PATTERN.test(recipient.prekeyId) ||
-        seen.has(recipient.username)
-      ) {
-        throw new Error("Recipient unavailable");
-      }
-      seen.add(recipient.username);
-      return {
-        username: recipient.username,
-        public_key: [...recipient.publicKey],
-        prekey_id: recipient.prekeyId,
-      };
-    });
-    if (rustRecipients.length === 0) throw new Error("Recipient unavailable");
-    const result = parseJson<RustEncryptedPayload>(
-      this.#session.encrypt(
+    const rustRecipients: Array<{ username: string; public_key: number[]; prekey_id: string }> = [];
+    try {
+      recipients.forEach((recipient) => {
+        if (
+          !USERNAME_PATTERN.test(recipient.username) ||
+          recipient.publicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+          !PREKEY_ID_PATTERN.test(recipient.prekeyId) ||
+          seen.has(recipient.username)
+        ) {
+          throw new Error("Recipient unavailable");
+        }
+        seen.add(recipient.username);
+        rustRecipients.push({
+          username: recipient.username,
+          public_key: [...recipient.publicKey],
+          prekey_id: recipient.prekeyId,
+        });
+      });
+      if (rustRecipients.length === 0) throw new Error("Recipient unavailable");
+    } catch {
+      rustRecipients.forEach((recipient) => recipient.public_key.fill(0));
+      throw new Error("Recipient unavailable");
+    }
+
+    const session = this.#session;
+    let rawResult: string;
+    try {
+      rawResult = session.encrypt(
         chatId,
         messageId,
         senderUsername,
         plaintext,
         JSON.stringify(rustRecipients),
-      ),
-    );
-    if (
-      result.version !== PROTOCOL_VERSION ||
-      result.message_id !== messageId ||
-      !Number.isSafeInteger(result.state_revision) ||
-      result.state_revision <= 0
-    ) {
+      );
+    } catch {
+      wipeState(this.#pendingPreviousState);
+      this.#pendingPreviousState = null;
       throw new Error("Payload unavailable");
+    } finally {
+      rustRecipients.forEach((recipient) => recipient.public_key.fill(0));
+    }
+
+    let result: RustEncryptedPayload;
+    try {
+      result = parseJson<RustEncryptedPayload>(rawResult);
+    } catch {
+      this.clear();
+      throw new FatalCipherError();
     }
     let identityEnvelope: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let identityPublicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let stateSignature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let nonce: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let ciphertext: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    const envelopes: RecipientEnvelope[] = [];
     try {
+      if (
+        result.version !== PROTOCOL_VERSION ||
+        result.message_id !== messageId ||
+        !Number.isSafeInteger(result.state_revision) ||
+        result.state_revision <= 0 ||
+        !Array.isArray(result.envelopes)
+      ) throw new Error("Payload unavailable");
       identityEnvelope = bytes(result.identity_envelope);
       identityPublicKey = bytes(result.identity_public);
       stateSignature = bytes(result.state_signature);
-    } catch (error) {
-      identityEnvelope.fill(0);
-      identityPublicKey.fill(0);
-      stateSignature.fill(0);
-      throw error;
-    }
-    if (
-      identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
-      stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
-      !PREKEY_ID_PATTERN.test(result.prekey_id)
-    ) {
-      identityEnvelope.fill(0);
-      identityPublicKey.fill(0);
-      stateSignature.fill(0);
+      if (
+        identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+        stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
+        !PREKEY_ID_PATTERN.test(result.prekey_id)
+      ) throw new Error("Payload unavailable");
+      nonce = bytes(result.nonce);
+      ciphertext = bytes(result.ciphertext);
+      if (nonce.byteLength !== 12 || !validPayloadCiphertext(ciphertext)) {
+        throw new Error("Payload unavailable");
+      }
+      result.envelopes.forEach((envelope) => {
+        if (
+          typeof envelope.username !== "string" ||
+          typeof envelope.prekey_id !== "string" ||
+          typeof envelope.is_prekey !== "boolean" ||
+          !USERNAME_PATTERN.test(envelope.username) ||
+          (envelope.is_prekey
+            ? !PREKEY_ID_PATTERN.test(envelope.prekey_id)
+            : envelope.prekey_id !== "")
+        ) throw new Error("Payload unavailable");
+        const wrappedKey = bytes(envelope.wrapped_key);
+        const signature = bytes(envelope.signature);
+        if (wrappedKey.byteLength === 0 || signature.byteLength !== STATE_SIGNATURE_BYTES) {
+          wipeBytes(wrappedKey);
+          wipeBytes(signature);
+          throw new Error("Payload unavailable");
+        }
+        envelopes.push({
+          username: envelope.username,
+          wrappedKey,
+          prekeyId: envelope.prekey_id,
+          isPrekey: envelope.is_prekey,
+          signature,
+        });
+      });
+      if (envelopes.length === 0) throw new Error("Payload unavailable");
+      const payload: EncryptedPayload = {
+        version: PROTOCOL_VERSION,
+        messageId: result.message_id,
+        nonce,
+        ciphertext,
+        envelopes,
+        stateRevision: result.state_revision,
+        identityEnvelope,
+        identityPublicKey,
+        prekeyId: result.prekey_id,
+        stateSignature,
+      };
+      this.#pendingPreviousState = cloneState(this.#committedState);
+      this.rememberPendingState(
+        result.state_revision,
+        identityEnvelope,
+        identityPublicKey,
+        result.prekey_id,
+        stateSignature,
+      );
+      return payload;
+    } catch {
+      wipeBytes(identityEnvelope);
+      wipeBytes(identityPublicKey);
+      wipeBytes(stateSignature);
+      wipeBytes(nonce);
+      wipeBytes(ciphertext);
+      envelopes.forEach((envelope) => {
+        wipeBytes(envelope.wrappedKey);
+        wipeBytes(envelope.signature);
+      });
+      wipeState(this.#pendingState);
+      wipeState(this.#pendingPreviousState);
+      this.#pendingState = null;
+      this.#pendingPreviousState = null;
+      const revision = outboundRevision(result);
+      if (revision === null || !rollbackCoreAfterFailedOutbound(session, messageId, revision)) {
+        this.clear();
+        throw new FatalCipherError();
+      }
       throw new Error("Payload unavailable");
     }
-    this.rememberState(
-      result.state_revision,
-      identityEnvelope,
-      identityPublicKey,
-      result.prekey_id,
-      stateSignature,
-    );
-    return {
-      version: PROTOCOL_VERSION,
-      messageId: result.message_id,
-      nonce: bytes(result.nonce),
-      ciphertext: bytes(result.ciphertext),
-      envelopes: result.envelopes.map((envelope) => ({
-        username: envelope.username,
-        wrappedKey: bytes(envelope.wrapped_key),
-        prekeyId: envelope.prekey_id,
-        isPrekey: envelope.is_prekey,
-        signature: bytes(envelope.signature),
-      })),
-      stateRevision: result.state_revision,
-      identityEnvelope,
-      identityPublicKey,
-      prekeyId: result.prekey_id,
-      stateSignature,
-    };
   }
 
   private decryptPayload(
@@ -491,10 +624,13 @@ export class InMemoryPayloadCipher {
     isPrekey: boolean,
     recipientUsername: string,
   ): Uint8Array {
-    if (!this.#session) throw new Error("Payload cipher unavailable");
+    if (!this.#session || payload.version !== PROTOCOL_VERSION || payload.nonce.byteLength !== 12 ||
+      !validPayloadCiphertext(payload.ciphertext)) throw new Error("Payload unavailable");
     normalizeContext(chatId, messageId, senderUsername);
-    const result = parseJson<RustE2eeDecryption>(
-      this.#session.decrypt(
+    const session = this.#session;
+    let rawResult: string;
+    try {
+      rawResult = session.decrypt(
         chatId,
         messageId,
         senderUsername,
@@ -508,58 +644,94 @@ export class InMemoryPayloadCipher {
         recipientPrekeyId,
         isPrekey,
         recipientUsername,
-      ),
-    );
-    if (!Number.isSafeInteger(result.state_revision) || result.state_revision <= 0) {
+      );
+    } catch {
+      // Authentication/decryption failures happen before the native wrapper
+      // returns a state transition. Keep this identity usable so callers can
+      // drop the malformed or unauthenticated frame normally.
       throw new Error("Payload unavailable");
     }
+
     let identityEnvelope: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let identityPublicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let stateSignature: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let plaintext: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     try {
+      const result = parseJson<RustE2eeDecryption>(rawResult);
+      if (!Number.isSafeInteger(result.state_revision) || result.state_revision <= 0) {
+        throw new Error("Payload unavailable");
+      }
       identityEnvelope = bytes(result.identity_envelope);
       identityPublicKey = bytes(result.identity_public);
       stateSignature = bytes(result.state_signature);
-    } catch (error) {
-      identityEnvelope.fill(0);
+      if (
+        identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+        stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
+        !PREKEY_ID_PATTERN.test(result.prekey_id)
+      ) {
+        throw new Error("Payload unavailable");
+      }
+      plaintext = bytes(result.plaintext);
+      this.rememberCommittedState(
+        result.state_revision,
+        identityEnvelope,
+        identityPublicKey,
+        result.prekey_id,
+        stateSignature,
+      );
+      wipeBytes(identityEnvelope);
       identityPublicKey.fill(0);
       stateSignature.fill(0);
-      throw error;
+      return plaintext;
+    } catch {
+      wipeBytes(identityEnvelope);
+      wipeBytes(identityPublicKey);
+      wipeBytes(stateSignature);
+      wipeBytes(plaintext);
+      this.throwFatalCipherError();
     }
-    if (
-      identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
-      stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
-      !PREKEY_ID_PATTERN.test(result.prekey_id)
-    ) {
-      identityEnvelope.fill(0);
-      identityPublicKey.fill(0);
-      stateSignature.fill(0);
-      throw new Error("Payload unavailable");
-    }
-    this.rememberState(
-      result.state_revision,
-      identityEnvelope,
-      identityPublicKey,
-      result.prekey_id,
-      stateSignature,
-    );
-    wipeBytes(identityEnvelope);
-    identityPublicKey.fill(0);
-    stateSignature.fill(0);
-    return bytes(result.plaintext);
   }
 
-  private rememberState(
+  private throwFatalCipherError(): never {
+    try {
+      this.clear();
+    } catch {
+      // Detach/wipe as much state as clear() can reach, then preserve the
+      // fail-closed contract even if native cleanup itself reports an error.
+    }
+    throw new FatalCipherError();
+  }
+
+  private rememberPendingState(
     revision: number,
     envelope: Uint8Array,
     identityPublicKey: Uint8Array,
     prekeyId: string,
     stateSignature: Uint8Array,
   ): void {
-    if (this.#pendingState) wipeBytes(this.#pendingState.envelope);
-    if (this.#pendingState) wipeBytes(this.#pendingState.identityPublicKey);
-    if (this.#pendingState) wipeBytes(this.#pendingState.stateSignature);
+    wipeState(this.#pendingState);
     this.#pendingState = {
+      revision,
+      envelope: envelope.slice(),
+      identityPublicKey: identityPublicKey.slice(),
+      prekeyId,
+      stateSignature: stateSignature.slice(),
+    };
+  }
+
+  private rememberCommittedState(
+    revision: number,
+    envelope: Uint8Array,
+    identityPublicKey: Uint8Array,
+    prekeyId: string,
+    stateSignature: Uint8Array,
+  ): void {
+    wipeState(this.#committedState);
+    wipeState(this.#pendingState);
+    wipeState(this.#pendingPreviousState);
+    this.#pendingState = null;
+    this.#pendingPreviousState = null;
+    this.#committedState = {
       revision,
       envelope: envelope.slice(),
       identityPublicKey: identityPublicKey.slice(),
@@ -585,7 +757,13 @@ export function maxSerializedAttachmentBytes(mediaType: string): number {
 }
 
 export function payloadToFrame(payload: EncryptedPayload): Record<string, unknown> {
-  if (payload.stateSignature.byteLength !== STATE_SIGNATURE_BYTES) {
+  if (
+    payload.version !== PROTOCOL_VERSION ||
+    payload.messageId.length === 0 ||
+    payload.nonce.byteLength !== 12 ||
+    !validPayloadCiphertext(payload.ciphertext) ||
+    payload.stateSignature.byteLength !== STATE_SIGNATURE_BYTES
+  ) {
     throw new Error("Payload unavailable");
   }
   return {
@@ -634,6 +812,57 @@ export function wipeOpaqueStart(state: OpaqueStartState): void {
   state.registrationRequest.fill(0);
   state.loginState.fill(0);
   state.credentialRequest.fill(0);
+}
+
+function cloneState(state: IdentityStateSnapshot | null): IdentityStateSnapshot | null {
+  if (!state) return null;
+  return {
+    revision: state.revision,
+    envelope: state.envelope.slice(),
+    identityPublicKey: state.identityPublicKey.slice(),
+    prekeyId: state.prekeyId,
+    stateSignature: state.stateSignature.slice(),
+  };
+}
+
+function wipeState(state: IdentityStateSnapshot | null): void {
+  if (!state) return;
+  wipeBytes(state.envelope);
+  wipeBytes(state.identityPublicKey);
+  wipeBytes(state.stateSignature);
+}
+
+function toRevisionBigInt(revision: number): bigint {
+  if (!Number.isSafeInteger(revision) || revision <= 0) throw new Error("Identity unavailable");
+  return BigInt(revision);
+}
+
+function validPayloadCiphertext(ciphertext: Uint8Array): boolean {
+  return ciphertext.byteLength >= PAYLOAD_PADDING_BUCKET_BYTES + CHACHA20_POLY1305_TAG_BYTES &&
+    ciphertext.byteLength <= MAX_PAYLOAD_CIPHERTEXT_BYTES &&
+    (ciphertext.byteLength - CHACHA20_POLY1305_TAG_BYTES) % PAYLOAD_PADDING_BUCKET_BYTES === 0;
+}
+
+function rollbackCoreAfterFailedOutbound(
+  session: WasmE2eeSession,
+  messageId: string,
+  revision: number,
+): boolean {
+  try {
+    if (Number.isSafeInteger(revision) && revision > 0) {
+      session.rollbackOutbound(messageId, BigInt(revision));
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function outboundRevision(result: unknown): number | null {
+  if (typeof result !== "object" || result === null || !("state_revision" in result)) return null;
+  const revision = (result as { state_revision: unknown }).state_revision;
+  return Number.isSafeInteger(revision) && (revision as number) > 0 ? revision as number : null;
 }
 
 function normalizeContext(chatId: string, messageId: string, username: string): void {

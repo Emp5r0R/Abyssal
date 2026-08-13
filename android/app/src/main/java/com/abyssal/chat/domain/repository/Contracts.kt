@@ -48,30 +48,74 @@ interface IMessageSender {
 interface IMessageRepository {
     fun getChatSessions(): Flow<List<ChatSession>>
     fun getMessages(chatId: String): Flow<List<Message>>
+    /** Monotonic in-memory epoch advanced by every synchronous repository purge. */
+    fun currentEpoch(): ULong = 0uL
     /** Synchronous RAM purge for ViewModel teardown; must not touch disk. */
     fun clearAllDataNow()
     suspend fun saveMessage(chatId: String, message: Message)
+    fun saveMessageIfCurrent(epoch: ULong, chatId: String, message: Message): Boolean = false
     suspend fun markAsRead(chatId: String, messageId: String)
+    fun markAsReadIfCurrent(epoch: ULong, chatId: String, messageId: String): Boolean = false
     suspend fun forgetAttachmentKey(chatId: String, messageId: String)
     suspend fun createForumSession(session: ChatSession)
+    fun createForumSessionIfCurrent(epoch: ULong, session: ChatSession): Boolean = false
     suspend fun deleteChatSession(chatId: String)
+    fun deleteChatSessionIfCurrent(epoch: ULong, chatId: String): Boolean = false
     suspend fun clearAllData()
     fun close()
+}
+
+/** Result of a message frame after the relay's admission decision. */
+enum class OutboundSendResult {
+    ACCEPTED,
+    REJECTED,
+    NOT_SENT,
+    /** The frame may have reached the relay, but no authenticated result arrived. */
+    AMBIGUOUS
 }
 
 interface IChatTransport {
     fun connect()
     fun disconnect()
+    /** Epoch of the active connection; zero keeps simple test transports source-compatible. */
+    fun currentConnectionGeneration(): Long = 0L
+    /** Runs one synchronous mutation while the expected connection epoch cannot advance. */
+    fun runIfConnectionCurrent(
+        expectedConnectionGeneration: Long,
+        mutation: () -> Boolean
+    ): Boolean = currentConnectionGeneration() == expectedConnectionGeneration && mutation()
     fun getServerStatus(): Flow<ServerStatus>
-    fun getIncomingWipeCommands(): Flow<Unit>
+    fun getIncomingWipeCommands(): Flow<Long>
     fun getIncomingPayloads(): Flow<IncomingTransportPayload>
     fun getRoomChanges(): Flow<RoomChange>
     fun getPresence(): Flow<List<UserPresence>>
     suspend fun joinChat(chatId: String)
+    /**
+     * Joins [chatId] only when the captured connection epoch is still active.
+     * The default keeps lightweight test transports and older implementations
+     * source-compatible; they retain the original join behavior.
+     */
+    suspend fun joinChat(chatId: String, expectedConnectionGeneration: Long) {
+        joinChat(chatId)
+    }
     suspend fun createForum(session: ChatSession)
+    suspend fun createForum(session: ChatSession, expectedConnectionGeneration: Long) {
+        createForum(session)
+    }
     suspend fun deleteForum(chatId: String)
+    suspend fun deleteForum(chatId: String, expectedConnectionGeneration: Long) {
+        deleteForum(chatId)
+    }
     suspend fun openDirect(peerUsername: String)
-    suspend fun sendEncryptedPayload(chatId: String, payload: EncryptedTransportPayload): Boolean
+    suspend fun openDirect(peerUsername: String, expectedConnectionGeneration: Long) {
+        openDirect(peerUsername)
+    }
+    suspend fun sendEncryptedPayload(chatId: String, payload: EncryptedTransportPayload): OutboundSendResult
+    suspend fun sendEncryptedPayload(
+        chatId: String,
+        payload: EncryptedTransportPayload,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult = sendEncryptedPayload(chatId, payload)
     suspend fun acknowledgeMessage(
         chatId: String,
         messageId: String,
@@ -79,14 +123,39 @@ interface IChatTransport {
         state: IdentityStateSnapshot,
         usedPrekeyId: String,
         ackSignature: ByteArray
-    ): Boolean
+    ): OutboundSendResult
+    suspend fun acknowledgeMessage(
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
+        state: IdentityStateSnapshot,
+        usedPrekeyId: String,
+        ackSignature: ByteArray,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult = acknowledgeMessage(
+        chatId,
+        messageId,
+        senderUsername,
+        state,
+        usedPrekeyId,
+        ackSignature
+    )
     suspend fun syncIdentityState(state: IdentityStateSnapshot): Boolean
+    suspend fun syncIdentityState(
+        state: IdentityStateSnapshot,
+        expectedConnectionGeneration: Long
+    ): Boolean = syncIdentityState(state)
     suspend fun signalUserActivity(): Boolean
+    suspend fun signalUserActivity(expectedConnectionGeneration: Long): Boolean = signalUserActivity()
     suspend fun broadcastGlobalWipe()
+    suspend fun broadcastGlobalWipe(expectedConnectionGeneration: Long) {
+        broadcastGlobalWipe()
+    }
 }
 
 interface IEncryptedAttachmentService {
     suspend fun uploadEncryptedAttachment(
+        session: NodeSession,
         chatId: String,
         mediaType: String,
         encryptedBytes: ByteArray,
@@ -96,10 +165,23 @@ interface IEncryptedAttachmentService {
         onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult
 
-    suspend fun downloadEncryptedAttachment(attachmentId: String): EncryptedAttachmentDownload?
-    suspend fun deleteUploadedAttachment(attachmentId: String): Boolean
-    suspend fun completeAttachmentDownload(attachmentId: String, claim: String): Boolean
-    suspend fun releaseAttachmentDownloadClaim(attachmentId: String, claim: String): Boolean
+    suspend fun downloadEncryptedAttachment(
+        session: NodeSession,
+        attachmentId: String,
+        mediaType: String,
+        expectedPlaintextBytes: Long
+    ): EncryptedAttachmentDownload?
+    suspend fun deleteUploadedAttachment(session: NodeSession, attachmentId: String): Boolean
+    suspend fun completeAttachmentDownload(
+        session: NodeSession,
+        attachmentId: String,
+        claim: String
+    ): Boolean
+    suspend fun releaseAttachmentDownloadClaim(
+        session: NodeSession,
+        attachmentId: String,
+        claim: String
+    ): Boolean
     suspend fun saveDecryptedAttachment(attachment: DecryptedAttachment, outputUri: android.net.Uri): Boolean
 }
 

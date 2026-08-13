@@ -32,6 +32,8 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     private val scope = CoroutineScope(Dispatchers.Default + Job())
     private val stateLock = Any()
+    private var repositoryEpoch: ULong = 0uL
+    private var repositoryEpochExhausted = false
 
     private val _sessions = MutableStateFlow<List<ChatSession>>(emptyList())
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
@@ -108,18 +110,25 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     override fun getChatSessions(): Flow<List<ChatSession>> = _sessions.asStateFlow()
 
+    override fun currentEpoch(): ULong = synchronized(stateLock) { repositoryEpoch }
+
     override fun getMessages(chatId: String): Flow<List<Message>> {
         return _messages.map { map -> map[chatId] ?: emptyList() }
     }
 
     override suspend fun saveMessage(chatId: String, message: Message) {
+        saveMessageIfCurrent(currentEpoch(), chatId, message)
+    }
+
+    override fun saveMessageIfCurrent(epoch: ULong, chatId: String, message: Message): Boolean {
         synchronized(stateLock) {
+            if (repositoryEpochExhausted || epoch != repositoryEpoch) return false
             val candidateBytes = estimatedMessageBytes(message)
             if (candidateBytes > MAX_MESSAGE_BYTES_PER_CHAT ||
                 candidateBytes > MAX_MESSAGE_BYTES_TOTAL
             ) {
                 wipeMessageKeys(message)
-                return
+                return true
             }
 
             val nextMessages = _messages.value
@@ -128,7 +137,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             val existing = currentChatMsgs.firstOrNull { it.id == message.id }
             if (existing != null) {
                 if (existing !== message) wipeMessageKeys(message)
-                return
+                return true
             }
 
             var chatBytes = currentChatMsgs.sumOf(::estimatedMessageBytes)
@@ -197,11 +206,17 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             ensureSessionExists(chatId, message.selfDestructDurationSec)
             _messages.value = nextMessages
             updateLastMessages()
+            return true
         }
     }
 
     override suspend fun createForumSession(session: ChatSession) {
+        createForumSessionIfCurrent(currentEpoch(), session)
+    }
+
+    override fun createForumSessionIfCurrent(epoch: ULong, session: ChatSession): Boolean {
         synchronized(stateLock) {
+            if (repositoryEpochExhausted || epoch != repositoryEpoch) return false
             val current = _sessions.value.toMutableList()
             val existingIndex = current.indexOfFirst { it.id == session.id }
             if (existingIndex >= 0) {
@@ -215,17 +230,24 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
             _sessions.value = current
             _messages.value = _messages.value.toMutableMap().apply { putIfAbsent(session.id, emptyList()) }
             updateLastMessages()
+            return true
         }
     }
 
     override suspend fun deleteChatSession(chatId: String) {
+        deleteChatSessionIfCurrent(currentEpoch(), chatId)
+    }
+
+    override fun deleteChatSessionIfCurrent(epoch: ULong, chatId: String): Boolean {
         synchronized(stateLock) {
+            if (repositoryEpochExhausted || epoch != repositoryEpoch) return false
             val removedSession = _sessions.value.firstOrNull { it.id == chatId }
             _sessions.value = _sessions.value.filterNot { it.id == chatId }
             val removed = _messages.value[chatId].orEmpty()
             removed.forEach(::wipeMessageKeys)
             removedSession?.lastMessage?.let(::wipeMessageKeys)
             _messages.value = _messages.value.toMutableMap().apply { remove(chatId) }
+            return true
         }
     }
 
@@ -270,8 +292,13 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     }
 
     override suspend fun markAsRead(chatId: String, messageId: String) {
+        markAsReadIfCurrent(currentEpoch(), chatId, messageId)
+    }
+
+    override fun markAsReadIfCurrent(epoch: ULong, chatId: String, messageId: String): Boolean {
         synchronized(stateLock) {
-            val chatMsgs = _messages.value[chatId] ?: return
+            if (repositoryEpochExhausted || epoch != repositoryEpoch) return false
+            val chatMsgs = _messages.value[chatId] ?: return true
             var changed = false
             val updated = chatMsgs.map { msg ->
                 if (msg.id == messageId && msg.readTimestampMs == null) {
@@ -292,6 +319,7 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
                     }
                 }
             }
+            return true
         }
     }
 
@@ -321,6 +349,11 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
 
     override fun clearAllDataNow() {
         synchronized(stateLock) {
+            if (repositoryEpoch == ULong.MAX_VALUE) {
+                repositoryEpochExhausted = true
+            } else {
+                repositoryEpoch++
+            }
             _messages.value.values.flatten().forEach(::wipeMessageKeys)
             resetToEmpty()
         }
