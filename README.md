@@ -163,6 +163,8 @@ ABYSSAL_NODE_ID=abyssal-node-1 \
 ABYSSAL_CODE_COUNT=8 \
 ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
 ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB=320 \
+ABYSSAL_ATTACHMENT_RECORD_LIMIT=16384 \
+ABYSSAL_ATTACHMENT_ACCOUNT_RECORD_LIMIT=4096 \
 ABYSSAL_ATTACHMENT_MAX_LIFETIME_HOURS=168 \
 ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY=2 \
 ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY=2 \
@@ -189,6 +191,8 @@ Security-related relay knobs:
 
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
 - `ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB`: per-account in-memory encrypted attachment quota, capped by the global RAM limit. Default: `320`.
+- `ABYSSAL_ATTACHMENT_RECORD_LIMIT`: global encrypted attachment-record quota. Default: `16384`; accepted range: `1` to `65536`.
+- `ABYSSAL_ATTACHMENT_ACCOUNT_RECORD_LIMIT`: per-account encrypted attachment-record quota. Default: `4096`; accepted range: `1` to `65536`, then capped by the global record limit. Record quotas count the authoritative bounded attachment map and are separate from byte quotas; expiry, deletion, completion cleanup, room cleanup, and global wipe free record capacity.
 - `ABYSSAL_ATTACHMENT_MAX_LIFETIME_HOURS`: hard relay-side maximum lifetime for every encrypted attachment, including an explicit `ttl=0`/no-expiry request. Default: `168` hours (7 days); accepted range: `1` to `720` hours. Room absolute-expiry rules may shorten this value, never extend it. Expired blobs are removed from RAM and release quota.
 - `ABYSSAL_ATTACHMENT_DOWNLOAD_CONCURRENCY`: maximum concurrent attachment responses across the relay. Default: `2`; accepted range: `1` to `16`.
 - `ABYSSAL_ATTACHMENT_UPLOAD_CONCURRENCY`: maximum concurrent attachment request-body reads. Default: `2`; accepted range: `1` to `4`. This bounds large encrypted request allocations before the RAM quota check.

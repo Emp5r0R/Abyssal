@@ -122,6 +122,10 @@ const PREKEY_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
 const ATTACHMENT_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_PREKEY_ID_BYTES: usize = 32;
 const DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB: usize = 320;
+const DEFAULT_ATTACHMENT_RECORD_LIMIT: usize = 16 * 1024;
+const DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT: usize = 4 * 1024;
+const MIN_ATTACHMENT_RECORD_LIMIT: usize = 1;
+const MAX_ATTACHMENT_RECORD_LIMIT: usize = 65_536;
 // A zero/omitted client TTL still receives this bounded relay-side lifetime.
 // This prevents an orphaned encrypted blob from remaining in RAM forever.
 const DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS: usize = 7 * 24;
@@ -153,6 +157,8 @@ struct AppState {
     node_id: String,
     attachment_ram_limit_bytes: usize,
     attachment_account_limit_bytes: usize,
+    attachment_record_limit: usize,
+    attachment_account_record_limit: usize,
     attachment_max_lifetime_sec: u64,
     max_rooms_per_user: usize,
     conversation_ops: Arc<Mutex<()>>,
@@ -959,6 +965,13 @@ impl AppState {
         )
         .saturating_mul(1024 * 1024)
         .min(attachment_ram_limit_bytes);
+        let (attachment_record_limit, attachment_account_record_limit) =
+            attachment_record_limits_from_values(
+                env::var("ABYSSAL_ATTACHMENT_RECORD_LIMIT").ok().as_deref(),
+                env::var("ABYSSAL_ATTACHMENT_ACCOUNT_RECORD_LIMIT")
+                    .ok()
+                    .as_deref(),
+            );
         let attachment_max_lifetime_sec = read_usize_env(
             "ABYSSAL_ATTACHMENT_MAX_LIFETIME_HOURS",
             DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS,
@@ -1006,6 +1019,8 @@ impl AppState {
             node_id,
             attachment_ram_limit_bytes,
             attachment_account_limit_bytes,
+            attachment_record_limit,
+            attachment_account_record_limit,
             attachment_max_lifetime_sec,
             max_rooms_per_user,
             conversation_ops: Arc::new(Mutex::new(())),
@@ -1069,6 +1084,14 @@ impl AppState {
             self.attachment_account_limit_bytes
         );
         info!(
+            "ABYSSAL_ATTACHMENT_RECORD_LIMIT records={}",
+            self.attachment_record_limit
+        );
+        info!(
+            "ABYSSAL_ATTACHMENT_ACCOUNT_RECORD_LIMIT records={}",
+            self.attachment_account_record_limit
+        );
+        info!(
             "ABYSSAL_ATTACHMENT_MAX_LIFETIME seconds={}",
             self.attachment_max_lifetime_sec
         );
@@ -1124,6 +1147,21 @@ fn read_usize_env(key: &str, fallback: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(fallback)
+}
+
+fn attachment_record_limits_from_values(
+    global: Option<&str>,
+    account: Option<&str>,
+) -> (usize, usize) {
+    let global = global
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ATTACHMENT_RECORD_LIMIT)
+        .clamp(MIN_ATTACHMENT_RECORD_LIMIT, MAX_ATTACHMENT_RECORD_LIMIT);
+    let account = account
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT)
+        .clamp(MIN_ATTACHMENT_RECORD_LIMIT, global);
+    (global, account)
 }
 
 fn pending_message_ttl_ms_from_env() -> u64 {
@@ -1960,6 +1998,36 @@ fn current_attachment_bytes(attachments: &HashMap<Uuid, AttachmentRecord>) -> us
         .values()
         .map(|record| record.blob.bytes.len())
         .sum()
+}
+
+fn current_attachment_records_for_owner(
+    attachments: &HashMap<Uuid, AttachmentRecord>,
+    owner_code_id: &CodeId,
+) -> usize {
+    attachments
+        .values()
+        .filter(|record| record.owner_code_id == *owner_code_id)
+        .count()
+}
+
+fn attachment_record_capacity_allows(
+    used_total: usize,
+    used_account: usize,
+    total_limit: usize,
+    account_limit: usize,
+) -> bool {
+    used_total < total_limit && used_account < account_limit
+}
+
+async fn attachment_record_capacity_available(state: &AppState, owner_code_id: &CodeId) -> bool {
+    prune_expired_attachments(state).await;
+    let attachments = state.attachments.lock().await;
+    attachment_record_capacity_allows(
+        attachments.len(),
+        current_attachment_records_for_owner(&attachments, owner_code_id),
+        state.attachment_record_limit,
+        state.attachment_account_record_limit,
+    )
 }
 
 fn subtract_attachment_usage(
@@ -2969,6 +3037,11 @@ async fn upload_attachment(
         Ok(length) => length,
         Err(status) => return status.into_response(),
     };
+    if !attachment_record_capacity_available(&state, &initial_auth.code_id).await {
+        return StatusCode::from_u16(507)
+            .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            .into_response();
+    }
     let _account_upload_permit =
         match acquire_account_attachment_upload_permit(&state, &initial_auth.code_id).await {
             Ok(permit) => permit,
@@ -3028,6 +3101,8 @@ async fn upload_attachment(
     let mut usage = state.attachment_bytes_by_code.lock().await;
     let used_bytes = current_attachment_bytes(&attachments);
     let account_used = usage.get(&auth.code_id).copied().unwrap_or_default();
+    let used_records = attachments.len();
+    let account_records = current_attachment_records_for_owner(&attachments, &auth.code_id);
     let encrypted_len = encrypted_body.len();
     if !attachment_capacity_allows(
         used_bytes,
@@ -3043,6 +3118,23 @@ async fn upload_attachment(
             encrypted_len,
             state.attachment_ram_limit_bytes,
             state.attachment_account_limit_bytes,
+        );
+        return StatusCode::from_u16(507)
+            .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            .into_response();
+    }
+    if !attachment_record_capacity_allows(
+        used_records,
+        account_records,
+        state.attachment_record_limit,
+        state.attachment_account_record_limit,
+    ) {
+        warn!(
+            "attachment_upload_rejected reason=record_limit used={} account_used={} limit={} account_limit={}",
+            used_records,
+            account_records,
+            state.attachment_record_limit,
+            state.attachment_account_record_limit,
         );
         return StatusCode::from_u16(507)
             .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
@@ -5781,6 +5873,61 @@ mod tests {
     }
 
     #[test]
+    fn attachment_record_limits_are_clamped_and_account_bound() {
+        assert_eq!(
+            attachment_record_limits_from_values(None, None),
+            (
+                DEFAULT_ATTACHMENT_RECORD_LIMIT,
+                DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT
+            )
+        );
+        assert_eq!(
+            attachment_record_limits_from_values(Some("0"), Some("999999")),
+            (MIN_ATTACHMENT_RECORD_LIMIT, MIN_ATTACHMENT_RECORD_LIMIT)
+        );
+        assert_eq!(
+            attachment_record_limits_from_values(Some("999999"), Some("999999")),
+            (MAX_ATTACHMENT_RECORD_LIMIT, MAX_ATTACHMENT_RECORD_LIMIT)
+        );
+        assert_eq!(
+            attachment_record_limits_from_values(Some("2"), Some("3")),
+            (2, 2)
+        );
+        assert_eq!(
+            attachment_record_limits_from_values(Some("2"), None),
+            (2, 2)
+        );
+        assert_eq!(
+            attachment_record_limits_from_values(Some("-1"), Some("")),
+            (
+                DEFAULT_ATTACHMENT_RECORD_LIMIT,
+                DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT
+            )
+        );
+        assert_eq!(
+            attachment_record_limits_from_values(Some("not-a-number"), Some("also-invalid")),
+            (
+                DEFAULT_ATTACHMENT_RECORD_LIMIT,
+                DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT
+            )
+        );
+    }
+
+    #[test]
+    fn attachment_record_capacity_isolated_and_boundary_safe() {
+        assert!(attachment_record_capacity_allows(0, 0, 1, 1));
+        assert!(!attachment_record_capacity_allows(1, 1, 2, 1));
+        assert!(!attachment_record_capacity_allows(0, 1, 2, 1));
+        assert!(!attachment_record_capacity_allows(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        ));
+        assert!(attachment_record_capacity_allows(1, 0, 2, 1));
+    }
+
+    #[test]
     fn attachment_content_length_must_be_positive_and_bounded() {
         let headers = HeaderMap::new();
         assert_eq!(
@@ -5836,7 +5983,9 @@ mod tests {
 
     #[tokio::test]
     async fn uploaded_attachment_cleanup_is_owner_only_and_releases_usage() {
-        let state = test_state();
+        let mut state = test_state();
+        state.attachment_record_limit = 1;
+        state.attachment_account_record_limit = 1;
         let owner = test_code_id("cleanup-owner");
         let other = test_code_id("cleanup-other");
         let attachment_id = Uuid::new_v4();
@@ -5856,6 +6005,15 @@ mod tests {
             },
         );
         state.attachment_bytes_by_code.lock().await.insert(owner, 4);
+        {
+            let attachments = state.attachments.lock().await;
+            assert!(!attachment_record_capacity_allows(
+                attachments.len(),
+                current_attachment_records_for_owner(&attachments, &owner),
+                1,
+                1,
+            ));
+        }
 
         assert_eq!(
             delete_owned_attachment(&state, attachment_id, &other).await,
@@ -5867,6 +6025,7 @@ mod tests {
         );
         assert!(!state.attachments.lock().await.contains_key(&attachment_id));
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+        assert!(attachment_record_capacity_available(&state, &owner).await);
     }
 
     #[tokio::test]
@@ -6326,7 +6485,9 @@ mod tests {
 
     #[tokio::test]
     async fn destructive_attachment_requires_explicit_completion_after_stream_eof() {
-        let state = test_state();
+        let mut state = test_state();
+        state.attachment_record_limit = 1;
+        state.attachment_account_record_limit = 1;
         let attachment_id = Uuid::new_v4();
         let owner = test_code_id("download-owner");
         let recipient = test_code_id("download-recipient");
@@ -6351,6 +6512,7 @@ mod tests {
             .lock()
             .await
             .insert(owner, expected.len());
+        assert!(!attachment_record_capacity_available(&state, &owner).await);
 
         let reservation = reserve_attachment_download(&state, attachment_id, &recipient)
             .await
@@ -6382,6 +6544,7 @@ mod tests {
             .expect("explicit completion");
         assert!(!state.attachments.lock().await.contains_key(&attachment_id));
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+        assert!(attachment_record_capacity_available(&state, &owner).await);
     }
 
     #[tokio::test]
@@ -6851,6 +7014,353 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn attachment_record_limit_rejects_before_body_allocation() {
+        let mut state = test_state();
+        state.attachment_record_limit = 1;
+        state.attachment_account_record_limit = 1;
+        add_test_account(&state, "record-limit-owner", "Alice").await;
+        let owner = test_code_id("record-limit-owner");
+        let room = test_room("record_limit_room");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room,
+                owner_code_id: owner,
+            },
+        );
+        state.sessions.lock().await.insert(
+            SessionToken::new("record-limit-token".to_string()),
+            AuthSession {
+                code_id: owner,
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+        state.attachments.lock().await.insert(
+            Uuid::new_v4(),
+            AttachmentRecord {
+                blob: test_attachment_blob(vec![
+                    ATTACHMENT_BLOB_VERSION;
+                    ATTACHMENT_WIRE_OVERHEAD_BYTES
+                ]),
+                chat_id: "record_limit_room".to_string(),
+                media_type: "FILE".to_string(),
+                owner_code_id: owner,
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: None,
+                eligible_recipient_code_ids: HashSet::new(),
+                download_claims: HashMap::new(),
+                completed_recipient_code_ids: HashSet::new(),
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer record-limit-token"),
+        );
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+        let body = Body::from_stream(futures_util::stream::once(async {
+            panic!("a saturated attachment record limit must reject before reading the body");
+            #[allow(unreachable_code)]
+            Ok::<Bytes, Infallible>(Bytes::new())
+        }));
+        let response = upload_attachment(
+            State(state.clone()),
+            Query(AttachmentQuery {
+                chat_id: "record_limit_room".to_string(),
+                media_type: Some("FILE".to_string()),
+                one_time: None,
+                delete_after_download: None,
+                ttl_sec: None,
+            }),
+            headers,
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::from_u16(507).unwrap());
+        assert_eq!(state.attachments.lock().await.len(), 1);
+        assert_eq!(state.attachment_memory.available_permits(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn concurrent_attachment_admission_rechecks_global_record_limit_atomically() {
+        let mut state = test_state();
+        state.attachment_record_limit = 1;
+        state.attachment_account_record_limit = 1;
+        state.attachment_uploads = Arc::new(Semaphore::new(2));
+        add_test_account(&state, "record-race-a", "Alice").await;
+        add_test_account(&state, "record-race-b", "Bob").await;
+        let room = test_room("record_race_room");
+        state.room_catalog.lock().await.insert(
+            room.id.clone(),
+            RoomEntry {
+                room,
+                owner_code_id: test_code_id("record-race-a"),
+            },
+        );
+        for (token, code_id, username) in [
+            ("record-race-token-a", "record-race-a", "Alice"),
+            ("record-race-token-b", "record-race-b", "Bob"),
+        ] {
+            state.sessions.lock().await.insert(
+                SessionToken::new(token.to_string()),
+                AuthSession {
+                    code_id: test_code_id(code_id),
+                    username: username.to_string(),
+                    last_activity_ms: now_ms(),
+                },
+            );
+        }
+
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let request_state = state.clone();
+        let make_request = move |token: &'static str, gate: Arc<tokio::sync::Barrier>| {
+            let state = request_state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static(match token {
+                        "record-race-token-a" => "Bearer record-race-token-a",
+                        _ => "Bearer record-race-token-b",
+                    }),
+                );
+                headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+                let body_gate = gate;
+                upload_attachment(
+                    State(state.clone()),
+                    Query(AttachmentQuery {
+                        chat_id: "record_race_room".to_string(),
+                        media_type: Some("FILE".to_string()),
+                        one_time: None,
+                        delete_after_download: None,
+                        ttl_sec: None,
+                    }),
+                    headers,
+                    Body::from_stream(futures_util::stream::once(async move {
+                        body_gate.wait().await;
+                        Ok::<Bytes, Infallible>(Bytes::from(vec![
+                            ATTACHMENT_BLOB_VERSION;
+                            ATTACHMENT_WIRE_OVERHEAD_BYTES
+                        ]))
+                    })),
+                )
+                .await
+            }
+        };
+        let release_gate = Arc::clone(&gate);
+        let (first, second, _) = tokio::join!(
+            make_request("record-race-token-a", Arc::clone(&gate)),
+            make_request("record-race-token-b", Arc::clone(&gate)),
+            async move {
+                release_gate.wait().await;
+            }
+        );
+        let statuses = [
+            first.into_response().status(),
+            second.into_response().status(),
+        ];
+        assert!(statuses.contains(&StatusCode::OK));
+        assert!(statuses.contains(&StatusCode::from_u16(507).unwrap()));
+        assert_eq!(state.attachments.lock().await.len(), 1);
+        assert_eq!(
+            state.attachment_memory.available_permits(),
+            8 * 1024 * 1024 - ATTACHMENT_WIRE_OVERHEAD_BYTES
+        );
+        let usage = state.attachment_bytes_by_code.lock().await;
+        assert_eq!(
+            usage.values().copied().sum::<usize>(),
+            ATTACHMENT_WIRE_OVERHEAD_BYTES
+        );
+        assert_eq!(usage.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attachment_record_limits_enforce_account_then_global_boundaries() {
+        let mut state = test_state();
+        state.attachment_record_limit = 2;
+        state.attachment_account_record_limit = 1;
+        add_test_account(&state, "record-boundary-a", "Alice").await;
+        add_test_account(&state, "record-boundary-b", "Bob").await;
+        let room_id = "record_boundary_room";
+        state.room_catalog.lock().await.insert(
+            room_id.to_string(),
+            RoomEntry {
+                room: test_room(room_id),
+                owner_code_id: test_code_id("record-boundary-a"),
+            },
+        );
+        for (token, code, username) in [
+            ("record-boundary-token-a", "record-boundary-a", "Alice"),
+            ("record-boundary-token-b", "record-boundary-b", "Bob"),
+        ] {
+            state.sessions.lock().await.insert(
+                SessionToken::new(token.to_string()),
+                AuthSession {
+                    code_id: test_code_id(code),
+                    username: username.to_string(),
+                    last_activity_ms: now_ms(),
+                },
+            );
+        }
+
+        let upload = |token: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).expect("test bearer token"),
+            );
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+            upload_attachment(
+                State(state.clone()),
+                Query(AttachmentQuery {
+                    chat_id: room_id.to_string(),
+                    media_type: Some("FILE".to_string()),
+                    one_time: None,
+                    delete_after_download: None,
+                    ttl_sec: None,
+                }),
+                headers,
+                Body::from(vec![
+                    ATTACHMENT_BLOB_VERSION;
+                    ATTACHMENT_WIRE_OVERHEAD_BYTES
+                ]),
+            )
+        };
+
+        assert_eq!(
+            upload("record-boundary-token-a")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            upload("record-boundary-token-a")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::from_u16(507).unwrap(),
+            "the per-account limit rejects the exact next record"
+        );
+        assert_eq!(
+            upload("record-boundary-token-b")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK,
+            "another account can use remaining global capacity"
+        );
+        assert_eq!(
+            upload("record-boundary-token-b")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::from_u16(507).unwrap(),
+            "the global limit rejects the exact next record"
+        );
+        assert_eq!(state.attachments.lock().await.len(), 2);
+        assert_eq!(
+            state.attachment_memory.available_permits(),
+            8 * 1024 * 1024 - 2 * ATTACHMENT_WIRE_OVERHEAD_BYTES
+        );
+        let usage = state.attachment_bytes_by_code.lock().await;
+        assert_eq!(usage.get(&test_code_id("record-boundary-a")), Some(&41));
+        assert_eq!(usage.get(&test_code_id("record-boundary-b")), Some(&41));
+        drop(usage);
+
+        remove_chat_attachments(&state, room_id).await;
+        assert!(state.attachments.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+        assert_eq!(state.attachment_memory.available_permits(), 8 * 1024 * 1024);
+        assert_eq!(
+            upload("record-boundary-token-a")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK,
+            "room deletion cleanup releases record and byte capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_wipe_releases_attachment_record_and_byte_capacity_for_reuse() {
+        let mut state = test_state();
+        state.attachment_record_limit = 1;
+        state.attachment_account_record_limit = 1;
+        add_test_account(&state, "record-wipe-owner", "Alice").await;
+        let room_id = "record_wipe_room";
+        state.room_catalog.lock().await.insert(
+            room_id.to_string(),
+            RoomEntry {
+                room: test_room(room_id),
+                owner_code_id: test_code_id("record-wipe-owner"),
+            },
+        );
+        state.sessions.lock().await.insert(
+            SessionToken::new("record-wipe-token".to_string()),
+            AuthSession {
+                code_id: test_code_id("record-wipe-owner"),
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+        let upload = |state: AppState| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer record-wipe-token"),
+            );
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+            upload_attachment(
+                State(state),
+                Query(AttachmentQuery {
+                    chat_id: room_id.to_string(),
+                    media_type: Some("FILE".to_string()),
+                    one_time: None,
+                    delete_after_download: None,
+                    ttl_sec: None,
+                }),
+                headers,
+                Body::from(vec![
+                    ATTACHMENT_BLOB_VERSION;
+                    ATTACHMENT_WIRE_OVERHEAD_BYTES
+                ]),
+            )
+            .await
+            .into_response()
+            .status()
+        };
+
+        assert_eq!(upload(state.clone()).await, StatusCode::OK);
+        assert_eq!(state.attachments.lock().await.len(), 1);
+        wipe_relay_state(&state, false).await;
+        assert!(state.attachments.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+        assert_eq!(state.attachment_memory.available_permits(), 8 * 1024 * 1024);
+
+        add_test_account(&state, "record-wipe-owner", "Alice").await;
+        state.room_catalog.lock().await.insert(
+            room_id.to_string(),
+            RoomEntry {
+                room: test_room(room_id),
+                owner_code_id: test_code_id("record-wipe-owner"),
+            },
+        );
+        state.sessions.lock().await.insert(
+            SessionToken::new("record-wipe-token".to_string()),
+            AuthSession {
+                code_id: test_code_id("record-wipe-owner"),
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+        assert_eq!(upload(state.clone()).await, StatusCode::OK);
     }
 
     #[test]
@@ -8567,7 +9077,9 @@ mod tests {
 
     #[tokio::test]
     async fn expired_attachment_pruning_decrements_owner_usage() {
-        let state = test_state();
+        let mut state = test_state();
+        state.attachment_record_limit = 1;
+        state.attachment_account_record_limit = 1;
         let owner = test_code_id("code-a");
         let attachment_id = Uuid::new_v4();
         state.attachments.lock().await.insert(
@@ -8586,10 +9098,20 @@ mod tests {
             },
         );
         state.attachment_bytes_by_code.lock().await.insert(owner, 3);
+        {
+            let attachments = state.attachments.lock().await;
+            assert!(!attachment_record_capacity_allows(
+                attachments.len(),
+                current_attachment_records_for_owner(&attachments, &owner),
+                state.attachment_record_limit,
+                state.attachment_account_record_limit,
+            ));
+        }
 
         prune_expired_attachments(&state).await;
         assert!(state.attachments.lock().await.is_empty());
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+        assert!(attachment_record_capacity_available(&state, &owner).await);
     }
 
     #[tokio::test]
@@ -10404,6 +10926,8 @@ mod tests {
             node_id: "test-node".to_string(),
             attachment_ram_limit_bytes: 8 * 1024 * 1024,
             attachment_account_limit_bytes: 4 * 1024 * 1024,
+            attachment_record_limit: DEFAULT_ATTACHMENT_RECORD_LIMIT,
+            attachment_account_record_limit: DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT,
             attachment_max_lifetime_sec: DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS as u64 * 60 * 60,
             max_rooms_per_user: 2,
             conversation_ops: Arc::new(Mutex::new(())),

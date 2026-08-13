@@ -1,5 +1,35 @@
 # Project Progress
 
+## Completed Deployment: Attachment Metadata Resource Hardening
+
+The protocol-v8 security checkpoint was committed and pushed as `a7450d3`.
+The next repository-fixable package closes a relay denial-of-service gap where
+minimum-size encrypted attachment records could exhaust heap through map and
+record metadata while remaining under the ciphertext-byte quota.
+
+### Delivered
+
+- Added configurable, clamped global and per-account attachment-record limits,
+  defaulting to 16,384 and 4,096 records respectively.
+- Enforced authoritative count capacity before request-body allocation and
+  again atomically with final insertion after expiry pruning and authorization
+  revalidation. Existing byte quotas and attachment wire behavior are unchanged.
+- Added deterministic boundary, concurrent admission, minimum-blob, expiry,
+  deletion, destructive completion, room cleanup, and wipe capacity tests.
+- Updated the example environment, operator configuration, security model, and
+  release checklist.
+
+### Verification
+
+- Independent focused attachment suite: 37 passed.
+- Full relay suite: 125 passed; warning-denied Clippy and rustfmt passed.
+- Final `./scripts/test-all.sh all`: passed, covering web, Rust, Android without
+  packaging, disposable-relay integration, supply-chain checks, and npm/RustSec
+  advisory scans.
+- No Android package, release, or production deployment was performed. The
+  unrelated `.gitignore` edit, `.npm-cache/`, `.rustup-local/`, and `sum.sh`
+  remain protected local state.
+
 ## Completed Deployment: Protocol-v8 Security Completion
 
 The repository-fixable protocol-v8 security package is complete and ready for
