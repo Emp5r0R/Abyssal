@@ -46,6 +46,11 @@ const WS_TICKET_BYTES = 32;
 const WS_TICKET_LENGTH = 43;
 const WS_TICKET_MIN_EXPIRY_SEC = 1;
 const WS_TICKET_MAX_EXPIRY_SEC = 30;
+const RECONNECT_JITTER_BOUND_MS = 500;
+const RECONNECT_JITTER_SAMPLE_RANGE = 2 ** 16;
+const RECONNECT_JITTER_SAMPLE_LIMIT =
+  Math.floor(RECONNECT_JITTER_SAMPLE_RANGE / RECONNECT_JITTER_BOUND_MS) *
+  RECONNECT_JITTER_BOUND_MS;
 const ATTACHMENT_BLOB_OVERHEAD_BYTES = 41;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES =
   maxSerializedAttachmentBytes("FILE") - ATTACHMENT_BLOB_OVERHEAD_BYTES;
@@ -396,7 +401,7 @@ export class RelaySocket {
 
   private scheduleReconnect(): void {
     if (this.#manualClose || this.#socket || this.#connecting || this.#reconnectTimer !== undefined) return;
-    const jitter = crypto.getRandomValues(new Uint16Array(1))[0] % 500;
+    const jitter = randomReconnectJitter();
     const delay = Math.min(15_000, 750 * 2 ** Math.min(this.#attempt++, 5)) + jitter;
     this.#reconnectTimer = window.setTimeout(() => {
       this.#reconnectTimer = undefined;
@@ -1139,6 +1144,15 @@ function parseIncomingFrameValue(frame: Record<string, unknown>): IncomingFrame 
     default:
       return null;
   }
+}
+
+function randomReconnectJitter(): number {
+  const sample = new Uint16Array(1);
+  do {
+    crypto.getRandomValues(sample);
+  } while (sample[0] >= RECONNECT_JITTER_SAMPLE_LIMIT);
+  return sample[0] -
+    Math.floor(sample[0] / RECONNECT_JITTER_BOUND_MS) * RECONNECT_JITTER_BOUND_MS;
 }
 
 function serializeRelayFrame(frame: object): string | null {

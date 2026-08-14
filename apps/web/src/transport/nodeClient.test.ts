@@ -1002,6 +1002,33 @@ describe("RelaySocket", () => {
     }
   });
 
+  it("rejects the biased jitter boundary before accepting the next random sample", async () => {
+    const original = globalThis.WebSocket;
+    const randomSamples = [65_500, 65_499];
+    const getRandomValues = vi.spyOn(globalThis.crypto, "getRandomValues")
+      .mockImplementation((values) => {
+        (values as Uint16Array)[0] = randomSamples.shift() ?? 0;
+        return values;
+      });
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementation(() => Promise.resolve(websocketTicketResponse(31)));
+    const timeoutSpy = vi.spyOn(window, "setTimeout");
+
+    try {
+      const relay = new RelaySocket(session, () => undefined, () => undefined);
+      relay.connect();
+      for (let index = 0; index < 20 && getRandomValues.mock.calls.length < 2; index += 1) {
+        await Promise.resolve();
+      }
+      expect(getRandomValues).toHaveBeenCalledTimes(2);
+      expect(getRandomValues.mock.calls[0]?.[0]).toBeInstanceOf(Uint16Array);
+      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toContain(750 + 499);
+      relay.close();
+    } finally {
+      globalThis.WebSocket = original;
+    }
+  });
+
   it("aborts a pending ticket request and cannot open a late socket", async () => {
     const original = globalThis.WebSocket;
     const sockets: FakeWebSocket[] = [];

@@ -1,6 +1,6 @@
 use crate::AbyssalError;
 use chacha20poly1305::{
-    aead::{Aead, Payload},
+    aead::{Aead, AeadCore, Payload},
     ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
@@ -724,10 +724,9 @@ impl E2eeSession {
             }
         }
         let aad = message_aad(&chat_id, &message_id, &sender_username);
-        let mut content_key = Zeroizing::new([0u8; 32]);
-        let mut nonce = [0u8; NONCE_BYTES];
-        OsRng.fill_bytes(content_key.as_mut());
-        OsRng.fill_bytes(&mut nonce);
+        let content_key: Zeroizing<[u8; 32]> =
+            Zeroizing::new(ChaCha20Poly1305::generate_key(&mut OsRng).into());
+        let nonce: [u8; NONCE_BYTES] = ChaCha20Poly1305::generate_nonce(&mut OsRng).into();
         let cipher = ChaCha20Poly1305::new_from_slice(content_key.as_ref())
             .map_err(|_| "Payload unavailable".to_string())?;
         let padded_plaintext = pad_payload(&plaintext).map_err(AbyssalError::from)?;
@@ -2071,6 +2070,8 @@ pub fn validate_identity_public_bundle(
         .map_err(|_| "Identity unavailable".to_string())?;
     let fallback = Curve25519PublicKey::from_slice(fallback)
         .map_err(|_| "Identity unavailable".to_string())?;
+    // This public, non-secret scalar is a deterministic contributory-behavior
+    // probe. It is not key material used to protect application data.
     let validation_secret = Curve25519SecretKey::from_slice(&KEY_VALIDATION_SCALAR);
     if validation_secret.diffie_hellman(&identity_curve).is_none()
         || validation_secret.diffie_hellman(&one_time).is_none()

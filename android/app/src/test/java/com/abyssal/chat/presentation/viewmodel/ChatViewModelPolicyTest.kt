@@ -526,11 +526,14 @@ class ChatViewModelPolicyTest {
     fun attachmentCoordinatorCancelsConcurrentJobsAndCleansPreStartCancellation() = runBlocking {
         val coordinator = AttachmentOperationCoordinator()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val firstStarted = CompletableDeferred<Unit>()
+        val secondStarted = CompletableDeferred<Unit>()
         val firstCancelled = CompletableDeferred<Unit>()
         val secondCancelled = CompletableDeferred<Unit>()
 
         val first = coordinator.launch(scope) {
             try {
+                firstStarted.complete(Unit)
                 delay(Long.MAX_VALUE)
             } finally {
                 firstCancelled.complete(Unit)
@@ -538,12 +541,15 @@ class ChatViewModelPolicyTest {
         }
         val second = coordinator.launch(scope) {
             try {
+                secondStarted.complete(Unit)
                 delay(Long.MAX_VALUE)
             } finally {
                 secondCancelled.complete(Unit)
             }
         }
 
+        firstStarted.await()
+        secondStarted.await()
         coordinator.invalidateOperations()
         coordinator.cancelAll()
         first.join()
