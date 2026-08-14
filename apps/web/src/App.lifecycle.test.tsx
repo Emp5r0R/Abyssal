@@ -30,7 +30,7 @@ const mocks = vi.hoisted(() => {
       displayHost: "node.example.test",
     },
     created: false,
-    identityPublicKey: new Uint8Array(128),
+    identityPublicKey: new Uint8Array(608),
     identityPrekeyId: "prekey-one",
   };
 

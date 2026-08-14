@@ -15,7 +15,7 @@ use opaque_ke::{
 use sha2::{Digest, Sha256};
 use sha2_legacy::Sha512;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
 };
 use vodozemac::{
@@ -29,8 +29,9 @@ use wasm_bindgen::prelude::*;
 
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
 const ONE_TIME_KEY_BYTES: usize = 32;
+pub const PREKEY_POOL_SIZE_V9: usize = 16;
 const ONE_TIME_KEY_OFFSET: usize = IDENTITY_FINGERPRINT_BYTES;
-const FALLBACK_KEY_OFFSET: usize = ONE_TIME_KEY_OFFSET + ONE_TIME_KEY_BYTES;
+const FALLBACK_KEY_OFFSET: usize = ONE_TIME_KEY_OFFSET + (PREKEY_POOL_SIZE_V9 * ONE_TIME_KEY_BYTES);
 const IDENTITY_PUBLIC_BYTES: usize = FALLBACK_KEY_OFFSET + 32;
 const NONCE_BYTES: usize = 12;
 const MAX_CONTEXT_BYTES: usize = 512;
@@ -59,8 +60,8 @@ const MAX_PEERS: usize = 256;
 const MAX_SESSIONS_PER_PEER: usize = 4;
 const IDENTITY_STATE_SIGNATURE_BYTES: usize = 64;
 const REGISTRATION_CHALLENGE_BYTES: usize = 32;
-const PROTOCOL_VERSION: u32 = 8;
-const IDENTITY_ENVELOPE_VERSION: u8 = 4;
+const PROTOCOL_VERSION: u32 = 9;
+const IDENTITY_ENVELOPE_VERSION: u8 = 5;
 const KEY_VALIDATION_SCALAR: [u8; 32] = [0x42; 32];
 
 pub struct AbyssalOpaqueSuite;
@@ -142,7 +143,24 @@ pub struct AttachmentCiphertext {
     pub blob: Vec<u8>,
 }
 
-pub const REGISTRATION_CHALLENGE_BYTES_V8: usize = REGISTRATION_CHALLENGE_BYTES;
+pub const REGISTRATION_CHALLENGE_BYTES_V9: usize = REGISTRATION_CHALLENGE_BYTES;
+pub const IDENTITY_PUBLIC_BYTES_V9: usize = IDENTITY_PUBLIC_BYTES;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct StoredPrekey {
+    id: String,
+    public: [u8; ONE_TIME_KEY_BYTES],
+}
+
+#[derive(serde::Deserialize)]
+struct AccountMaterialView {
+    one_time_keys: OneTimeKeyMaterialView,
+}
+
+#[derive(serde::Deserialize)]
+struct OneTimeKeyMaterialView {
+    private_keys: BTreeMap<String, Curve25519SecretKey>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredPeerSessions {
@@ -154,8 +172,7 @@ struct StoredPeerSessions {
 struct StoredE2eeState {
     revision: u64,
     fallback_public: [u8; 32],
-    one_time_public: [u8; ONE_TIME_KEY_BYTES],
-    one_time_key_id: String,
+    prekeys: Vec<StoredPrekey>,
     account: AccountPickle,
     peers: Vec<StoredPeerSessions>,
     session_prekeys: HashMap<String, String>,
@@ -174,8 +191,7 @@ struct PendingOutbound {
 struct E2eeState {
     revision: u64,
     fallback_public: [u8; 32],
-    one_time_public: [u8; ONE_TIME_KEY_BYTES],
-    one_time_key_id: String,
+    prekeys: Vec<StoredPrekey>,
     account: Account,
     sessions: HashMap<String, Vec<Session>>,
     session_prekeys: HashMap<String, String>,
@@ -472,14 +488,8 @@ impl E2eeSession {
         validate_export_key(&export_key)?;
         let mut account = Account::new();
         account.generate_fallback_key();
-        account.generate_one_time_keys(1);
-        let one_time_public = account
-            .one_time_keys()
-            .into_iter()
-            .next()
-            .map(|(_, public)| public.to_bytes())
-            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
-        let one_time_key_id = prekey_id_for_public(&one_time_public);
+        account.generate_one_time_keys(PREKEY_POOL_SIZE_V9);
+        let prekeys = canonical_prekeys(&account).map_err(AbyssalError::from)?;
         let fallback_public = account
             .fallback_key()
             .into_values()
@@ -491,8 +501,7 @@ impl E2eeSession {
             state: Mutex::new(E2eeState {
                 revision: 0,
                 fallback_public,
-                one_time_public,
-                one_time_key_id,
+                prekeys,
                 account,
                 sessions: HashMap::new(),
                 session_prekeys: HashMap::new(),
@@ -540,7 +549,9 @@ impl E2eeSession {
         if stored.peers.len() > MAX_PEERS {
             return Err("Identity unavailable".to_string().into());
         }
-        validate_prekey_bundle(&stored.one_time_key_id, &stored.one_time_public)?;
+        validate_prekey_pool(&stored.prekeys).map_err(AbyssalError::from)?;
+        validate_account_prekey_material(&stored.account, &stored.prekeys)
+            .map_err(AbyssalError::from)?;
         let mut sessions = HashMap::with_capacity(stored.peers.len());
         let mut session_ids = HashSet::new();
         for peer in stored.peers {
@@ -582,8 +593,7 @@ impl E2eeSession {
             state: Mutex::new(E2eeState {
                 revision: stored.revision,
                 fallback_public: stored.fallback_public,
-                one_time_public: stored.one_time_public,
-                one_time_key_id: stored.one_time_key_id,
+                prekeys: stored.prekeys,
                 account: Account::from_pickle(stored.account),
                 sessions,
                 session_prekeys: stored.session_prekeys,
@@ -608,7 +618,9 @@ impl E2eeSession {
         let mut result = Vec::with_capacity(IDENTITY_PUBLIC_BYTES);
         result.extend_from_slice(identity.curve25519.as_bytes());
         result.extend_from_slice(identity.ed25519.as_bytes());
-        result.extend_from_slice(&state.one_time_public);
+        for prekey in &state.prekeys {
+            result.extend_from_slice(&prekey.public);
+        }
         result.extend_from_slice(&state.fallback_public);
         result
     }
@@ -617,7 +629,26 @@ impl E2eeSession {
         let Ok(state) = self.state.lock() else {
             return String::new();
         };
-        state.one_time_key_id.clone()
+        state
+            .prekeys
+            .first()
+            .map_or_else(String::new, |key| key.id.clone())
+    }
+
+    /// Returns whether the next outbound message to `peer` must use an
+    /// authenticated leased prekey. Established reciprocal sessions do not
+    /// require a lease.
+    pub fn requires_prekey(&self, peer: String) -> Result<bool, AbyssalError> {
+        validate_username(&peer)?;
+        let state = lock(&self.state, "Identity unavailable")?;
+        if state.pending_outbound.is_some() {
+            return Err("Identity unavailable".to_string().into());
+        }
+        Ok(state
+            .sessions
+            .get(&peer_key(&peer))
+            .and_then(|sessions| sessions.last())
+            .is_none_or(|session| !session.has_received_message()))
     }
 
     /// Sign an acknowledgement as an independent action proof.
@@ -635,7 +666,7 @@ impl E2eeSession {
         used_prekey_id: String,
     ) -> Result<Vec<u8>, AbyssalError> {
         let state = lock(&self.state, "Identity unavailable")?;
-        sign_ack_signature_v8(
+        sign_ack_signature_v9(
             PROTOCOL_VERSION,
             &chat_id,
             &message_id,
@@ -662,7 +693,7 @@ impl E2eeSession {
         prekey_id: String,
         identity_envelope: Vec<u8>,
     ) -> Result<Vec<u8>, AbyssalError> {
-        let transcript = registration_identity_proof_input_v8(
+        let transcript = registration_identity_proof_input_v9(
             &node_id,
             &handshake_id,
             &challenge,
@@ -775,8 +806,11 @@ impl E2eeSession {
                 .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
             let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
             let identity_public = public_key_from_state(&state);
-            let prekey_id = state.one_time_key_id.clone();
-            let state_signature = sign_identity_state_v8(
+            let prekey_id = state
+                .prekeys
+                .first()
+                .map_or_else(String::new, |key| key.id.clone());
+            let state_signature = sign_identity_state_v9(
                 PROTOCOL_VERSION,
                 state.revision,
                 &identity_envelope,
@@ -786,7 +820,7 @@ impl E2eeSession {
             )
             .map_err(AbyssalError::from)?;
             for envelope in &mut envelopes {
-                let signature_input = signature_input_v8(
+                let signature_input = signature_input_v9(
                     PROTOCOL_VERSION,
                     &aad,
                     &nonce,
@@ -900,7 +934,7 @@ impl E2eeSession {
         };
         validate_recipient_envelope(&envelope).map_err(AbyssalError::from)?;
         let aad = message_aad(&chat_id, &message_id, &sender_username);
-        let signature_input = signature_input_v8(
+        let signature_input = signature_input_v9(
             version,
             &aad,
             &nonce,
@@ -959,7 +993,8 @@ impl E2eeSession {
             );
             let plaintext = unpad_payload(&padded_plaintext).map_err(AbyssalError::from)?;
             if used_prekey {
-                rotate_one_time_key(&mut state).map_err(AbyssalError::from)?;
+                replenish_consumed_prekey(&mut state, &envelope.prekey_id)
+                    .map_err(AbyssalError::from)?;
             }
             state.revision = state
                 .revision
@@ -967,8 +1002,11 @@ impl E2eeSession {
                 .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?;
             let identity_envelope = seal_state(&state, sealing).map_err(AbyssalError::from)?;
             let identity_public = public_key_from_state(&state);
-            let prekey_id = state.one_time_key_id.clone();
-            let state_signature = sign_identity_state_v8(
+            let prekey_id = state
+                .prekeys
+                .first()
+                .map_or_else(String::new, |key| key.id.clone());
+            let state_signature = sign_identity_state_v9(
                 PROTOCOL_VERSION,
                 state.revision,
                 &identity_envelope,
@@ -1032,10 +1070,9 @@ fn ratchet_wrap_content_key(
         }
         let identity_key = Curve25519PublicKey::from_slice(&recipient_public[..32])
             .map_err(|_| "Recipient unavailable".to_string())?;
-        let one_time_key = Curve25519PublicKey::from_slice(
-            &recipient_public[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET],
-        )
-        .map_err(|_| "Recipient unavailable".to_string())?;
+        let selected = selected_prekey_public(recipient_public, recipient_prekey_id)?;
+        let one_time_key = Curve25519PublicKey::from_slice(selected)
+            .map_err(|_| "Recipient unavailable".to_string())?;
         let session = state
             .account
             .create_outbound_session(SessionConfig::version_2(), identity_key, one_time_key)
@@ -1247,8 +1284,7 @@ fn checkpoint_state(state: &E2eeState) -> StoredE2eeState {
     StoredE2eeState {
         revision: state.revision,
         fallback_public: state.fallback_public,
-        one_time_public: state.one_time_public,
-        one_time_key_id: state.one_time_key_id.clone(),
+        prekeys: state.prekeys.clone(),
         account: state.account.pickle(),
         session_prekeys: state.session_prekeys.clone(),
         peers: state
@@ -1271,8 +1307,7 @@ fn checkpoint_state_bytes(state: &E2eeState) -> Result<Zeroizing<Vec<u8>>, Strin
 fn restore_state(state: &mut E2eeState, stored: StoredE2eeState) {
     state.revision = stored.revision;
     state.fallback_public = stored.fallback_public;
-    state.one_time_public = stored.one_time_public;
-    state.one_time_key_id = stored.one_time_key_id;
+    state.prekeys = stored.prekeys;
     state.account = Account::from_pickle(stored.account);
     state.sessions = stored
         .peers
@@ -1398,23 +1433,101 @@ fn public_key_from_state(state: &E2eeState) -> Vec<u8> {
     let mut result = Vec::with_capacity(IDENTITY_PUBLIC_BYTES);
     result.extend_from_slice(identity.curve25519.as_bytes());
     result.extend_from_slice(identity.ed25519.as_bytes());
-    result.extend_from_slice(&state.one_time_public);
+    for prekey in &state.prekeys {
+        result.extend_from_slice(&prekey.public);
+    }
     result.extend_from_slice(&state.fallback_public);
     result
 }
 
-fn rotate_one_time_key(state: &mut E2eeState) -> Result<(), String> {
-    state.account.generate_one_time_keys(1);
-    let public = state
-        .account
-        .one_time_keys()
+fn replenish_consumed_prekey(state: &mut E2eeState, consumed_id: &str) -> Result<(), String> {
+    let index = state
+        .prekeys
+        .iter()
+        .position(|key| key.id == consumed_id)
+        .ok_or_else(|| "Payload unavailable".to_string())?;
+    let generated = state.account.generate_one_time_keys(1);
+    if generated.created.len() != 1 || !generated.removed.is_empty() {
+        return Err("Identity unavailable".to_string());
+    }
+    let public = generated
+        .created
         .into_iter()
         .next()
-        .map(|(_, public)| public.to_bytes())
-        .ok_or_else(|| "Identity unavailable".to_string())?;
+        .ok_or_else(|| "Identity unavailable".to_string())?
+        .to_bytes();
+    let existing = state
+        .prekeys
+        .iter()
+        .map(|key| key.id.as_str())
+        .collect::<HashSet<_>>();
+    let replacement = StoredPrekey {
+        id: prekey_id_for_public(&public),
+        public,
+    };
+    if replacement.id == consumed_id || existing.contains(replacement.id.as_str()) {
+        return Err("Identity unavailable".to_string());
+    }
+    state.prekeys.remove(index);
     state.account.mark_keys_as_published();
-    state.one_time_key_id = prekey_id_for_public(&public);
-    state.one_time_public = public;
+    state.prekeys.push(replacement);
+    state.prekeys.sort_by(|left, right| left.id.cmp(&right.id));
+    validate_prekey_pool(&state.prekeys)?;
+    validate_account_prekey_material(&state.account.pickle(), &state.prekeys)
+}
+
+fn canonical_prekeys(account: &Account) -> Result<Vec<StoredPrekey>, String> {
+    let mut prekeys = account
+        .one_time_keys()
+        .into_values()
+        .map(|public| public.to_bytes())
+        .map(|public| StoredPrekey {
+            id: prekey_id_for_public(&public),
+            public,
+        })
+        .collect::<Vec<_>>();
+    prekeys.sort_by(|left, right| left.id.cmp(&right.id));
+    validate_prekey_pool(&prekeys)?;
+    Ok(prekeys)
+}
+
+fn validate_prekey_pool(prekeys: &[StoredPrekey]) -> Result<(), String> {
+    if prekeys.len() != PREKEY_POOL_SIZE_V9 {
+        return Err("Identity unavailable".to_string());
+    }
+    let mut previous = None;
+    for prekey in prekeys {
+        validate_prekey_bundle(&prekey.id, &prekey.public)?;
+        if previous.is_some_and(|id: &str| id >= prekey.id.as_str()) {
+            return Err("Identity unavailable".to_string());
+        }
+        previous = Some(prekey.id.as_str());
+    }
+    Ok(())
+}
+
+fn validate_account_prekey_material(
+    account: &AccountPickle,
+    prekeys: &[StoredPrekey],
+) -> Result<(), String> {
+    let encoded = Zeroizing::new(
+        serde_json::to_vec(account).map_err(|_| "Identity unavailable".to_string())?,
+    );
+    let material: AccountMaterialView =
+        serde_json::from_slice(&encoded).map_err(|_| "Identity unavailable".to_string())?;
+    let mut account_public = material
+        .one_time_keys
+        .private_keys
+        .values()
+        .map(Curve25519PublicKey::from)
+        .map(|public| public.to_bytes())
+        .collect::<Vec<_>>();
+    account_public.sort_unstable();
+    let mut sealed_public = prekeys.iter().map(|key| key.public).collect::<Vec<_>>();
+    sealed_public.sort_unstable();
+    if account_public != sealed_public {
+        return Err("Identity unavailable".to_string());
+    }
     Ok(())
 }
 
@@ -1449,7 +1562,7 @@ fn identity_wrap_key(export_key: &[u8], context: &[u8]) -> Result<[u8; 32], Stri
 
 fn message_aad(chat_id: &str, message_id: &str, sender_username: &str) -> Vec<u8> {
     canonical_parts(&[
-        b"ABYSSAL_E2EE_PAYLOAD_V8",
+        b"ABYSSAL_E2EE_PAYLOAD_V9",
         chat_id.as_bytes(),
         message_id.as_bytes(),
         sender_username.as_bytes(),
@@ -1501,7 +1614,7 @@ fn attachment_aad(
     ])
 }
 
-fn sign_identity_state_v8(
+fn sign_identity_state_v9(
     version: u32,
     state_revision: u64,
     identity_envelope: &[u8],
@@ -1509,7 +1622,7 @@ fn sign_identity_state_v8(
     prekey_id: &str,
     account: &Account,
 ) -> Result<Vec<u8>, String> {
-    let transcript = Zeroizing::new(identity_state_signature_input_v8(
+    let transcript = Zeroizing::new(identity_state_signature_input_v9(
         version,
         state_revision,
         identity_envelope,
@@ -1519,12 +1632,12 @@ fn sign_identity_state_v8(
     Ok(account.sign(&transcript).to_bytes().to_vec())
 }
 
-/// Build the exact protocol-v8 signed identity-state transcript.
+/// Build the exact protocol-v9 signed identity-state transcript.
 ///
 /// The transcript covers the complete sealed state envelope and the public
 /// identity/prekey bundle returned with it.  The relay can use this helper to
 /// verify the state signature without decrypting the envelope.
-pub fn identity_state_signature_input_v8(
+pub fn identity_state_signature_input_v9(
     version: u32,
     state_revision: u64,
     identity_envelope: &[u8],
@@ -1541,7 +1654,7 @@ pub fn identity_state_signature_input_v8(
     let version = version.to_be_bytes();
     let revision = state_revision.to_be_bytes();
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_IDENTITY_STATE_SIGNATURE_V8",
+        b"ABYSSAL_E2EE_IDENTITY_STATE_SIGNATURE_V9",
         &version,
         &revision,
         identity_envelope,
@@ -1550,12 +1663,12 @@ pub fn identity_state_signature_input_v8(
     ]))
 }
 
-/// Verify a protocol-v8 signed identity-state snapshot.
+/// Verify a protocol-v9 signed identity-state snapshot.
 ///
 /// The caller must bind `identity_public` to the authenticated account before
 /// accepting the snapshot.  This function verifies the Ed25519 signature and
 /// validates every transcript field, including the prekey commitment.
-pub fn verify_identity_state_signature_v8(
+pub fn verify_identity_state_signature_v9(
     version: u32,
     state_revision: u64,
     identity_envelope: &[u8],
@@ -1566,7 +1679,7 @@ pub fn verify_identity_state_signature_v8(
     if state_signature.len() != IDENTITY_STATE_SIGNATURE_BYTES {
         return Err("Payload unavailable".to_string());
     }
-    let transcript = Zeroizing::new(identity_state_signature_input_v8(
+    let transcript = Zeroizing::new(identity_state_signature_input_v9(
         version,
         state_revision,
         identity_envelope,
@@ -1586,12 +1699,12 @@ pub fn verify_identity_state_signature_v8(
         .map_err(|_| "Payload unavailable".to_string())
 }
 
-/// Build the canonical protocol-v8 registration proof transcript.
+/// Build the canonical protocol-v9 registration proof transcript.
 ///
 /// Every variable-length field is length-prefixed with a big-endian u32. This
 /// avoids concatenation ambiguity while keeping the transcript deterministic
 /// across Rust, Kotlin, and WebAssembly clients.
-pub fn registration_identity_proof_input_v8(
+pub fn registration_identity_proof_input_v9(
     node_id: &str,
     handshake_id: &str,
     challenge: &[u8],
@@ -1628,7 +1741,7 @@ pub fn registration_identity_proof_input_v8(
             + prekey_id.len()
             + identity_envelope.len(),
     );
-    transcript.extend_from_slice(b"ABYSSAL_REGISTRATION_IDENTITY_PROOF_V8");
+    transcript.extend_from_slice(b"ABYSSAL_REGISTRATION_IDENTITY_PROOF_V9");
     transcript.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     append_transcript_field(&mut transcript, node_id.as_bytes());
     append_transcript_field(&mut transcript, handshake_id.as_bytes());
@@ -1643,7 +1756,7 @@ pub fn registration_identity_proof_input_v8(
 /// Verify a registration proof against the Ed25519 key embedded in the exact
 /// public identity bundle supplied by the client.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_registration_identity_proof_v8(
+pub fn verify_registration_identity_proof_v9(
     node_id: &str,
     handshake_id: &str,
     challenge: &[u8],
@@ -1656,7 +1769,7 @@ pub fn verify_registration_identity_proof_v8(
     if proof.len() != IDENTITY_STATE_SIGNATURE_BYTES {
         return Err("Identity proof rejected".to_string());
     }
-    let transcript = Zeroizing::new(registration_identity_proof_input_v8(
+    let transcript = Zeroizing::new(registration_identity_proof_input_v9(
         node_id,
         handshake_id,
         challenge,
@@ -1693,7 +1806,7 @@ fn valid_prekey_id_for_protocol(value: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sign_ack_signature_v8(
+fn sign_ack_signature_v9(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1701,7 +1814,7 @@ fn sign_ack_signature_v8(
     used_prekey_id: &str,
     account: &Account,
 ) -> Result<Vec<u8>, String> {
-    let transcript = Zeroizing::new(ack_signature_input_v8(
+    let transcript = Zeroizing::new(ack_signature_input_v9(
         version,
         chat_id,
         message_id,
@@ -1711,13 +1824,13 @@ fn sign_ack_signature_v8(
     Ok(account.sign(&transcript).to_bytes().to_vec())
 }
 
-/// Build the exact protocol-v8 message acknowledgement transcript.
+/// Build the exact protocol-v9 message acknowledgement transcript.
 ///
 /// This proof covers only the acknowledgement action.  It intentionally does
 /// not include the current ratchet revision or state signature, because a
 /// duplicate delivery may be acknowledged after the recipient has advanced
 /// its ratchet state.  The relay verifies the signed state separately.
-pub fn ack_signature_input_v8(
+pub fn ack_signature_input_v9(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1733,7 +1846,7 @@ pub fn ack_signature_input_v8(
     )?;
     let version = version.to_be_bytes();
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_ACK_SIGNATURE_V8",
+        b"ABYSSAL_E2EE_ACK_SIGNATURE_V9",
         &version,
         chat_id.as_bytes(),
         message_id.as_bytes(),
@@ -1742,8 +1855,8 @@ pub fn ack_signature_input_v8(
     ]))
 }
 
-/// Verify a protocol-v8 message acknowledgement signature.
-pub fn verify_ack_signature_v8(
+/// Verify a protocol-v9 message acknowledgement signature.
+pub fn verify_ack_signature_v9(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1757,7 +1870,7 @@ pub fn verify_ack_signature_v8(
     {
         return Err("Payload unavailable".to_string());
     }
-    let transcript = Zeroizing::new(ack_signature_input_v8(
+    let transcript = Zeroizing::new(ack_signature_input_v9(
         version,
         chat_id,
         message_id,
@@ -1814,7 +1927,7 @@ fn validate_identity_state_signature_fields(
         .map_err(|_| "Payload unavailable".to_string())
 }
 
-fn signature_input_v8(
+fn signature_input_v9(
     version: u32,
     aad: &[u8],
     nonce: &[u8],
@@ -1826,7 +1939,7 @@ fn signature_input_v8(
     let version = version.to_be_bytes();
     let is_prekey = [u8::from(envelope.is_prekey)];
     Ok(canonical_parts(&[
-        b"ABYSSAL_E2EE_SIGNATURE_V8",
+        b"ABYSSAL_E2EE_SIGNATURE_V9",
         &version,
         aad,
         nonce,
@@ -1839,12 +1952,12 @@ fn signature_input_v8(
     ]))
 }
 
-/// Build the exact protocol-v8 recipient-envelope signature transcript.
+/// Build the exact protocol-v9 recipient-envelope signature transcript.
 ///
 /// This helper is intentionally kept outside the UniFFI surface. The relay
 /// and its adversarial tests use the same canonical construction as clients.
 #[allow(clippy::too_many_arguments)]
-pub fn message_signature_input_v8(
+pub fn message_signature_input_v9(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1871,7 +1984,7 @@ pub fn message_signature_input_v8(
         is_prekey,
         signature: Vec::new(),
     };
-    let result = signature_input_v8(
+    let result = signature_input_v9(
         version,
         &message_aad(chat_id, message_id, sender_username),
         nonce,
@@ -1885,13 +1998,13 @@ pub fn message_signature_input_v8(
     result
 }
 
-/// Verify the exact protocol-v8 recipient-envelope signature transcript.
+/// Verify the exact protocol-v9 recipient-envelope signature transcript.
 ///
 /// The relay must verify signatures with the same canonical transcript as the
 /// clients, while still binding the long-term signing key to the account
 /// identity authenticated by the relay before calling this helper.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_message_signature_v8(
+pub fn verify_message_signature_v9(
     version: u32,
     chat_id: &str,
     message_id: &str,
@@ -1912,7 +2025,7 @@ pub fn verify_message_signature_v8(
     {
         return Err("Payload unavailable".to_string());
     }
-    let signature_input = Zeroizing::new(message_signature_input_v8(
+    let signature_input = Zeroizing::new(message_signature_input_v9(
         version,
         chat_id,
         message_id,
@@ -2044,9 +2157,9 @@ fn validate_prekey_bundle(prekey_id: &str, public_key: &[u8]) -> Result<(), Stri
 /// Validate the public identity bundle before storing or routing it.
 ///
 /// This is intentionally shared by every protocol boundary.  Besides shape,
-/// Ed25519 encoding, and the one-time-key commitment, it performs a real
-/// X25519 contribution check for the identity, one-time, and fallback keys so
-/// known low-order/non-contributory keys cannot enter relay fanout state.
+/// Ed25519 encoding and prekey commitments, it performs a real X25519
+/// contribution check for the identity, every one-time key, and the fallback
+/// key so known low-order/non-contributory keys cannot enter relay state.
 pub fn validate_identity_public_bundle(
     public_key: &[u8],
     prekey_id: Option<&str>,
@@ -2056,7 +2169,6 @@ pub fn validate_identity_public_bundle(
     }
     let identity_curve = &public_key[..32];
     let identity_ed = &public_key[32..IDENTITY_FINGERPRINT_BYTES];
-    let one_time = &public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET];
     let fallback = &public_key[FALLBACK_KEY_OFFSET..IDENTITY_PUBLIC_BYTES];
     if identity_curve.iter().all(|byte| *byte == 0)
         || identity_ed.iter().all(|byte| *byte == 0)
@@ -2066,15 +2178,12 @@ pub fn validate_identity_public_bundle(
     }
     let identity_curve = Curve25519PublicKey::from_slice(identity_curve)
         .map_err(|_| "Identity unavailable".to_string())?;
-    let one_time = Curve25519PublicKey::from_slice(one_time)
-        .map_err(|_| "Identity unavailable".to_string())?;
     let fallback = Curve25519PublicKey::from_slice(fallback)
         .map_err(|_| "Identity unavailable".to_string())?;
     // This public, non-secret scalar is a deterministic contributory-behavior
     // probe. It is not key material used to protect application data.
     let validation_secret = Curve25519SecretKey::from_slice(&KEY_VALIDATION_SCALAR);
     if validation_secret.diffie_hellman(&identity_curve).is_none()
-        || validation_secret.diffie_hellman(&one_time).is_none()
         || validation_secret.diffie_hellman(&fallback).is_none()
     {
         return Err("Identity unavailable".to_string());
@@ -2083,12 +2192,56 @@ pub fn validate_identity_public_bundle(
         .try_into()
         .map_err(|_| "Identity unavailable".to_string())?;
     Ed25519PublicKey::from_slice(identity_ed).map_err(|_| "Identity unavailable".to_string())?;
-    if let Some(prekey_id) = prekey_id {
-        validate_prekey_bundle(prekey_id, one_time.as_bytes())?;
-    } else if one_time.as_bytes().iter().all(|byte| *byte == 0) {
+    let mut previous = None;
+    let mut selected = false;
+    for public in
+        public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET].chunks_exact(ONE_TIME_KEY_BYTES)
+    {
+        let public: &[u8; ONE_TIME_KEY_BYTES] = public
+            .try_into()
+            .map_err(|_| "Identity unavailable".to_string())?;
+        let id = prekey_id_for_public(public);
+        if previous.as_ref().is_some_and(|value: &String| value >= &id) {
+            return Err("Identity unavailable".to_string());
+        }
+        let curve = Curve25519PublicKey::from_slice(public)
+            .map_err(|_| "Identity unavailable".to_string())?;
+        if validation_secret.diffie_hellman(&curve).is_none() {
+            return Err("Identity unavailable".to_string());
+        }
+        selected |= prekey_id.is_some_and(|expected| expected == id);
+        previous = Some(id);
+    }
+    if prekey_id.is_some() && !selected {
         return Err("Identity unavailable".to_string());
     }
     Ok(())
+}
+
+/// Return every canonical prekey commitment from a protocol-v9 public bundle.
+/// Validation is all-or-nothing so callers never lease from malformed pools.
+pub fn prekey_ids_from_identity_public_v9(public_key: &[u8]) -> Result<Vec<String>, String> {
+    validate_identity_public_bundle(public_key, None)?;
+    Ok(public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET]
+        .chunks_exact(ONE_TIME_KEY_BYTES)
+        .map(|public| {
+            let public: &[u8; ONE_TIME_KEY_BYTES] = public
+                .try_into()
+                .expect("validated v9 bundle has exact prekey chunks");
+            prekey_id_for_public(public)
+        })
+        .collect())
+}
+
+fn selected_prekey_public<'a>(public_key: &'a [u8], prekey_id: &str) -> Result<&'a [u8], String> {
+    validate_identity_public_bundle(public_key, Some(prekey_id))?;
+    public_key[ONE_TIME_KEY_OFFSET..FALLBACK_KEY_OFFSET]
+        .chunks_exact(ONE_TIME_KEY_BYTES)
+        .find(|public| {
+            <&[u8; ONE_TIME_KEY_BYTES]>::try_from(*public)
+                .is_ok_and(|key| prekey_id_for_public(key) == prekey_id)
+        })
+        .ok_or_else(|| "Recipient unavailable".to_string())
 }
 
 fn validate_identifier(identifier: &[u8]) -> Result<(), String> {
@@ -2242,6 +2395,11 @@ impl WasmE2eeSession {
     #[wasm_bindgen(js_name = prekeyId)]
     pub fn wasm_prekey_id(&self) -> String {
         self.inner.prekey_id()
+    }
+
+    #[wasm_bindgen(js_name = requiresPrekey)]
+    pub fn wasm_requires_prekey(&self, peer: String) -> Result<bool, JsValue> {
+        self.inner.requires_prekey(peer).map_err(js_error)
     }
 
     #[wasm_bindgen(js_name = signAcknowledgement)]
@@ -2424,6 +2582,92 @@ mod tests {
             envelope.is_prekey,
             recipient_username.to_string(),
         )
+    }
+
+    #[test]
+    fn protocol_v9_bundle_is_exact_canonical_pool_and_v8_shapes_fail_closed() {
+        let session = sealed_session(91);
+        let public = session.public_key();
+        let ids = prekey_ids_from_identity_public_v9(&public).expect("canonical v9 pool");
+        assert_eq!(public.len(), IDENTITY_PUBLIC_BYTES_V9);
+        assert_eq!(ids.len(), PREKEY_POOL_SIZE_V9);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(session.prekey_id(), ids[0]);
+
+        let v8_sized = &public[..IDENTITY_FINGERPRINT_BYTES + ONE_TIME_KEY_BYTES + 32];
+        assert!(validate_identity_public_bundle(v8_sized, None).is_err());
+        assert!(prekey_ids_from_identity_public_v9(v8_sized).is_err());
+
+        let export_key = vec![91; 64];
+        let context = b"node:INVITE-CODE-0091".to_vec();
+        let mut v8_envelope = session
+            .seal_identity(export_key.clone(), context.clone())
+            .expect("v9 state");
+        v8_envelope[0] = 4;
+        assert!(E2eeSession::recover(export_key, context, v8_envelope, public).is_err());
+    }
+
+    #[test]
+    fn sealed_pool_must_equal_account_material_and_requires_prekey_fails_closed() {
+        let alice = sealed_session(92);
+        let bob = sealed_session(93);
+        {
+            let state = bob.state.lock().expect("Bob state");
+            validate_account_prekey_material(&state.account.pickle(), &state.prekeys)
+                .expect("exact account material");
+            let mut tampered = state.prekeys.clone();
+            tampered[0].public[0] ^= 1;
+            assert!(validate_account_prekey_material(&state.account.pickle(), &tampered).is_err());
+        }
+        assert!(alice
+            .requires_prekey("Bob".to_string())
+            .expect("initial state"));
+        let staged = alice
+            .encrypt(
+                "dm_alice_bob".to_string(),
+                "requires-prekey-pending".to_string(),
+                "Alice".to_string(),
+                b"hello".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Bob".to_string(),
+                    public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
+                }],
+            )
+            .expect("stage outbound");
+        assert!(alice.requires_prekey("Bob".to_string()).is_err());
+        alice
+            .rollback_outbound(staged.message_id, staged.state_revision)
+            .expect("exact rollback");
+        assert!(alice
+            .requires_prekey("Bob".to_string())
+            .expect("rolled back"));
+
+        let incoming = alice
+            .encrypt_for_test(
+                "dm_alice_bob".to_string(),
+                "requires-prekey-reciprocal".to_string(),
+                "Alice".to_string(),
+                b"hello again".to_vec(),
+                vec![RecipientPublicKey {
+                    username: "Bob".to_string(),
+                    public_key: bob.public_key(),
+                    prekey_id: bob.prekey_id(),
+                }],
+            )
+            .expect("outbound");
+        decrypt_payload(
+            &bob,
+            &incoming,
+            "dm_alice_bob",
+            "Alice",
+            alice.public_key(),
+            "Bob",
+        )
+        .expect("inbound session");
+        assert!(!bob
+            .requires_prekey("Alice".to_string())
+            .expect("established"));
     }
 
     fn opaque_registration_and_login(password: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -2874,7 +3118,7 @@ mod tests {
                 identity_envelope.clone(),
             )
             .expect("registration proof");
-        verify_registration_identity_proof_v8(
+        verify_registration_identity_proof_v9(
             "node-1",
             "11111111-1111-4111-8111-111111111111",
             &challenge,
@@ -2888,7 +3132,7 @@ mod tests {
 
         let mut tampered_upload = upload.clone();
         tampered_upload[0] ^= 1;
-        assert!(verify_registration_identity_proof_v8(
+        assert!(verify_registration_identity_proof_v9(
             "node-1",
             "11111111-1111-4111-8111-111111111111",
             &challenge,
@@ -2899,7 +3143,7 @@ mod tests {
             &proof,
         )
         .is_err());
-        assert!(verify_registration_identity_proof_v8(
+        assert!(verify_registration_identity_proof_v9(
             "node-2",
             "11111111-1111-4111-8111-111111111111",
             &challenge,
@@ -2910,7 +3154,7 @@ mod tests {
             &proof,
         )
         .is_err());
-        assert!(verify_registration_identity_proof_v8(
+        assert!(verify_registration_identity_proof_v9(
             "node-1",
             "11111111-1111-4111-8111-111111111111",
             &challenge,
@@ -2924,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_state_signatures_round_trip_and_reject_tampering() {
+    fn protocol_v9_state_signatures_round_trip_and_reject_tampering() {
         let alice = sealed_session(73);
         let bob = sealed_session(74);
         let payload = alice
@@ -2945,7 +3189,7 @@ mod tests {
             payload.state_signature.len(),
             IDENTITY_STATE_SIGNATURE_BYTES
         );
-        verify_identity_state_signature_v8(
+        verify_identity_state_signature_v9(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2956,7 +3200,7 @@ mod tests {
         .expect("valid payload state signature");
 
         let tampered_revision = payload.state_revision + 1;
-        assert!(verify_identity_state_signature_v8(
+        assert!(verify_identity_state_signature_v9(
             payload.version,
             tampered_revision,
             &payload.identity_envelope,
@@ -2968,7 +3212,7 @@ mod tests {
 
         let mut tampered_envelope = payload.identity_envelope.clone();
         tampered_envelope[1] ^= 1;
-        assert!(verify_identity_state_signature_v8(
+        assert!(verify_identity_state_signature_v9(
             payload.version,
             payload.state_revision,
             &tampered_envelope,
@@ -2980,7 +3224,7 @@ mod tests {
 
         let mut tampered_public = payload.identity_public.clone();
         tampered_public[IDENTITY_FINGERPRINT_BYTES - 1] ^= 1;
-        assert!(verify_identity_state_signature_v8(
+        assert!(verify_identity_state_signature_v9(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -2997,7 +3241,7 @@ mod tests {
             b'a'
         };
         let tampered_prekey = String::from_utf8(tampered_prekey).expect("ascii prekey");
-        assert!(verify_identity_state_signature_v8(
+        assert!(verify_identity_state_signature_v9(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -3009,7 +3253,7 @@ mod tests {
 
         let mut tampered_signature = payload.state_signature.clone();
         tampered_signature[0] ^= 1;
-        assert!(verify_identity_state_signature_v8(
+        assert!(verify_identity_state_signature_v9(
             payload.version,
             payload.state_revision,
             &payload.identity_envelope,
@@ -3019,7 +3263,7 @@ mod tests {
         )
         .is_err());
 
-        assert!(identity_state_signature_input_v8(
+        assert!(identity_state_signature_input_v9(
             PROTOCOL_VERSION - 1,
             payload.state_revision,
             &payload.identity_envelope,
@@ -3027,7 +3271,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v8(
+        assert!(identity_state_signature_input_v9(
             PROTOCOL_VERSION,
             0,
             &payload.identity_envelope,
@@ -3035,7 +3279,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v8(
+        assert!(identity_state_signature_input_v9(
             PROTOCOL_VERSION,
             payload.state_revision,
             &[IDENTITY_ENVELOPE_VERSION],
@@ -3043,7 +3287,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v8(
+        assert!(identity_state_signature_input_v9(
             PROTOCOL_VERSION,
             payload.state_revision,
             &payload.identity_envelope,
@@ -3051,7 +3295,7 @@ mod tests {
             &payload.prekey_id,
         )
         .is_err());
-        assert!(identity_state_signature_input_v8(
+        assert!(identity_state_signature_input_v9(
             PROTOCOL_VERSION,
             payload.state_revision,
             &payload.identity_envelope,
@@ -3074,7 +3318,7 @@ mod tests {
             decrypted.state_signature.len(),
             IDENTITY_STATE_SIGNATURE_BYTES
         );
-        verify_identity_state_signature_v8(
+        verify_identity_state_signature_v9(
             PROTOCOL_VERSION,
             decrypted.state_revision,
             &decrypted.identity_envelope,
@@ -3098,7 +3342,7 @@ mod tests {
                           sender_username: &str,
                           used_prekey_id: &str,
                           ack_signature: &[u8]| {
-            verify_ack_signature_v8(
+            verify_ack_signature_v9(
                 PROTOCOL_VERSION,
                 chat_id,
                 message_id,
@@ -3169,7 +3413,7 @@ mod tests {
             )
             .expect("sign duplicate ACK");
         assert_eq!(duplicate_ack, ack_signature);
-        assert!(ack_signature_input_v8(
+        assert!(ack_signature_input_v9(
             PROTOCOL_VERSION,
             "dm_alice_bob",
             "state-signature-message",
@@ -3321,6 +3565,10 @@ mod tests {
         let bob = sealed_session(32);
         let initial_prekey = bob.prekey_id();
         let initial_public_key = bob.public_key();
+        let initial_account = {
+            let state = bob.state.lock().expect("initial Bob state");
+            serde_json::to_vec(&state.account.pickle()).expect("initial account pickle")
+        };
         let recipient = RecipientPublicKey {
             username: "Bob".to_string(),
             public_key: initial_public_key.clone(),
@@ -3348,7 +3596,7 @@ mod tests {
         let mut tampered_ciphertext = first.clone();
         tampered_ciphertext.ciphertext[0] ^= 1;
         let aad = message_aad("dm_alice_bob", &tampered_ciphertext.message_id, "Alice");
-        let signature_input = signature_input_v8(
+        let signature_input = signature_input_v9(
             PROTOCOL_VERSION,
             &aad,
             &tampered_ciphertext.nonce,
@@ -3381,6 +3629,10 @@ mod tests {
             assert_eq!(state.revision, 0);
             assert!(state.sessions.is_empty());
             assert!(state.session_prekeys.is_empty());
+            assert_eq!(
+                serde_json::to_vec(&state.account.pickle()).expect("restored account pickle"),
+                initial_account
+            );
         }
 
         let mut spliced = first.clone();
@@ -3403,6 +3655,10 @@ mod tests {
             assert_eq!(state.revision, 0);
             assert!(state.sessions.is_empty());
             assert!(state.session_prekeys.is_empty());
+            assert_eq!(
+                serde_json::to_vec(&state.account.pickle()).expect("restored account pickle"),
+                initial_account
+            );
         }
 
         let first_plain = decrypt_payload(
@@ -3597,7 +3853,10 @@ mod tests {
         assert_eq!(state.revision, 0);
         assert!(state.sessions.is_empty());
         assert!(state.session_prekeys.is_empty());
-        assert_eq!(state.one_time_key_id, initial_prekey);
+        assert_eq!(
+            state.prekeys.first().map(|key| key.id.as_str()),
+            Some(initial_prekey.as_str())
+        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
 package com.abyssal.chat.presentation.viewmodel
 
+import com.abyssal.chat.data.network.InMemoryPayloadCipher
+import com.abyssal.chat.domain.model.EncryptedTransportPayload
+import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientIdentity
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
@@ -9,9 +13,16 @@ import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.SessionInactivityPolicy
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
+import com.abyssal.chat.domain.repository.IAppUpdateService
 import com.abyssal.chat.domain.repository.IChatTransport
+import com.abyssal.chat.domain.repository.IDisguiseManager
+import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
+import com.abyssal.chat.domain.repository.IIdentityService
 import com.abyssal.chat.domain.repository.IMessageRepository
+import com.abyssal.chat.domain.repository.IMessageSender
+import com.abyssal.chat.domain.repository.INodeConfigService
 import com.abyssal.chat.domain.repository.OutboundSendResult
+import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 import java.util.concurrent.CancellationException
 import java.lang.reflect.InvocationTargetException
@@ -23,10 +34,12 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.MainCoroutineDispatcher
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
@@ -35,14 +48,58 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import org.json.JSONObject
+import org.junit.Before
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChatViewModelPolicyTest {
+    @Before
+    fun installMainDispatcherForConstructorFixtures() {
+        // Local Android tests do not provide a real android.os.Looper, while
+        // ViewModel's production scope correctly binds to Dispatchers.Main.
+        // Replace only the coroutines loader for these constructor-backed
+        // transaction fixtures; production dispatching remains untouched.
+        val loader = Class.forName(
+            "kotlinx.coroutines.internal.MainDispatcherLoader",
+            true,
+            ChatViewModel::class.java.classLoader
+        )
+        val field = loader.getDeclaredField("dispatcher")
+        field.isAccessible = true
+        val unsafeClass = Class.forName("sun.misc.Unsafe")
+        val unsafeField = unsafeClass.getDeclaredField("theUnsafe")
+        unsafeField.isAccessible = true
+        val unsafe = unsafeField.get(null)
+        val base = unsafeClass.getMethod("staticFieldBase", java.lang.reflect.Field::class.java)
+            .invoke(unsafe, field)
+        val offset = unsafeClass.getMethod("staticFieldOffset", java.lang.reflect.Field::class.java)
+            .invoke(unsafe, field)
+        unsafeClass.getMethod(
+            "putObject",
+            Any::class.java,
+            Long::class.javaPrimitiveType,
+            Any::class.java
+        ).invoke(unsafe, base, offset, TestMainDispatcher)
+    }
+
+    private object TestMainDispatcher : MainCoroutineDispatcher() {
+        override val immediate: MainCoroutineDispatcher
+            get() = this
+
+        override fun dispatch(
+            context: kotlin.coroutines.CoroutineContext,
+            block: Runnable
+        ) {
+            Dispatchers.Default.dispatch(context, block)
+        }
+    }
+
     @Test
     fun soloForumCanStoreTextLocallyWithoutCryptoRecipients() {
         assertTrue(isLocalOnlyForum("forum_general", emptyList()))
@@ -90,7 +147,7 @@ class ChatViewModelPolicyTest {
         val valid = IdentityValidationResult(
             accepted = true,
             token = "token",
-            publicKey = ByteArray(128),
+            publicKey = ByteArray(608),
             prekeyId = "prekey"
         )
         assertTrue(canInstallAccountEntryResult(true, valid))
@@ -170,7 +227,7 @@ class ChatViewModelPolicyTest {
 
     @Test
     fun staleAckFailureCannotClearAReestablishedSameIdentitySession() = runBlocking {
-        val publicKey = ByteArray(128) { 4 }
+        val publicKey = ByteArray(608) { 4 }
         val viewModel = allocateUninitializedViewModel()
         setCurrentUser(viewModel, User("Alice", publicKey))
         setSessionGeneration(viewModel, 2L)
@@ -198,7 +255,7 @@ class ChatViewModelPolicyTest {
 
     @Test
     fun staleDuressEvaluationCannotBroadcastOrLogoutReplacementAccount() = runBlocking {
-        val replacementKey = ByteArray(128) { 12 }
+        val replacementKey = ByteArray(608) { 12 }
         val viewModel = allocateUninitializedViewModel()
         setCurrentUser(viewModel, User("Replacement", replacementKey))
         setSessionGeneration(viewModel, 2L)
@@ -214,7 +271,7 @@ class ChatViewModelPolicyTest {
         val staleStamp = newSessionStamp(
             generation = 1L,
             username = "Original",
-            identityPublicKey = ByteArray(128) { 3 },
+            identityPublicKey = ByteArray(608) { 3 },
             repositoryEpoch = 0uL,
             connectionGeneration = 1L
         )
@@ -229,7 +286,7 @@ class ChatViewModelPolicyTest {
 
     @Test
     fun oldSessionStampIsInvalidAfterGenerationOrIdentityChangeAndItsCopyCanBeWiped() {
-        val oldKey = ByteArray(128) { 4 }
+        val oldKey = ByteArray(608) { 4 }
         val viewModel = allocateUninitializedViewModel()
         setCurrentUser(viewModel, User("Alice", oldKey))
         setSessionGeneration(viewModel, 1L)
@@ -250,19 +307,19 @@ class ChatViewModelPolicyTest {
         assertFalse(invokeIsSessionStampValid(viewModel, stamp))
 
         repositoryEpoch.set(0L)
-        setCurrentUser(viewModel, User("Alice", ByteArray(128) { 5 }))
+        setCurrentUser(viewModel, User("Alice", ByteArray(608) { 5 }))
         assertFalse(invokeIsSessionStampValid(viewModel, stamp))
 
         val copiedKey = sessionStampKey(stamp)
         assertArrayEquals(oldKey, copiedKey)
         wipeSessionStamp(stamp)
-        assertArrayEquals(ByteArray(128), copiedKey)
+        assertArrayEquals(ByteArray(608), copiedKey)
         oldKey.fill(0)
     }
 
     @Test
     fun connectionChangeInvalidatesTransportStampButNotCapturedAccountIdentity() {
-        val publicKey = ByteArray(128) { 11 }
+        val publicKey = ByteArray(608) { 11 }
         val viewModel = allocateUninitializedViewModel()
         setCurrentUser(viewModel, User("Alice", publicKey))
         setSessionGeneration(viewModel, 1L)
@@ -285,7 +342,7 @@ class ChatViewModelPolicyTest {
 
     @Test
     fun staleQueuedTextTransactionCannotReachTransportAfterSessionChange() = runBlocking {
-        val oldKey = ByteArray(128) { 6 }
+        val oldKey = ByteArray(608) { 6 }
         val viewModel = allocateUninitializedViewModel()
         setCurrentUser(viewModel, User("Alice", oldKey))
         setSessionGeneration(viewModel, 1L)
@@ -297,7 +354,7 @@ class ChatViewModelPolicyTest {
 
         val stamp = invokeCaptureSessionStamp(viewModel)
         setSessionGeneration(viewModel, 2L)
-        setCurrentUser(viewModel, User("Alice", ByteArray(128) { 7 }))
+        setCurrentUser(viewModel, User("Alice", ByteArray(608) { 7 }))
 
         assertEquals(
             OutboundSendResult.NOT_SENT,
@@ -310,7 +367,7 @@ class ChatViewModelPolicyTest {
 
     @Test
     fun staleAttachmentMetadataSkipsMetadataTransport() = runBlocking {
-        val oldKey = ByteArray(128) { 8 }
+        val oldKey = ByteArray(608) { 8 }
         val viewModel = allocateUninitializedViewModel()
         setCurrentUser(viewModel, User("Alice", oldKey))
         setSessionGeneration(viewModel, 1L)
@@ -323,7 +380,7 @@ class ChatViewModelPolicyTest {
 
         val stamp = invokeCaptureSessionStamp(viewModel)
         setSessionGeneration(viewModel, 2L)
-        setCurrentUser(viewModel, User("Alice", ByteArray(128) { 9 }))
+        setCurrentUser(viewModel, User("Alice", ByteArray(608) { 9 }))
         val attachmentMetadata = JSONObject()
             .put("kind", "attachment")
             .put("id", "5dbf06b8-fca4-46c4-8f26-5589e7024d94")
@@ -343,6 +400,201 @@ class ChatViewModelPolicyTest {
         assertEquals(0L, transportCalls.get())
         wipeSessionStamp(stamp)
         oldKey.fill(0)
+    }
+
+    @Test
+    fun firstContactLeasesAllRecipientsBeforeNativeEncryptAndAcceptedCommitsWithoutRelease() =
+        runBlocking {
+            val sender = nativeIdentity(21)
+            val bob = nativeIdentity(22)
+            val carol = nativeIdentity(23)
+            val senderKey = sender.publicKey()
+            val user = User("Alice", senderKey, sender.prekeyId())
+            val bobRecipient = recipientFromNative("Bob", bob)
+            val carolRecipient = recipientFromNative("Carol", carol)
+            val probe = TransactionTransportProbe(
+                cipher = sender,
+                leases = listOf(leaseFor("forum_ops", "message-first", "Bob", bob),
+                    leaseFor("forum_ops", "message-first", "Carol", carol)),
+                sendResult = OutboundSendResult.ACCEPTED
+            )
+            val viewModel = transactionViewModel(sender, user, probe)
+            val stamp = invokeCaptureSessionStamp(viewModel)
+
+            try {
+                val result = invokeSendEncryptedMetadata(
+                    viewModel,
+                    stamp,
+                    chatId = "forum_ops",
+                    messageId = "message-first",
+                    metadata = "hello",
+                    recipients = listOf(bobRecipient, carolRecipient)
+                )
+
+                assertEquals(OutboundSendResult.ACCEPTED, result)
+                assertEquals(
+                    listOf("lease:Bob:preEncrypt", "lease:Carol:preEncrypt", "send:encrypted"),
+                    probe.events
+                )
+                assertNotNull(sender.stateSnapshot())
+            } finally {
+                wipeSessionStamp(stamp)
+                viewModel.clear()
+                wipeUserAndCipher(user, sender, bobRecipient, carolRecipient, bob, carol)
+            }
+        }
+
+    @Test
+    fun partialMultiRecipientAcquisitionReleasesEveryKnownLeaseBeforeReturning() = runBlocking {
+        val sender = nativeIdentity(24)
+        val bob = nativeIdentity(25)
+        val carol = nativeIdentity(26)
+        val user = User("Alice", sender.publicKey(), sender.prekeyId())
+        val bobRecipient = recipientFromNative("Bob", bob)
+        val carolRecipient = recipientFromNative("Carol", carol)
+        val probe = TransactionTransportProbe(
+            cipher = sender,
+            leases = listOf(leaseFor("forum_ops", "message-partial", "Bob", bob), null),
+            sendResult = OutboundSendResult.ACCEPTED
+        )
+        val viewModel = transactionViewModel(sender, user, probe)
+        val stamp = invokeCaptureSessionStamp(viewModel)
+
+        try {
+            val result = invokeSendEncryptedMetadata(
+                viewModel,
+                stamp,
+                chatId = "forum_ops",
+                messageId = "message-partial",
+                metadata = "hello",
+                recipients = listOf(bobRecipient, carolRecipient)
+            )
+
+            assertNull(result)
+            assertEquals(
+                listOf(
+                    "lease:Bob:preEncrypt",
+                    "lease:Carol:preEncrypt",
+                    "release:Bob:rolledBack"
+                ),
+                probe.events
+            )
+            assertNull(sender.stateSnapshot())
+        } finally {
+            wipeSessionStamp(stamp)
+            viewModel.clear()
+            wipeUserAndCipher(user, sender, bobRecipient, carolRecipient, bob, carol)
+        }
+    }
+
+    @Test
+    fun rejectedAndNotSentTransactionsRollbackBeforeReleasingTheirLeases() = runBlocking {
+        listOf(OutboundSendResult.REJECTED, OutboundSendResult.NOT_SENT).forEachIndexed { index, outcome ->
+            val sender = nativeIdentity(30 + index)
+            val bob = nativeIdentity(40 + index)
+            val user = User("Alice", sender.publicKey(), sender.prekeyId())
+            val bobRecipient = recipientFromNative("Bob", bob)
+            val messageId = "message-reject-$index"
+            val probe = TransactionTransportProbe(
+                cipher = sender,
+                leases = listOf(leaseFor("dm_bob", messageId, "Bob", bob)),
+                sendResult = outcome
+            )
+            val viewModel = transactionViewModel(sender, user, probe)
+            val stamp = invokeCaptureSessionStamp(viewModel)
+
+            try {
+                val result = invokeSendEncryptedMetadata(
+                    viewModel,
+                    stamp,
+                    chatId = "dm_bob",
+                    messageId = messageId,
+                    metadata = "hello",
+                    recipients = listOf(bobRecipient)
+                )
+
+                assertEquals(outcome, result)
+                assertEquals(
+                    listOf("lease:Bob:preEncrypt", "send:encrypted", "release:Bob:rolledBack"),
+                    probe.events
+                )
+                assertNull(sender.stateSnapshot())
+            } finally {
+                wipeSessionStamp(stamp)
+                viewModel.clear()
+                wipeUserAndCipher(user, sender, bobRecipient, bob)
+            }
+        }
+    }
+
+    @Test
+    fun ambiguousTransactionNeverReleasesAndFailsClosed() = runBlocking {
+        val sender = nativeIdentity(50)
+        val bob = nativeIdentity(51)
+        val user = User("Alice", sender.publicKey(), sender.prekeyId())
+        val bobRecipient = recipientFromNative("Bob", bob)
+        val probe = TransactionTransportProbe(
+            cipher = sender,
+            leases = listOf(leaseFor("dm_bob", "message-ambiguous", "Bob", bob)),
+            sendResult = OutboundSendResult.AMBIGUOUS
+        )
+        val viewModel = transactionViewModel(sender, user, probe)
+        val stamp = invokeCaptureSessionStamp(viewModel)
+
+        try {
+            val result = invokeSendEncryptedMetadata(
+                viewModel,
+                stamp,
+                chatId = "dm_bob",
+                messageId = "message-ambiguous",
+                metadata = "hello",
+                recipients = listOf(bobRecipient)
+            )
+
+            assertEquals(OutboundSendResult.AMBIGUOUS, result)
+            assertEquals(listOf("lease:Bob:preEncrypt", "send:encrypted", "disconnect"), probe.events)
+            assertTrue(viewModel.currentUser.value == null)
+            assertNull(sender.stateSnapshot())
+        } finally {
+            wipeSessionStamp(stamp)
+            viewModel.clear()
+            wipeUserAndCipher(user, sender, bobRecipient, bob)
+        }
+    }
+
+    @Test
+    fun establishedSessionUsesCatalogIdentityWithoutRequestingLease() = runBlocking {
+        val sender = nativeIdentity(60)
+        val bob = nativeIdentity(61)
+        establishReciprocalSession(sender, bob)
+        assertFalse(sender.requiresPrekey("Bob"))
+        val user = User("Alice", sender.publicKey(), sender.prekeyId())
+        val bobRecipient = recipientFromNative("Bob", bob)
+        val probe = TransactionTransportProbe(
+            cipher = sender,
+            leases = emptyList(),
+            sendResult = OutboundSendResult.ACCEPTED
+        )
+        val viewModel = transactionViewModel(sender, user, probe)
+        val stamp = invokeCaptureSessionStamp(viewModel)
+
+        try {
+            val result = invokeSendEncryptedMetadata(
+                viewModel,
+                stamp,
+                chatId = "dm_bob",
+                messageId = "message-established",
+                metadata = "hello",
+                recipients = listOf(bobRecipient)
+            )
+
+            assertEquals(OutboundSendResult.ACCEPTED, result)
+            assertEquals(listOf("send:encrypted"), probe.events)
+        } finally {
+            wipeSessionStamp(stamp)
+            viewModel.clear()
+            wipeUserAndCipher(user, sender, bobRecipient, bob)
+        }
     }
 
     @Test
@@ -478,7 +730,7 @@ class ChatViewModelPolicyTest {
 
     @Test
     fun teardownClearsIdentitySessionAndWipesCurrentUserKey() {
-        val publicKey = ByteArray(128) { 7 }
+        val publicKey = ByteArray(608) { 7 }
         var logoutCalled = false
         var nodeCleared = false
 
@@ -490,12 +742,12 @@ class ChatViewModelPolicyTest {
 
         assertTrue(logoutCalled)
         assertTrue(nodeCleared)
-        assertArrayEquals(ByteArray(128), publicKey)
+        assertArrayEquals(ByteArray(608), publicKey)
     }
 
     @Test
     fun teardownStillClearsOtherStateWhenAServiceThrows() {
-        val publicKey = ByteArray(128) { 9 }
+        val publicKey = ByteArray(608) { 9 }
         var nodeCleared = false
 
         clearClientIdentity(
@@ -505,7 +757,7 @@ class ChatViewModelPolicyTest {
         )
 
         assertTrue(nodeCleared)
-        assertArrayEquals(ByteArray(128), publicKey)
+        assertArrayEquals(ByteArray(608), publicKey)
     }
 
     @Test
@@ -654,6 +906,241 @@ class ChatViewModelPolicyTest {
         }
     }
 
+    private fun transactionViewModel(
+        payloadCipher: InMemoryPayloadCipher,
+        user: User,
+        probe: TransactionTransportProbe
+    ): ChatViewModel {
+        val identityService = proxy(IIdentityService::class.java) { method ->
+            when (method.name) {
+                "getCurrentUser" -> null
+                "revokeSession" -> false
+                else -> Unit
+            }
+        }
+        val nodeConfig = proxy(INodeConfigService::class.java) { method ->
+            when (method.name) {
+                "getActiveSession" -> null
+                "normalizeNodeUrl" -> error("normalizeNodeUrl must not run")
+                else -> Unit
+            }
+        }
+        val repository = proxy(IMessageRepository::class.java) { method ->
+            when (method.name) {
+                "getChatSessions" -> flowOf(emptyList<com.abyssal.chat.domain.model.ChatSession>())
+                "getMessages" -> flowOf(emptyList<Message>())
+                // Kotlin ULong is represented as a primitive/boxed Long at
+                // this Java proxy boundary (the method name is mangled).
+                else -> if (method.name.startsWith("currentEpoch")) 0L else Unit
+            }
+        }
+        val sender = proxy(IMessageSender::class.java) { Unit }
+        val attachmentService = proxy(IEncryptedAttachmentService::class.java) { Unit }
+        val disguiseManager = proxy(IDisguiseManager::class.java) { method ->
+            when (method.name) {
+                "isDisguiseEnabled" -> false
+                else -> Unit
+            }
+        }
+        val updateService = proxy(IAppUpdateService::class.java) { Unit }
+        val viewModel = ChatViewModel(
+            identityService = identityService,
+            nodeConfigService = nodeConfig,
+            messageRepository = repository,
+            messageSender = sender,
+            chatTransport = probe.transport,
+            attachmentService = attachmentService,
+            disguiseManager = disguiseManager,
+            appUpdateService = updateService,
+            payloadCipher = payloadCipher
+        )
+        setCurrentUser(viewModel, user)
+        setSessionGeneration(viewModel, 1L)
+        setActiveSessionPolicy(viewModel)
+        return viewModel
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> proxy(type: Class<T>, handler: (Method) -> Any?): T =
+        Proxy.newProxyInstance(
+            type.classLoader,
+            arrayOf(type)
+        ) { _, method, _ -> handler(method) } as T
+
+    private fun nativeIdentity(fill: Int): InMemoryPayloadCipher = InMemoryPayloadCipher().also {
+        val exportKey = ByteArray(64) { fill.toByte() }
+        val context = "ABYSSAL_IDENTITY_V2:node:CODE-12345678".encodeToByteArray()
+        try {
+            val material = it.createIdentity(exportKey, context)
+            material.publicKey.fill(0)
+            material.envelope.fill(0)
+        } finally {
+            exportKey.fill(0)
+            context.fill(0)
+        }
+    }
+
+    private fun recipientFromNative(
+        username: String,
+        cipher: InMemoryPayloadCipher
+    ): RecipientIdentity = RecipientIdentity(
+        username = username,
+        publicKey = cipher.publicKey(),
+        prekeyId = cipher.prekeyId()
+    )
+
+    private fun leaseFor(
+        chatId: String,
+        messageId: String,
+        username: String,
+        cipher: InMemoryPayloadCipher
+    ): PrekeyLease = PrekeyLease(
+        chatId = chatId,
+        messageId = messageId,
+        recipientUsername = username,
+        recipientPublicKey = cipher.publicKey(),
+        prekeyId = cipher.prekeyId(),
+        expiresAtMs = 1L,
+        connectionGeneration = 1L
+    )
+
+    private fun establishReciprocalSession(
+        sender: InMemoryPayloadCipher,
+        receiver: InMemoryPayloadCipher
+    ) {
+        val senderPublic = sender.publicKey()
+        val receiverPublic = receiver.publicKey()
+        try {
+            // A peer's first-contact frame is enough to install the sender's
+            // established catalog entry. The reply path is intentionally not
+            // part of this policy fixture; it would exercise a second native
+            // ratchet transition rather than the lease decision under test.
+            val first = receiver.encrypt(
+                "dm_bob",
+                "setup-one",
+                "Bob",
+                byteArrayOf(1),
+                listOf(RecipientIdentity("Alice", senderPublic, sender.prekeyId()))
+            )
+            receiver.commitOutbound(first.messageId, first.stateRevision)
+            sender.decrypt(
+                incomingFrom(first, receiverPublic, "Bob", "Alice"),
+                "Alice"
+            ).plaintext.fill(0)
+            wipePayload(first)
+        } finally {
+            senderPublic.fill(0)
+            receiverPublic.fill(0)
+        }
+    }
+
+    private fun incomingFrom(
+        payload: EncryptedTransportPayload,
+        senderPublicKey: ByteArray,
+        senderUsername: String,
+        recipientUsername: String
+    ): IncomingTransportPayload {
+        val envelope = payload.envelopes.single {
+            it.recipientUsername == recipientUsername
+        }
+        return IncomingTransportPayload(
+            chatId = "dm_bob",
+            messageId = payload.messageId,
+            version = payload.version,
+            identityPublicKey = payload.identityPublicKey,
+            nonce = payload.nonce,
+            ciphertext = payload.ciphertext,
+            signature = envelope.signature,
+            wrappedKey = envelope.wrappedKey,
+            senderUsername = senderUsername,
+            senderPublicKey = senderPublicKey,
+            prekeyId = envelope.prekeyId,
+            isPrekey = envelope.isPrekey
+        )
+    }
+
+    private fun wipePayload(payload: EncryptedTransportPayload) {
+        payload.nonce.fill(0)
+        payload.ciphertext.fill(0)
+        payload.identityEnvelope.fill(0)
+        payload.identityPublicKey.fill(0)
+        payload.stateSignature.fill(0)
+        payload.envelopes.forEach {
+            it.wrappedKey.fill(0)
+            it.signature.fill(0)
+        }
+    }
+
+    private fun wipeUserAndCipher(
+        user: User,
+        sender: InMemoryPayloadCipher,
+        vararg recipients: Any
+    ) {
+        user.publicKey.fill(0)
+        sender.clear()
+        recipients.forEach { value ->
+            when (value) {
+                is RecipientIdentity -> value.publicKey.fill(0)
+                is InMemoryPayloadCipher -> value.clear()
+            }
+        }
+    }
+
+    private class TransactionTransportProbe(
+        private val cipher: InMemoryPayloadCipher,
+        private val leases: List<PrekeyLease?>,
+        private val sendResult: OutboundSendResult
+    ) {
+        val events = mutableListOf<String>()
+        private var leaseIndex = 0
+
+        val transport: IChatTransport = Proxy.newProxyInstance(
+            IChatTransport::class.java.classLoader,
+            arrayOf(IChatTransport::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "currentConnectionGeneration" -> 1L
+                "getServerStatus" -> flowOf(ServerStatus("CONNECTED", "node", 0))
+                "getPresence" -> flowOf(emptyList<com.abyssal.chat.domain.model.UserPresence>())
+                "getIncomingWipeCommands" -> flowOf<Long>()
+                "getIncomingPayloads" -> flowOf<IncomingTransportPayload>()
+                "getRoomChanges" -> flowOf<com.abyssal.chat.domain.model.RoomChange>()
+                "requestPrekeyLease" -> {
+                    val username = args?.getOrNull(2) as String
+                    check(cipher.stateSnapshot() == null) {
+                        "native encrypt staged before its lease request"
+                    }
+                    events += "lease:$username:preEncrypt"
+                    leases.getOrNull(leaseIndex++)
+                }
+                "releasePrekeyLease" -> {
+                    val username = args?.getOrNull(2) as String
+                    val prekeyId = args.getOrNull(3) as String
+                    events += "release:$username:${if (cipher.stateSnapshot() == null) "rolledBack" else "staged"}"
+                    check(prekeyId.isNotEmpty())
+                    true
+                }
+                "sendEncryptedPayload" -> {
+                    check(cipher.stateSnapshot() != null) {
+                        "native encrypt did not stage before relay send"
+                    }
+                    events += "send:encrypted"
+                    sendResult
+                }
+                "disconnect" -> {
+                    events += "disconnect"
+                    Unit
+                }
+                else -> when (method.returnType) {
+                    Boolean::class.javaPrimitiveType -> false
+                    Long::class.javaPrimitiveType -> 0L
+                    Int::class.javaPrimitiveType -> 0
+                    else -> null
+                }
+            }
+        } as IChatTransport
+    }
+
     private fun allocateUninitializedViewModel(): ChatViewModel {
         val unsafeClass = Class.forName("sun.misc.Unsafe")
         val unsafeField = unsafeClass.getDeclaredField("theUnsafe")
@@ -778,7 +1265,8 @@ class ChatViewModelPolicyTest {
         stamp: Any,
         chatId: String = "dm_bob",
         messageId: String = "message-stale",
-        metadata: String = "hello"
+        metadata: String = "hello",
+        recipients: List<RecipientIdentity>? = null
     ): Any? = suspendCoroutine { continuation: Continuation<Any?> ->
         try {
             val method = ChatViewModel::class.java.getDeclaredMethod(
@@ -796,7 +1284,7 @@ class ChatViewModelPolicyTest {
                 chatId,
                 messageId,
                 metadata,
-                null,
+                recipients,
                 stamp,
                 continuation
             )
@@ -881,7 +1369,7 @@ class ChatViewModelPolicyTest {
 
     private fun recipient(username: String) = RecipientIdentity(
         username = username,
-        publicKey = ByteArray(128),
+        publicKey = ByteArray(608),
         prekeyId = "prekey-1"
     )
 
@@ -912,7 +1400,7 @@ class ChatViewModelPolicyTest {
         attachmentName = "report.pdf",
         attachmentMimeType = "application/pdf",
         attachmentSizeBytes = 4L,
-        senderPublicKey = ByteArray(128) { (seed + it).toByte() }
+        senderPublicKey = ByteArray(608) { (seed + it).toByte() }
     )
 
     private fun wipeMessageSecretsForTest(message: Message) {

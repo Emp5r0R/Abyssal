@@ -697,6 +697,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_public_key(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_requires_prekey(
+    ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_rollback_outbound(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_seal_identity(
@@ -745,6 +747,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_public_key(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_e2eesession_requires_prekey(`ptr`: Long,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
     external fun uniffi_abyssal_core_fn_method_e2eesession_rollback_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     external fun uniffi_abyssal_core_fn_method_e2eesession_seal_identity(`ptr`: Long,`exportKey`: RustBuffer.ByValue,`context`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -915,6 +919,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_public_key() != 3928) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_requires_prekey() != 44097) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_rollback_outbound() != 61837) {
@@ -1351,6 +1358,13 @@ public interface E2eeSessionInterface {
     fun `publicKey`(): kotlin.ByteArray
 
     /**
+     * Returns whether the next outbound message to `peer` must use an
+     * authenticated leased prekey. Established reciprocal sessions do not
+     * require a lease.
+     */
+    fun `requiresPrekey`(`peer`: kotlin.String): kotlin.Boolean
+
+    /**
      * Restore the pre-send snapshot for an explicitly rejected message.
      * Revision matching is strict so a stale result cannot roll back a newer
      * transaction.
@@ -1569,6 +1583,26 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
     UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_public_key(
         it,
         _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Returns whether the next outbound message to `peer` must use an
+     * authenticated leased prekey. Established reciprocal sessions do not
+     * require a lease.
+     */
+    @Throws(AbyssalException::class)override fun `requiresPrekey`(`peer`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_requires_prekey(
+        it,
+
+        FfiConverterString.lower(`peer`),_status)
 }
     }
     )

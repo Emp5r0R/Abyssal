@@ -50,6 +50,7 @@ export const uniffi_abyssal_core_checksum_method_e2eesession_decrypt: () => numb
 export const uniffi_abyssal_core_checksum_method_e2eesession_encrypt: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_prekey_id: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_public_key: () => number;
+export const uniffi_abyssal_core_checksum_method_e2eesession_requires_prekey: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_rollback_outbound: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_seal_identity: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_sign_acknowledgement: () => number;
@@ -69,6 +70,7 @@ export const uniffi_abyssal_core_fn_method_e2eesession_decrypt: (a: number, b: b
 export const uniffi_abyssal_core_fn_method_e2eesession_encrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_prekey_id: (a: number, b: bigint, c: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_public_key: (a: number, b: bigint, c: number) => void;
+export const uniffi_abyssal_core_fn_method_e2eesession_requires_prekey: (a: bigint, b: number, c: number) => number;
 export const uniffi_abyssal_core_fn_method_e2eesession_rollback_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_seal_identity: (a: number, b: bigint, c: number, d: number, e: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_sign_acknowledgement: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number) => void;
@@ -80,6 +82,7 @@ export const wasme2eesession_encrypt: (a: number, b: number, c: number, d: numbe
 export const wasme2eesession_prekeyId: (a: number) => [number, number];
 export const wasme2eesession_publicKey: (a: number) => [number, number];
 export const wasme2eesession_recover: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+export const wasme2eesession_requiresPrekey: (a: number, b: number, c: number) => [number, number, number];
 export const wasme2eesession_rollbackOutbound: (a: number, b: number, c: number, d: bigint) => [number, number];
 export const wasme2eesession_sealIdentity: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const wasme2eesession_signAcknowledgement: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];

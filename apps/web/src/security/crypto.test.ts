@@ -8,6 +8,7 @@ import {
   finishOpaqueLogin,
   finishOpaqueRegistration,
   FatalCipherError,
+  IDENTITY_PUBLIC_KEY_BYTES,
   identityContext,
   InMemoryPayloadCipher,
   maxSerializedAttachmentBytes,
@@ -88,6 +89,19 @@ describe("conversation safety numbers", () => {
 });
 
 describe("recipient E2EE", () => {
+  it("frees a native identity and wipes outputs when sealing fails", () => {
+    const cipher = new InMemoryPayloadCipher();
+    const free = vi.spyOn(WasmE2eeSession.prototype, "free");
+    vi.spyOn(WasmE2eeSession.prototype, "sealIdentity").mockImplementationOnce(() => {
+      throw new Error("seal failed");
+    });
+
+    expect(() => cipher.createIdentity(new Uint8Array(64).fill(31), CONTEXT))
+      .toThrow("seal failed");
+    expect(free).toHaveBeenCalledOnce();
+    expect(() => cipher.publicKey()).toThrow("Identity unavailable");
+  });
+
   it("rolls back malformed staged output exactly and invalidates unparseable native output", () => {
     const alice = identity(17);
     const bob = identity(18);
@@ -132,7 +146,7 @@ describe("recipient E2EE", () => {
 
     expect(() => alice.encryptText(CHAT_ID, "native-rejected", "Alice", "first", recipients))
       .toThrow("Payload unavailable");
-    expect(alice.publicKey()).toHaveLength(128);
+    expect(alice.publicKey()).toHaveLength(IDENTITY_PUBLIC_KEY_BYTES);
     const retry = alice.encryptText(CHAT_ID, "native-retry", "Alice", "retry", recipients);
     commit(alice, retry);
   });
@@ -169,7 +183,7 @@ describe("recipient E2EE", () => {
     }
     expect(nativeError).toBeInstanceOf(Error);
     expect(nativeError).not.toBeInstanceOf(FatalCipherError);
-    expect(bob.publicKey()).toHaveLength(128);
+    expect(bob.publicKey()).toHaveLength(IDENTITY_PUBLIC_KEY_BYTES);
     expect(decryptArgs()).toBe("classified");
   });
 
@@ -313,7 +327,7 @@ describe("recipient E2EE", () => {
     commit(alice, payload);
     const envelope = payload.envelopes[0];
 
-    expect(payload.version).toBe(8);
+    expect(payload.version).toBe(9);
     expect(payload.stateRevision).toBe(1);
     expect(payload.identityEnvelope.byteLength).toBeGreaterThan(64);
     expect(payload.stateSignature.byteLength).toBe(STATE_SIGNATURE_BYTES);
@@ -607,7 +621,7 @@ describe("recipient E2EE", () => {
       envelope.wrappedKey.fill(0);
       envelope.signature.fill(0);
     });
-    expect(frame.version).toBe(8);
+    expect(frame.version).toBe(9);
     expect(frame).not.toHaveProperty("signature_b64");
     expect(frame.state_signature_b64).toBeTruthy();
     expect((frame.envelopes as Array<{ signature_b64: string }>)[0].signature_b64).toBeTruthy();

@@ -21,10 +21,10 @@ const MAX_PADDED_PAYLOAD_BYTES = Math.ceil(
 ) * PAYLOAD_PADDING_BUCKET_BYTES;
 export const MAX_PAYLOAD_CIPHERTEXT_BYTES = MAX_PADDED_PAYLOAD_BYTES + CHACHA20_POLY1305_TAG_BYTES;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES = 200 * 1024 * 1024;
-const IDENTITY_PUBLIC_KEY_BYTES = 128;
+export const IDENTITY_PUBLIC_KEY_BYTES = 608;
 export const STATE_SIGNATURE_BYTES = 64;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 export const ATTACHMENT_CIPHER_VERSION = 1;
 const ATTACHMENT_KEY_BYTES = 32;
 const ATTACHMENT_NONCE_BYTES = 24;
@@ -96,6 +96,13 @@ export interface IdentityStateSnapshot {
   identityPublicKey: Uint8Array;
   prekeyId: string;
   stateSignature: Uint8Array;
+}
+
+/** The generated WASM binding gains this method with protocol v9. Keep the
+ * boundary local so the checked-in generated artifact can be regenerated
+ * independently without weakening the v9 fail-closed contract. */
+interface NativeE2eeSession extends WasmE2eeSession {
+  requiresPrekey(peer: string): boolean;
 }
 
 interface RustOpaqueStart {
@@ -222,6 +229,10 @@ export function identityContext(nodeId: string, code: string): Uint8Array {
 }
 
 export function conversationSafetyNumber(firstPublicKey: Uint8Array, secondPublicKey: Uint8Array): string {
+  if (firstPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+    secondPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES) {
+    throw new Error("Identity unavailable");
+  }
   return rustConversationSafetyNumber(firstPublicKey, secondPublicKey);
 }
 
@@ -231,6 +242,14 @@ export class InMemoryPayloadCipher {
   #pendingState: IdentityStateSnapshot | null = null;
   #pendingPreviousState: IdentityStateSnapshot | null = null;
 
+  private nativeSession(): NativeE2eeSession {
+    const session = this.#session as NativeE2eeSession | null;
+    if (!session || typeof session.requiresPrekey !== "function") {
+      throw new Error("Identity unavailable");
+    }
+    return session;
+  }
+
   createIdentity(exportKey: Uint8Array, context: Uint8Array): {
     publicKey: Uint8Array;
     prekeyId: string;
@@ -238,11 +257,28 @@ export class InMemoryPayloadCipher {
   } {
     this.clear();
     const session = WasmE2eeSession.create(exportKey);
-    this.#session = session;
+    const native = session as NativeE2eeSession;
+    let publicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let envelope: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let prekeyId: string;
+    try {
+      publicKey = native.publicKey();
+      prekeyId = native.prekeyId();
+      if (publicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || !PREKEY_ID_PATTERN.test(prekeyId)) {
+        throw new Error("Identity unavailable");
+      }
+      envelope = native.sealIdentity(exportKey, context);
+      this.#session = native;
+    } catch (error) {
+      wipeBytes(publicKey);
+      wipeBytes(envelope);
+      try { native.free(); } catch { /* native handle is detached below */ }
+      throw error;
+    }
     return {
-      publicKey: session.publicKey(),
-      prekeyId: session.prekeyId(),
-      envelope: session.sealIdentity(exportKey, context),
+      publicKey,
+      prekeyId,
+      envelope,
     };
   }
 
@@ -253,17 +289,47 @@ export class InMemoryPayloadCipher {
     expectedPublicKey: Uint8Array,
   ): void {
     this.clear();
-    this.#session = WasmE2eeSession.recover(exportKey, context, envelope, expectedPublicKey);
+    if (expectedPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES) throw new Error("Identity unavailable");
+    const session = WasmE2eeSession.recover(exportKey, context, envelope, expectedPublicKey) as NativeE2eeSession;
+    let actual: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    try {
+      actual = session.publicKey();
+      if (actual.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || !constantTimeEqual(actual, expectedPublicKey) ||
+        !PREKEY_ID_PATTERN.test(session.prekeyId())) {
+        throw new Error("Identity unavailable");
+      }
+      this.#session = session;
+    } catch (error) {
+      wipeBytes(actual);
+      try { session.free(); } catch { /* native handle is detached below */ }
+      throw error;
+    } finally {
+      wipeBytes(actual);
+    }
   }
 
   publicKey(): Uint8Array {
     if (!this.#session) throw new Error("Identity unavailable");
-    return this.#session.publicKey();
+    const publicKey = this.#session.publicKey();
+    if (publicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES) {
+      wipeBytes(publicKey);
+      throw new Error("Identity unavailable");
+    }
+    return publicKey;
   }
 
   prekeyId(): string {
     if (!this.#session) throw new Error("Identity unavailable");
-    return this.#session.prekeyId();
+    const prekeyId = this.#session.prekeyId();
+    if (!PREKEY_ID_PATTERN.test(prekeyId)) throw new Error("Identity unavailable");
+    return prekeyId;
+  }
+
+  requiresPrekey(peer: string): boolean {
+    if (!USERNAME_PATTERN.test(peer)) throw new Error("Recipient unavailable");
+    const required = this.nativeSession().requiresPrekey(peer);
+    if (typeof required !== "boolean") throw new Error("Identity unavailable");
+    return required;
   }
 
   stateSnapshot(): IdentityStateSnapshot | null {
@@ -624,8 +690,11 @@ export class InMemoryPayloadCipher {
     isPrekey: boolean,
     recipientUsername: string,
   ): Uint8Array {
-    if (!this.#session || payload.version !== PROTOCOL_VERSION || payload.nonce.byteLength !== 12 ||
-      !validPayloadCiphertext(payload.ciphertext)) throw new Error("Payload unavailable");
+    if (!this.#session || senderPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+      payload.version !== PROTOCOL_VERSION || payload.identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+      payload.nonce.byteLength !== 12 || !validPayloadCiphertext(payload.ciphertext)) {
+      throw new Error("Payload unavailable");
+    }
     normalizeContext(chatId, messageId, senderUsername);
     const session = this.#session;
     let rawResult: string;
@@ -759,11 +828,19 @@ export function maxSerializedAttachmentBytes(mediaType: string): number {
 export function payloadToFrame(payload: EncryptedPayload): Record<string, unknown> {
   if (
     payload.version !== PROTOCOL_VERSION ||
-    payload.messageId.length === 0 ||
+    !CHAT_ID_PATTERN.test(payload.messageId) ||
     payload.nonce.byteLength !== 12 ||
     !validPayloadCiphertext(payload.ciphertext) ||
+    payload.identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+    !PREKEY_ID_PATTERN.test(payload.prekeyId) ||
     payload.stateSignature.byteLength !== STATE_SIGNATURE_BYTES
   ) {
+    throw new Error("Payload unavailable");
+  }
+  if (payload.envelopes.length === 0 || payload.envelopes.some((envelope) =>
+    !USERNAME_PATTERN.test(envelope.username) || envelope.wrappedKey.byteLength === 0 ||
+    envelope.signature.byteLength !== STATE_SIGNATURE_BYTES ||
+    (envelope.isPrekey ? !PREKEY_ID_PATTERN.test(envelope.prekeyId) : envelope.prekeyId !== ""))) {
     throw new Error("Payload unavailable");
   }
   return {
@@ -841,6 +918,15 @@ function validPayloadCiphertext(ciphertext: Uint8Array): boolean {
   return ciphertext.byteLength >= PAYLOAD_PADDING_BUCKET_BYTES + CHACHA20_POLY1305_TAG_BYTES &&
     ciphertext.byteLength <= MAX_PAYLOAD_CIPHERTEXT_BYTES &&
     (ciphertext.byteLength - CHACHA20_POLY1305_TAG_BYTES) % PAYLOAD_PADDING_BUCKET_BYTES === 0;
+}
+
+function constantTimeEqual(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    difference |= left[index] ^ right[index];
+  }
+  return difference === 0;
 }
 
 function rollbackCoreAfterFailedOutbound(

@@ -37,6 +37,7 @@ import {
   finishOpaqueRegistration,
   FatalCipherError,
   identityContext,
+  IDENTITY_PUBLIC_KEY_BYTES,
   InMemoryPayloadCipher,
   payloadToFrame,
   PROTOCOL_VERSION,
@@ -61,6 +62,8 @@ import {
   type EncryptedSendOutcome,
   type AttachmentPlaintextPolicy,
   type DownloadedEncryptedAttachment,
+  type PrekeyLease,
+  PrekeyLeaseError,
 } from "../transport/nodeClient";
 
 const ACTIVITY_SIGNAL_INTERVAL_MS = 20_000;
@@ -949,21 +952,63 @@ export function useAbyssalSession() {
   ): Promise<EncryptedSendOutcome> => {
     let encrypted: EncryptedPayload | null = null;
     let staged = false;
+    let admissionAttempted = false;
+    const acquiredLeases: PrekeyLease[] = [];
+    let leasesReleaseAttempted = false;
     const active = () => generation === sessionGenerationRef.current &&
       sessionRef.current?.token === currentSession.token;
+    const releaseAcquiredLeases = () => {
+      if (leasesReleaseAttempted || !active()) return;
+      leasesReleaseAttempted = true;
+      acquiredLeases.forEach((lease) => {
+        try {
+          socketRef.current?.releasePrekeyLease(lease);
+        } catch {
+          // Lease cleanup is best effort; the relay owns the final expiry.
+        }
+      });
+    };
     try {
       const outcome = await cryptoGateRef.current.run(async () => {
         if (!active()) return "NOT_SENT" as const;
         try {
+          for (const recipient of recipients) {
+            if (!cipherRef.current.requiresPrekey(recipient.username)) continue;
+            let lease: PrekeyLease;
+            try {
+              lease = await (socketRef.current?.requestPrekeyLease(
+                chatId,
+                messageId,
+                recipient.username,
+              ) ?? Promise.reject(new PrekeyLeaseError("NOT_SENT")));
+            } catch (error) {
+              // Only this request's lease is unknown. Every earlier response
+              // is known unused and must be released before propagating the
+              // failure (including AMBIGUOUS/CLOSED outcomes).
+              releaseAcquiredLeases();
+              throw error;
+            }
+            if (!active()) {
+              wipeBytes(lease.recipientPublicKey);
+              return "NOT_SENT" as const;
+            }
+            acquiredLeases.push(lease);
+            wipeBytes(recipient.publicKey);
+            recipient.publicKey = lease.recipientPublicKey.slice();
+            recipient.prekeyId = lease.prekeyId;
+          }
+          if (!active()) return "NOT_SENT" as const;
           encrypted = createPayload();
           staged = true;
           const stagedPayload = encrypted;
+          const frame = payloadToFrame(stagedPayload);
+          admissionAttempted = true;
           const sent = await (socketRef.current?.sendEncryptedPayload(
             messageId,
             {
               type: "message",
               chat_id: chatId,
-              ...payloadToFrame(stagedPayload),
+              ...frame,
             },
           ) ?? Promise.resolve("NOT_SENT" as const));
           if (!active()) return sent;
@@ -980,15 +1025,26 @@ export function useAbyssalSession() {
             try {
               cipherRef.current.rollbackOutbound(messageId, stagedPayload.stateRevision);
             } catch {
+              releaseAcquiredLeases();
               failClosed(currentSession);
               return "AMBIGUOUS" as const;
             }
+            releaseAcquiredLeases();
             return sent;
           }
           failClosed(currentSession);
           return sent;
         } catch (error) {
           if (error instanceof FatalCipherError) {
+            // Native encryption failed before admission when this flag is
+            // still clear. The lease claims are therefore definitely unused;
+            // release them while the authenticated relay is still active,
+            // then discard the now-invalid native identity.
+            if (!admissionAttempted) releaseAcquiredLeases();
+            if (active()) failClosed(currentSession);
+            return "AMBIGUOUS" as const;
+          }
+          if (admissionAttempted) {
             if (active()) failClosed(currentSession);
             return "AMBIGUOUS" as const;
           }
@@ -996,16 +1052,19 @@ export function useAbyssalSession() {
             try {
               cipherRef.current.rollbackOutbound(messageId, encrypted.stateRevision);
             } catch {
+              if (!admissionAttempted) releaseAcquiredLeases();
               failClosed(currentSession);
               return "AMBIGUOUS" as const;
             }
           }
+          releaseAcquiredLeases();
           return "NOT_SENT" as const;
         }
       });
       return outcome;
     } finally {
       if (encrypted) wipeEncryptedPayload(encrypted);
+      acquiredLeases.forEach((lease) => wipeBytes(lease.recipientPublicKey));
       recipients.forEach((recipient) => wipeBytes(recipient.publicKey));
     }
   }, [failClosed]);
@@ -1545,7 +1604,7 @@ function validPresence(value: unknown): value is PresenceUser {
   ) {
     return false;
   }
-  return canonicalBase64Bytes(user.identity_public_b64, 128) &&
+  return canonicalBase64Bytes(user.identity_public_b64, IDENTITY_PUBLIC_KEY_BYTES) &&
     canonicalBase64Bytes(user.directory_digest, 32);
 }
 
@@ -1568,7 +1627,7 @@ function stableIdentityFingerprint(publicKeyB64: string): string {
   let decoded: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   try {
     decoded = base64ToBytes(publicKeyB64);
-    if (decoded.byteLength !== 128 || bytesToBase64(decoded) !== publicKeyB64) {
+    if (decoded.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || bytesToBase64(decoded) !== publicKeyB64) {
       throw new Error("Identity unavailable");
     }
     return bytesToBase64(decoded.subarray(0, 64));

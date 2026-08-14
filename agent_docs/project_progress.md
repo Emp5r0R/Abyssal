@@ -1,34 +1,53 @@
 # Project Progress
 
-## Active Deployment: Protocol-v9 Initial Prekey Pool
+## Completed Deployment: Protocol-v9 Initial Prekey Pool
 
-Protocol v8's single advertised Olm one-time prekey is being replaced with a
-bounded, signed pool and an authenticated lease-before-encrypt transaction.
-The package must preserve transactional ratchet rollback, exact recipient
-binding, queued-ciphertext claim lifetime, RAM-only state, and existing replay
-and resource bounds across Rust core, relay, web, and Android.
+Protocol v9 replaces the single advertised Olm one-time prekey with a bounded,
+signed pool and an authenticated lease-before-encrypt transaction across the
+Rust core, relay, web client, and Android client.
 
-### Required Invariants
+### Delivered
 
-1. Each identity publishes a canonical fixed-size prekey pool signed by the
-   long-term Ed25519 identity and covered by registration and state transcripts.
-2. The relay atomically leases an exact unused key to a sender, conversation,
-   recipient, and message ID before encryption; retries are idempotent and
-   unused leases expire promptly.
-3. Accepted pending ciphertext retains its exact lease until ACK, eviction,
-   expiry, or wipe. ACK state may remove only the consumed key and must add
-   exactly one signed replacement while preserving every other live claim.
-4. Clients request leases only when the native ratchet requires a new inbound
-   session, bind all asynchronous work to the current session generation, and
-   release unused leases on deterministic cancellation or failure.
-5. Protocol-v8 frames and identity bundles are rejected after the versioned
-   migration. Generated WASM/JNI artifacts must remain reproducible.
+- Each identity publishes a canonical 16-key pool covered by its long-term
+  Ed25519 identity signature, registration proof, and state transcript. The
+  exact public bundle is 608 bytes and protocol-v8 bundles and checkpoints fail
+  closed.
+- The relay leases an exact unused prekey to the authenticated sender,
+  conversation, recipient, and message ID before encryption. Exact retries are
+  idempotent; leases expire after 30 seconds unless pinned by accepted pending
+  ciphertext, and global/per-recipient bounds are 4,096/16.
+- ACK handling locks and validates the account, pending frame, pending-byte
+  accounting, and lease together. It removes exactly the consumed key, accepts
+  exactly one replacement, and preserves every other live lease.
+- Web and Android consult the native ratchet before leasing, bind asynchronous
+  operations to the active session/connection generation, release only leases
+  known to remain unused, roll back on explicit rejection or not-sent outcomes,
+  and fail closed on ambiguous outcomes.
+- Generated WASM, UniFFI, and four JNI artifacts were regenerated twice with
+  pinned tools and byte-identical manifests. The disposable-relay integration
+  exercises lease acquisition, deterministic release/reuse, first-contact
+  encryption, delivery, and acknowledgement.
 
-Rooms remain on bounded pairwise Olm fanout. The relay can create at most 117
+### Verification
+
+- Rust: 25 core tests and 130 relay tests passed with rustfmt, wasm32 checking,
+  warning-denied workspace Clippy, and locked workspace tests.
+- Web: 229 tests, zero-warning lint, TypeScript compilation, and the production
+  Vite build passed.
+- Android: 179 unit tests, release lint, and debug/release Kotlin compilation
+  passed without packaging an APK or AAB.
+- Reproducible binding generation, artifact/source digests, path-leak scans,
+  shell/Node syntax checks, live relay integration, npm audit, and RustSec audit
+  passed. No package, release, or production deployment was performed.
+
+### Remaining External Limits
+
+Rooms remain bounded pairwise Olm fanout. The relay can create at most 117
 accounts from its distinct invite-code lengths and the core caps fanout at 256;
-replacing pairwise sessions with Megolm would lose Olm post-compromise recovery.
-MLS therefore remains a separate reviewed protocol migration, not part of the
-prekey availability fix.
+replacing pairwise sessions with MLS is a separate protocol migration. Abyssal
+still has no independent cryptographic/application audit, external
+key-transparency witness, multi-device coordination protocol, or persistent
+rollback anchor. These limits remain disclosed in `SECURITY.md`.
 
 ## Completed Deployment: Dependency Update Integration
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountSession, IncomingFrame, NodeEndpoint } from "../domain/types";
-import { bytesToBase64 } from "../security/crypto";
+import { bytesToBase64, IDENTITY_PUBLIC_KEY_BYTES } from "../security/crypto";
 import {
   finishOpaqueAccount,
   RelaySocket,
@@ -11,6 +11,9 @@ import {
   decryptAndCompleteAttachment,
   deleteUploadedAttachment,
   MAX_RELAY_TEXT_BYTES,
+  MAX_PENDING_PREKEY_LEASES,
+  PREKEY_LEASE_TIMEOUT_MS,
+  PrekeyLeaseError,
   uploadEncryptedAttachment,
 } from "./nodeClient";
 
@@ -29,7 +32,7 @@ const session: AccountSession = {
   sessionInactivitySec: 900,
   endpoint,
   created: false,
-  identityPublicKey: new Uint8Array(128),
+  identityPublicKey: new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES),
   identityPrekeyId: "test-prekey",
 };
 const WS_TICKET = bytesToBase64(new Uint8Array(32).fill(7));
@@ -72,7 +75,7 @@ describe("account transport", () => {
       response_b64: "AQID",
       challenge_b64: null,
       node_id: "node-1",
-      identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
+      identity_public_b64: bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7)),
       identity_prekey_id: "test-prekey",
       identity_envelope_b64: "AQID",
       error: null,
@@ -144,7 +147,7 @@ describe("account transport", () => {
     )).rejects.toThrow("Wrong information");
 
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    const canonicalPublic = bytesToBase64(new Uint8Array(128).fill(7));
+    const canonicalPublic = bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7));
     const lastIndex = alphabet.indexOf(canonicalPublic.at(-1)!);
     const nonCanonicalPublic = `${canonicalPublic.slice(0, -1)}${alphabet[(lastIndex & 0x30) | 1]}`;
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
@@ -161,6 +164,26 @@ describe("account transport", () => {
       error: null,
     }), { status: 200 }));
 
+    await expect(finishOpaqueAccount(endpoint, {
+      handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
+      credentialFinalization: new Uint8Array([9]),
+    })).rejects.toThrow("Wrong information");
+  });
+
+  it("fails closed on the retired 128-byte account identity bundle", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      accepted: true,
+      created: false,
+      token: SESSION_TOKEN,
+      node_id: "node-1",
+      username: "Alice",
+      max_rooms_per_user: 3,
+      session_inactivity_sec: 900,
+      identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
+      identity_prekey_id: "test-prekey",
+      identity_envelope_b64: "AQID",
+      error: null,
+    }), { status: 200 }));
     await expect(finishOpaqueAccount(endpoint, {
       handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
       credentialFinalization: new Uint8Array([9]),
@@ -297,7 +320,7 @@ describe("account transport", () => {
       username: "Alice",
       max_rooms_per_user: "3",
       session_inactivity_sec: 900,
-      identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
+      identity_public_b64: bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7)),
       identity_prekey_id: "test-prekey",
       identity_envelope_b64: "AQID",
     }), { status: 200 });
@@ -318,7 +341,7 @@ describe("account transport", () => {
   });
 
   it("finishes OPAQUE and validates returned identity material", async () => {
-    const publicKey = new Uint8Array(128).fill(7);
+    const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       accepted: true,
       created: true,
@@ -830,6 +853,122 @@ describe("account transport", () => {
 });
 
 describe("RelaySocket", () => {
+  it("leases an exact v9 prekey tuple and releases only the unused claim", async () => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
+    try {
+      const pending = relay.requestPrekeyLease("dm_123", "lease-1", "Bob");
+      expect(socket.sent.at(-1)).toBe(JSON.stringify({
+        type: "prekey_lease",
+        chat_id: "dm_123",
+        message_id: "lease-1",
+        recipient_username: "Bob",
+      }));
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "prekey_lease",
+        chat_id: "dm_123",
+        message_id: "lease-1",
+        recipient_username: "Bob",
+        recipient_public_key_b64: bytesToBase64(publicKey),
+        prekey_id: "pool-key-1",
+        // The relay is authoritative for lease TTL; the client must not
+        // reject a server-valid timestamp because of local clock skew.
+        expires_at_ms: 1,
+      }) }));
+      const lease = await pending;
+      expect(lease).toMatchObject({
+        chatId: "dm_123",
+        messageId: "lease-1",
+        recipientUsername: "Bob",
+        prekeyId: "pool-key-1",
+      });
+      expect(lease.recipientPublicKey).toEqual(publicKey);
+      expect(relay.releasePrekeyLease(lease)).toBe(true);
+      expect(socket.sent.at(-1)).toBe(JSON.stringify({
+        type: "prekey_lease_release",
+        chat_id: "dm_123",
+        message_id: "lease-1",
+        recipient_username: "Bob",
+        prekey_id: "pool-key-1",
+      }));
+    } finally {
+      publicKey.fill(0);
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("rejects duplicate, mismatched, malformed, timed-out, and closed lease operations", async () => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
+    vi.useFakeTimers();
+    try {
+      const first = relay.requestPrekeyLease("dm_123", "lease-2", "Bob");
+      await expect(relay.requestPrekeyLease("dm_123", "lease-2", "Bob"))
+        .rejects.toMatchObject({ code: "NOT_SENT" });
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "prekey_lease",
+        chat_id: "dm_123",
+        message_id: "lease-2",
+        recipient_username: "Carol",
+        recipient_public_key_b64: bytesToBase64(publicKey),
+        prekey_id: "pool-key-2",
+        expires_at_ms: Date.now() + 60_000,
+      }) }));
+      await expect(first).rejects.toMatchObject({ code: "CLOSED" });
+      expect(socket.readyState).toBe(3);
+
+      const timeoutContext = await connectRelay();
+      const timeout = timeoutContext.relay.requestPrekeyLease("dm_123", "lease-timeout", "Bob");
+      const timeoutAssertion = expect(timeout).rejects.toMatchObject({ code: "AMBIGUOUS" });
+      await vi.advanceTimersByTimeAsync(PREKEY_LEASE_TIMEOUT_MS);
+      await timeoutAssertion;
+      timeoutContext.relay.close();
+      globalThis.WebSocket = timeoutContext.originalWebSocket;
+    } finally {
+      vi.useRealTimers();
+      publicKey.fill(0);
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("caps pending leases and rejects all pending promises on purge", async () => {
+    const context = await connectRelay(() => undefined, () => undefined);
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      const pending = Array.from({ length: MAX_PENDING_PREKEY_LEASES }, (_, index) =>
+        relay.requestPrekeyLease("dm_123", `lease-${index}`, "Bob"));
+      await expect(relay.requestPrekeyLease("dm_123", "lease-over-cap", "Bob"))
+        .rejects.toMatchObject({ code: "NOT_SENT" });
+      socket.onclose?.({ code: 4001, reason: "purge", wasClean: true } as CloseEvent);
+      await expect(Promise.all(pending)).rejects.toBeInstanceOf(PrekeyLeaseError);
+      await expect(pending[0]).rejects.toMatchObject({ code: "CLOSED" });
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("rejects a pending lease on manual close and clears its timer", async () => {
+    const context = await connectRelay();
+    const { relay, originalWebSocket } = context;
+    vi.useFakeTimers();
+    try {
+      const pending = relay.requestPrekeyLease("dm_123", "lease-close", "Bob");
+      relay.close();
+      await expect(pending).rejects.toMatchObject({ code: "CLOSED" });
+      await vi.advanceTimersByTimeAsync(PREKEY_LEASE_TIMEOUT_MS);
+      await expect(pending).rejects.toMatchObject({ code: "CLOSED" });
+    } finally {
+      vi.useRealTimers();
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
   it("uses a short-lived ticket subprotocol and emits canonical DM commands", async () => {
     const original = globalThis.WebSocket;
     const sockets: FakeWebSocket[] = [];
@@ -873,7 +1012,7 @@ describe("RelaySocket", () => {
       const pendingAck = relay.acknowledge("dm_123", "message_1", "Alice", {
         revision: 2,
         envelope: new Uint8Array([2, 3, 4]),
-        identityPublicKey: new Uint8Array(128).fill(7),
+        identityPublicKey: new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7),
         prekeyId: "test-prekey",
         stateSignature: new Uint8Array(64).fill(8),
       }, ACK_SIGNATURE, "used-prekey");
@@ -886,7 +1025,7 @@ describe("RelaySocket", () => {
           sender_username: "Alice",
           state_revision: 2,
           identity_envelope_b64: "AgME",
-          identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
+          identity_public_b64: bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7)),
           prekey_id: "test-prekey",
           state_signature_b64: bytesToBase64(new Uint8Array(64).fill(8)),
           ack_signature_b64: bytesToBase64(ACK_SIGNATURE),
@@ -1574,8 +1713,10 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
+      const lease = relay.requestPrekeyLease("dm_123", "lease-stale", "Bob");
       first.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
       await expect(pending).resolves.toBe("AMBIGUOUS");
+      await expect(lease).rejects.toMatchObject({ code: "AMBIGUOUS" });
       await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 3_000 });
       const second = sockets[1];
       second.readyState = 1;
@@ -1584,6 +1725,15 @@ describe("RelaySocket", () => {
         type: "ack_result",
         message_id: "ack-stale",
         accepted: true,
+      }) }));
+      first.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "prekey_lease",
+        chat_id: "dm_123",
+        message_id: "lease-stale",
+        recipient_username: "Bob",
+        recipient_public_key_b64: bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7)),
+        prekey_id: "stale-key",
+        expires_at_ms: Date.now() + 60_000,
       }) }));
       expect(frames).toEqual([]);
       relay.close();
@@ -1617,7 +1767,7 @@ function ackState() {
   return {
     revision: 2,
     envelope: new Uint8Array([2, 3, 4]),
-    identityPublicKey: new Uint8Array(128).fill(7),
+    identityPublicKey: new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7),
     prekeyId: "test-prekey",
     stateSignature: new Uint8Array(64).fill(8),
   };

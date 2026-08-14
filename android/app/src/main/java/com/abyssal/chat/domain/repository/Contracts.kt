@@ -12,6 +12,7 @@ import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
@@ -116,6 +117,38 @@ interface IChatTransport {
         payload: EncryptedTransportPayload,
         expectedConnectionGeneration: Long
     ): OutboundSendResult = sendEncryptedPayload(chatId, payload)
+
+    /** Requests one exact recipient-bound protocol-v9 prekey lease. */
+    suspend fun requestPrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String
+    ): PrekeyLease? = null
+
+    /** Requests a lease only while the captured connection generation is live. */
+    suspend fun requestPrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        expectedConnectionGeneration: Long
+    ): PrekeyLease? = requestPrekeyLease(chatId, messageId, recipientUsername)
+
+    /** Releases an acquired but unused lease; relay failures are best effort. */
+    suspend fun releasePrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        prekeyId: String
+    ): Boolean = false
+
+    /** Releases a lease only while the captured connection generation is live. */
+    suspend fun releasePrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        prekeyId: String,
+        expectedConnectionGeneration: Long
+    ): Boolean = releasePrekeyLease(chatId, messageId, recipientUsername, prekeyId)
     suspend fun acknowledgeMessage(
         chatId: String,
         messageId: String,

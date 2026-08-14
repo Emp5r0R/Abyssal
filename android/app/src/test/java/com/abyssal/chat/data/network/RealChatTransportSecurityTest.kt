@@ -8,6 +8,8 @@ import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.PrekeyLease
+import com.abyssal.chat.domain.model.RecipientEnvelope
 import com.abyssal.chat.domain.repository.OutboundSendResult
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
@@ -80,6 +82,117 @@ class RealChatTransportSecurityTest {
         assertFalse(isPurgeClose(PURGE_CLOSE_CODE, "Purge"))
         assertFalse(isPurgeClose(PURGE_CLOSE_CODE, "purge "))
         assertFalse(isPurgeClose(1000, PURGE_CLOSE_REASON))
+    }
+
+    @Test
+    fun prekeyLeaseParserRequiresExactV9TupleCanonicalIdentityAndPositiveLongExpiry() {
+        val publicKey = ByteArray(608) { 7 }
+        val valid = JSONObject()
+            .put("type", "prekey_lease")
+            .put("chat_id", "dm_alice")
+            .put("message_id", "message-1")
+            .put("recipient_username", "Alice")
+            .put("recipient_public_key_b64", encode(publicKey))
+            .put("prekey_id", "prekey-1")
+            // The relay's lease clock is authoritative. This deliberately
+            // looks expired to any current client clock but is valid on-wire.
+            .put("expires_at_ms", 1L)
+
+        val parsed = valid.toPrekeyLease()
+        assertNotNull(parsed)
+        assertEquals("dm_alice", parsed?.chatId)
+        assertEquals("message-1", parsed?.messageId)
+        assertEquals("Alice", parsed?.recipientUsername)
+        assertEquals("prekey-1", parsed?.prekeyId)
+        assertArrayEquals(publicKey, parsed?.recipientPublicKey)
+        parsed?.recipientPublicKey?.fill(0)
+
+        assertNull(valid.put("extra", true).toPrekeyLease())
+        assertNull(valid.put("expires_at_ms", 0L).toPrekeyLease())
+        assertNull(valid.put("expires_at_ms", 1).toPrekeyLease())
+        assertNull(valid.put("recipient_public_key_b64", encode(ByteArray(128))).toPrekeyLease())
+        assertNull(valid.put("prekey_id", "").toPrekeyLease())
+        publicKey.fill(0)
+    }
+
+    @Test
+    fun pendingPrekeyLeaseCompletesOnlyForMatchingTupleAndDrainsOnClose() = runBlocking {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) {
+            transport.requestPrekeyLease("dm_alice", "message-lease", "Alice")
+        }
+        awaitSent(socket, 1)
+        val request = JSONObject(socket.sentTexts.single())
+        assertEquals(
+            setOf("type", "chat_id", "message_id", "recipient_username"),
+            request.keys().asSequence().toSet()
+        )
+        assertEquals("prekey_lease", request.getString("type"))
+
+        val response = JSONObject()
+            .put("type", "prekey_lease")
+            .put("chat_id", "dm_alice")
+            .put("message_id", "message-lease")
+            .put("recipient_username", "Alice")
+            .put("recipient_public_key_b64", encode(ByteArray(608) { 4 }))
+            .put("prekey_id", "prekey-2")
+            .put("expires_at_ms", System.currentTimeMillis() + 5_000L)
+        listener.onMessage(socket, response.put("message_id", "wrong").toString())
+        assertFalse(pending.isCompleted)
+        listener.onMessage(socket, response.put("message_id", "message-lease").toString())
+        val lease = pending.await()
+        assertEquals("prekey-2", lease?.prekeyId)
+        lease?.recipientPublicKey?.fill(0)
+
+        val draining = async(start = CoroutineStart.UNDISPATCHED) {
+            transport.requestPrekeyLease("dm_alice", "message-drain", "Alice")
+        }
+        awaitSent(socket, 2)
+        listener.onClosed(socket, 1000, "bye")
+        assertNull(draining.await())
+    }
+
+    @Test
+    fun completedPrekeyLeaseResultIsWipedWhenCancellationWinsCompletionRace() {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val key = ByteArray(608) { 9 }
+        val result = CompletableDeferred<PrekeyLease?>()
+        result.complete(
+            PrekeyLease(
+                chatId = "dm_alice",
+                messageId = "message-race",
+                recipientUsername = "Alice",
+                recipientPublicKey = key,
+                prekeyId = "prekey-1",
+                expiresAtMs = 1L,
+                connectionGeneration = 1L
+            )
+        )
+
+        val wipe = RealChatTransport::class.java.getDeclaredMethod(
+            "wipeCompletedPrekeyResult",
+            CompletableDeferred::class.java
+        )
+        wipe.isAccessible = true
+        wipe.invoke(transport, result)
+
+        assertArrayEquals(ByteArray(608), key)
+    }
+
+    @Test
+    fun unusedPrekeyLeaseReleaseUsesExactBoundedSchema() = runBlocking {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        installSocket(transport, socket)
+        assertTrue(transport.releasePrekeyLease("dm_alice", "message-1", "Alice", "prekey-1"))
+        val frame = JSONObject(socket.sentTexts.single())
+        assertEquals(
+            setOf("type", "chat_id", "message_id", "recipient_username", "prekey_id"),
+            frame.keys().asSequence().toSet()
+        )
+        assertEquals("prekey_lease_release", frame.getString("type"))
     }
 
     @Test
@@ -926,12 +1039,12 @@ class RealChatTransportSecurityTest {
     @Test
     fun inboundMessageRequiresPinnedStableIdentityAndAllowsPrekeyRotation() {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
-        val stable = ByteArray(128) { index -> if (index < 64) 1 else 2 }
+        val stable = ByteArray(608) { index -> if (index < 64) 1 else 2 }
         val rotated = stable.clone().also { it[100] = 9 }
         val forged = stable.clone().also { it[0] = 7 }
         fun frame(publicKey: ByteArray, username: String = "Alice") = JSONObject()
             .put("type", "message")
-            .put("version", 8)
+            .put("version", 9)
             .put("chat_id", "dm_alice")
             .put("message_id", "message-1")
             .put("nonce_b64", encode(ByteArray(12) { 3 }))
@@ -1010,7 +1123,7 @@ class RealChatTransportSecurityTest {
         fun payload(chatId: String, sender: String) = IncomingTransportPayload(
             chatId = chatId,
             messageId = "message-1",
-            version = 8,
+            version = 9,
             identityPublicKey = ByteArray(1),
             nonce = ByteArray(1),
             ciphertext = ByteArray(1),
@@ -1031,8 +1144,8 @@ class RealChatTransportSecurityTest {
     private fun validAckState() = IdentityStateSnapshot(
         revision = 1u,
         envelope = ByteArray(8) { 1 },
-        identityPublicKey = ByteArray(128) { 2 },
-        prekeyId = "",
+        identityPublicKey = ByteArray(608) { 2 },
+        prekeyId = "prekey-1",
         stateSignature = ByteArray(64) { 3 }
     )
 
@@ -1055,7 +1168,7 @@ class RealChatTransportSecurityTest {
 
     private fun inboundMessageFrame(chatId: String = "dm_alice"): String = JSONObject()
         .put("type", "message")
-        .put("version", 8)
+        .put("version", 9)
         .put("chat_id", chatId)
         .put("message_id", "message-unauthorized")
         .put("nonce_b64", encode(ByteArray(12) { 3 }))
@@ -1063,23 +1176,31 @@ class RealChatTransportSecurityTest {
         .put("signature_b64", encode(ByteArray(64) { 5 }))
         .put("wrapped_key_b64", encode(byteArrayOf(6)))
         .put("sender_username", "Alice")
-        .put("sender_public_key_b64", encode(ByteArray(128) { 1 }))
-        .put("identity_public_b64", encode(ByteArray(128) { 1 }))
+        .put("sender_public_key_b64", encode(ByteArray(608) { 1 }))
+        .put("identity_public_b64", encode(ByteArray(608) { 1 }))
         .put("prekey_id", "")
         .put("is_prekey", false)
         .toString()
 
     private fun outboundPayload(messageId: String): EncryptedTransportPayload =
         EncryptedTransportPayload(
-            version = 8,
+            version = 9,
             messageId = messageId,
             nonce = ByteArray(12) { 1 },
             ciphertext = byteArrayOf(2),
-            envelopes = emptyList(),
+            envelopes = listOf(
+                RecipientEnvelope(
+                    recipientUsername = "Alice",
+                    wrappedKey = byteArrayOf(7),
+                    prekeyId = "",
+                    isPrekey = false,
+                    signature = ByteArray(64) { 8 }
+                )
+            ),
             stateRevision = 1u,
             identityEnvelope = ByteArray(8) { 3 },
-            identityPublicKey = ByteArray(128) { 4 },
-            prekeyId = "",
+            identityPublicKey = ByteArray(608) { 4 },
+            prekeyId = "prekey-1",
             stateSignature = ByteArray(64) { 5 }
         )
 
@@ -1165,7 +1286,7 @@ class RealChatTransportSecurityTest {
     private fun presence(username: String): JSONObject = JSONObject()
         .put("username", username)
         .put("connected", true)
-        .put("identity_public_b64", encode(ByteArray(128) { 1 }))
+        .put("identity_public_b64", encode(ByteArray(608) { 1 }))
         .put("identity_prekey_id", "prekey-1")
         .put("directory_digest", encode(ByteArray(32) { 2 }))
 

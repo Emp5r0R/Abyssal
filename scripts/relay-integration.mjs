@@ -27,11 +27,13 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const RESULT_TIMEOUT_MS = 5_000;
 const MAX_PENDING_RESULT_WAITERS = 256;
+const IDENTITY_PUBLIC_BYTES_V9 = 64 + (16 * 32) + 32;
 
 const encode = (value) => Buffer.from(value).toString("base64url");
 const decode = (value) => new Uint8Array(Buffer.from(value, "base64url"));
 
 const pendingResultWaiters = new Map();
+const releasedPrekeysAwaitingReuse = new Map();
 
 class AmbiguousRelayResult extends Error {}
 
@@ -236,6 +238,7 @@ async function register(code, password) {
     identity = WasmE2eeSession.create(exportKey);
     context = encoder.encode(`ABYSSAL_IDENTITY_V2:${start.node_id}:${code.toUpperCase()}`);
     identityPublic = identity.publicKey();
+    assert.equal(identityPublic.byteLength, IDENTITY_PUBLIC_BYTES_V9);
     const identityPrekeyId = identity.prekeyId();
     identityEnvelope = identity.sealIdentity(exportKey, context);
     identityProof = identity.signRegistrationIdentityProof(
@@ -390,10 +393,68 @@ function expectWebSocketRejected(protocols) {
   });
 }
 
-function stageEncryptedFrame(sender, recipient, chatId, text) {
-  const messageId = randomUUID();
+async function requestPrekeyLease(socket, chatId, messageId, recipientUsername) {
+  const response = waitForFrame(
+    socket,
+    (frame) => frame.type === "prekey_lease" &&
+      frame.chat_id === chatId &&
+      frame.message_id === messageId &&
+      frame.recipient_username === recipientUsername,
+  );
+  socket.send(JSON.stringify({
+    type: "prekey_lease",
+    chat_id: chatId,
+    message_id: messageId,
+    recipient_username: recipientUsername,
+  }));
+  const lease = await response;
+  assert.deepEqual(Object.keys(lease).sort(), [
+    "chat_id",
+    "expires_at_ms",
+    "message_id",
+    "prekey_id",
+    "recipient_public_key_b64",
+    "recipient_username",
+    "type",
+  ]);
+  assert.match(lease.prekey_id, /^[A-Za-z0-9_-]{1,32}$/);
+  assert.ok(Number.isSafeInteger(lease.expires_at_ms));
+  assert.ok(lease.expires_at_ms > Date.now());
+  const releaseKey = `${chatId}:${recipientUsername}`;
+  const expectedReleasedPrekey = releasedPrekeysAwaitingReuse.get(releaseKey);
+  if (expectedReleasedPrekey !== undefined) {
+    assert.equal(lease.prekey_id, expectedReleasedPrekey);
+    releasedPrekeysAwaitingReuse.delete(releaseKey);
+  }
+  const recipientPublic = decode(lease.recipient_public_key_b64);
+  assert.equal(recipientPublic.byteLength, IDENTITY_PUBLIC_BYTES_V9);
+  return { ...lease, recipientPublic };
+}
+
+function releaseUnusedPrekeyLease(socket, lease) {
+  socket.send(JSON.stringify({
+    type: "prekey_lease_release",
+    chat_id: lease.chat_id,
+    message_id: lease.message_id,
+    recipient_username: lease.recipient_username,
+    prekey_id: lease.prekey_id,
+  }));
+  releasedPrekeysAwaitingReuse.set(
+    `${lease.chat_id}:${lease.recipient_username}`,
+    lease.prekey_id,
+  );
+}
+
+function stageEncryptedFrame(
+  sender,
+  recipient,
+  chatId,
+  messageId,
+  text,
+  recipientPublic,
+  recipientPrekeyId,
+) {
   const plaintext = encoder.encode(text);
-  const recipientPublic = recipient.identity.publicKey();
   let payload;
   try {
     payload = JSON.parse(sender.identity.encrypt(
@@ -404,7 +465,7 @@ function stageEncryptedFrame(sender, recipient, chatId, text) {
       JSON.stringify([{
         username: recipient.username,
         public_key: [...recipientPublic],
-        prekey_id: recipient.identity.prekeyId(),
+        prekey_id: recipientPrekeyId,
       }]),
     ));
   } finally {
@@ -452,9 +513,43 @@ function stageEncryptedFrame(sender, recipient, chatId, text) {
 }
 
 async function sendEncryptedMessage(sender, recipient, socket, chatId, text, mutate = undefined) {
-  const staged = stageEncryptedFrame(sender, recipient, chatId, text);
+  const messageId = randomUUID();
+  const requiresPrekey = sender.identity.requiresPrekey(recipient.username);
+  let lease;
+  let recipientPublic;
+  let recipientPrekeyId;
+  if (requiresPrekey) {
+    lease = await requestPrekeyLease(socket, chatId, messageId, recipient.username);
+    recipientPublic = lease.recipientPublic;
+    recipientPrekeyId = lease.prekey_id;
+    const expectedRecipientPublic = recipient.identity.publicKey();
+    try {
+      assert.deepEqual(recipientPublic, expectedRecipientPublic);
+    } finally {
+      expectedRecipientPublic.fill(0);
+    }
+  } else {
+    recipientPublic = recipient.identity.publicKey();
+    recipientPrekeyId = recipient.identity.prekeyId();
+  }
+  let staged;
   let waiter;
   try {
+    staged = stageEncryptedFrame(
+      sender,
+      recipient,
+      chatId,
+      messageId,
+      text,
+      recipientPublic,
+      recipientPrekeyId,
+    );
+    assert.equal(staged.frame.envelopes.length, 1);
+    assert.equal(staged.frame.envelopes[0].is_prekey, requiresPrekey);
+    assert.equal(
+      staged.frame.envelopes[0].prekey_id,
+      requiresPrekey ? lease.prekey_id : "",
+    );
     const serialized = JSON.stringify(staged.frame);
     assert.equal(serialized.includes(text), false);
     if (mutate) mutate(staged.frame);
@@ -473,12 +568,18 @@ async function sendEncryptedMessage(sender, recipient, socket, chatId, text, mut
       sender.identity.commitOutbound(staged.messageId, BigInt(staged.stateRevision));
     } else if (outcome === "REJECTED" || outcome === "NOT_SENT") {
       sender.identity.rollbackOutbound(staged.messageId, BigInt(staged.stateRevision));
+      if (lease) releaseUnusedPrekeyLease(socket, lease);
     } else {
       throw new AmbiguousRelayResult(`unexpected message result ${outcome}`);
     }
     return outcome;
+  } catch (error) {
+    if (lease && !staged) releaseUnusedPrekeyLease(socket, lease);
+    throw error;
   } finally {
-    staged.wipe();
+    recipientPublic.fill(0);
+    lease?.recipientPublic?.fill?.(0);
+    staged?.wipe();
   }
 }
 
@@ -835,5 +936,7 @@ try {
   alice.identity.free();
   bob.identity.free();
 }
+
+assert.equal(releasedPrekeysAwaitingReuse.size, 0);
 
 console.log("relay integration passed: OPAQUE auth, E2EE DM, offline replay, and access control");

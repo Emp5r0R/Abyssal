@@ -12,6 +12,7 @@ export class WasmE2eeSession {
     prekeyId(): string;
     publicKey(): Uint8Array;
     static recover(export_key: Uint8Array, context: Uint8Array, envelope: Uint8Array, expected_public_key: Uint8Array): WasmE2eeSession;
+    requiresPrekey(peer: string): boolean;
     rollbackOutbound(message_id: string, revision: bigint): void;
     sealIdentity(export_key: Uint8Array, context: Uint8Array): Uint8Array;
     signAcknowledgement(chat_id: string, message_id: string, original_sender_username: string, used_prekey_id: string): Uint8Array;
@@ -83,6 +84,7 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_checksum_method_e2eesession_encrypt: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_prekey_id: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_public_key: () => number;
+    readonly uniffi_abyssal_core_checksum_method_e2eesession_requires_prekey: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_rollback_outbound: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_seal_identity: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_sign_acknowledgement: () => number;
@@ -102,6 +104,7 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_method_e2eesession_encrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_prekey_id: (a: number, b: bigint, c: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_public_key: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_e2eesession_requires_prekey: (a: bigint, b: number, c: number) => number;
     readonly uniffi_abyssal_core_fn_method_e2eesession_rollback_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_seal_identity: (a: number, b: bigint, c: number, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_sign_acknowledgement: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number) => void;
@@ -113,6 +116,7 @@ export interface InitOutput {
     readonly wasme2eesession_prekeyId: (a: number) => [number, number];
     readonly wasme2eesession_publicKey: (a: number) => [number, number];
     readonly wasme2eesession_recover: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+    readonly wasme2eesession_requiresPrekey: (a: number, b: number, c: number) => [number, number, number];
     readonly wasme2eesession_rollbackOutbound: (a: number, b: number, c: number, d: bigint) => [number, number];
     readonly wasme2eesession_sealIdentity: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly wasme2eesession_signAcknowledgement: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => [number, number, number, number];

@@ -68,8 +68,8 @@ for abi in arm64-v8a armeabi-v7a x86 x86_64; do
     printf 'Missing native crypto library for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
     exit 1
   }
-  grep -aFq 'ABYSSAL_E2EE_PAYLOAD_V8' "$NATIVE_LIBRARY" || {
-    printf 'Native crypto library is not protocol v8 for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
+  grep -aFq 'ABYSSAL_E2EE_PAYLOAD_V9' "$NATIVE_LIBRARY" || {
+    printf 'Native crypto library is not protocol v9 for %s: %s\n' "$abi" "$NATIVE_LIBRARY" >&2
     exit 1
   }
 done

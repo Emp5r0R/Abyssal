@@ -16,9 +16,11 @@ use std::{
 use abyssal_core::secure_protocol::{
     opaque_server_finish_login, opaque_server_finish_registration,
     opaque_server_registration_response, opaque_server_setup, opaque_server_start_login,
+    prekey_ids_from_identity_public_v9,
     validate_identity_public_bundle as validate_core_identity_public_bundle,
-    verify_ack_signature_v8, verify_identity_state_signature_v8, verify_message_signature_v8,
-    verify_registration_identity_proof_v8, REGISTRATION_CHALLENGE_BYTES_V8,
+    verify_ack_signature_v9, verify_identity_state_signature_v9, verify_message_signature_v9,
+    verify_registration_identity_proof_v9, IDENTITY_PUBLIC_BYTES_V9, PREKEY_POOL_SIZE_V9,
+    REGISTRATION_CHALLENGE_BYTES_V9,
 };
 use axum::{
     body::{Body, Bytes},
@@ -106,19 +108,22 @@ const MAX_OPAQUE_HANDSHAKES: usize = 1_024;
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
 const ONE_TIME_KEY_BYTES: usize = 32;
 const ONE_TIME_KEY_OFFSET: usize = IDENTITY_FINGERPRINT_BYTES;
-const FALLBACK_KEY_OFFSET: usize = ONE_TIME_KEY_OFFSET + ONE_TIME_KEY_BYTES;
+const FALLBACK_KEY_OFFSET: usize = ONE_TIME_KEY_OFFSET + (PREKEY_POOL_SIZE_V9 * ONE_TIME_KEY_BYTES);
 const IDENTITY_PUBLIC_BYTES: usize = FALLBACK_KEY_OFFSET + 32;
+const _: () = assert!(IDENTITY_PUBLIC_BYTES == IDENTITY_PUBLIC_BYTES_V9);
 const MAX_IDENTITY_ENVELOPE_BYTES: usize = 512 * 1024;
 const MESSAGE_NONCE_BYTES: usize = 12;
 const MESSAGE_SIGNATURE_BYTES: usize = 64;
 const MAX_WRAPPED_KEY_BYTES: usize = 4096;
-const E2EE_PROTOCOL_VERSION: u32 = 8;
+const E2EE_PROTOCOL_VERSION: u32 = 9;
 const MAX_STATE_REVISION_ADVANCE: u64 = 1_024;
-const IDENTITY_ENVELOPE_VERSION: u8 = 4;
+const IDENTITY_ENVELOPE_VERSION: u8 = 5;
 const REPLAY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_REPLAY_IDS: usize = 50_000;
 const MAX_REPLAY_IDS_PER_SENDER: usize = 2_048;
-const PREKEY_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
+const PREKEY_LEASE_TTL_MS: u64 = 30_000;
+const MAX_PREKEY_LEASES: usize = 4_096;
+const MAX_PREKEY_LEASES_PER_RECIPIENT: usize = PREKEY_POOL_SIZE_V9;
 const ATTACHMENT_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_PREKEY_ID_BYTES: usize = 32;
 const DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB: usize = 320;
@@ -186,7 +191,7 @@ struct AppState {
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
     login_limits: Arc<Mutex<HashMap<CodeId, RateState>>>,
     replay_ids: Arc<Mutex<HashMap<ReplayKey, u64>>>,
-    prekey_claims: Arc<Mutex<HashMap<PrekeyClaimKey, PrekeyClaim>>>,
+    prekey_leases: Arc<Mutex<HashMap<PrekeyLeaseKey, PrekeyLease>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     room_catalog: Arc<Mutex<HashMap<String, RoomEntry>>>,
     direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
@@ -357,12 +362,12 @@ impl Drop for ReplayKey {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-struct PrekeyClaimKey {
+struct PrekeyLeaseKey {
     code_id: CodeId,
     prekey_id: String,
 }
 
-struct PrekeyClaim {
+struct PrekeyLease {
     chat_id: String,
     message_id: String,
     sender_username: String,
@@ -370,14 +375,14 @@ struct PrekeyClaim {
     created_at_ms: u64,
 }
 
-impl Drop for PrekeyClaimKey {
+impl Drop for PrekeyLeaseKey {
     fn drop(&mut self) {
         self.code_id.zeroize();
         self.prekey_id.zeroize();
     }
 }
 
-impl Drop for PrekeyClaim {
+impl Drop for PrekeyLease {
     fn drop(&mut self) {
         self.chat_id.zeroize();
         self.message_id.zeroize();
@@ -627,6 +632,19 @@ struct HealthResponse {
 enum InboundFrame {
     #[serde(rename = "activity")]
     Activity,
+    #[serde(rename = "prekey_lease")]
+    PrekeyLease {
+        chat_id: String,
+        message_id: String,
+        recipient_username: String,
+    },
+    #[serde(rename = "prekey_lease_release")]
+    PrekeyLeaseRelease {
+        chat_id: String,
+        message_id: String,
+        recipient_username: String,
+        prekey_id: String,
+    },
     #[serde(rename = "join")]
     Join { chat_id: String },
     #[serde(rename = "leave")]
@@ -718,6 +736,15 @@ enum OutboundFrame {
         sender_public_key_b64: String,
         identity_public_b64: String,
     },
+    #[serde(rename = "prekey_lease")]
+    PrekeyLease {
+        chat_id: String,
+        message_id: String,
+        recipient_username: String,
+        recipient_public_key_b64: String,
+        prekey_id: String,
+        expires_at_ms: u64,
+    },
     #[serde(rename = "presence")]
     Presence { users: Vec<PresenceUser> },
     #[serde(rename = "GLOBAL_WIPE")]
@@ -762,6 +789,21 @@ impl OutboundFrame {
             sender_username.zeroize();
             sender_public_key_b64.zeroize();
             identity_public_b64.zeroize();
+        }
+        if let Self::PrekeyLease {
+            chat_id,
+            message_id,
+            recipient_username,
+            recipient_public_key_b64,
+            prekey_id,
+            ..
+        } = self
+        {
+            chat_id.zeroize();
+            message_id.zeroize();
+            recipient_username.zeroize();
+            recipient_public_key_b64.zeroize();
+            prekey_id.zeroize();
         }
         if let Self::MessageResult { message_id, .. } | Self::AckResult { message_id, .. } = self {
             message_id.zeroize();
@@ -1045,7 +1087,7 @@ impl AppState {
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
-            prekey_claims: Arc::new(Mutex::new(HashMap::new())),
+            prekey_leases: Arc::new(Mutex::new(HashMap::new())),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
@@ -1595,7 +1637,7 @@ async fn session_sweeper(state: AppState) {
 async fn prune_pending_queues(state: &AppState, now: u64) {
     let mut pending = state.pending.lock().await;
     let mut pending_bytes = state.pending_bytes.lock().await;
-    let mut claims = state.prekey_claims.lock().await;
+    let mut claims = state.prekey_leases.lock().await;
     let removed = prune_pending_queues_locked(
         &mut pending,
         &mut pending_bytes,
@@ -1614,7 +1656,7 @@ async fn prune_pending_queues(state: &AppState, now: u64) {
 fn prune_pending_queues_locked(
     pending: &mut HashMap<PendingKey, Vec<PendingFrame>>,
     pending_bytes: &mut usize,
-    claims: &mut HashMap<PrekeyClaimKey, PrekeyClaim>,
+    claims: &mut HashMap<PrekeyLeaseKey, PrekeyLease>,
     now: u64,
     pending_message_ttl_ms: u64,
 ) -> usize {
@@ -1626,7 +1668,7 @@ fn prune_pending_queues_locked(
             if now.saturating_sub(pending_frame.enqueued_at_ms) >= pending_message_ttl_ms {
                 *pending_bytes =
                     (*pending_bytes).saturating_sub(outbound_frame_bytes(&pending_frame.frame));
-                if let Some(details) = prekey_claim_details(&pending_frame.frame) {
+                if let Some(details) = prekey_lease_details(&pending_frame.frame) {
                     expired_claims.push(details);
                 }
                 pending_frame.zeroize_sensitive();
@@ -1640,14 +1682,14 @@ fn prune_pending_queues_locked(
     pending.retain(|_, queue| !queue.is_empty());
 
     for mut details in expired_claims {
-        release_prekey_claim_details_locked(claims, &mut details);
+        release_prekey_lease_details_locked(claims, &mut details);
     }
-    prune_prekey_claims(claims, pending, now);
+    prune_prekey_leases(claims, pending, now);
     removed
 }
 
-fn release_prekey_claim_details_locked(
-    claims: &mut HashMap<PrekeyClaimKey, PrekeyClaim>,
+fn release_prekey_lease_details_locked(
+    claims: &mut HashMap<PrekeyLeaseKey, PrekeyLease>,
     details: &mut (String, String, String, String),
 ) {
     let (chat_id, message_id, sender_username, prekey_id) = details;
@@ -1663,10 +1705,10 @@ fn release_prekey_claim_details_locked(
     prekey_id.zeroize();
 }
 
-fn pending_contains_prekey_frame(
+fn pending_contains_leased_frame(
     pending: &HashMap<PendingKey, Vec<PendingFrame>>,
-    key: &PrekeyClaimKey,
-    claim: &PrekeyClaim,
+    key: &PrekeyLeaseKey,
+    claim: &PrekeyLease,
 ) -> bool {
     pending.iter().any(|(pending_key, frames)| {
         pending_key.recipient_username == claim.recipient_username
@@ -1689,14 +1731,14 @@ fn pending_contains_prekey_frame(
     })
 }
 
-fn prune_prekey_claims(
-    claims: &mut HashMap<PrekeyClaimKey, PrekeyClaim>,
+fn prune_prekey_leases(
+    claims: &mut HashMap<PrekeyLeaseKey, PrekeyLease>,
     pending: &HashMap<PendingKey, Vec<PendingFrame>>,
     now: u64,
 ) {
     claims.retain(|key, claim| {
-        now.saturating_sub(claim.created_at_ms) < PREKEY_CLAIM_TTL_MS
-            || pending_contains_prekey_frame(pending, key, claim)
+        now.saturating_sub(claim.created_at_ms) < PREKEY_LEASE_TTL_MS
+            || pending_contains_leased_frame(pending, key, claim)
     });
 }
 
@@ -2450,7 +2492,7 @@ async fn start_opaque_account(
         Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
     };
     let response = Zeroizing::new(response);
-    let mut challenge = Zeroizing::new(vec![0_u8; REGISTRATION_CHALLENGE_BYTES_V8]);
+    let mut challenge = Zeroizing::new(vec![0_u8; REGISTRATION_CHALLENGE_BYTES_V9]);
     OsRng.fill_bytes(&mut challenge);
     if !store_opaque_handshake(
         &state,
@@ -2571,7 +2613,7 @@ async fn finish_opaque_account(
                     return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await
                 }
             };
-            if verify_registration_identity_proof_v8(
+            if verify_registration_identity_proof_v9(
                 &state.node_id,
                 &request.handshake_id.to_string(),
                 challenge,
@@ -2760,8 +2802,18 @@ fn valid_prekey_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+fn valid_username(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_USERNAME_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 fn valid_identity_public_bundle(public_key: &[u8], prekey_id: &str) -> bool {
     validate_core_identity_public_bundle(public_key, Some(prekey_id)).is_ok()
+        && prekey_ids_from_identity_public_v9(public_key)
+            .is_ok_and(|pool| pool.first().is_some_and(|first| first == prekey_id))
 }
 
 async fn replace_connected_clients_for_code(state: &AppState, code_id: &CodeId) {
@@ -3724,6 +3776,37 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             touch_activity(state).await;
             Ok(())
         }
+        InboundFrame::PrekeyLease {
+            chat_id,
+            message_id,
+            recipient_username,
+        } => {
+            let lease =
+                lease_prekey(state, sender_id, &chat_id, &message_id, &recipient_username).await?;
+            send_to_client(state, sender_id, &lease).await;
+            touch_activity(state).await;
+            Ok(())
+        }
+        InboundFrame::PrekeyLeaseRelease {
+            chat_id,
+            message_id,
+            recipient_username,
+            prekey_id,
+        } => {
+            touch_activity_on_success(
+                state,
+                release_unused_prekey_lease(
+                    state,
+                    sender_id,
+                    &chat_id,
+                    &message_id,
+                    &recipient_username,
+                    &prekey_id,
+                )
+                .await,
+            )
+            .await
+        }
         InboundFrame::Dummy { padding_b64, bytes } => {
             let _discarded_hint =
                 padding_b64.as_deref().map(str::len).unwrap_or(0) + bytes.unwrap_or_default();
@@ -3847,6 +3930,166 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 .await
         }
     }
+}
+
+async fn lease_prekey(
+    state: &AppState,
+    sender_id: Uuid,
+    chat_id: &str,
+    message_id: &str,
+    recipient_username: &str,
+) -> Result<OutboundFrame, String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    if !valid_chat_id(chat_id) || !valid_chat_id(message_id) || !valid_username(recipient_username)
+    {
+        return Err("prekey lease rejected".to_string());
+    }
+    let (_, sender_username) = client_identity(state, sender_id).await?;
+    if sender_username == recipient_username {
+        return Err("prekey lease rejected".to_string());
+    }
+    let access = conversation_access(state, &sender_username, chat_id)
+        .await
+        .ok_or_else(|| "conversation unavailable".to_string())?;
+    let authorized = match access {
+        ConversationAccess::Direct => state
+            .direct_catalog
+            .lock()
+            .await
+            .get(chat_id)
+            .and_then(|direct| direct.peer_for(&sender_username))
+            .is_some_and(|peer| peer == recipient_username),
+        ConversationAccess::Room(_) => state
+            .accounts
+            .lock()
+            .await
+            .values()
+            .any(|account| account.username == recipient_username),
+    };
+    if !authorized {
+        return Err("prekey lease rejected".to_string());
+    }
+
+    prune_pending_queues(state, now_ms()).await;
+    let accounts = state.accounts.lock().await;
+    let (recipient_code_id, recipient) = accounts
+        .iter()
+        .find(|(_, account)| account.username == recipient_username)
+        .ok_or_else(|| "recipient unavailable".to_string())?;
+    let pool = prekey_ids_from_identity_public_v9(&recipient.identity_public)
+        .map_err(|_| "recipient unavailable".to_string())?;
+    let recipient_public_key_b64 = URL_SAFE_NO_PAD.encode(&recipient.identity_public);
+    let recipient_code_id = *recipient_code_id;
+    let now = now_ms();
+    let pending = state.pending.lock().await;
+    let mut leases = state.prekey_leases.lock().await;
+    prune_prekey_leases(&mut leases, &pending, now);
+
+    let mut matching = leases.iter().filter(|(key, lease)| {
+        key.code_id == recipient_code_id
+            && lease.chat_id == chat_id
+            && lease.message_id == message_id
+            && lease.sender_username == sender_username
+            && lease.recipient_username == recipient_username
+    });
+    if let Some((key, lease)) = matching.next() {
+        if matching.next().is_some() {
+            return Err("prekey lease rejected".to_string());
+        }
+        return Ok(OutboundFrame::PrekeyLease {
+            chat_id: chat_id.to_string(),
+            message_id: message_id.to_string(),
+            recipient_username: recipient_username.to_string(),
+            recipient_public_key_b64,
+            prekey_id: key.prekey_id.clone(),
+            expires_at_ms: lease.created_at_ms.saturating_add(PREKEY_LEASE_TTL_MS),
+        });
+    }
+    if leases.len() >= MAX_PREKEY_LEASES
+        || leases
+            .keys()
+            .filter(|key| key.code_id == recipient_code_id)
+            .count()
+            >= MAX_PREKEY_LEASES_PER_RECIPIENT
+    {
+        return Err("prekey lease capacity full".to_string());
+    }
+    let prekey_id = pool
+        .into_iter()
+        .find(|id| {
+            !leases.contains_key(&PrekeyLeaseKey {
+                code_id: recipient_code_id,
+                prekey_id: id.clone(),
+            })
+        })
+        .ok_or_else(|| "recipient prekey unavailable".to_string())?;
+    leases.insert(
+        PrekeyLeaseKey {
+            code_id: recipient_code_id,
+            prekey_id: prekey_id.clone(),
+        },
+        PrekeyLease {
+            chat_id: chat_id.to_string(),
+            message_id: message_id.to_string(),
+            sender_username,
+            recipient_username: recipient_username.to_string(),
+            created_at_ms: now,
+        },
+    );
+    Ok(OutboundFrame::PrekeyLease {
+        chat_id: chat_id.to_string(),
+        message_id: message_id.to_string(),
+        recipient_username: recipient_username.to_string(),
+        recipient_public_key_b64,
+        prekey_id,
+        expires_at_ms: now.saturating_add(PREKEY_LEASE_TTL_MS),
+    })
+}
+
+async fn release_unused_prekey_lease(
+    state: &AppState,
+    sender_id: Uuid,
+    chat_id: &str,
+    message_id: &str,
+    recipient_username: &str,
+    prekey_id: &str,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    if !valid_chat_id(chat_id)
+        || !valid_chat_id(message_id)
+        || !valid_username(recipient_username)
+        || !valid_prekey_id(prekey_id)
+        || prekey_id.is_empty()
+    {
+        return Err("prekey lease release rejected".to_string());
+    }
+    let (_, sender_username) = client_identity(state, sender_id).await?;
+    let recipient_code_id = state
+        .accounts
+        .lock()
+        .await
+        .iter()
+        .find_map(|(code_id, account)| (account.username == recipient_username).then_some(*code_id))
+        .ok_or_else(|| "prekey lease release rejected".to_string())?;
+    let key = PrekeyLeaseKey {
+        code_id: recipient_code_id,
+        prekey_id: prekey_id.to_string(),
+    };
+    let pending = state.pending.lock().await;
+    let mut leases = state.prekey_leases.lock().await;
+    let lease = leases
+        .get(&key)
+        .ok_or_else(|| "prekey lease release rejected".to_string())?;
+    if lease.chat_id != chat_id
+        || lease.message_id != message_id
+        || lease.sender_username != sender_username
+        || lease.recipient_username != recipient_username
+        || pending_contains_leased_frame(&pending, &key, lease)
+    {
+        return Err("prekey lease release rejected".to_string());
+    }
+    leases.remove(&key);
+    Ok(())
 }
 
 async fn touch_activity_on_success(
@@ -4003,7 +4246,7 @@ async fn route_encrypted_message(
             &envelope.signature_b64,
             MESSAGE_SIGNATURE_BYTES,
         )?);
-        verify_message_signature_v8(
+        verify_message_signature_v9(
             version,
             &chat_id,
             &message_id,
@@ -4062,10 +4305,7 @@ async fn route_encrypted_message(
         }
         prepared_frames.push((recipient_username.clone(), frame));
     }
-    let mut pending_plan = preflight_pending_frames(state, &prepared_frames).await?;
-    commit_pending_frames(state, &prepared_frames, &mut pending_plan).await?;
-
-    if let Err(error) = claim_prekeys(
+    admit_prekey_leases(
         state,
         &expected_recipients,
         &envelope_map,
@@ -4073,13 +4313,10 @@ async fn route_encrypted_message(
         &message_id,
         &sender_username,
     )
-    .await
-    {
-        rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
-        return Err(error);
-    }
+    .await?;
+    let mut pending_plan = preflight_pending_frames(state, &prepared_frames).await?;
+    commit_pending_frames(state, &prepared_frames, &mut pending_plan).await?;
     if let Err(error) = register_message_id(state, &chat_id, &sender_username, &message_id).await {
-        release_prekey_claims(state, &chat_id, &message_id, &sender_username).await;
         rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
         return Err(error);
     }
@@ -4096,7 +4333,6 @@ async fn route_encrypted_message(
     .await
     {
         unregister_message_id(state, &chat_id, &sender_username, &message_id).await;
-        release_prekey_claims(state, &chat_id, &message_id, &sender_username).await;
         rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
         return Err(error);
     }
@@ -4173,7 +4409,7 @@ async fn unregister_message_id(
     });
 }
 
-async fn claim_prekeys(
+async fn admit_prekey_leases(
     state: &AppState,
     expected_recipients: &HashSet<String>,
     envelopes: &HashMap<String, InboundRecipientEnvelope>,
@@ -4181,16 +4417,19 @@ async fn claim_prekeys(
     message_id: &str,
     sender_username: &str,
 ) -> Result<(), String> {
-    // The caller holds conversation_ops. Prune frames and claims before
-    // deciding whether an advertised one-time prekey is still reserved.
+    // The caller holds conversation_ops. Admission only verifies leases that
+    // were created before encryption; it never chooses or reserves a key.
     prune_pending_queues(state, now_ms()).await;
     let accounts = state.accounts.lock().await;
-    let mut claims_to_add = Vec::new();
+    let pending = state.pending.lock().await;
+    let mut leases = state.prekey_leases.lock().await;
+    let now = now_ms();
+    prune_prekey_leases(&mut leases, &pending, now);
     for username in expected_recipients {
         let Some(envelope) = envelopes.get(username) else {
             return Err("recipient envelope rejected".to_string());
         };
-        if !envelope.is_prekey || envelope.prekey_id.is_empty() {
+        if !envelope.is_prekey {
             continue;
         }
         let Some((code_id, account)) = accounts
@@ -4199,59 +4438,37 @@ async fn claim_prekeys(
         else {
             return Err("recipient envelope rejected".to_string());
         };
-        if account.prekey_id != envelope.prekey_id {
+        let pool = prekey_ids_from_identity_public_v9(&account.identity_public)
+            .map_err(|_| "recipient prekey unavailable".to_string())?;
+        if !pool.iter().any(|id| id == &envelope.prekey_id) {
             return Err("recipient prekey unavailable".to_string());
         }
-        claims_to_add.push((
-            PrekeyClaimKey {
-                code_id: *code_id,
-                prekey_id: envelope.prekey_id.clone(),
-            },
-            PrekeyClaim {
-                chat_id: chat_id.to_string(),
-                message_id: message_id.to_string(),
-                sender_username: sender_username.to_string(),
-                recipient_username: username.clone(),
-                created_at_ms: now_ms(),
-            },
-        ));
-    }
-    drop(accounts);
-
-    let now = now_ms();
-    let pending = state.pending.lock().await;
-    let mut claims = state.prekey_claims.lock().await;
-    prune_prekey_claims(&mut claims, &pending, now);
-    drop(pending);
-    if claims_to_add
-        .iter()
-        .any(|(key, _)| claims.contains_key(key))
-    {
-        return Err("recipient prekey unavailable".to_string());
-    }
-    for (key, claim) in claims_to_add {
-        claims.insert(key, claim);
+        let key = PrekeyLeaseKey {
+            code_id: *code_id,
+            prekey_id: envelope.prekey_id.clone(),
+        };
+        let lease = leases
+            .get(&key)
+            .ok_or_else(|| "recipient prekey lease required".to_string())?;
+        if lease.chat_id != chat_id
+            || lease.message_id != message_id
+            || lease.sender_username != sender_username
+            || lease.recipient_username != *username
+        {
+            return Err("recipient prekey lease rejected".to_string());
+        }
     }
     Ok(())
 }
 
-async fn release_prekey_claims(
-    state: &AppState,
-    chat_id: &str,
-    message_id: &str,
-    sender_username: &str,
-) {
-    release_prekey_claim(state, chat_id, message_id, sender_username, None).await;
-}
-
-async fn release_prekey_claim(
+async fn release_prekey_lease(
     state: &AppState,
     chat_id: &str,
     message_id: &str,
     sender_username: &str,
     prekey_id: Option<&str>,
 ) {
-    state.prekey_claims.lock().await.retain(|key, claim| {
+    state.prekey_leases.lock().await.retain(|key, claim| {
         !(claim.chat_id == chat_id
             && claim.message_id == message_id
             && claim.sender_username == sender_username
@@ -4270,7 +4487,7 @@ fn is_prekey_frame(frame: &OutboundFrame) -> bool {
     )
 }
 
-fn prekey_claim_details(frame: &OutboundFrame) -> Option<(String, String, String, String)> {
+fn prekey_lease_details(frame: &OutboundFrame) -> Option<(String, String, String, String)> {
     match frame {
         OutboundFrame::Message {
             chat_id,
@@ -4335,7 +4552,7 @@ async fn preflight_pending_frames(
     frames: &[(String, OutboundFrame)],
 ) -> Result<Vec<PendingQueuePlan>, String> {
     // The caller holds conversation_ops. Prune before taking the snapshot so
-    // expired frames and their prekey claims cannot consume admission budget.
+    // expired frames and their prekey leases cannot consume admission budget.
     let transient_fanout_bytes = frames
         .iter()
         .try_fold(0usize, |total, (recipient, frame)| {
@@ -4598,6 +4815,31 @@ fn apply_identity_state_locked(
     state_signature_b64: &str,
     allow_reuse: bool,
 ) -> Result<(), String> {
+    apply_identity_state_locked_with_consumed(
+        accounts,
+        code_id,
+        revision,
+        envelope_b64,
+        identity_public_b64,
+        prekey_id,
+        state_signature_b64,
+        allow_reuse,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_identity_state_locked_with_consumed(
+    accounts: &mut HashMap<CodeId, Account>,
+    code_id: &CodeId,
+    revision: u64,
+    envelope_b64: &str,
+    identity_public_b64: &str,
+    prekey_id: &str,
+    state_signature_b64: &str,
+    allow_reuse: bool,
+    consumed_prekey_id: Option<&str>,
+) -> Result<(), String> {
     let mut envelope = decode_bounded(envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
     let mut identity_public = decode_exact(identity_public_b64, IDENTITY_PUBLIC_BYTES)?;
     let state_signature =
@@ -4623,7 +4865,12 @@ fn apply_identity_state_locked(
         identity_public.zeroize();
         return Err("identity state rejected".to_string());
     }
-    if verify_identity_state_signature_v8(
+    validate_prekey_pool_transition(
+        &account.identity_public,
+        &identity_public,
+        consumed_prekey_id,
+    )?;
+    if verify_identity_state_signature_v9(
         E2EE_PROTOCOL_VERSION,
         revision,
         &envelope,
@@ -4692,6 +4939,40 @@ fn apply_identity_state_locked(
     envelope.zeroize();
     identity_public.zeroize();
     Ok(())
+}
+
+fn validate_prekey_pool_transition(
+    previous_public: &[u8],
+    next_public: &[u8],
+    consumed_prekey_id: Option<&str>,
+) -> Result<(), String> {
+    let previous = prekey_ids_from_identity_public_v9(previous_public)
+        .map_err(|_| "identity state rejected".to_string())?;
+    let next = prekey_ids_from_identity_public_v9(next_public)
+        .map_err(|_| "identity state rejected".to_string())?;
+    match consumed_prekey_id {
+        None if previous == next => Ok(()),
+        None => Err("identity prekey pool changed without consumption".to_string()),
+        Some(consumed) => {
+            let removed = previous
+                .iter()
+                .filter(|id| !next.contains(id))
+                .collect::<Vec<_>>();
+            let added = next
+                .iter()
+                .filter(|id| !previous.contains(id))
+                .collect::<Vec<_>>();
+            if removed.len() == 1
+                && removed[0].as_str() == consumed
+                && added.len() == 1
+                && !next.iter().any(|id| id == consumed)
+            {
+                Ok(())
+            } else {
+                Err("identity prekey pool transition rejected".to_string())
+            }
+        }
+    }
 }
 
 fn pending_frame_matches_ack(
@@ -4772,7 +5053,7 @@ async fn acknowledge_message(
     }
     let identity_public = Zeroizing::new(decode_exact(identity_public_b64, IDENTITY_PUBLIC_BYTES)?);
     let ack_signature = Zeroizing::new(decode_exact(ack_signature_b64, MESSAGE_SIGNATURE_BYTES)?);
-    verify_ack_signature_v8(
+    verify_ack_signature_v9(
         E2EE_PROTOCOL_VERSION,
         chat_id,
         message_id,
@@ -4787,13 +5068,13 @@ async fn acknowledge_message(
         recipient_username: username.clone(),
     };
     // Keep the lock order used by message admission and claim maintenance:
-    // accounts -> pending -> pending_bytes -> prekey_claims.  Every
+    // accounts -> pending -> pending_bytes -> prekey_leases.  Every
     // precondition is checked while these guards are held, then the signed
     // state and queue/claim consumption commit as one conversation operation.
     let mut accounts = state.accounts.lock().await;
     let mut pending = state.pending.lock().await;
     let mut pending_bytes = state.pending_bytes.lock().await;
-    let mut claims = state.prekey_claims.lock().await;
+    let mut claims = state.prekey_leases.lock().await;
 
     let (matching_index, matching_bytes) = {
         let queue = pending
@@ -4824,7 +5105,7 @@ async fn acknowledge_message(
     }
 
     if !used_prekey_id.is_empty() {
-        let claim_key = PrekeyClaimKey {
+        let claim_key = PrekeyLeaseKey {
             code_id,
             prekey_id: used_prekey_id.to_string(),
         };
@@ -4840,7 +5121,20 @@ async fn acknowledge_message(
         }
     }
 
-    apply_identity_state_locked(
+    let next_identity_public =
+        Zeroizing::new(decode_exact(identity_public_b64, IDENTITY_PUBLIC_BYTES)?);
+    let next_pool = prekey_ids_from_identity_public_v9(&next_identity_public)
+        .map_err(|_| "message acknowledgement rejected".to_string())?;
+    if leases_for_recipient_missing_from_pool(
+        &claims,
+        &code_id,
+        &next_pool,
+        (!used_prekey_id.is_empty()).then_some(used_prekey_id),
+    ) {
+        return Err("message acknowledgement rejected".to_string());
+    }
+
+    apply_identity_state_locked_with_consumed(
         &mut accounts,
         &code_id,
         revision,
@@ -4849,6 +5143,7 @@ async fn acknowledge_message(
         current_prekey_id,
         state_signature_b64,
         true,
+        (!used_prekey_id.is_empty()).then_some(used_prekey_id),
     )?;
 
     let queue = pending
@@ -4862,12 +5157,25 @@ async fn acknowledge_message(
         pending.remove(&key);
     }
     if !used_prekey_id.is_empty() {
-        claims.remove(&PrekeyClaimKey {
+        claims.remove(&PrekeyLeaseKey {
             code_id,
             prekey_id: used_prekey_id.to_string(),
         });
     }
     Ok(())
+}
+
+fn leases_for_recipient_missing_from_pool(
+    leases: &HashMap<PrekeyLeaseKey, PrekeyLease>,
+    code_id: &CodeId,
+    next_pool: &[String],
+    consumed_prekey_id: Option<&str>,
+) -> bool {
+    leases.keys().any(|key| {
+        key.code_id == *code_id
+            && consumed_prekey_id != Some(key.prekey_id.as_str())
+            && !next_pool.contains(&key.prekey_id)
+    })
 }
 
 async fn broadcast_wipe(state: &AppState, sender_id: Uuid) -> Result<(), String> {
@@ -4939,7 +5247,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     }
     state.frame_limits.lock().await.clear();
     state.replay_ids.lock().await.clear();
-    state.prekey_claims.lock().await.clear();
+    state.prekey_leases.lock().await.clear();
     state.opaque_handshakes.lock().await.clear();
     let mut login_limits = state.login_limits.lock().await;
     zeroize_code_id_map(&mut login_limits);
@@ -5020,7 +5328,7 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
                 for pending_frame in &mut frames {
                     *pending_bytes =
                         (*pending_bytes).saturating_sub(outbound_frame_bytes(&pending_frame.frame));
-                    if let Some(details) = prekey_claim_details(&pending_frame.frame) {
+                    if let Some(details) = prekey_lease_details(&pending_frame.frame) {
                         released_claims.push(details);
                     }
                     pending_frame.zeroize_sensitive();
@@ -5030,7 +5338,7 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
         drop(pending_bytes);
     }
     for (claim_chat_id, message_id, sender_username, prekey_id) in released_claims {
-        release_prekey_claim(
+        release_prekey_lease(
             state,
             &claim_chat_id,
             &message_id,
@@ -5713,7 +6021,7 @@ mod tests {
                     id,
                     OpaqueHandshake::Registration {
                         code_id: test_code_id("handshake"),
-                        challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
+                        challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V9]),
                         created_at_ms: now_ms(),
                     },
                 )
@@ -5726,7 +6034,7 @@ mod tests {
                 Uuid::new_v4(),
                 OpaqueHandshake::Registration {
                     code_id: test_code_id("overflow-handshake"),
-                    challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
+                    challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V9]),
                     created_at_ms: now_ms(),
                 },
             )
@@ -5810,7 +6118,7 @@ mod tests {
             handshake_id,
             OpaqueHandshake::Registration {
                 code_id,
-                challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
+                challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V9]),
                 created_at_ms: now_ms(),
             },
         );
@@ -7913,7 +8221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_time_prekey_claims_are_single_use_and_bound_to_recipient_state() {
+    async fn one_time_prekey_leases_are_single_use_and_bound_to_recipient_state() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         add_test_account(&state, "code-b", "Bob").await;
@@ -7926,8 +8234,21 @@ mod tests {
             signature_b64: test_signature_b64(b'S'),
         };
         let envelopes = HashMap::from([("Bob".to_string(), envelope)]);
+        state.prekey_leases.lock().await.insert(
+            PrekeyLeaseKey {
+                code_id: test_code_id("code-b"),
+                prekey_id: test_prekey_id(b'B'),
+            },
+            PrekeyLease {
+                chat_id: "dm_alice_bob".to_string(),
+                message_id: "message-1".to_string(),
+                sender_username: "Alice".to_string(),
+                recipient_username: "Bob".to_string(),
+                created_at_ms: now_ms(),
+            },
+        );
 
-        claim_prekeys(
+        admit_prekey_leases(
             &state,
             &expected,
             &envelopes,
@@ -7936,8 +8257,8 @@ mod tests {
             "Alice",
         )
         .await
-        .expect("first claim");
-        assert!(claim_prekeys(
+        .expect("exact lease");
+        assert!(admit_prekey_leases(
             &state,
             &expected,
             &envelopes,
@@ -7950,8 +8271,7 @@ mod tests {
 
         let mut mismatched = envelopes;
         mismatched.get_mut("Bob").expect("Bob envelope").prekey_id = "other-key".to_string();
-        state.prekey_claims.lock().await.clear();
-        assert!(claim_prekeys(
+        assert!(admit_prekey_leases(
             &state,
             &expected,
             &mismatched,
@@ -7964,22 +8284,229 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_prekey_frame_keeps_claim_alive_until_queue_is_removed() {
+    async fn authenticated_prekey_lease_is_idempotent_exactly_releasable_and_pending_safe() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct conversation");
+        let chat_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .keys()
+            .next()
+            .expect("direct id")
+            .clone();
+
+        let first = lease_prekey(&state, alice_id, &chat_id, "lease-message", "Bob")
+            .await
+            .expect("first lease");
+        let second = lease_prekey(&state, alice_id, &chat_id, "lease-message", "Bob")
+            .await
+            .expect("idempotent lease");
+        let leased_id = match (&first, &second) {
+            (
+                OutboundFrame::PrekeyLease {
+                    prekey_id: first, ..
+                },
+                OutboundFrame::PrekeyLease {
+                    prekey_id: second, ..
+                },
+            ) if first == second => first.clone(),
+            _ => panic!("expected identical lease responses"),
+        };
+        assert_eq!(state.prekey_leases.lock().await.len(), 1);
+        assert!(release_unused_prekey_lease(
+            &state,
+            alice_id,
+            &chat_id,
+            "wrong-message",
+            "Bob",
+            &leased_id,
+        )
+        .await
+        .is_err());
+
+        state.pending.lock().await.insert(
+            PendingKey {
+                chat_id: chat_id.clone(),
+                recipient_username: "Bob".to_string(),
+            },
+            vec![PendingFrame::new(
+                test_message_frame(&chat_id, "lease-message", "Alice", &leased_id, true),
+                now_ms(),
+            )],
+        );
+        assert!(release_unused_prekey_lease(
+            &state,
+            alice_id,
+            &chat_id,
+            "lease-message",
+            "Bob",
+            &leased_id,
+        )
+        .await
+        .is_err());
+        state.pending.lock().await.clear();
+        release_unused_prekey_lease(
+            &state,
+            alice_id,
+            &chat_id,
+            "lease-message",
+            "Bob",
+            &leased_id,
+        )
+        .await
+        .expect("exact unused release");
+        assert!(state.prekey_leases.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_prekey_leases_are_distinct_bounded_expiring_and_purged() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct conversation");
+        let chat_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .keys()
+            .next()
+            .expect("direct id")
+            .clone();
+        let tasks = (0..PREKEY_POOL_SIZE_V9)
+            .map(|index| {
+                let state = state.clone();
+                let chat_id = chat_id.clone();
+                tokio::spawn(async move {
+                    lease_prekey(
+                        &state,
+                        alice_id,
+                        &chat_id,
+                        &format!("concurrent-{index}"),
+                        "Bob",
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut ids = HashSet::new();
+        for task in tasks {
+            let frame = task.await.expect("lease task").expect("bounded lease");
+            let OutboundFrame::PrekeyLease { ref prekey_id, .. } = frame else {
+                panic!("expected lease frame")
+            };
+            assert!(ids.insert(prekey_id.clone()));
+        }
+        assert_eq!(ids.len(), PREKEY_POOL_SIZE_V9);
+        assert!(lease_prekey(&state, alice_id, &chat_id, "exhausted", "Bob")
+            .await
+            .is_err());
+
+        let now = now_ms();
+        for lease in state.prekey_leases.lock().await.values_mut() {
+            lease.created_at_ms = now.saturating_sub(PREKEY_LEASE_TTL_MS);
+        }
+        let refreshed = lease_prekey(&state, alice_id, &chat_id, "after-expiry", "Bob")
+            .await
+            .expect("expired leases release capacity");
+        assert!(matches!(refreshed, OutboundFrame::PrekeyLease { .. }));
+        assert_eq!(state.prekey_leases.lock().await.len(), 1);
+
+        {
+            let mut leases = state.prekey_leases.lock().await;
+            for index in 1..MAX_PREKEY_LEASES {
+                let mut code_id = [0_u8; 32];
+                code_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                leases.insert(
+                    PrekeyLeaseKey {
+                        code_id,
+                        prekey_id: format!("global-{index}"),
+                    },
+                    PrekeyLease {
+                        chat_id: "global-bound".to_string(),
+                        message_id: format!("message-{index}"),
+                        sender_username: "Other".to_string(),
+                        recipient_username: "OtherRecipient".to_string(),
+                        created_at_ms: now,
+                    },
+                );
+            }
+        }
+        assert_eq!(state.prekey_leases.lock().await.len(), MAX_PREKEY_LEASES);
+        assert!(
+            lease_prekey(&state, alice_id, &chat_id, "global-full", "Bob")
+                .await
+                .is_err()
+        );
+
+        wipe_relay_state(&state, false).await;
+        assert!(state.prekey_leases.lock().await.is_empty());
+    }
+
+    #[test]
+    fn prekey_pool_transition_is_exact_and_preserves_other_live_leases() {
+        let previous = test_identity_public(b'B');
+        let consumed = test_prekey_id(b'B');
+        let (next, _) = test_identity_public_after_consumption(b'B', &consumed);
+        validate_prekey_pool_transition(&previous, &next, Some(&consumed))
+            .expect("one-for-one transition");
+        assert!(validate_prekey_pool_transition(&previous, &next, None).is_err());
+        assert!(validate_prekey_pool_transition(&previous, &previous, Some(&consumed)).is_err());
+        validate_prekey_pool_transition(&previous, &previous, None)
+            .expect("established pool preservation");
+
+        let preserved_id = prekey_ids_from_identity_public_v9(&previous)
+            .expect("pool")
+            .into_iter()
+            .find(|id| id != &consumed)
+            .expect("other key");
+        let leases = HashMap::from([(
+            PrekeyLeaseKey {
+                code_id: test_code_id("code-b"),
+                prekey_id: preserved_id,
+            },
+            PrekeyLease {
+                chat_id: "dm_alice_bob".to_string(),
+                message_id: "other-message".to_string(),
+                sender_username: "Carol".to_string(),
+                recipient_username: "Bob".to_string(),
+                created_at_ms: now_ms(),
+            },
+        )]);
+        let next_pool = prekey_ids_from_identity_public_v9(&next).expect("next pool");
+        assert!(!leases_for_recipient_missing_from_pool(
+            &leases,
+            &test_code_id("code-b"),
+            &next_pool,
+            Some(&consumed),
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_prekey_frame_keeps_lease_alive_until_queue_is_removed() {
         let state = test_state();
         let code_id = test_code_id("code-b");
         let prekey_id = test_prekey_id(b'B');
-        let key = PrekeyClaimKey {
+        let key = PrekeyLeaseKey {
             code_id,
             prekey_id: prekey_id.clone(),
         };
-        let claim = PrekeyClaim {
+        let claim = PrekeyLease {
             chat_id: "dm_alice_bob".to_string(),
             message_id: "message-1".to_string(),
             sender_username: "Alice".to_string(),
             recipient_username: "Bob".to_string(),
-            created_at_ms: now_ms().saturating_sub(PREKEY_CLAIM_TTL_MS + 1),
+            created_at_ms: now_ms().saturating_sub(PREKEY_LEASE_TTL_MS + 1),
         };
-        state.prekey_claims.lock().await.insert(key.clone(), claim);
+        state.prekey_leases.lock().await.insert(key.clone(), claim);
         state.pending.lock().await.insert(
             PendingKey {
                 chat_id: "dm_alice_bob".to_string(),
@@ -7993,33 +8520,33 @@ mod tests {
 
         {
             let pending = state.pending.lock().await;
-            let mut claims = state.prekey_claims.lock().await;
-            prune_prekey_claims(&mut claims, &pending, now_ms());
+            let mut claims = state.prekey_leases.lock().await;
+            prune_prekey_leases(&mut claims, &pending, now_ms());
             assert!(claims.contains_key(&key));
         }
 
         state.pending.lock().await.clear();
         let pending = state.pending.lock().await;
-        let mut claims = state.prekey_claims.lock().await;
-        prune_prekey_claims(&mut claims, &pending, now_ms());
+        let mut claims = state.prekey_leases.lock().await;
+        prune_prekey_leases(&mut claims, &pending, now_ms());
         assert!(!claims.contains_key(&key));
     }
 
     #[tokio::test]
-    async fn expired_pending_prekey_frame_releases_claim_and_bytes_together() {
+    async fn expired_pending_prekey_frame_releases_lease_and_bytes_together() {
         let mut state = test_state();
         state.pending_message_ttl_ms = MIN_PENDING_MESSAGE_TTL_HOURS as u64 * HOURS_TO_MILLISECONDS;
         let now = now_ms();
         let prekey_id = test_prekey_id(b'B');
         let frame = test_message_frame("dm_alice_bob", "expired-prekey", "Alice", &prekey_id, true);
         let frame_bytes = outbound_frame_bytes(&frame);
-        let claim_key = PrekeyClaimKey {
+        let claim_key = PrekeyLeaseKey {
             code_id: test_code_id("code-b"),
             prekey_id: prekey_id.clone(),
         };
-        state.prekey_claims.lock().await.insert(
+        state.prekey_leases.lock().await.insert(
             claim_key.clone(),
-            PrekeyClaim {
+            PrekeyLease {
                 chat_id: "dm_alice_bob".to_string(),
                 message_id: "expired-prekey".to_string(),
                 sender_username: "Alice".to_string(),
@@ -8043,7 +8570,7 @@ mod tests {
 
         assert!(state.pending.lock().await.is_empty());
         assert_eq!(*state.pending_bytes.lock().await, 0);
-        assert!(!state.prekey_claims.lock().await.contains_key(&claim_key));
+        assert!(!state.prekey_leases.lock().await.contains_key(&claim_key));
     }
 
     #[tokio::test]
@@ -8216,7 +8743,7 @@ mod tests {
             chat_id: "room_atomic".to_string(),
             recipient_username: "Carol".to_string(),
         }));
-        assert!(state.prekey_claims.lock().await.is_empty());
+        assert!(state.prekey_leases.lock().await.is_empty());
         assert!(state.replay_ids.lock().await.is_empty());
     }
 
@@ -8683,7 +9210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_room_releases_only_claims_for_removed_prekey_frames() {
+    async fn deleting_room_releases_prekey_leases() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         let (alice_id, _) = add_test_client(&state, "code-a", "Alice").await;
@@ -8698,22 +9225,22 @@ mod tests {
 
         let removed_prekey_id = test_prekey_id(b'B');
         let retained_prekey_id = test_prekey_id(b'C');
-        let removed_key = PrekeyClaimKey {
+        let removed_key = PrekeyLeaseKey {
             code_id: test_code_id("code-b"),
             prekey_id: removed_prekey_id.clone(),
         };
-        let retained_key = PrekeyClaimKey {
+        let retained_key = PrekeyLeaseKey {
             code_id: test_code_id("code-c"),
             prekey_id: retained_prekey_id.clone(),
         };
-        let claim = |recipient_username: &str| PrekeyClaim {
+        let claim = |recipient_username: &str| PrekeyLease {
             chat_id: room.id.clone(),
             message_id: "message-1".to_string(),
             sender_username: "Alice".to_string(),
             recipient_username: recipient_username.to_string(),
             created_at_ms: now_ms(),
         };
-        state.prekey_claims.lock().await.extend([
+        state.prekey_leases.lock().await.extend([
             (removed_key.clone(), claim("Bob")),
             (retained_key.clone(), claim("Carol")),
         ]);
@@ -8752,9 +9279,9 @@ mod tests {
         delete_room(&state, alice_id, &room.id)
             .await
             .expect("owner can delete room");
-        let claims = state.prekey_claims.lock().await;
+        let claims = state.prekey_leases.lock().await;
         assert!(!claims.contains_key(&removed_key));
-        assert!(claims.contains_key(&retained_key));
+        assert!(!claims.contains_key(&retained_key));
         drop(claims);
         assert!(state.attachments.lock().await.is_empty());
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
@@ -8824,7 +9351,7 @@ mod tests {
             handshake_id,
             OpaqueHandshake::Registration {
                 code_id,
-                challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V8]),
+                challenge: Zeroizing::new(vec![0; REGISTRATION_CHALLENGE_BYTES_V9]),
                 created_at_ms: now_ms(),
             },
         );
@@ -8885,7 +9412,7 @@ mod tests {
         let owner_envelope = owner
             .seal_identity(vec![71; 64], b"registration-context".to_vec())
             .expect("owner envelope");
-        let challenge = vec![17; REGISTRATION_CHALLENGE_BYTES_V8];
+        let challenge = vec![17; REGISTRATION_CHALLENGE_BYTES_V9];
         let handshake_id = Uuid::new_v4();
         state.opaque_handshakes.lock().await.insert(
             handshake_id,
@@ -8953,7 +9480,7 @@ mod tests {
         let envelope = session
             .seal_identity(vec![73; 64], b"registration-context".to_vec())
             .expect("identity envelope");
-        let challenge = vec![18; REGISTRATION_CHALLENGE_BYTES_V8];
+        let challenge = vec![18; REGISTRATION_CHALLENGE_BYTES_V9];
         let handshake_id = Uuid::new_v4();
         state.opaque_handshakes.lock().await.insert(
             handshake_id,
@@ -9494,7 +10021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_requires_v8_signature_on_each_recipient_envelope() {
+    async fn relay_requires_v9_signature_on_each_recipient_envelope() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         add_test_account(&state, "code-b", "Bob").await;
@@ -9605,13 +10132,13 @@ mod tests {
             }],
         )
         .await
-        .expect("valid v8 message should route");
+        .expect("valid v9 message should route");
         let OutboundFrame::Message {
             signature_b64,
             identity_public_b64,
             sender_public_key_b64,
             ..
-        } = &bob_rx.try_recv().expect("Bob receives v8 message")
+        } = &bob_rx.try_recv().expect("Bob receives v9 message")
         else {
             panic!("expected text frame");
         };
@@ -9620,7 +10147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forged_signature_cannot_claim_prekey_or_mutate_relay_state() {
+    async fn forged_signature_cannot_lease_prekey_or_mutate_relay_state() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         add_test_account(&state, "code-b", "Bob").await;
@@ -9685,7 +10212,7 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert!(state.prekey_claims.lock().await.is_empty());
+        assert!(state.prekey_leases.lock().await.is_empty());
         assert!(state.replay_ids.lock().await.is_empty());
         assert!(state.pending.lock().await.is_empty());
         assert_eq!(*state.pending_bytes.lock().await, 0);
@@ -9769,7 +10296,7 @@ mod tests {
             .expect("Bob account");
         let pending_bytes_before = *state.pending_bytes.lock().await;
         let replay_before = state.replay_ids.lock().await.len();
-        let claims_before = state.prekey_claims.lock().await.len();
+        let claims_before = state.prekey_leases.lock().await.len();
 
         let result = acknowledge_message(
             &state,
@@ -9806,7 +10333,7 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(*state.pending_bytes.lock().await, pending_bytes_before);
         assert_eq!(state.replay_ids.lock().await.len(), replay_before);
-        assert_eq!(state.prekey_claims.lock().await.len(), claims_before);
+        assert_eq!(state.prekey_leases.lock().await.len(), claims_before);
         assert!(state.pending.lock().await.is_empty());
     }
 
@@ -9836,6 +10363,19 @@ mod tests {
         let message_id = "exact-message";
         let prekey_id = test_prekey_id(b'B');
         let wrapped_key = [4_u8; 256];
+        state.prekey_leases.lock().await.insert(
+            PrekeyLeaseKey {
+                code_id: test_code_id("code-b"),
+                prekey_id: prekey_id.clone(),
+            },
+            PrekeyLease {
+                chat_id: room.id.clone(),
+                message_id: message_id.to_string(),
+                sender_username: "Alice".to_string(),
+                recipient_username: "Bob".to_string(),
+                created_at_ms: now_ms(),
+            },
+        );
         route_test_message_with_envelopes(
             &state,
             alice_id,
@@ -9864,20 +10404,22 @@ mod tests {
         .expect("prekey message queues");
 
         let envelope_b64 = test_identity_envelope_b64(4);
-        let identity_public_b64 = test_identity_public_b64(b'B');
+        let (identity_public, current_prekey_id) =
+            test_identity_public_after_consumption(b'B', &prekey_id);
+        let identity_public_b64 = URL_SAFE_NO_PAD.encode(identity_public);
         let state_signature_b64 = test_valid_state_signature_b64(
             b'B',
             1,
             &envelope_b64,
             &identity_public_b64,
-            &prekey_id,
+            &current_prekey_id,
         );
         let pending_key = PendingKey {
             chat_id: room.id.clone(),
             recipient_username: "Bob".to_string(),
         };
         let before = ack_test_snapshot(&state, &test_code_id("code-b"), &pending_key).await;
-        assert!(!before.3.is_empty(), "prekey claim should be pending");
+        assert!(!before.3.is_empty(), "prekey lease should be pending");
 
         let wrong_chat_ack_signature_b64 =
             test_valid_ack_signature_b64(b'B', &wrong_chat.id, message_id, "Alice", &prekey_id);
@@ -9890,7 +10432,7 @@ mod tests {
             1,
             &envelope_b64,
             &identity_public_b64,
-            &prekey_id,
+            &current_prekey_id,
             &state_signature_b64,
             &wrong_chat_ack_signature_b64,
             &prekey_id,
@@ -9913,7 +10455,7 @@ mod tests {
             1,
             &envelope_b64,
             &identity_public_b64,
-            &prekey_id,
+            &current_prekey_id,
             &state_signature_b64,
             &wrong_prekey_ack_signature_b64,
             &wrong_prekey_id,
@@ -9936,7 +10478,7 @@ mod tests {
             1,
             &envelope_b64,
             &identity_public_b64,
-            &prekey_id,
+            &current_prekey_id,
             &state_signature_b64,
             &wrong_ack_signature_b64,
             &prekey_id,
@@ -9957,7 +10499,7 @@ mod tests {
             1,
             &envelope_b64,
             &identity_public_b64,
-            &prekey_id,
+            &current_prekey_id,
             &state_signature_b64,
             &ack_signature_b64,
             &prekey_id,
@@ -10019,7 +10561,7 @@ mod tests {
             pending_bytes_after_matching
         );
         assert!(state.pending.lock().await.is_empty());
-        assert!(state.prekey_claims.lock().await.is_empty());
+        assert!(state.prekey_leases.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -10489,12 +11031,12 @@ mod tests {
             },
         );
         let prekey_id = test_prekey_id(b'B');
-        state.prekey_claims.lock().await.insert(
-            PrekeyClaimKey {
+        state.prekey_leases.lock().await.insert(
+            PrekeyLeaseKey {
                 code_id: test_code_id("code-b"),
                 prekey_id: prekey_id.clone(),
             },
-            PrekeyClaim {
+            PrekeyLease {
                 chat_id: "prekey_ack_order".to_string(),
                 message_id: "claimed-message".to_string(),
                 sender_username: "Alice".to_string(),
@@ -10534,17 +11076,17 @@ mod tests {
         assert_eq!(account.state_revision, 0);
         assert_eq!(account.state_revision_window, 1);
         assert!(state
-            .prekey_claims
+            .prekey_leases
             .lock()
             .await
-            .contains_key(&PrekeyClaimKey {
+            .contains_key(&PrekeyLeaseKey {
                 code_id: test_code_id("code-b"),
                 prekey_id,
             }));
     }
 
     #[tokio::test]
-    async fn prekey_ack_requires_a_matching_claim_before_mutating_state() {
+    async fn prekey_ack_requires_a_matching_lease_before_mutating_state() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         add_test_account(&state, "code-b", "Bob").await;
@@ -10781,7 +11323,7 @@ mod tests {
             2,
             &envelope_two_b64,
             &identity_public_b64,
-            &test_prekey_id(b'B'),
+            "wrong-prekey",
             &signature_two,
             false,
         )
@@ -10864,10 +11406,12 @@ mod tests {
         .expect("current state");
 
         let mut stale_public = test_identity_public(b'A');
-        stale_public[IDENTITY_FINGERPRINT_BYTES..IDENTITY_FINGERPRINT_BYTES + ONE_TIME_KEY_BYTES]
-            .fill(b'Z');
+        for (index, (_, public)) in test_prekey_pool(b'Z').into_iter().enumerate() {
+            let start = ONE_TIME_KEY_OFFSET + (index * ONE_TIME_KEY_BYTES);
+            stale_public[start..start + ONE_TIME_KEY_BYTES].copy_from_slice(&public);
+        }
         let stale_public_b64 = URL_SAFE_NO_PAD.encode(&stale_public);
-        let stale_prekey_id = abyssal_core::secure_protocol::prekey_id_for_public(&[b'Z'; 32]);
+        let stale_prekey_id = test_prekey_id(b'Z');
         let stale_envelope_b64 = test_identity_envelope_b64(8);
         let stale_signature = test_valid_state_signature_b64(
             b'A',
@@ -11000,7 +11544,7 @@ mod tests {
             attachment_uploads: Arc::new(Semaphore::new(1)),
             attachment_memory: Arc::new(Semaphore::new(8 * 1024 * 1024)),
             attachment_epoch: Arc::new(AtomicU64::new(0)),
-            prekey_claims: Arc::new(Mutex::new(HashMap::new())),
+            prekey_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -11069,7 +11613,7 @@ mod tests {
             })
             .collect();
         let mut claims = state
-            .prekey_claims
+            .prekey_leases
             .lock()
             .await
             .iter()
@@ -11272,6 +11816,10 @@ mod tests {
         let mut identity_public = vec![fill; IDENTITY_PUBLIC_BYTES];
         identity_public[IDENTITY_FINGERPRINT_BYTES - 32..IDENTITY_FINGERPRINT_BYTES]
             .copy_from_slice(signing_key.verifying_key().as_bytes());
+        for (index, (_, public)) in test_prekey_pool(fill).into_iter().enumerate() {
+            let start = ONE_TIME_KEY_OFFSET + (index * ONE_TIME_KEY_BYTES);
+            identity_public[start..start + ONE_TIME_KEY_BYTES].copy_from_slice(&public);
+        }
         identity_public
     }
 
@@ -11280,7 +11828,54 @@ mod tests {
     }
 
     fn test_prekey_id(fill: u8) -> String {
-        abyssal_core::secure_protocol::prekey_id_for_public(&[fill; ONE_TIME_KEY_BYTES])
+        test_prekey_pool(fill)
+            .into_iter()
+            .next()
+            .expect("test prekey pool")
+            .0
+    }
+
+    fn test_prekey_pool(fill: u8) -> Vec<(String, [u8; ONE_TIME_KEY_BYTES])> {
+        let mut pool = (0..PREKEY_POOL_SIZE_V9)
+            .map(|index| {
+                let public = [fill.wrapping_add(index as u8); ONE_TIME_KEY_BYTES];
+                (
+                    abyssal_core::secure_protocol::prekey_id_for_public(&public),
+                    public,
+                )
+            })
+            .collect::<Vec<_>>();
+        pool.sort_by(|left, right| left.0.cmp(&right.0));
+        pool
+    }
+
+    fn test_identity_public_after_consumption(
+        fill: u8,
+        consumed_prekey_id: &str,
+    ) -> (Vec<u8>, String) {
+        let mut pool = test_prekey_pool(fill);
+        pool.retain(|(id, _)| id != consumed_prekey_id);
+        let replacement = (1_u16..=u8::MAX as u16)
+            .map(|offset| [fill.wrapping_add(offset as u8); ONE_TIME_KEY_BYTES])
+            .map(|public| {
+                (
+                    abyssal_core::secure_protocol::prekey_id_for_public(&public),
+                    public,
+                )
+            })
+            .find(|(id, _)| {
+                id != consumed_prekey_id && !pool.iter().any(|(existing, _)| existing == id)
+            })
+            .expect("replacement prekey");
+        pool.push(replacement);
+        pool.sort_by(|left, right| left.0.cmp(&right.0));
+        let current_prekey_id = pool.first().expect("rotated pool").0.clone();
+        let mut identity_public = test_identity_public(fill);
+        for (index, (_, public)) in pool.into_iter().enumerate() {
+            let start = ONE_TIME_KEY_OFFSET + (index * ONE_TIME_KEY_BYTES);
+            identity_public[start..start + ONE_TIME_KEY_BYTES].copy_from_slice(&public);
+        }
+        (identity_public, current_prekey_id)
     }
 
     fn test_signature_b64(fill: u8) -> String {
@@ -11306,7 +11901,7 @@ mod tests {
         let identity_public = URL_SAFE_NO_PAD
             .decode(identity_public_b64)
             .expect("test identity public");
-        let transcript = abyssal_core::secure_protocol::identity_state_signature_input_v8(
+        let transcript = abyssal_core::secure_protocol::identity_state_signature_input_v9(
             E2EE_PROTOCOL_VERSION,
             revision,
             &envelope,
@@ -11325,7 +11920,7 @@ mod tests {
         sender_username: &str,
         used_prekey_id: &str,
     ) -> String {
-        let transcript = abyssal_core::secure_protocol::ack_signature_input_v8(
+        let transcript = abyssal_core::secure_protocol::ack_signature_input_v9(
             E2EE_PROTOCOL_VERSION,
             chat_id,
             message_id,
@@ -11349,7 +11944,7 @@ mod tests {
         prekey_id: &str,
         is_prekey: bool,
     ) -> String {
-        let transcript = abyssal_core::secure_protocol::message_signature_input_v8(
+        let transcript = abyssal_core::secure_protocol::message_signature_input_v9(
             E2EE_PROTOCOL_VERSION,
             chat_id,
             message_id,

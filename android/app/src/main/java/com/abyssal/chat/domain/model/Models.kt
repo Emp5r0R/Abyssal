@@ -242,6 +242,44 @@ data class UserPresence(
     val directoryDigest: String = ""
 )
 
+/**
+ * An authenticated relay lease for one recipient's unused protocol-v9
+ * prekey.  The public bundle is deliberately kept in RAM only and is owned
+ * by the caller for the duration of the encryption transaction.
+ */
+data class PrekeyLease(
+    val chatId: String,
+    val messageId: String,
+    val recipientUsername: String,
+    val recipientPublicKey: ByteArray,
+    val prekeyId: String,
+    val expiresAtMs: Long,
+    val connectionGeneration: Long = 0L
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PrekeyLease) return false
+        return chatId == other.chatId &&
+            messageId == other.messageId &&
+            recipientUsername == other.recipientUsername &&
+            recipientPublicKey.contentEquals(other.recipientPublicKey) &&
+            prekeyId == other.prekeyId &&
+            expiresAtMs == other.expiresAtMs &&
+            connectionGeneration == other.connectionGeneration
+    }
+
+    override fun hashCode(): Int {
+        var result = chatId.hashCode()
+        result = 31 * result + messageId.hashCode()
+        result = 31 * result + recipientUsername.hashCode()
+        result = 31 * result + recipientPublicKey.contentHashCode()
+        result = 31 * result + prekeyId.hashCode()
+        result = 31 * result + expiresAtMs.hashCode()
+        result = 31 * result + connectionGeneration.hashCode()
+        return result
+    }
+}
+
 data class AttachmentUploadResult(
     val accepted: Boolean,
     val attachmentId: String? = null

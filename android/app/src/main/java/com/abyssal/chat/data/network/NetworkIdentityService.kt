@@ -390,6 +390,9 @@ class NetworkIdentityService(
         val credential = code.trim().uppercase(Locale.ROOT)
         require(node.isNotEmpty() && node.length <= 128)
         require(credential.isNotEmpty() && credential.length <= 128)
+        // The identity context is shared by Android and web clients.  The
+        // sealed envelope's protocol domain is versioned natively; retaining
+        // this account context keeps cross-client login/recovery compatible.
         return "ABYSSAL_IDENTITY_V2:$node:$credential".toByteArray(StandardCharsets.UTF_8)
     }
 
@@ -408,7 +411,7 @@ private const val MIN_SESSION_INACTIVITY_SEC = 60
 private const val MAX_SESSION_INACTIVITY_SEC = 24 * 60 * 60
 private const val MIN_MAX_ROOMS_PER_USER = 1
 private const val MAX_MAX_ROOMS_PER_USER = 100
-private const val IDENTITY_PUBLIC_KEY_BYTES = 128
+private const val IDENTITY_PUBLIC_KEY_BYTES = 608
 private const val REGISTRATION_CHALLENGE_BYTES = 32
 private const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
 private const val MAX_OPAQUE_RESPONSE_BYTES = 64 * 1024

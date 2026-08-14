@@ -12,9 +12,11 @@ import type {
 import {
   base64ToBytes,
   bytesToBase64,
+  IDENTITY_PUBLIC_KEY_BYTES,
   maxSerializedAttachmentBytes,
   STATE_SIGNATURE_BYTES,
   type IdentityStateSnapshot,
+  wipeBytes,
 } from "../security/crypto";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
@@ -27,6 +29,7 @@ const UUID_V4_PATTERN = ATTACHMENT_ID_PATTERN;
 const BASE64_URL_PATTERN = /^[A-Za-z0-9_-]+$/u;
 const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
 const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
+const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 const MAX_OPAQUE_JSON_BYTES = 768 * 1024;
 const MAX_OPAQUE_MESSAGE_BYTES = 16 * 1024;
 const MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024;
@@ -34,10 +37,13 @@ export const MAX_RELAY_TEXT_BYTES = 1024 * 1024;
 export const PURGE_CLOSE_CODE = 4001;
 export const PURGE_CLOSE_REASON = "purge";
 const MESSAGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
+const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/u;
 const MAX_PENDING_MESSAGE_RESULTS = 256;
 const MAX_PENDING_ACK_RESULTS = 256;
+export const MAX_PENDING_PREKEY_LEASES = 256;
 const MESSAGE_RESULT_TIMEOUT_MS = 10_000;
 const ACK_RESULT_TIMEOUT_MS = 10_000;
+export const PREKEY_LEASE_TIMEOUT_MS = 10_000;
 const MAX_WS_TICKET_JSON_BYTES = 4 * 1024;
 const MAX_ATTACHMENT_UPLOAD_JSON_BYTES = 4 * 1024;
 const ATTACHMENT_CLEANUP_TIMEOUT_MS = 5_000;
@@ -79,6 +85,38 @@ interface PendingMessageResult {
   timer: number;
 }
 
+export interface PrekeyLease {
+  chatId: string;
+  messageId: string;
+  recipientUsername: string;
+  recipientPublicKey: Uint8Array;
+  prekeyId: string;
+  expiresAtMs: number;
+}
+
+export type PrekeyLeaseErrorCode = "NOT_SENT" | "AMBIGUOUS" | "INVALID_RESPONSE" | "CLOSED";
+
+export class PrekeyLeaseError extends Error {
+  readonly code: PrekeyLeaseErrorCode;
+
+  constructor(code: PrekeyLeaseErrorCode) {
+    super(`Prekey lease ${code.toLowerCase()}`);
+    this.name = "PrekeyLeaseError";
+    this.code = code;
+  }
+}
+
+interface PendingPrekeyLease {
+  generation: number;
+  key: string;
+  chatId: string;
+  messageId: string;
+  recipientUsername: string;
+  resolve: (lease: PrekeyLease) => void;
+  reject: (error: PrekeyLeaseError) => void;
+  timer: number;
+}
+
 interface MessageResultFrame {
   type: "message_result";
   message_id: string;
@@ -89,6 +127,16 @@ interface AckResultFrame {
   type: "ack_result";
   message_id: string;
   accepted: boolean;
+}
+
+interface PrekeyLeaseFrame {
+  type: "prekey_lease";
+  chat_id: string;
+  message_id: string;
+  recipient_username: string;
+  recipient_public_key_b64: string;
+  prekey_id: string;
+  expires_at_ms: number;
 }
 
 export async function startOpaqueAccount(
@@ -165,7 +213,7 @@ export async function finishOpaqueAccount(
     throw new Error("Wrong information");
   }
   const identityPublicKey = base64ToBytes(payload.identity_public_b64);
-  if (identityPublicKey.byteLength !== 128 || !/^[A-Za-z0-9_-]{1,32}$/.test(payload.identity_prekey_id)) {
+  if (identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || !PREKEY_ID_PATTERN.test(payload.identity_prekey_id)) {
     identityPublicKey.fill(0);
     throw new Error("Wrong information");
   }
@@ -226,6 +274,7 @@ export class RelaySocket {
   #purgeNotified = false;
   #pendingResults = new Map<string, PendingMessageResult>();
   #pendingAckResults = new Map<string, PendingMessageResult>();
+  #pendingPrekeyLeases = new Map<string, PendingPrekeyLease>();
 
   constructor(
     private readonly session: AccountSession,
@@ -291,6 +340,73 @@ export class RelaySocket {
     });
   }
 
+  requestPrekeyLease(
+    chatId: string,
+    messageId: string,
+    recipientUsername: string,
+  ): Promise<PrekeyLease> {
+    const key = prekeyLeaseKey(chatId, messageId, recipientUsername);
+    if (
+      !CHAT_ID_PATTERN.test(chatId) ||
+      !MESSAGE_ID_PATTERN.test(messageId) ||
+      !USERNAME_PATTERN.test(recipientUsername) ||
+      this.#socket?.readyState !== WebSocket.OPEN ||
+      this.#pendingPrekeyLeases.size >= MAX_PENDING_PREKEY_LEASES ||
+      this.#pendingPrekeyLeases.has(key)
+    ) return Promise.reject(new PrekeyLeaseError("NOT_SENT"));
+
+    const socket = this.#socket;
+    const generation = this.#socketGeneration;
+    const serialized = serializeRelayFrame({
+      type: "prekey_lease",
+      chat_id: chatId,
+      message_id: messageId,
+      recipient_username: recipientUsername,
+    });
+    if (serialized === null) return Promise.reject(new PrekeyLeaseError("NOT_SENT"));
+    return new Promise<PrekeyLease>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        const pending = this.#pendingPrekeyLeases.get(key);
+        if (!pending || pending.generation !== generation) return;
+        this.#pendingPrekeyLeases.delete(key);
+        pending.reject(new PrekeyLeaseError("AMBIGUOUS"));
+      }, PREKEY_LEASE_TIMEOUT_MS);
+      this.#pendingPrekeyLeases.set(key, {
+        generation,
+        key,
+        chatId,
+        messageId,
+        recipientUsername,
+        resolve,
+        reject,
+        timer,
+      });
+      try {
+        socket.send(serialized);
+      } catch {
+        window.clearTimeout(timer);
+        this.#pendingPrekeyLeases.delete(key);
+        reject(new PrekeyLeaseError("NOT_SENT"));
+      }
+    });
+  }
+
+  releasePrekeyLease(lease: Pick<PrekeyLease, "chatId" | "messageId" | "recipientUsername" | "prekeyId">): boolean {
+    if (
+      !CHAT_ID_PATTERN.test(lease.chatId) ||
+      !MESSAGE_ID_PATTERN.test(lease.messageId) ||
+      !USERNAME_PATTERN.test(lease.recipientUsername) ||
+      !PREKEY_ID_PATTERN.test(lease.prekeyId)
+    ) return false;
+    return this.send({
+      type: "prekey_lease_release",
+      chat_id: lease.chatId,
+      message_id: lease.messageId,
+      recipient_username: lease.recipientUsername,
+      prekey_id: lease.prekeyId,
+    });
+  }
+
   join(chatId: string): boolean {
     return this.send({ type: "join", chat_id: chatId });
   }
@@ -330,6 +446,8 @@ export class RelaySocket {
     if (
       !MESSAGE_ID_PATTERN.test(messageId) ||
       state.stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
+      state.identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+      !PREKEY_ID_PATTERN.test(state.prekeyId) ||
       ackSignature.byteLength !== STATE_SIGNATURE_BYTES ||
       this.#socket?.readyState !== WebSocket.OPEN ||
       this.#pendingAckResults.size >= MAX_PENDING_ACK_RESULTS ||
@@ -372,7 +490,9 @@ export class RelaySocket {
   }
 
   syncIdentityState(state: IdentityStateSnapshot): boolean {
-    if (state.stateSignature.byteLength !== STATE_SIGNATURE_BYTES) return false;
+    if (state.stateSignature.byteLength !== STATE_SIGNATURE_BYTES ||
+      state.identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+      !PREKEY_ID_PATTERN.test(state.prekeyId)) return false;
     return this.send({
       type: "identity_state",
       state_revision: state.revision,
@@ -393,6 +513,7 @@ export class RelaySocket {
     this.#reconnectTimer = undefined;
     this.settlePending("AMBIGUOUS");
     this.settleAckPending("AMBIGUOUS");
+    this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     this.#socket?.close(1000, "client disconnect");
     this.#socket = null;
     this.#socketGeneration = 0;
@@ -449,6 +570,10 @@ export class RelaySocket {
           }
           return;
         }
+        if (parsed.kind === "prekey-lease") {
+          this.resolvePrekeyLease(parsed.lease);
+          return;
+        }
         if (parsed.kind !== "frame") return;
         const frame = parsed.frame;
         if (frame.type === "GLOBAL_WIPE" || frame.type === "global_wipe") {
@@ -462,6 +587,7 @@ export class RelaySocket {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         this.settlePending("AMBIGUOUS");
         this.settleAckPending("AMBIGUOUS");
+        this.settlePrekeyPending(new PrekeyLeaseError("AMBIGUOUS"));
         socket.close();
       };
       socket.onclose = (event) => {
@@ -472,6 +598,7 @@ export class RelaySocket {
         }
         this.settlePending("AMBIGUOUS");
         this.settleAckPending("AMBIGUOUS");
+        this.settlePrekeyPending(new PrekeyLeaseError("AMBIGUOUS"));
         this.#socket = null;
         this.#socketGeneration = 0;
         this.onState("disconnected");
@@ -511,6 +638,7 @@ export class RelaySocket {
     this.#reconnectTimer = undefined;
     this.settlePending("AMBIGUOUS");
     this.settleAckPending("AMBIGUOUS");
+    this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     this.#socket = null;
     this.#socketGeneration = 0;
     this.onState("disconnected");
@@ -560,6 +688,51 @@ export class RelaySocket {
     });
   }
 
+  private settlePrekeyPending(error: PrekeyLeaseError): void {
+    const pending = [...this.#pendingPrekeyLeases.values()];
+    this.#pendingPrekeyLeases.clear();
+    pending.forEach((entry) => {
+      window.clearTimeout(entry.timer);
+      entry.reject(error);
+    });
+  }
+
+  private resolvePrekeyLease(frame: PrekeyLeaseFrame): void {
+    const key = prekeyLeaseKey(frame.chat_id, frame.message_id, frame.recipient_username);
+    const pending = this.#pendingPrekeyLeases.get(key);
+    if (!pending || pending.generation !== this.#socketGeneration) {
+      this.failClosed("unknown prekey lease");
+      return;
+    }
+    let recipientPublicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    try {
+      recipientPublicKey = base64ToBytes(frame.recipient_public_key_b64);
+      if (
+        recipientPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+        bytesToBase64(recipientPublicKey) !== frame.recipient_public_key_b64 ||
+        !PREKEY_ID_PATTERN.test(frame.prekey_id) ||
+        !Number.isSafeInteger(frame.expires_at_ms) ||
+        frame.expires_at_ms <= 0
+      ) throw new Error("invalid prekey lease");
+      this.#pendingPrekeyLeases.delete(key);
+      window.clearTimeout(pending.timer);
+      pending.resolve({
+        chatId: frame.chat_id,
+        messageId: frame.message_id,
+        recipientUsername: frame.recipient_username,
+        recipientPublicKey,
+        prekeyId: frame.prekey_id,
+        expiresAtMs: frame.expires_at_ms,
+      });
+    } catch {
+      wipeBytes(recipientPublicKey);
+      this.#pendingPrekeyLeases.delete(key);
+      window.clearTimeout(pending.timer);
+      pending.reject(new PrekeyLeaseError("INVALID_RESPONSE"));
+      this.failClosed("invalid prekey lease");
+    }
+  }
+
   private failClosed(reason: string): void {
     this.#manualClose = true;
     this.#connectGeneration += 1;
@@ -570,6 +743,7 @@ export class RelaySocket {
     this.#reconnectTimer = undefined;
     this.settlePending("AMBIGUOUS");
     this.settleAckPending("AMBIGUOUS");
+    this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     const socket = this.#socket;
     this.#socket = null;
     this.#socketGeneration = 0;
@@ -963,7 +1137,7 @@ function validOpaqueStartResponse(value: unknown): value is OpaqueAccountStartRe
       validBase64Url(payload.challenge_b64, 32, 32);
   }
   return nullish(payload.challenge_b64) &&
-    validBase64Url(payload.identity_public_b64, 128, 128) &&
+    validBase64Url(payload.identity_public_b64, IDENTITY_PUBLIC_KEY_BYTES, IDENTITY_PUBLIC_KEY_BYTES) &&
     typeof payload.identity_prekey_id === "string" &&
     /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
     validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES);
@@ -1008,7 +1182,7 @@ function validAccountResponse(value: unknown): value is AccountResponse & {
     Number.isInteger(payload.session_inactivity_sec) &&
     (payload.session_inactivity_sec as number) >= 60 &&
     (payload.session_inactivity_sec as number) <= 86_400 &&
-    validBase64Url(payload.identity_public_b64, 128, 128) &&
+    validBase64Url(payload.identity_public_b64, IDENTITY_PUBLIC_KEY_BYTES, IDENTITY_PUBLIC_KEY_BYTES) &&
     typeof payload.identity_prekey_id === "string" &&
     /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
     validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES) &&
@@ -1060,6 +1234,7 @@ function nullish(value: unknown): boolean {
 type ParsedRelayFrame =
   | { kind: "frame"; frame: IncomingFrame }
   | { kind: "result"; result: MessageResultFrame | AckResultFrame }
+  | { kind: "prekey-lease"; lease: PrekeyLeaseFrame }
   | { kind: "invalid-result" }
   | { kind: "ignored" };
 
@@ -1073,6 +1248,24 @@ function parseRelayFrame(text: string): ParsedRelayFrame {
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "ignored" };
   const frame = value as Record<string, unknown>;
+  if (frame.type === "prekey_lease") {
+    if (!exactObjectKeys(frame, [
+      "type", "chat_id", "message_id", "recipient_username", "recipient_public_key_b64",
+      "prekey_id", "expires_at_ms",
+    ]) ||
+      typeof frame.chat_id !== "string" || !CHAT_ID_PATTERN.test(frame.chat_id) ||
+      typeof frame.message_id !== "string" || !MESSAGE_ID_PATTERN.test(frame.message_id) ||
+      typeof frame.recipient_username !== "string" || !USERNAME_PATTERN.test(frame.recipient_username) ||
+      typeof frame.recipient_public_key_b64 !== "string" ||
+      typeof frame.prekey_id !== "string" || !PREKEY_ID_PATTERN.test(frame.prekey_id) ||
+      typeof frame.expires_at_ms !== "number" || !Number.isSafeInteger(frame.expires_at_ms)) {
+      return { kind: "invalid-result" };
+    }
+    return {
+      kind: "prekey-lease",
+      lease: frame as unknown as PrekeyLeaseFrame,
+    };
+  }
   if (frame.type === "message_result") {
     if (!exactObjectKeys(frame, ["type", "message_id", "accepted"]) ||
       typeof frame.message_id !== "string" ||
@@ -1153,6 +1346,10 @@ function randomReconnectJitter(): number {
   } while (sample[0] >= RECONNECT_JITTER_SAMPLE_LIMIT);
   return sample[0] -
     Math.floor(sample[0] / RECONNECT_JITTER_BOUND_MS) * RECONNECT_JITTER_BOUND_MS;
+}
+
+function prekeyLeaseKey(chatId: string, messageId: string, recipientUsername: string): string {
+  return `${chatId}\u0000${messageId}\u0000${recipientUsername}`;
 }
 
 function serializeRelayFrame(frame: object): string | null {

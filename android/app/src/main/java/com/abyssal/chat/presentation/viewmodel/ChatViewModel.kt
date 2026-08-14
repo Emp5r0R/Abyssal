@@ -27,6 +27,7 @@ import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientIdentity
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
@@ -372,6 +373,18 @@ class ChatViewModel(
     ) {
         fun wipe() = identityPublicKey.fill(0)
     }
+
+    private data class LeasedPrekeyReference(
+        val chatId: String,
+        val messageId: String,
+        val recipientUsername: String,
+        val prekeyId: String
+    )
+
+    private data class PreparedEncryptedMessage(
+        val payload: EncryptedTransportPayload,
+        val leases: List<LeasedPrekeyReference>
+    )
 
     private val _currentScreen = MutableStateFlow<Screen>(Screen.Entrance)
     val currentScreen: StateFlow<Screen> = _currentScreen.asStateFlow()
@@ -2018,16 +2031,24 @@ class ChatViewModel(
         val sessionGenerationSnapshot = sessionStamp?.generation ?: sessionGeneration.get()
         val connectionGeneration = sessionStamp?.connectionGeneration
             ?: chatTransport.currentConnectionGeneration()
-        val encrypted = try {
-            encryptMetadata(chatId, messageId, metadata, recipientsOverride)
+        val prepared = try {
+            encryptMetadata(
+                chatId = chatId,
+                messageId = messageId,
+                metadata = metadata,
+                recipientsOverride = recipientsOverride,
+                expectedConnectionGeneration = connectionGeneration
+            )
         } catch (_: FatalPayloadCipherException) {
             failClosedAfterAmbiguous()
             return@withLock OutboundSendResult.AMBIGUOUS
         } ?: return@withLock null
+        val encrypted = prepared.payload
         try {
             if (sessionStamp != null && !isSessionStampValid(sessionStamp)) {
                 return@withLock try {
                     payloadCipher.rollbackOutbound(encrypted.messageId, encrypted.stateRevision)
+                    releasePrekeyLeases(prepared.leases, connectionGeneration)
                     OutboundSendResult.NOT_SENT
                 } catch (_: Exception) {
                     failClosedAfterAmbiguous()
@@ -2064,6 +2085,7 @@ class ChatViewModel(
                 OutboundSendResult.NOT_SENT -> {
                     try {
                         payloadCipher.rollbackOutbound(encrypted.messageId, encrypted.stateRevision)
+                        releasePrekeyLeases(prepared.leases, connectionGeneration)
                     } catch (_: Exception) {
                         failClosedAfterAmbiguous()
                         return@withLock OutboundSendResult.AMBIGUOUS
@@ -2090,29 +2112,105 @@ class ChatViewModel(
         }
     }
 
-    private fun encryptMetadata(
+    private suspend fun encryptMetadata(
         chatId: String,
         messageId: String,
         metadata: String,
-        recipientsOverride: List<RecipientIdentity>? = null
-    ): EncryptedTransportPayload? {
+        recipientsOverride: List<RecipientIdentity>? = null,
+        expectedConnectionGeneration: Long = chatTransport.currentConnectionGeneration()
+    ): PreparedEncryptedMessage? {
         val sender = currentUser.value ?: return null
         val recipients = recipientsOverride ?: recipientIdentities(chatId, includeSelf = false) ?: return null
         val plainBytes = metadata.toByteArray(StandardCharsets.UTF_8)
+        val acquiredLeases = ArrayList<PrekeyLease>()
+        val leaseReferences = ArrayList<LeasedPrekeyReference>()
+        val leasedRecipientKeys = ArrayList<ByteArray>()
         return try {
-            payloadCipher.encrypt(
-                chatId = chatId,
-                messageId = messageId,
-                senderUsername = sender.username,
-                plainBytes = plainBytes,
-                recipients = recipients
+            val leasedRecipients = recipients
+                .distinctBy { it.username.lowercase(Locale.ROOT) }
+                .map { recipient ->
+                    if (!payloadCipher.requiresPrekey(recipient.username)) {
+                        recipient
+                    } else {
+                        val lease = chatTransport.requestPrekeyLease(
+                            chatId = chatId,
+                            messageId = messageId,
+                            recipientUsername = recipient.username,
+                            expectedConnectionGeneration = expectedConnectionGeneration
+                        ) ?: throw IllegalStateException("Prekey lease unavailable")
+                        if (lease.chatId != chatId ||
+                            lease.messageId != messageId ||
+                            lease.recipientUsername != recipient.username ||
+                            lease.recipientPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
+                            !PREKEY_ID_REGEX.matches(lease.prekeyId) ||
+                            lease.expiresAtMs <= 0L ||
+                            (lease.connectionGeneration != 0L &&
+                                lease.connectionGeneration != expectedConnectionGeneration)
+                        ) throw IllegalStateException("Prekey lease mismatch")
+                        acquiredLeases += lease
+                        leaseReferences += LeasedPrekeyReference(
+                            chatId = chatId,
+                            messageId = messageId,
+                            recipientUsername = lease.recipientUsername,
+                            prekeyId = lease.prekeyId
+                        )
+                        val leasedPublicKey = lease.recipientPublicKey.copyOf()
+                        leasedRecipientKeys += leasedPublicKey
+                        RecipientIdentity(
+                            username = lease.recipientUsername,
+                            publicKey = leasedPublicKey,
+                            prekeyId = lease.prekeyId
+                        )
+                    }
+                }
+            PreparedEncryptedMessage(
+                payload = payloadCipher.encrypt(
+                    chatId = chatId,
+                    messageId = messageId,
+                    senderUsername = sender.username,
+                    plainBytes = plainBytes,
+                    recipients = leasedRecipients
+                ),
+                leases = leaseReferences.toList()
             )
         } catch (error: FatalPayloadCipherException) {
+            // Native encryption happens before relay admission, so every lease
+            // acquired in this preparation phase is definitely unused even if
+            // native rollback failed. Release only the exact known tuples,
+            // then preserve the fatal identity transition for fail-closed
+            // handling by the caller.
+            releasePrekeyLeases(leaseReferences, expectedConnectionGeneration)
+            throw error
+        } catch (error: CancellationException) {
+            releasePrekeyLeases(leaseReferences, expectedConnectionGeneration)
             throw error
         } catch (_: Exception) {
+            releasePrekeyLeases(leaseReferences, expectedConnectionGeneration)
             null
         } finally {
             plainBytes.fill(0)
+            acquiredLeases.forEach { it.recipientPublicKey.fill(0) }
+            leasedRecipientKeys.forEach { it.fill(0) }
+        }
+    }
+
+    private suspend fun releasePrekeyLeases(
+        leases: List<LeasedPrekeyReference>,
+        expectedConnectionGeneration: Long
+    ) {
+        if (leases.isEmpty()) return
+        withContext(NonCancellable) {
+            leases.forEach { lease ->
+                runCatching {
+                    chatTransport.releasePrekeyLease(
+                        chatId = lease.chatId,
+                        messageId = lease.messageId,
+                        recipientUsername = lease.recipientUsername,
+                        prekeyId = lease.prekeyId,
+                        expectedConnectionGeneration = expectedConnectionGeneration
+                    )
+                }
+            }
         }
     }
 
@@ -2554,7 +2652,8 @@ class ChatViewModel(
         private const val SESSION_WATCHDOG_INTERVAL_MS = 1_000L
         private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
-        private const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        private const val IDENTITY_PUBLIC_KEY_BYTES = 608
+        private val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
         private const val MAX_RECEIVED_FRAME_IDS = 10_000
         private const val MAX_OWN_MESSAGE_IDS = 10_000
         private const val MAX_MESSAGE_SEND_JOBS = 64

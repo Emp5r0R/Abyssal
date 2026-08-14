@@ -6,6 +6,7 @@ import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
@@ -25,6 +26,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,6 +76,85 @@ internal const val PURGE_CLOSE_REASON = "purge"
 private const val WS_TICKET_B64_LENGTH = 43
 private val WS_TICKET_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
 private const val OUTBOUND_RESULT_TIMEOUT_MS = 15_000L
+internal const val PREKEY_LEASE_REQUEST_TIMEOUT_MS = 5_000L
+internal const val IDENTITY_PUBLIC_KEY_BYTES_V9 = 608
+internal val PREKEY_ID_REGEX_V9 = Regex("^[A-Za-z0-9_-]{1,32}$")
+
+private val CANONICAL_BASE64_URL_REGEX_V9 = Regex("^[A-Za-z0-9_-]+$")
+
+private fun isSafeProtocolIdentifier(value: String): Boolean =
+    value.isNotEmpty() && value.length <= 128 &&
+        value.all { it.isLetterOrDigit() || it == '_' || it == '-' }
+
+private fun isSafeProtocolUsername(value: String): Boolean =
+    value.length in 1..80 && value.all { it.isLetterOrDigit() || it == '_' || it == '-' }
+
+private fun decodeCanonicalBase64UrlValue(value: String, expectedBytes: Int): ByteArray? {
+    val expectedLength = (expectedBytes * 8 + 5) / 6
+    if (value.length != expectedLength || !CANONICAL_BASE64_URL_REGEX_V9.matches(value)) return null
+    val decoded = runCatching { Base64.getUrlDecoder().decode(value) }.getOrNull() ?: return null
+    if (decoded.size != expectedBytes || Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) != value) {
+        decoded.fill(0)
+        return null
+    }
+    return decoded
+}
+
+private fun decodeCanonicalBase64UrlValue(value: String): ByteArray? {
+    if (!CANONICAL_BASE64_URL_REGEX_V9.matches(value)) return null
+    val decoded = runCatching { Base64.getUrlDecoder().decode(value) }.getOrNull() ?: return null
+    if (Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) != value) {
+        decoded.fill(0)
+        return null
+    }
+    return decoded
+}
+
+internal data class PrekeyLeaseTuple(
+    val chatId: String,
+    val messageId: String,
+    val recipientUsername: String
+)
+
+internal fun JSONObject.toPrekeyLease(): PrekeyLease? {
+    if (keys().asSequence().toSet() != setOf(
+            "type",
+            "chat_id",
+            "message_id",
+            "recipient_username",
+            "recipient_public_key_b64",
+            "prekey_id",
+            "expires_at_ms"
+    ) || (opt("type") as? String) != "prekey_lease"
+    ) return null
+    val chatId = (opt("chat_id") as? String)?.takeIf(::isSafeProtocolIdentifier) ?: return null
+    val messageId = (opt("message_id") as? String)?.takeIf(::isSafeProtocolIdentifier) ?: return null
+    val recipientUsername = (opt("recipient_username") as? String)
+        ?.takeIf(::isSafeProtocolUsername) ?: return null
+    val publicKey = decodeCanonicalBase64UrlValue(
+        (opt("recipient_public_key_b64") as? String) ?: return null,
+        IDENTITY_PUBLIC_KEY_BYTES_V9
+    ) ?: return null
+    val prekeyId = (opt("prekey_id") as? String)
+        .takeIf { it != null && PREKEY_ID_REGEX_V9.matches(it) }
+        ?: run {
+            publicKey.fill(0)
+            return null
+        }
+    val expiresAtMs = (opt("expires_at_ms") as? Long)
+    if (expiresAtMs == null || expiresAtMs <= 0L) {
+        publicKey.fill(0)
+        return null
+    }
+    return PrekeyLease(
+        chatId = chatId,
+        messageId = messageId,
+        recipientUsername = recipientUsername,
+        recipientPublicKey = publicKey,
+        prekeyId = prekeyId,
+        expiresAtMs = expiresAtMs
+    )
+}
 
 internal fun JSONObject.toOutboundMessageResult(): Pair<String, Boolean>? {
     if (keys().asSequence().toSet() != setOf("type", "message_id", "accepted")) return null
@@ -151,7 +232,13 @@ class RealChatTransport(
 
     private data class DrainedPendingOperations(
         val outbound: List<CompletableDeferred<OutboundSendResult>>,
-        val acknowledgements: List<CompletableDeferred<OutboundSendResult>>
+        val acknowledgements: List<CompletableDeferred<OutboundSendResult>>,
+        val prekeyLeases: List<CompletableDeferred<PrekeyLease?>>
+    )
+
+    private data class PendingPrekeyLease(
+        val generation: Long,
+        val result: CompletableDeferred<PrekeyLease?>
     )
 
     private data class SocketSnapshot(
@@ -195,6 +282,7 @@ class RealChatTransport(
     private val pendingOutbound = LinkedHashMap<String, PendingOperation>()
     private val pendingAcknowledgements =
         LinkedHashMap<String, PendingOperation>()
+    private val pendingPrekeyLeases = LinkedHashMap<PrekeyLeaseTuple, PendingPrekeyLease>()
 
     override fun connect() {
         val session = nodeConfigService.getActiveSession()
@@ -436,7 +524,19 @@ class RealChatTransport(
         val acknowledgements = synchronized(pendingAcknowledgements) {
             drainPendingResultsLocked(pendingAcknowledgements, currentGeneration)
         }
-        return DrainedPendingOperations(outbound, acknowledgements)
+        val prekeyLeases = synchronized(pendingPrekeyLeases) {
+            val drained = ArrayList<CompletableDeferred<PrekeyLease?>>(pendingPrekeyLeases.size)
+            val iterator = pendingPrekeyLeases.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.value.generation != currentGeneration) {
+                    drained += entry.value.result
+                    iterator.remove()
+                }
+            }
+            drained
+        }
+        return DrainedPendingOperations(outbound, acknowledgements, prekeyLeases)
     }
 
     /** Must be called under [connectionLock]. */
@@ -647,7 +747,28 @@ class RealChatTransport(
         lateinit var socket: WebSocket
         var generation = 0L
         return try {
-            if (payload.version != PROTOCOL_VERSION || payload.stateSignature.size != STATE_SIGNATURE_BYTES) {
+            if (payload.version != PROTOCOL_VERSION ||
+                !isSafeIdentifier(chatId) ||
+                !isSafeIdentifier(payload.messageId) ||
+                payload.stateSignature.size != STATE_SIGNATURE_BYTES ||
+                payload.identityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
+                !PREKEY_ID_REGEX.matches(payload.prekeyId) ||
+                payload.nonce.size != MESSAGE_NONCE_BYTES ||
+                payload.ciphertext.isEmpty() ||
+                payload.ciphertext.size > MAX_CIPHERTEXT_BYTES ||
+                payload.identityEnvelope.isEmpty() ||
+                payload.identityEnvelope.size > MAX_IDENTITY_ENVELOPE_BYTES ||
+                payload.envelopes.isEmpty() ||
+                payload.envelopes.size > MAX_RECIPIENT_ENVELOPES ||
+                payload.envelopes.any { envelope ->
+                    !isSafeUsername(envelope.recipientUsername) ||
+                        envelope.wrappedKey.isEmpty() ||
+                        envelope.wrappedKey.size > MAX_WRAPPED_KEY_BYTES ||
+                        envelope.signature.size != MESSAGE_SIGNATURE_BYTES ||
+                        envelope.prekeyId.isEmpty() != !envelope.isPrekey ||
+                        (envelope.prekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(envelope.prekeyId))
+                }
+            ) {
                 return OutboundSendResult.NOT_SENT
             }
             val frame = JSONObject()
@@ -745,6 +866,145 @@ class RealChatTransport(
         }
     }
 
+    override suspend fun requestPrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String
+    ): PrekeyLease? = requestPrekeyLeaseInternal(chatId, messageId, recipientUsername, null)
+
+    override suspend fun requestPrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        expectedConnectionGeneration: Long
+    ): PrekeyLease? = requestPrekeyLeaseInternal(
+        chatId,
+        messageId,
+        recipientUsername,
+        expectedConnectionGeneration
+    )
+
+    private suspend fun requestPrekeyLeaseInternal(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        expectedGeneration: Long?
+    ): PrekeyLease? {
+        if (!isSafeIdentifier(chatId) || !isSafeIdentifier(messageId) ||
+            !isSafeUsername(recipientUsername)
+        ) return null
+        val tuple = PrekeyLeaseTuple(chatId, messageId, recipientUsername)
+        val frame = JSONObject()
+            .put("type", "prekey_lease")
+            .put("chat_id", chatId)
+            .put("message_id", messageId)
+            .put("recipient_username", recipientUsername)
+            .toString()
+        lateinit var socket: WebSocket
+        val generation: Long
+        var operation: PendingPrekeyLease
+        synchronized(connectionLock) {
+            socket = webSocket ?: return null
+            generation = connectionGeneration.get()
+            if (expectedGeneration != null && expectedGeneration != generation) return null
+            synchronized(pendingPrekeyLeases) {
+                // A second local waiter would complicate cancellation
+                // ownership. The relay itself is idempotent, so callers retry
+                // only after this bounded operation has completed or timed out.
+                if (pendingPrekeyLeases.containsKey(tuple)) return null
+                if (pendingPrekeyLeases.size >= MAX_PENDING_PREKEY_LEASES) return null
+                operation = PendingPrekeyLease(generation, CompletableDeferred()).also {
+                    pendingPrekeyLeases[tuple] = it
+                }
+            }
+            // Registration and write are one critical section. Invalidation
+            // either drains this generation or observes the sent request.
+            if (!runCatching { socket.send(frame) }.getOrDefault(false)) {
+                synchronized(pendingPrekeyLeases) {
+                    if (pendingPrekeyLeases[tuple] === operation) pendingPrekeyLeases.remove(tuple)
+                }
+                operation.result.complete(null)
+                wipeCompletedPrekeyResult(operation.result)
+                return null
+            }
+        }
+        return try {
+            withTimeout(PREKEY_LEASE_REQUEST_TIMEOUT_MS) { operation.result.await() }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            synchronized(pendingPrekeyLeases) {
+                if (pendingPrekeyLeases[tuple] === operation) pendingPrekeyLeases.remove(tuple)
+            }
+            operation.result.complete(null)
+            wipeCompletedPrekeyResult(operation.result)
+            null
+        } catch (error: CancellationException) {
+            synchronized(pendingPrekeyLeases) {
+                if (pendingPrekeyLeases[tuple] === operation) pendingPrekeyLeases.remove(tuple)
+            }
+            operation.result.complete(null)
+            wipeCompletedPrekeyResult(operation.result)
+            throw error
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun wipeCompletedPrekeyResult(result: CompletableDeferred<PrekeyLease?>) {
+        val lease = runCatching { result.getCompleted() }.getOrNull() ?: return
+        lease.recipientPublicKey.fill(0)
+    }
+
+    override suspend fun releasePrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        prekeyId: String
+    ): Boolean = releasePrekeyLeaseInternal(
+        chatId,
+        messageId,
+        recipientUsername,
+        prekeyId,
+        null
+    )
+
+    override suspend fun releasePrekeyLease(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        prekeyId: String,
+        expectedConnectionGeneration: Long
+    ): Boolean = releasePrekeyLeaseInternal(
+        chatId,
+        messageId,
+        recipientUsername,
+        prekeyId,
+        expectedConnectionGeneration
+    )
+
+    private fun releasePrekeyLeaseInternal(
+        chatId: String,
+        messageId: String,
+        recipientUsername: String,
+        prekeyId: String,
+        expectedGeneration: Long?
+    ): Boolean {
+        if (!isSafeIdentifier(chatId) || !isSafeIdentifier(messageId) ||
+            !isSafeUsername(recipientUsername) || !PREKEY_ID_REGEX.matches(prekeyId)
+        ) return false
+        val frame = JSONObject()
+            .put("type", "prekey_lease_release")
+            .put("chat_id", chatId)
+            .put("message_id", messageId)
+            .put("recipient_username", recipientUsername)
+            .put("prekey_id", prekeyId)
+            .toString()
+        return synchronized(connectionLock) {
+            val snapshot = captureSocketSnapshot(expectedGeneration) ?: return false
+            // A release is deliberately fire-and-forget: relay rejection is
+            // silent and the short lease expiry remains the final safety net.
+            runCatching { snapshot.socket.send(frame) }.getOrDefault(false)
+        }
+    }
+
     override suspend fun acknowledgeMessage(
         chatId: String,
         messageId: String,
@@ -795,6 +1055,7 @@ class RealChatTransport(
                 (usedPrekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(usedPrekeyId)) ||
                 state.stateSignature.size != STATE_SIGNATURE_BYTES ||
                 state.identityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
+                !PREKEY_ID_REGEX.matches(state.prekeyId) ||
                 ackSignature.size != ACK_SIGNATURE_BYTES
             ) return OutboundSendResult.NOT_SENT
             JSONObject()
@@ -882,7 +1143,10 @@ class RealChatTransport(
         state: IdentityStateSnapshot,
         expectedGeneration: Long?
     ): Boolean {
-        if (state.stateSignature.size != STATE_SIGNATURE_BYTES) return false
+        if (state.stateSignature.size != STATE_SIGNATURE_BYTES ||
+            state.identityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
+            !PREKEY_ID_REGEX.matches(state.prekeyId)
+        ) return false
         return sendCommandFrame(
             JSONObject()
                 .put("type", "identity_state")
@@ -953,6 +1217,46 @@ class RealChatTransport(
                     val json = JSONObject(text)
                     when (json.optString("type")) {
                         "GLOBAL_WIPE", "global_wipe" -> signalPurgeForSocket(webSocket, generation)
+                        "prekey_lease" -> {
+                            val lease = json.toPrekeyLease() ?: run {
+                                closeCurrentSocket(webSocket, nodeId, "invalid prekey lease")
+                                return
+                            }
+                            val tuple = PrekeyLeaseTuple(
+                                lease.chatId,
+                                lease.messageId,
+                                lease.recipientUsername
+                            )
+                            val pending = synchronized(connectionLock) {
+                                if (!isCurrentSocket(webSocket, generation)) {
+                                    null
+                                } else {
+                                    synchronized(pendingPrekeyLeases) {
+                                        val operation = pendingPrekeyLeases[tuple]
+                                        if (operation == null || operation.generation != generation) {
+                                            null
+                                        } else {
+                                            pendingPrekeyLeases.remove(tuple)
+                                            operation.result
+                                        }
+                                    }
+                                }
+                            }
+                            if (pending == null) {
+                                lease.recipientPublicKey.fill(0)
+                                // A timed-out or invalidated request may still
+                                // have a late authenticated response in the
+                                // OkHttp queue.  Ignore it silently rather than
+                                // letting a stale result tear down a live epoch.
+                            } else {
+                                val delivered = lease.copy(
+                                    recipientPublicKey = lease.recipientPublicKey.clone(),
+                                    connectionGeneration = generation
+                                )
+                                if (!pending.complete(delivered)) delivered.recipientPublicKey.fill(0)
+                                lease.recipientPublicKey.fill(0)
+                            }
+                        }
                         "message" -> {
                             if (json.optInt("version") != PROTOCOL_VERSION) return
                             json.toIncomingPayload(generation)?.let { payload ->
@@ -1090,17 +1394,39 @@ class RealChatTransport(
     }
 
     internal fun signalPurge() {
-        synchronized(connectionLock) {
+        val drained = synchronized(connectionLock) {
             signalPurgeLocked(connectionGeneration.get(), force = false)
+            drainPendingPrekeyLeasesLocked(connectionGeneration.get())
         }
+        drained.forEach { it.complete(null) }
     }
 
     private fun signalPurgeForSocket(socket: WebSocket, generation: Long) {
-        synchronized(connectionLock) {
+        val drained = synchronized(connectionLock) {
             if (isCurrentSocket(socket, generation)) {
                 signalPurgeLocked(generation, force = false)
+                drainPendingPrekeyLeasesLocked(generation)
+            } else {
+                emptyList()
             }
         }
+        drained.forEach { it.complete(null) }
+    }
+
+    /** Must be called under [connectionLock]. */
+    private fun drainPendingPrekeyLeasesLocked(
+        generation: Long
+    ): List<CompletableDeferred<PrekeyLease?>> = synchronized(pendingPrekeyLeases) {
+        val drained = ArrayList<CompletableDeferred<PrekeyLease?>>()
+        val iterator = pendingPrekeyLeases.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.value.generation == generation) {
+                drained += entry.value.result
+                iterator.remove()
+            }
+        }
+        drained
     }
 
     /** Must be called under [connectionLock]. */
@@ -1119,6 +1445,7 @@ class RealChatTransport(
     ) {
         drained.outbound.forEach { it.complete(result) }
         drained.acknowledgements.forEach { it.complete(result) }
+        drained.prekeyLeases.forEach { it.complete(null) }
     }
 
     private fun abortPendingOutbound(
@@ -1563,37 +1890,52 @@ class RealChatTransport(
         var identityPublicKey: ByteArray? = null
         var ownershipTransferred = false
         return try {
-            val chatId = optString("chat_id").takeIf { isSafeIdentifier(it) } ?: return null
-            val messageId = optString("message_id").takeIf { isSafeIdentifier(it) } ?: return null
-            val version = optInt("version")
+            if (keys().asSequence().toSet() != INCOMING_MESSAGE_KEYS || optString("type") != "message") {
+                return null
+            }
+            val chatId = stringValue("chat_id")?.takeIf { isSafeIdentifier(it) } ?: return null
+            val messageId = stringValue("message_id")?.takeIf { isSafeIdentifier(it) } ?: return null
+            val version = opt("version") as? Int ?: return null
             if (version != PROTOCOL_VERSION) return null
-            val senderUsername = optString("sender_username")
-                .takeIf { isSafeUsername(it) } ?: return null
-            val prekeyId = optString("prekey_id")
-            val isPrekey = optBoolean("is_prekey", false)
+            val senderUsername = stringValue("sender_username")
+                ?.takeIf { isSafeUsername(it) } ?: return null
+            val prekeyId = stringValue("prekey_id") ?: return null
+            val isPrekey = booleanValue("is_prekey") ?: return null
             if (isPrekey != prekeyId.isNotEmpty() ||
                 (prekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(prekeyId))
             ) return null
 
-            val decodedNonce = decode(getString("nonce_b64"))
-            val decodedCiphertext = decode(getString("ciphertext_b64"))
-            val decodedSignature = decode(getString("signature_b64"))
-            val decodedWrappedKey = decode(getString("wrapped_key_b64"))
-            val decodedSenderPublicKey = decode(getString("sender_public_key_b64"))
-            val decodedIdentityPublicKey = decode(getString("identity_public_b64"))
+            val decodedNonce = decodeCanonicalBase64UrlValue(
+                stringValue("nonce_b64") ?: return null
+            ) ?: return null
             nonce = decodedNonce
+            val decodedCiphertext = decodeCanonicalBase64UrlValue(
+                stringValue("ciphertext_b64") ?: return null
+            ) ?: return null
             ciphertext = decodedCiphertext
+            val decodedSignature = decodeCanonicalBase64UrlValue(
+                stringValue("signature_b64") ?: return null
+            ) ?: return null
             signature = decodedSignature
+            val decodedWrappedKey = decodeCanonicalBase64UrlValue(
+                stringValue("wrapped_key_b64") ?: return null
+            ) ?: return null
             wrappedKey = decodedWrappedKey
+            val decodedSenderPublicKey = decodeCanonicalBase64Url(
+                stringValue("sender_public_key_b64") ?: return null,
+                IDENTITY_PUBLIC_KEY_BYTES
+            ) ?: return null
             senderPublicKey = decodedSenderPublicKey
+            val decodedIdentityPublicKey = decodeCanonicalBase64Url(
+                stringValue("identity_public_b64") ?: return null,
+                IDENTITY_PUBLIC_KEY_BYTES
+            ) ?: return null
             identityPublicKey = decodedIdentityPublicKey
             if (
                 decodedNonce.size != MESSAGE_NONCE_BYTES ||
                 decodedCiphertext.isEmpty() || decodedCiphertext.size > MAX_CIPHERTEXT_BYTES ||
                 decodedSignature.size != MESSAGE_SIGNATURE_BYTES ||
                 decodedWrappedKey.isEmpty() || decodedWrappedKey.size > MAX_WRAPPED_KEY_BYTES ||
-                decodedSenderPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
-                decodedIdentityPublicKey.size != IDENTITY_PUBLIC_KEY_BYTES ||
                 !isPinnedIdentity(senderUsername, decodedSenderPublicKey)
             ) return null
 
@@ -1710,17 +2052,18 @@ class RealChatTransport(
     }
 
     private companion object {
-        const val PROTOCOL_VERSION = 8
-        // Protocol-v8 ciphertext is padded to 256-byte buckets. Base64url and
+        const val PROTOCOL_VERSION = 9
+        // Protocol-v9 ciphertext is padded to 256-byte buckets. Base64url and
         // JSON framing add overhead, so this client keeps room below the relay cap.
         const val MAX_WEBSOCKET_FRAME_BYTES = 1 * 1024 * 1024
         const val MAX_CIPHERTEXT_BYTES = 1_048_848
+        const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
         const val MAX_WRAPPED_KEY_BYTES = 4096
         const val MESSAGE_NONCE_BYTES = 12
         const val MESSAGE_SIGNATURE_BYTES = 64
         const val ACK_SIGNATURE_BYTES = 64
         const val STATE_SIGNATURE_BYTES = 64
-        const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        const val IDENTITY_PUBLIC_KEY_BYTES = 608
         const val MAX_USERNAME_CHARS = 80
         const val MAX_ROOM_NAME_CHARS = 36
         const val MAX_RETENTION_SEC = 86_400
@@ -1733,6 +2076,8 @@ class RealChatTransport(
         const val MAX_JOINED_CHAT_IDS = 512
         const val MAX_PENDING_OUTBOUND = 64
         const val MAX_PENDING_ACKNOWLEDGEMENTS = 64
+        const val MAX_PENDING_PREKEY_LEASES = 64
+        const val MAX_RECIPIENT_ENVELOPES = 256
         const val DIRECTORY_DIGEST_BYTES = 32
         const val IDENTITY_FINGERPRINT_BYTES = 64
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
@@ -1740,6 +2085,11 @@ class RealChatTransport(
         val CANONICAL_BASE64_URL_REGEX = Regex("^[A-Za-z0-9_-]+$")
         val PRESENCE_KEYS = setOf(
             "username", "connected", "identity_public_b64", "identity_prekey_id", "directory_digest"
+        )
+        val INCOMING_MESSAGE_KEYS = setOf(
+            "type", "chat_id", "version", "message_id", "nonce_b64", "ciphertext_b64",
+            "signature_b64", "wrapped_key_b64", "prekey_id", "is_prekey", "sender_username",
+            "sender_public_key_b64", "identity_public_b64"
         )
         val ROOM_KEYS = setOf(
             "id", "name", "owner_username", "self_destruct_timer_sec", "overall_expiry_sec",

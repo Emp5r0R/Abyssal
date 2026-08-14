@@ -35,12 +35,20 @@ class InMemoryPayloadCipher {
         val next = E2eeSession.create(exportKey)
         return try {
             session = next
+            val publicKey = next.publicKey()
+            try {
+                require(publicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
+                require(PREKEY_ID_REGEX.matches(next.prekeyId()))
+            } finally {
+                publicKey.fill(0)
+            }
             IdentityMaterial(
                 publicKey = next.publicKey(),
                 prekeyId = next.prekeyId(),
                 envelope = next.sealIdentity(exportKey, context)
             )
         } catch (error: Exception) {
+            session = null
             next.close()
             throw error
         }
@@ -54,14 +62,48 @@ class InMemoryPayloadCipher {
         expectedPublicKey: ByteArray
     ) {
         clear()
-        session = E2eeSession.recover(exportKey, context, envelope, expectedPublicKey)
+        require(expectedPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
+        val recovered = E2eeSession.recover(exportKey, context, envelope, expectedPublicKey)
+        try {
+            val actual = recovered.publicKey()
+            try {
+                require(actual.size == IDENTITY_PUBLIC_KEY_BYTES)
+                require(actual.contentEquals(expectedPublicKey))
+                require(PREKEY_ID_REGEX.matches(recovered.prekeyId()))
+            } finally {
+                actual.fill(0)
+            }
+            session = recovered
+        } catch (error: Exception) {
+            recovered.close()
+            throw error
+        }
     }
 
     @Synchronized
-    fun publicKey(): ByteArray = requireSession().publicKey()
+    fun publicKey(): ByteArray {
+        val publicKey = requireSession().publicKey()
+        if (publicKey.size != IDENTITY_PUBLIC_KEY_BYTES) {
+            publicKey.fill(0)
+            throw IllegalStateException("Identity unavailable")
+        }
+        return publicKey
+    }
 
     @Synchronized
-    fun prekeyId(): String = requireSession().prekeyId()
+    fun prekeyId(): String = requireSession().prekeyId().also {
+        require(PREKEY_ID_REGEX.matches(it))
+    }
+
+    /**
+     * Native ratchet policy decides whether this recipient needs a fresh
+     * authenticated lease.  This must run before [encrypt] stages any state.
+     */
+    @Synchronized
+    fun requiresPrekey(peerUsername: String): Boolean {
+        require(isSafeUsername(peerUsername))
+        return requireSession().requiresPrekey(peerUsername)
+    }
 
     @Synchronized
     fun stateSnapshot(): IdentityStateSnapshot? = (pendingState ?: committedState)?.let {
@@ -83,11 +125,18 @@ class InMemoryPayloadCipher {
         recipients: List<RecipientIdentity>
     ): EncryptedTransportPayload {
         check(pendingState == null) { "Outbound operation already pending" }
-        wipeState(pendingPreviousState)
-        pendingPreviousState = copyState(committedState)
+        require(isSafeIdentifier(chatId) && isSafeIdentifier(messageId) && isSafeUsername(senderUsername))
         val uniqueRecipients = recipients
             .distinctBy { it.username.lowercase(Locale.ROOT) }
-            .map { RecipientPublicKey(it.username, it.publicKey, it.prekeyId) }
+            .map {
+                require(isSafeUsername(it.username))
+                require(it.publicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
+                require(PREKEY_ID_REGEX.matches(it.prekeyId))
+                RecipientPublicKey(it.username, it.publicKey, it.prekeyId)
+            }
+        require(uniqueRecipients.isNotEmpty())
+        wipeState(pendingPreviousState)
+        pendingPreviousState = copyState(committedState)
         var encrypted: uniffi.abyssal_core.E2eePayload? = null
         return try {
             encrypted = requireSession().encrypt(
@@ -145,6 +194,23 @@ class InMemoryPayloadCipher {
     @Synchronized
     fun decrypt(payload: IncomingTransportPayload, recipientUsername: String): DecryptionResult {
         check(pendingState == null) { "Outbound operation already pending" }
+        require(
+            isSafeIdentifier(payload.chatId) &&
+                isSafeIdentifier(payload.messageId) &&
+                isSafeUsername(payload.senderUsername) &&
+                isSafeUsername(recipientUsername) &&
+                payload.version == PROTOCOL_VERSION &&
+                payload.senderPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES &&
+                payload.identityPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES &&
+                payload.nonce.size == MESSAGE_NONCE_BYTES &&
+                payload.ciphertext.isNotEmpty() &&
+                payload.ciphertext.size <= MAX_METADATA_CIPHERTEXT_BYTES &&
+                payload.signature.size == MESSAGE_SIGNATURE_BYTES &&
+                payload.wrappedKey.isNotEmpty() &&
+                payload.wrappedKey.size <= MAX_WRAPPED_KEY_BYTES &&
+                payload.prekeyId.isEmpty() == !payload.isPrekey &&
+                (payload.prekeyId.isEmpty() || PREKEY_ID_REGEX.matches(payload.prekeyId))
+        )
         val decrypted = requireSession().decrypt(
             payload.chatId,
             payload.messageId,
@@ -195,6 +261,12 @@ class InMemoryPayloadCipher {
         senderUsername: String,
         usedPrekeyId: String
     ): ByteArray {
+        require(
+            isSafeIdentifier(chatId) &&
+                isSafeIdentifier(messageId) &&
+                isSafeUsername(senderUsername) &&
+                (usedPrekeyId.isEmpty() || PREKEY_ID_REGEX.matches(usedPrekeyId))
+        )
         val signature = requireSession().signAcknowledgement(
             chatId,
             messageId,
@@ -229,8 +301,28 @@ class InMemoryPayloadCipher {
     }
 
     fun serialize(payload: EncryptedTransportPayload): ByteArray {
-        require(payload.version == PROTOCOL_VERSION)
+        require(
+            payload.version == PROTOCOL_VERSION &&
+                isSafeIdentifier(payload.messageId) &&
+                payload.nonce.size == MESSAGE_NONCE_BYTES &&
+                payload.ciphertext.isNotEmpty() &&
+                payload.ciphertext.size <= MAX_METADATA_CIPHERTEXT_BYTES &&
+                payload.identityEnvelope.isNotEmpty() &&
+                payload.identityEnvelope.size <= MAX_IDENTITY_ENVELOPE_BYTES &&
+                payload.envelopes.isNotEmpty() &&
+                payload.envelopes.size <= MAX_RECIPIENT_ENVELOPES &&
+                payload.envelopes.all { envelope ->
+                    isSafeUsername(envelope.recipientUsername) &&
+                        envelope.wrappedKey.isNotEmpty() &&
+                        envelope.wrappedKey.size <= MAX_WRAPPED_KEY_BYTES &&
+                        envelope.signature.size == MESSAGE_SIGNATURE_BYTES &&
+                        envelope.prekeyId.isEmpty() == !envelope.isPrekey &&
+                        (envelope.prekeyId.isEmpty() || PREKEY_ID_REGEX.matches(envelope.prekeyId))
+                }
+        )
         require(payload.stateSignature.size == STATE_SIGNATURE_BYTES)
+        require(payload.identityPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
+        require(PREKEY_ID_REGEX.matches(payload.prekeyId))
         val json = JSONObject()
             .put("version", payload.version)
             .put("message_id", payload.messageId)
@@ -261,16 +353,27 @@ class InMemoryPayloadCipher {
         recipientUsername: String
     ): IncomingTransportPayload {
         require(bytes.size <= MAX_METADATA_SERIALIZED_BYTES)
+        require(
+            isSafeIdentifier(chatId) &&
+                isSafeUsername(senderUsername) &&
+                isSafeUsername(recipientUsername) &&
+                senderPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES
+        )
         val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
-        require(json.optInt("version") == PROTOCOL_VERSION)
+        require(json.keys().asSequence().toSet() == SERIALIZED_PAYLOAD_KEYS)
+        require((json.get("version") as? Int) == PROTOCOL_VERSION)
         val messageId = json.getString("message_id")
             .takeIf { isSafeIdentifier(it) }
             ?: throw IllegalArgumentException("Invalid message id")
         val envelopes = json.getJSONArray("envelopes")
         require(envelopes.length() in 1..MAX_RECIPIENT_ENVELOPES)
-        val envelope = (0 until envelopes.length())
+        val parsedEnvelopes = (0 until envelopes.length())
+            .map { envelopes.getJSONObject(it).also { value ->
+                require(value.keys().asSequence().toSet() == SERIALIZED_ENVELOPE_KEYS)
+                require(isSafeUsername(value.getString("recipient_username")))
+            } }
+        val envelope = parsedEnvelopes
             .asSequence()
-            .map { envelopes.getJSONObject(it) }
             .firstOrNull { it.getString("recipient_username") == recipientUsername }
             ?: throw IllegalArgumentException("Recipient unavailable")
         var nonce: ByteArray? = null
@@ -281,17 +384,17 @@ class InMemoryPayloadCipher {
         var identityPublicKey: ByteArray? = null
         var ownershipTransferred = false
         return try {
-            val decodedNonce = decode(json.getString("nonce_b64"))
-            val decodedCiphertext = decode(json.getString("ciphertext_b64"))
-            val decodedSignature = decode(envelope.getString("signature_b64"))
-            val decodedWrappedKey = envelope.getString("wrapped_key_b64").let(::decode)
-            val decodedSenderKey = senderPublicKey.copyOf()
-            val decodedIdentityPublicKey = decode(json.getString("identity_public_b64"))
+            val decodedNonce = decodeCanonical(json.getString("nonce_b64"))
             nonce = decodedNonce
+            val decodedCiphertext = decodeCanonical(json.getString("ciphertext_b64"))
             ciphertext = decodedCiphertext
+            val decodedSignature = decodeCanonical(envelope.getString("signature_b64"))
             signature = decodedSignature
+            val decodedWrappedKey = decodeCanonical(envelope.getString("wrapped_key_b64"))
             wrappedKey = decodedWrappedKey
+            val decodedSenderKey = senderPublicKey.copyOf()
             senderKey = decodedSenderKey
+            val decodedIdentityPublicKey = decodeCanonical(json.getString("identity_public_b64"))
             identityPublicKey = decodedIdentityPublicKey
             require(decodedNonce.size == MESSAGE_NONCE_BYTES)
             require(decodedCiphertext.isNotEmpty() && decodedCiphertext.size <= MAX_METADATA_CIPHERTEXT_BYTES)
@@ -299,8 +402,10 @@ class InMemoryPayloadCipher {
             require(decodedWrappedKey.isNotEmpty() && decodedWrappedKey.size <= MAX_WRAPPED_KEY_BYTES)
             require(decodedSenderKey.size == IDENTITY_PUBLIC_KEY_BYTES)
             require(decodedIdentityPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
-            val prekeyId = envelope.optString("prekey_id")
-            val isPrekey = envelope.optBoolean("is_prekey", false)
+            val prekeyId = envelope.get("prekey_id") as? String
+                ?: throw IllegalArgumentException("Invalid prekey id")
+            val isPrekey = envelope.get("is_prekey") as? Boolean
+                ?: throw IllegalArgumentException("Invalid prekey flag")
             require(prekeyId.isEmpty() == !isPrekey)
             if (prekeyId.isNotEmpty()) require(PREKEY_ID_REGEX.matches(prekeyId))
             val payload = IncomingTransportPayload(
@@ -387,6 +492,8 @@ class InMemoryPayloadCipher {
         stateSignature: ByteArray
     ) {
         require(stateSignature.size == STATE_SIGNATURE_BYTES)
+        require(identityPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
+        require(PREKEY_ID_REGEX.matches(prekeyId))
         wipeState(committedState)
         committedState = state(
             revision = revision,
@@ -405,6 +512,8 @@ class InMemoryPayloadCipher {
         stateSignature: ByteArray
     ): IdentityStateSnapshot {
         require(stateSignature.size == STATE_SIGNATURE_BYTES)
+        require(identityPublicKey.size == IDENTITY_PUBLIC_KEY_BYTES)
+        require(PREKEY_ID_REGEX.matches(prekeyId))
         return IdentityStateSnapshot(
             revision = revision,
             envelope = envelope.clone(),
@@ -449,23 +558,43 @@ class InMemoryPayloadCipher {
     )
 
     private companion object {
-        const val PROTOCOL_VERSION = 8
+        const val PROTOCOL_VERSION = 9
         const val MESSAGE_NONCE_BYTES = 12
         const val MESSAGE_SIGNATURE_BYTES = 64
         const val STATE_SIGNATURE_BYTES = 64
         const val ACK_SIGNATURE_BYTES = 64
-        const val IDENTITY_PUBLIC_KEY_BYTES = 128
+        const val IDENTITY_PUBLIC_KEY_BYTES = 608
         const val MAX_WRAPPED_KEY_BYTES = 4096
         const val MAX_METADATA_SERIALIZED_BYTES = 1 * 1024 * 1024
         const val MAX_METADATA_CIPHERTEXT_BYTES = 1_048_848
+        const val MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024
         const val MAX_RECIPIENT_ENVELOPES = 256
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
+        val SERIALIZED_PAYLOAD_KEYS = setOf(
+            "version", "message_id", "identity_public_b64", "state_signature_b64",
+            "nonce_b64", "ciphertext_b64", "envelopes"
+        )
+        val SERIALIZED_ENVELOPE_KEYS = setOf(
+            "recipient_username", "wrapped_key_b64", "prekey_id", "is_prekey", "signature_b64"
+        )
 
         fun isSafeIdentifier(value: String): Boolean =
             value.length in 1..128 && value.all { it.isLetterOrDigit() || it == '_' || it == '-' }
 
+        fun isSafeUsername(value: String): Boolean =
+            value.length in 1..80 && value.all { it.isLetterOrDigit() || it == '_' || it == '-' }
+
         fun encode(bytes: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
         fun decode(value: String): ByteArray = Base64.getUrlDecoder().decode(value)
+
+        fun decodeCanonical(value: String): ByteArray {
+            val decoded = decode(value)
+            if (Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) != value) {
+                decoded.fill(0)
+                throw IllegalArgumentException("Non-canonical base64")
+            }
+            return decoded
+        }
     }
 }

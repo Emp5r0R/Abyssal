@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountSession, IncomingFrame, RoomRecord } from "../domain/types";
 
 const mocks = vi.hoisted(() => {
-  const identityPublicKey = new Uint8Array(128).fill(7);
+  const identityPublicKey = new Uint8Array(608).fill(7);
   const nodeEndpoint = {
     apiBaseUrl: "https://node.example.test",
     wsBaseUrl: "wss://node.example.test",
@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => {
     static encryptError: Error | null = null;
     static decryptError: Error | null = null;
     static decryptCount = 0;
+    static requiredPeers = new Set<string>();
     static payloadIdOverride: string | null = null;
     static plaintextOverride: Record<string, unknown> | null = null;
     static lastAttachmentPlain: Uint8Array | null = null;
@@ -45,6 +46,10 @@ const mocks = vi.hoisted(() => {
       return this.prekey;
     }
 
+    requiresPrekey(peer: string): boolean {
+      return FakeCipher.requiredPeers.has(peer);
+    }
+
     stateSnapshot() {
       const snapshot = {
         revision: 1,
@@ -69,7 +74,7 @@ const mocks = vi.hoisted(() => {
     encryptText() {
       if (FakeCipher.encryptError) throw FakeCipher.encryptError;
       return {
-        version: 8,
+        version: 9,
         messageId: "message",
         nonce: new Uint8Array([1]),
         ciphertext: new Uint8Array([2]),
@@ -120,12 +125,16 @@ const mocks = vi.hoisted(() => {
   class FakeRelay {
     static readonly instances: FakeRelay[] = [];
     static encryptedOutcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS" = "ACCEPTED";
+    static leaseFailureAt: number | null = null;
+    static leaseFailureCode: "NOT_SENT" | "AMBIGUOUS" | "CLOSED" = "NOT_SENT";
     static acknowledgeResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
     private readonly frameHandler: (frame: IncomingFrame) => void;
     readonly session: AccountSession;
     connected = false;
     closed = false;
     sent: object[] = [];
+    leasesRequested: string[] = [];
+    leasesReleased: string[] = [];
 
     constructor(
       session: AccountSession,
@@ -158,6 +167,29 @@ const mocks = vi.hoisted(() => {
     sendEncryptedPayload(_messageId: string, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
       this.send(frame);
       return Promise.resolve(FakeRelay.encryptedOutcome);
+    }
+
+    requestPrekeyLease(chatId: string, messageId: string, recipientUsername: string) {
+      this.leasesRequested.push(recipientUsername);
+      if (FakeRelay.leaseFailureAt !== null &&
+        this.leasesRequested.length > FakeRelay.leaseFailureAt) {
+        return Promise.reject(Object.assign(new Error("lease rejected"), {
+          code: FakeRelay.leaseFailureCode,
+        }));
+      }
+      return Promise.resolve({
+        chatId,
+        messageId,
+        recipientUsername,
+        recipientPublicKey: identityPublicKey.slice(),
+        prekeyId: `lease-${recipientUsername}`,
+        expiresAtMs: Date.now() + 60_000,
+      });
+    }
+
+    releasePrekeyLease(lease: { prekeyId: string }): boolean {
+      this.leasesReleased.push(lease.prekeyId);
+      return this.send({ type: "prekey_lease_release", prekey_id: lease.prekeyId });
     }
 
     join(): boolean { return this.send({ type: "join" }); }
@@ -198,11 +230,14 @@ const mocks = vi.hoisted(() => {
     reset: () => {
       FakeRelay.instances.length = 0;
       FakeRelay.encryptedOutcome = "ACCEPTED";
+      FakeRelay.leaseFailureAt = null;
+      FakeRelay.leaseFailureCode = "NOT_SENT";
       FakeRelay.acknowledgeResult = null;
       FakeCipher.failAcknowledgement = false;
       FakeCipher.encryptError = null;
       FakeCipher.decryptError = null;
       FakeCipher.decryptCount = 0;
+      FakeCipher.requiredPeers.clear();
       FakeCipher.payloadIdOverride = null;
       FakeCipher.plaintextOverride = null;
       FakeCipher.lastAttachmentPlain = null;
@@ -246,7 +281,7 @@ vi.mock("../security/crypto", async () => {
     })),
     InMemoryPayloadCipher: mocks.FakeCipher,
     payloadToFrame: vi.fn(() => ({
-      version: 8,
+      version: 9,
       message_id: "message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -515,7 +550,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const frame: IncomingFrame = {
       type: "message",
       chat_id: room.id,
-      version: 8,
+      version: 9,
       message_id: "incoming-message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -579,7 +614,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const frame: IncomingFrame = {
       type: "message",
       chat_id: room.id,
-      version: 8,
+      version: 9,
       message_id: "late-ack-message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -635,7 +670,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const baseFrame: IncomingFrame = {
       type: "message",
       chat_id: room.id,
-      version: 8,
+      version: 9,
       message_id: "identity-bound-message",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -650,6 +685,21 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await act(async () => relay?.emit(baseFrame));
     expect(mocks.FakeCipher.decryptCount).toBe(0);
 
+    const retiredIdentityB64 = Buffer.from(new Uint8Array(128).fill(7)).toString("base64url");
+    await act(async () => relay?.emit({
+      type: "presence",
+      users: [{
+        username: "Bob",
+        connected: true,
+        identity_public_b64: retiredIdentityB64,
+        identity_prekey_id: "prekey-one",
+        directory_digest: "A".repeat(43),
+      }],
+    }));
+    expect(result.current.presence).toEqual([]);
+    await act(async () => relay?.emit({ ...baseFrame, version: 8 }));
+    expect(mocks.FakeCipher.decryptCount).toBe(0);
+
     await act(async () => relay?.emit({
       type: "presence",
       users: [{
@@ -660,7 +710,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         directory_digest: "A".repeat(43),
       }],
     }));
-    const mismatched = new Uint8Array(128).fill(9);
+    const mismatched = new Uint8Array(608).fill(9);
     const mismatchedB64 = Buffer.from(mismatched).toString("base64url");
     await act(async () => relay?.emit({
       ...baseFrame,
@@ -711,7 +761,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const frame = (chatId: string, sender: string, messageId: string): IncomingFrame => ({
       type: "message",
       chat_id: chatId,
-      version: 8,
+      version: 9,
       message_id: messageId,
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -767,7 +817,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await act(async () => relay?.emit({
       type: "message",
       chat_id: room.id,
-      version: 8,
+      version: 9,
       message_id: "outer-id",
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -812,7 +862,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const frame = (messageId: string): IncomingFrame => ({
       type: "message",
       chat_id: room.id,
-      version: 8,
+      version: 9,
       message_id: messageId,
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -871,7 +921,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const receiptFrame = (messageId: string): IncomingFrame => ({
       type: "message",
       chat_id: room.id,
-      version: 8,
+      version: 9,
       message_id: messageId,
       nonce_b64: "AQ",
       ciphertext_b64: "Ag",
@@ -1190,10 +1240,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     act(() => result.current.openRoom(room.id));
+    mocks.FakeCipher.requiredPeers.add("Bob");
     mocks.FakeCipher.encryptError = new FatalCipherError();
 
     await act(async () => expect(result.current.sendText("must not publish")).resolves.toBe(false));
 
+    expect(relay?.leasesReleased).toEqual(["lease-Bob"]);
     expect(result.current.session).toBeNull();
     expect(result.current.messages[room.id]).toBeUndefined();
     expect(mocks.revokeSession).toHaveBeenCalledOnce();
@@ -1326,6 +1378,94 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(result.current.session).toBeNull();
     expect(mocks.revokeSession).toHaveBeenCalledOnce();
     expect(mocks.getLastRelay()).toBeNull();
+    unmount();
+  });
+
+  it("leases only direct first contact and keeps established sends lease-free", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
+      relay?.emit({ type: "presence", users: [{
+        username: "Bob",
+        connected: true,
+        identity_public_b64: validPublicKeyB64,
+        identity_prekey_id: "catalog-key",
+        directory_digest: "A".repeat(43),
+      }] });
+    });
+    await waitFor(() => {
+      expect(result.current.directs).toHaveLength(1);
+      expect(result.current.presence).toHaveLength(1);
+      expect(result.current.connection).toBe("connected");
+    });
+    act(() => result.current.openRoom("dm_bob"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
+
+    mocks.FakeCipher.requiredPeers.add("Bob");
+    await act(async () => expect(await result.current.sendText("first")).toBe(true));
+    expect(relay?.leasesRequested).toEqual(["Bob"]);
+    expect(relay?.leasesReleased).toEqual([]);
+
+    mocks.FakeCipher.requiredPeers.delete("Bob");
+    await act(async () => expect(await result.current.sendText("established")).toBe(true));
+    expect(relay?.leasesRequested).toEqual(["Bob"]);
+    expect(relay?.leasesReleased).toEqual([]);
+    unmount();
+  });
+
+  it("releases partial timeout and rejected room leases but never ambiguous admission", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: ["Bob", "Carol"].map((username) => ({
+        username,
+        connected: true,
+        identity_public_b64: validPublicKeyB64,
+        identity_prekey_id: "catalog-key",
+        directory_digest: "A".repeat(43),
+      })) });
+    });
+    await waitFor(() => {
+      expect(result.current.rooms).toHaveLength(1);
+      expect(result.current.presence).toHaveLength(2);
+      expect(result.current.connection).toBe("connected");
+    });
+    act(() => result.current.openRoom(room.id));
+    await waitFor(() => expect(result.current.activeRoomId).toBe(room.id));
+    mocks.FakeCipher.requiredPeers.add("Bob");
+    mocks.FakeCipher.requiredPeers.add("Carol");
+
+    mocks.FakeRelay.leaseFailureAt = 1;
+    mocks.FakeRelay.leaseFailureCode = "AMBIGUOUS";
+    await act(async () => expect(await result.current.sendText("partial")).toBe(false));
+    expect(relay?.leasesReleased).toHaveLength(1);
+
+    mocks.FakeRelay.leaseFailureAt = null;
+    mocks.FakeRelay.encryptedOutcome = "REJECTED";
+    await act(async () => expect(await result.current.sendText("rejected")).toBe(false));
+    expect(relay?.leasesReleased).toHaveLength(3);
+
+    mocks.FakeRelay.encryptedOutcome = "AMBIGUOUS";
+    await act(async () => expect(await result.current.sendText("ambiguous")).toBe(false));
+    expect(relay?.leasesReleased).toHaveLength(3);
     unmount();
   });
 });

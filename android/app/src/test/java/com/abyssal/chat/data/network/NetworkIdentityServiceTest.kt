@@ -34,7 +34,7 @@ class NetworkIdentityServiceTest {
         assertEquals("node-1", validatedRegistration?.nodeId)
 
         val login = validOpaqueStart("login")
-            .put("identity_public_b64", base64(ByteArray(128) { 7 }))
+            .put("identity_public_b64", base64(ByteArray(608) { 7 }))
             .put("identity_prekey_id", "prekey-1")
             .put("identity_envelope_b64", base64(byteArrayOf(1, 2, 3)))
         assertNotNull(validateOpaqueStartResponse(login))
@@ -222,7 +222,7 @@ class NetworkIdentityServiceTest {
             .put("username", "Alice_1")
             .put("max_rooms_per_user", 3)
             .put("session_inactivity_sec", 900)
-            .put("identity_public_b64", base64(ByteArray(128) { 7 }))
+            .put("identity_public_b64", base64(ByteArray(608) { 7 }))
             .put("identity_prekey_id", "prekey-1")
             .put("identity_envelope_b64", "AQID")
             .put("error", JSONObject.NULL)
