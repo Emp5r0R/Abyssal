@@ -12,7 +12,8 @@ use opaque_ke::{
     CredentialResponse, RegistrationRequest, RegistrationResponse, RegistrationUpload, ServerLogin,
     ServerLoginParameters, ServerRegistration, ServerSetup,
 };
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
+use sha2_legacy::Sha512;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
@@ -3891,5 +3892,40 @@ mod tests {
         let mut truncated = padded.to_vec();
         truncated.truncate(PAYLOAD_HEADER_BYTES);
         assert!(unpad_payload(&truncated).is_err());
+    }
+
+    #[test]
+    fn rustcrypto_sha256_and_hkdf_sha256_match_known_answers() {
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&Sha256::digest(b"abc"));
+        assert_eq!(
+            digest,
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+
+        // RFC 5869, Appendix A.1 (SHA-256, 42-byte output).
+        let ikm = [0x0b_u8; 22];
+        let salt = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
+        let info = [
+            0xf0_u8, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9,
+        ];
+        let mut okm = [0_u8; 42];
+        Hkdf::<Sha256>::new(Some(&salt), &ikm)
+            .expand(&info, &mut okm)
+            .expect("RFC 5869 output length is valid");
+        assert_eq!(
+            okm,
+            [
+                0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a, 0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36,
+                0x2f, 0x2a, 0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c, 0x5d, 0xb0, 0x2d, 0x56,
+                0xec, 0xc4, 0xc5, 0xbf, 0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18, 0x58, 0x65,
+            ]
+        );
     }
 }

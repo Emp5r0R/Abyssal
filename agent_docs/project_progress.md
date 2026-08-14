@@ -1,8 +1,76 @@
 # Project Progress
 
+## Active Deployment: Protocol-v9 Initial Prekey Pool
+
+Protocol v8's single advertised Olm one-time prekey is being replaced with a
+bounded, signed pool and an authenticated lease-before-encrypt transaction.
+The package must preserve transactional ratchet rollback, exact recipient
+binding, queued-ciphertext claim lifetime, RAM-only state, and existing replay
+and resource bounds across Rust core, relay, web, and Android.
+
+### Required Invariants
+
+1. Each identity publishes a canonical fixed-size prekey pool signed by the
+   long-term Ed25519 identity and covered by registration and state transcripts.
+2. The relay atomically leases an exact unused key to a sender, conversation,
+   recipient, and message ID before encryption; retries are idempotent and
+   unused leases expire promptly.
+3. Accepted pending ciphertext retains its exact lease until ACK, eviction,
+   expiry, or wipe. ACK state may remove only the consumed key and must add
+   exactly one signed replacement while preserving every other live claim.
+4. Clients request leases only when the native ratchet requires a new inbound
+   session, bind all asynchronous work to the current session generation, and
+   release unused leases on deterministic cancellation or failure.
+5. Protocol-v8 frames and identity bundles are rejected after the versioned
+   migration. Generated WASM/JNI artifacts must remain reproducible.
+
+Rooms remain on bounded pairwise Olm fanout. The relay can create at most 117
+accounts from its distinct invite-code lengths and the core caps fanout at 256;
+replacing pairwise sessions with Megolm would lose Olm post-compromise recovery.
+MLS therefore remains a separate reviewed protocol migration, not part of the
+prekey availability fix.
+
+## Completed Deployment: Dependency Update Integration
+
+Compatible Dependabot families were integrated together and independently
+verified instead of force-merging eighteen isolated pull requests.
+
+### Delivered
+
+- Upgraded direct RustCrypto SHA-256/HKDF/HMAC, `base64`, and `futures-util`
+  dependencies while preserving the `opaque-ke` SHA-512 digest boundary.
+- Aligned React/react-dom 19.2.8 and compatible web tooling, retained TypeScript
+  6.0.3, and pinned transitive `nanoid` 3.3.18 to clear the full npm audit.
+- Upgraded AndroidX JUnit 1.3.0 and Espresso 3.7.0 with strict exact-hash Gradle
+  verification metadata.
+- Updated pinned checkout/setup-node actions and aligned CI and the immutable
+  Docker builder on Node 26.7.0.
+
+### Deferred
+
+- OkHttp/MockWebServer 5.4.0 require Kotlin 2.1/2.2 metadata, so the app remains
+  on 4.12.0 rather than bypassing compiler checks or excluding its runtime.
+- The 2026 Compose BOM remains incompatible with the current Kotlin/compiler
+  family, and TypeScript 7 exceeds `typescript-eslint`'s declared `<6.1` range.
+
+### Verification
+
+- Rust: 23 core and 127 relay tests, warning-denied Clippy, RustSec scan, and
+  two byte-identical WASM/JNI generations passed.
+- Web: clean locked install, 220 tests, lint/build, peer/engine inspection, and
+  full npm audit with zero vulnerabilities passed independently.
+- Android: 170 unit tests, debug/release compilation, release lint, strict
+  dependency resolution, and verification-metadata inspection passed; no APK
+  or AAB was built.
+- CI/container: action/digest pin checks, cached and uncached Docker builds,
+  hardened Compose runtime smoke, health endpoint, and served web UI passed.
+- Final integrated `./scripts/test-all.sh all` passed after the dependency and
+  progress-document changes, including live relay integration and both npm and
+  RustSec advisory scans.
+
 ## Completed Deployment: Attachment Metadata Resource Hardening
 
-The protocol-v8 security checkpoint was committed and pushed as `a7450d3`.
+The protocol-v8 security checkpoint was committed and pushed as `a11c0e5`.
 The next repository-fixable package closes a relay denial-of-service gap where
 minimum-size encrypted attachment records could exhaust heap through map and
 record metadata while remaining under the ciphertext-byte quota.

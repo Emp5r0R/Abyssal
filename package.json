@@ -5,6 +5,9 @@
   "workspaces": [
     "apps/*"
   ],
+  "overrides": {
+    "nanoid": "3.3.18"
+  },
   "scripts": {
     "web:dev": "npm run dev --workspace @abyssal/web",
     "web:build": "npm run build --workspace @abyssal/web",

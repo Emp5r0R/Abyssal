@@ -35,7 +35,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rand::{rngs::OsRng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7394,13 +7394,32 @@ mod tests {
 
     #[test]
     fn protocol_base64_requires_exact_unpadded_lengths() {
+        let url_safe_bytes = [0xfb_u8, 0xff, 0x00];
+        let url_safe = URL_SAFE_NO_PAD.encode(url_safe_bytes);
+        assert_eq!(url_safe, "-_8A");
+        assert_eq!(
+            decode_bounded(&url_safe, url_safe_bytes.len()).unwrap(),
+            url_safe_bytes
+        );
+
         let encoded = URL_SAFE_NO_PAD.encode([7_u8; MESSAGE_NONCE_BYTES]);
         assert_eq!(
             decode_exact(&encoded, MESSAGE_NONCE_BYTES).unwrap(),
             vec![7; 12]
         );
         assert!(decode_exact(&encoded, MESSAGE_NONCE_BYTES + 1).is_err());
+        assert!(decode_exact(&encoded[..encoded.len() - 1], MESSAGE_NONCE_BYTES).is_err());
+
+        // URL_SAFE_NO_PAD must reject the padded form and non-canonical
+        // trailing bits rather than accepting alternate encodings of bytes.
+        assert!(decode_bounded("AQ==", 1).is_err());
+        assert!(decode_bounded("AB", 1).is_err());
+        assert!(decode_bounded("AA+_", 3).is_err());
+        assert!(decode_bounded("", 128).is_err());
         assert!(decode_bounded("not base64!", 128).is_err());
+
+        let oversized = "A".repeat(2 * 4 + 1);
+        assert!(decode_bounded(&oversized, 4).is_err());
     }
 
     #[test]
@@ -7541,6 +7560,24 @@ mod tests {
             HeaderValue::from_static("abyssal-v1, ticket.invalid"),
         );
         assert!(websocket_ticket_header(&headers).is_none());
+    }
+
+    #[test]
+    fn websocket_ticket_digest_requires_canonical_url_safe_no_pad() {
+        let canonical = URL_SAFE_NO_PAD.encode([0_u8; WS_TICKET_BYTES]);
+        assert_eq!(canonical.len(), WS_TICKET_B64_LEN);
+        assert!(ws_ticket_digest(&canonical).is_some());
+
+        let padded = format!("{canonical}=");
+        assert!(ws_ticket_digest(&padded).is_none());
+
+        let mut noncanonical = canonical.clone();
+        noncanonical.replace_range((WS_TICKET_B64_LEN - 1).., "B");
+        assert!(ws_ticket_digest(&noncanonical).is_none());
+
+        let mut standard_alphabet = canonical;
+        standard_alphabet.replace_range((WS_TICKET_B64_LEN - 1).., "/");
+        assert!(ws_ticket_digest(&standard_alphabet).is_none());
     }
 
     fn ticket_auth_headers(token: &str) -> HeaderMap {
@@ -11374,5 +11411,22 @@ mod tests {
             file_overall_expiry_sec: 0,
             enforce_file_absolute_expiry: false,
         }
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_known_answer() {
+        // RFC 4231, test case 2.
+        let mut mac = HmacSha256::new_from_slice(b"Jefe").expect("HMAC accepts any key length");
+        mac.update(b"what do ya want for nothing?");
+        let mut output = [0_u8; 32];
+        output.copy_from_slice(&mac.finalize().into_bytes());
+        assert_eq!(
+            output,
+            [
+                0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95,
+                0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
+                0x64, 0xec, 0x38, 0x43,
+            ]
+        );
     }
 }
