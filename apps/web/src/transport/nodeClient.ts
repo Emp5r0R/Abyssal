@@ -2,6 +2,7 @@ import type {
   AccountResponse,
   AccountSession,
   AttachmentOptions,
+  DirectoryStamp,
   IncomingFrame,
   MediaType,
   NodeEndpoint,
@@ -275,6 +276,7 @@ export class RelaySocket {
   #pendingResults = new Map<string, PendingMessageResult>();
   #pendingAckResults = new Map<string, PendingMessageResult>();
   #pendingPrekeyLeases = new Map<string, PendingPrekeyLease>();
+  #directoryStamp: DirectoryStamp | null = null;
 
   constructor(
     private readonly session: AccountSession,
@@ -305,6 +307,11 @@ export class RelaySocket {
     }
   }
 
+  /** Installs the latest authenticated directory evidence for encrypted sends. */
+  setDirectoryStamp(stamp: DirectoryStamp | null): void {
+    this.#directoryStamp = stamp ? { ...stamp } : null;
+  }
+
   sendEncryptedPayload(messageId: string, frame: object): Promise<EncryptedSendOutcome> {
     if (
       !MESSAGE_ID_PATTERN.test(messageId) ||
@@ -315,6 +322,10 @@ export class RelaySocket {
       this.#pendingResults.size >= MAX_PENDING_MESSAGE_RESULTS ||
       this.#pendingResults.has(messageId)
     ) {
+      return Promise.resolve("NOT_SENT");
+    }
+    const stamp = this.#directoryStamp;
+    if (!stamp || !frameDirectoryStampMatches(frame, stamp)) {
       return Promise.resolve("NOT_SENT");
     }
     const serialized = serializeRelayFrame(frame);
@@ -453,7 +464,7 @@ export class RelaySocket {
       this.#pendingAckResults.size >= MAX_PENDING_ACK_RESULTS ||
       this.#pendingAckResults.has(messageId)
     ) return Promise.resolve("NOT_SENT");
-    const frame = {
+    const frame: Record<string, unknown> = {
       type: "message_ack",
       chat_id: chatId,
       message_id: messageId,
@@ -517,6 +528,7 @@ export class RelaySocket {
     this.#socket?.close(1000, "client disconnect");
     this.#socket = null;
     this.#socketGeneration = 0;
+    this.#directoryStamp = null;
     this.onState("disconnected");
   }
 
@@ -641,6 +653,7 @@ export class RelaySocket {
     this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     this.#socket = null;
     this.#socketGeneration = 0;
+    this.#directoryStamp = null;
     this.onState("disconnected");
     if (!this.#purgeFrameSeen && !this.#purgeNotified) {
       this.#purgeNotified = true;
@@ -1299,7 +1312,10 @@ function parseRelayFrame(text: string): ParsedRelayFrame {
     };
   }
   const parsed = parseIncomingFrameValue(frame);
-  return parsed ? { kind: "frame", frame: parsed } : { kind: "ignored" };
+  if (parsed) return { kind: "frame", frame: parsed };
+  return frame.type === "message" || frame.type === "presence"
+    ? { kind: "invalid-result" }
+    : { kind: "ignored" };
 }
 
 function parseIncomingFrameValue(frame: Record<string, unknown>): IncomingFrame | null {
@@ -1331,7 +1347,11 @@ function parseIncomingFrameValue(frame: Record<string, unknown>): IncomingFrame 
         typeof frame.sender_public_key_b64 === "string" &&
         (frame.identity_public_b64 === undefined || typeof frame.identity_public_b64 === "string") &&
         typeof frame.prekey_id === "string" &&
-        typeof frame.is_prekey === "boolean"
+        typeof frame.is_prekey === "boolean" &&
+        typeof frame.directory_node_id === "string" &&
+        typeof frame.directory_revision === "number" &&
+        Number.isSafeInteger(frame.directory_revision) &&
+        typeof frame.directory_digest === "string"
         ? frame as IncomingFrame
         : null;
     default:
@@ -1362,6 +1382,14 @@ function serializeRelayFrame(frame: object): string | null {
   return typeof serialized === "string" && utf8LengthWithin(serialized, MAX_RELAY_TEXT_BYTES)
     ? serialized
     : null;
+}
+
+function frameDirectoryStampMatches(frame: object, stamp: DirectoryStamp): boolean {
+  if (!plainRecord(frame)) return false;
+  const record = frame as Record<string, unknown>;
+  return record.directory_node_id === stamp.directory_node_id &&
+    record.directory_revision === stamp.directory_revision &&
+    record.directory_digest === stamp.directory_digest;
 }
 
 function exactObjectKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {

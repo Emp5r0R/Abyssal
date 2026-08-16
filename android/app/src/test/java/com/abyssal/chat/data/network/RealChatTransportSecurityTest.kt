@@ -4,6 +4,8 @@ import com.abyssal.chat.data.repository.InMemoryMessageRepository
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.DirectoryStamp
+import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.IncomingTransportPayload
@@ -16,6 +18,10 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -253,6 +259,11 @@ class RealChatTransportSecurityTest {
             )
         }
         awaitSent(socket, 1)
+        val acceptedFrame = JSONObject(socket.sentTexts.single())
+        assertEquals("message_ack", acceptedFrame.getString("type"))
+        assertFalse(acceptedFrame.has("directory_node_id"))
+        assertFalse(acceptedFrame.has("directory_revision"))
+        assertFalse(acceptedFrame.has("directory_digest"))
         assertFalse(accepted.isCompleted)
         listener.onMessage(
             socket,
@@ -545,6 +556,10 @@ class RealChatTransportSecurityTest {
         installSocket(transport, oldSocket, generation = 70L)
         val currentSocket = RecordingWebSocket()
         val currentListener = installSocket(transport, currentSocket, generation = 71L)
+        val catalog = with(transport) {
+            JSONArray().put(presence("Alice")).toPresenceCatalog()
+        } ?: error("test presence must parse")
+        assertTrue(with(transport) { acceptPresenceCatalog(catalog) })
 
         val pending = async(start = CoroutineStart.UNDISPATCHED) {
             transport.sendEncryptedPayload(
@@ -553,6 +568,10 @@ class RealChatTransportSecurityTest {
             )
         }
         awaitSent(currentSocket, 1)
+        val sentPayload = JSONObject(currentSocket.sentTexts.single())
+        assertEquals("node-1", sentPayload.getString("directory_node_id"))
+        assertEquals(1L, sentPayload.getLong("directory_revision"))
+        assertEquals(directoryDigest("Alice"), sentPayload.getString("directory_digest"))
 
         invokeAbortPendingOutbound(
             transport = transport,
@@ -672,6 +691,10 @@ class RealChatTransportSecurityTest {
         installSocket(transport, oldSocket, generation = 80L)
         val currentSocket = RecordingWebSocket()
         installSocket(transport, currentSocket, generation = 81L)
+        val catalog = with(transport) {
+            JSONArray().put(presence("Alice")).toPresenceCatalog()
+        } ?: error("test presence must parse")
+        assertTrue(with(transport) { acceptPresenceCatalog(catalog) })
 
         transport.createForum(roomSession("forum_stale_command"), 80L)
         transport.deleteForum("forum_stale_command", 80L)
@@ -837,6 +860,10 @@ class RealChatTransportSecurityTest {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket, generation = 60L)
+        val catalog = with(transport) {
+            JSONArray().put(presence("Alice")).toPresenceCatalog()
+        } ?: error("test presence must parse")
+        assertTrue(with(transport) { acceptPresenceCatalog(catalog) })
 
         listener.onMessage(socket, inboundMessageFrame())
 
@@ -964,6 +991,15 @@ class RealChatTransportSecurityTest {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val valid = presence("Alice")
         assertEquals(1, with(transport) { JSONArray().put(valid).toPresenceCatalog()?.entries?.size })
+        assertNull(with(transport) {
+            JSONArray().put(presence("Alice").remove("directory_node_id")).toPresenceCatalog()
+        })
+        assertNull(with(transport) {
+            JSONArray().put(presence("Alice").put("directory_revision", 0L)).toPresenceCatalog()
+        })
+        assertNull(with(transport) {
+            JSONArray().put(presence("Alice").put("directory_node_id", "node/foreign")).toPresenceCatalog()
+        })
 
         val malformed = JSONArray().put(presence("Alice")).put(presence("alice"))
         assertNull(with(transport) { malformed.toPresenceCatalog() })
@@ -984,6 +1020,66 @@ class RealChatTransportSecurityTest {
         val oversized = JSONArray()
         repeat(129) { oversized.put(presence("User$it")) }
         assertNull(with(transport) { oversized.toPresenceCatalog() })
+    }
+
+    @Test
+    fun directoryCheckpointRejectsDigestConflictsAndDropsEvictedOldEvidence() {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val first = with(transport) {
+            JSONArray().put(presence("Alice")).toPresenceCatalog()
+        } ?: error("test presence must parse")
+        assertTrue(with(transport) { acceptPresenceCatalog(first) })
+        assertEquals(
+            DirectoryEvidenceStatus.KNOWN,
+            transport.directoryEvidenceStatus(DirectoryStamp("node-1", 1u, directoryDigest("Alice")))
+        )
+
+        val malformedDigest = with(transport) {
+            JSONArray().put(presence("Alice").put("directory_digest", encode(ByteArray(32) { 9 })))
+                .toPresenceCatalog()
+        } ?: error("schema-valid malformed digest must parse")
+        assertFalse(with(transport) { acceptPresenceCatalog(malformedDigest) })
+
+        val sameRevisionConflict = with(transport) {
+            JSONArray().put(presence("Bob")).toPresenceCatalog()
+        } ?: error("conflicting catalog must parse")
+        assertFalse(with(transport) { acceptPresenceCatalog(sameRevisionConflict) })
+
+        for (revision in 2uL..34uL) {
+            val catalog = with(transport) {
+                JSONArray().put(presence("Alice", revision = revision)).toPresenceCatalog()
+            } ?: error("revision $revision must parse")
+            assertTrue(with(transport) { acceptPresenceCatalog(catalog) })
+        }
+        assertEquals(
+            DirectoryEvidenceStatus.UNKNOWN_OLD,
+            transport.directoryEvidenceStatus(DirectoryStamp("node-1", 1u, directoryDigest("Alice")))
+        )
+        assertEquals(
+            DirectoryEvidenceStatus.KNOWN,
+            transport.directoryEvidenceStatus(DirectoryStamp("node-1", 34u, directoryDigest("Alice", revision = 34u)))
+        )
+        assertEquals(
+            DirectoryEvidenceStatus.CONFLICT,
+            transport.directoryEvidenceStatus(DirectoryStamp("node-foreign", 34u, directoryDigest("Alice", "node-foreign", 34u)))
+        )
+    }
+
+    @Test
+    fun presenceCallbackRejectsAuthenticatedNodeMismatch() {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket, generation = 35L)
+        val foreignCatalog = JSONArray().put(presence("Alice", nodeId = "node-foreign"))
+
+        listener.onMessage(
+            socket,
+            JSONObject().put("type", "presence").put("users", foreignCatalog).toString()
+        )
+
+        assertEquals(1008, socket.closeCode)
+        assertEquals("directory changed", socket.closeReason)
+        assertNull(transport.currentDirectoryStamp())
     }
 
     @Test
@@ -1056,6 +1152,9 @@ class RealChatTransportSecurityTest {
             .put("identity_public_b64", encode(publicKey))
             .put("prekey_id", "")
             .put("is_prekey", false)
+            .put("directory_node_id", "node-1")
+            .put("directory_revision", 1L)
+            .put("directory_digest", directoryDigest("Alice"))
 
         val aliceCatalog = with(transport) {
             JSONArray().put(presence("Alice")).toPresenceCatalog()
@@ -1076,7 +1175,7 @@ class RealChatTransportSecurityTest {
         // A historical pin is insufficient after the directory removes a user.
         // The current presence catalog must still bind the username to its key.
         val bobCatalog = with(transport) {
-            JSONArray().put(presence("Bob")).toPresenceCatalog()
+            JSONArray().put(presence("Bob", revision = 2u)).toPresenceCatalog()
         }
         assertNotNull(bobCatalog)
         assertTrue(with(transport) { acceptPresenceCatalog(bobCatalog!!) })
@@ -1180,6 +1279,9 @@ class RealChatTransportSecurityTest {
         .put("identity_public_b64", encode(ByteArray(608) { 1 }))
         .put("prekey_id", "")
         .put("is_prekey", false)
+        .put("directory_node_id", "node-1")
+        .put("directory_revision", 1L)
+        .put("directory_digest", directoryDigest("Alice"))
         .toString()
 
     private fun outboundPayload(messageId: String): EncryptedTransportPayload =
@@ -1201,7 +1303,10 @@ class RealChatTransportSecurityTest {
             identityEnvelope = ByteArray(8) { 3 },
             identityPublicKey = ByteArray(608) { 4 },
             prekeyId = "prekey-1",
-            stateSignature = ByteArray(64) { 5 }
+            stateSignature = ByteArray(64) { 5 },
+            directoryNodeId = "node-1",
+            directoryRevision = 1u,
+            directoryDigest = directoryDigest("Alice")
         )
 
     private fun invokeAbortPendingOutbound(
@@ -1283,12 +1388,41 @@ class RealChatTransportSecurityTest {
         return listenerMethod.invoke(transport, "node-1", generation) as WebSocketListener
     }
 
-    private fun presence(username: String): JSONObject = JSONObject()
+    private fun presence(
+        username: String,
+        nodeId: String = "node-1",
+        revision: ULong = 1u,
+        identity: ByteArray = ByteArray(608) { 1 },
+    ): JSONObject = JSONObject()
         .put("username", username)
         .put("connected", true)
-        .put("identity_public_b64", encode(ByteArray(608) { 1 }))
+        .put("identity_public_b64", encode(identity))
         .put("identity_prekey_id", "prekey-1")
-        .put("directory_digest", encode(ByteArray(32) { 2 }))
+        .put("directory_digest", directoryDigest(username, nodeId, revision, identity))
+        .put("directory_node_id", nodeId)
+        .put("directory_revision", revision.toLong())
+
+    private fun directoryDigest(
+        username: String,
+        nodeId: String = "node-1",
+        revision: ULong = 1u,
+        identity: ByteArray = ByteArray(608) { 1 },
+    ): String {
+        val domain = "ABYSSAL_DIRECTORY_CHECKPOINT_V2".toByteArray(StandardCharsets.UTF_8)
+        val node = nodeId.toByteArray(StandardCharsets.UTF_8)
+        val name = username.toByteArray(StandardCharsets.UTF_8)
+        val transcript = ByteBuffer.allocate(domain.size + 4 + node.size + 8 + 4 + 4 + name.size + 64)
+            .order(ByteOrder.BIG_ENDIAN)
+        transcript.put(domain)
+        transcript.putInt(node.size)
+        transcript.put(node)
+        transcript.putLong(revision.toLong())
+        transcript.putInt(1)
+        transcript.putInt(name.size)
+        transcript.put(name)
+        transcript.put(identity, 0, 64)
+        return encode(MessageDigest.getInstance("SHA-256").digest(transcript.array()))
+    }
 
     private fun testSession() = NodeSession(
         endpoint = NodeEndpoint(

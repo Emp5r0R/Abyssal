@@ -48,9 +48,9 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> =
     directs: [{ id: "dm_random", peer_username: "Bob" }],
     messages: {},
     presence: [
-      { username: "Alice", connected: true, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43) },
-      { username: "Bob", connected: true, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43) },
-      { username: "Carol", connected: false, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43) },
+      { username: "Alice", connected: true, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43), directory_node_id: "node-one", directory_revision: 1 },
+      { username: "Bob", connected: true, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43), directory_node_id: "node-one", directory_revision: 1 },
+      { username: "Carol", connected: false, identity_public_b64: "AA", identity_prekey_id: "test-prekey", directory_digest: "A".repeat(43), directory_node_id: "node-one", directory_revision: 1 },
     ],
     activeRoomId: null,
     maxRooms: 2,

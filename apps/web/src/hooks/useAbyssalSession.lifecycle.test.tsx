@@ -1,6 +1,13 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountSession, IncomingFrame, RoomRecord } from "../domain/types";
+import type {
+  AccountSession,
+  DirectoryStamp,
+  IncomingFrame,
+  PresenceUser,
+  RoomRecord,
+} from "../domain/types";
 
 const mocks = vi.hoisted(() => {
   const identityPublicKey = new Uint8Array(608).fill(7);
@@ -20,6 +27,12 @@ const mocks = vi.hoisted(() => {
     static lastAttachmentPlain: Uint8Array | null = null;
     static lastAttachmentKey: Uint8Array | null = null;
     static lastAttachmentBlob: Uint8Array | null = null;
+    static encryptedPlaintexts: string[] = [];
+    static directoryStamp: DirectoryStamp = {
+      directory_node_id: "node-one",
+      directory_revision: 1,
+      directory_digest: "",
+    };
     static lastSnapshot: {
       envelope: Uint8Array;
       identityPublicKey: Uint8Array;
@@ -71,8 +84,9 @@ const mocks = vi.hoisted(() => {
       return new Uint8Array(64).fill(9);
     }
 
-    encryptText() {
+    encryptText(_chatId: string, _messageId: string, _sender: string, plaintext: string) {
       if (FakeCipher.encryptError) throw FakeCipher.encryptError;
+      FakeCipher.encryptedPlaintexts.push(plaintext);
       return {
         version: 9,
         messageId: "message",
@@ -93,14 +107,14 @@ const mocks = vi.hoisted(() => {
     decryptText(_chatId: string, messageId: string) {
       FakeCipher.decryptCount += 1;
       if (FakeCipher.decryptError) throw FakeCipher.decryptError;
-      if (FakeCipher.plaintextOverride) return JSON.stringify(FakeCipher.plaintextOverride);
-      return JSON.stringify({
+      const payload = FakeCipher.plaintextOverride ?? {
         kind: "text",
         id: FakeCipher.payloadIdOverride ?? messageId,
         sender: "Bob",
         content: "incoming secret",
         timestamp_ms: Date.now(),
-      });
+      };
+      return JSON.stringify({ ...FakeCipher.directoryStamp, ...payload });
     }
 
     encryptAttachment(_chatId: string, _messageId: string, _sender: string, _mediaType: string, plain: Uint8Array) {
@@ -135,6 +149,7 @@ const mocks = vi.hoisted(() => {
     sent: object[] = [];
     leasesRequested: string[] = [];
     leasesReleased: string[] = [];
+    directoryStamp: DirectoryStamp | null = null;
 
     constructor(
       session: AccountSession,
@@ -162,6 +177,11 @@ const mocks = vi.hoisted(() => {
       if (!this.connected || this.closed) return false;
       this.sent.push(frame);
       return true;
+    }
+
+    setDirectoryStamp(stamp: DirectoryStamp | null): void {
+      this.directoryStamp = stamp ? { ...stamp } : null;
+      if (stamp) FakeCipher.directoryStamp = { ...stamp };
     }
 
     sendEncryptedPayload(_messageId: string, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
@@ -243,6 +263,12 @@ const mocks = vi.hoisted(() => {
       FakeCipher.lastAttachmentPlain = null;
       FakeCipher.lastAttachmentKey = null;
       FakeCipher.lastAttachmentBlob = null;
+      FakeCipher.encryptedPlaintexts = [];
+      FakeCipher.directoryStamp = {
+        directory_node_id: "node-one",
+        directory_revision: 1,
+        directory_digest: "",
+      };
       FakeCipher.lastSnapshot = null;
     },
     startOpaqueAccount: vi.fn(async () => ({
@@ -336,6 +362,64 @@ const originalURL = URL;
 const originalCreateObjectURL = URL.createObjectURL;
 const originalRevokeObjectURL = URL.revokeObjectURL;
 const validPublicKeyB64 = Buffer.from(mocks.identityPublicKey).toString("base64").replace(/=+$/u, "");
+const DIRECTORY_NODE_ID = "node-one";
+const DIRECTORY_REVISION = 1;
+
+function directoryDigest(users: readonly PresenceUser[], nodeId = DIRECTORY_NODE_ID, revision = DIRECTORY_REVISION): string {
+  const domain = Buffer.from("ABYSSAL_DIRECTORY_CHECKPOINT_V2", "utf8");
+  const node = Buffer.from(nodeId, "utf8");
+  const sorted = [...users].sort((left, right) => left.username < right.username ? -1 : left.username > right.username ? 1 : 0);
+  const parts: Buffer[] = [
+    domain,
+    (() => { const bytes = Buffer.alloc(4); bytes.writeUInt32BE(node.byteLength); return bytes; })(),
+    node,
+    (() => { const bytes = Buffer.alloc(8); bytes.writeBigUInt64BE(BigInt(revision)); return bytes; })(),
+    (() => { const bytes = Buffer.alloc(4); bytes.writeUInt32BE(sorted.length); return bytes; })(),
+  ];
+  sorted.forEach((user) => {
+    const username = Buffer.from(user.username, "utf8");
+    const identity = Buffer.from(user.identity_public_b64, "base64url");
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(username.byteLength);
+    parts.push(length, username, identity.subarray(0, 64));
+  });
+  return createHash("sha256").update(Buffer.concat(parts)).digest("base64url");
+}
+
+function presenceUser(username: string, overrides: Partial<PresenceUser> = {}): PresenceUser {
+  return {
+    username,
+    connected: true,
+    identity_public_b64: validPublicKeyB64,
+    identity_prekey_id: "prekey-one",
+    directory_node_id: DIRECTORY_NODE_ID,
+    directory_revision: DIRECTORY_REVISION,
+    directory_digest: "",
+    ...overrides,
+  };
+}
+
+function presenceCatalog(
+  entries: Array<string | Partial<PresenceUser>>,
+  nodeId = DIRECTORY_NODE_ID,
+  revision = DIRECTORY_REVISION,
+): { users: PresenceUser[]; stamp: DirectoryStamp } {
+  const users = entries.map((entry) => typeof entry === "string" ? presenceUser(entry) : presenceUser(entry.username ?? "User", entry));
+  users.forEach((user) => {
+    user.directory_node_id = nodeId;
+    user.directory_revision = revision;
+  });
+  const digest = directoryDigest(users, nodeId, revision);
+  users.forEach((user) => { user.directory_digest = digest; });
+  return { users, stamp: { directory_node_id: nodeId, directory_revision: revision, directory_digest: digest } };
+}
+
+function stampedFrame(
+  frame: Omit<Extract<IncomingFrame, { type: "message" }>, keyof DirectoryStamp>,
+  stamp: DirectoryStamp,
+): Extract<IncomingFrame, { type: "message" }> {
+  return { ...frame, ...stamp };
+}
 
 afterEach(() => {
   cleanup();
@@ -372,22 +456,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
-    const validPresence = [
-      {
-        username: "Alice",
-        connected: true,
-        identity_public_b64: validPublicKeyB64,
-        identity_prekey_id: "prekey-one",
-        directory_digest: "A".repeat(43),
-      },
-      {
-        username: "Bob",
-        connected: true,
-        identity_public_b64: validPublicKeyB64,
-        identity_prekey_id: "prekey-two",
-        directory_digest: "A".repeat(43),
-      },
-    ];
+    const validPresence = presenceCatalog([
+      "Alice",
+      { username: "Bob", identity_prekey_id: "prekey-two" },
+    ]).users;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
       relay?.emit({ type: "presence", users: validPresence });
@@ -398,57 +470,318 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     });
 
     const malformedRoom = { ...room, name: "x".repeat(37) };
-    const malformedDigest = `${"A".repeat(42)}B`;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [malformedRoom] });
       relay?.emit({ type: "rooms", rooms: [room, room] });
       relay?.emit({ type: "rooms", rooms: [room, { ...room, id: "FORUM_OPS" }] });
-      relay?.emit({ type: "presence", users: [validPresence[0], validPresence[0]] });
-      relay?.emit({
-        type: "presence",
-        users: [{ ...validPresence[0], directory_digest: malformedDigest }, validPresence[1]],
-      });
-      relay?.emit({ type: "presence", users: Array.from({ length: 129 }, () => validPresence[0]) });
     });
-
     expect(result.current.rooms).toEqual([room]);
     expect(result.current.presence).toEqual(validPresence);
 
     await act(async () => {
-      relay?.emit({
-        type: "directs",
-        directs: [{ id: "dm_bob", peer_username: "Bob" }],
-      });
+      relay?.emit({ type: "presence", users: [validPresence[0], validPresence[0]] });
     });
-    await waitFor(() => expect(result.current.directs).toHaveLength(1));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.rooms).toEqual([]);
+    expect(result.current.presence).toEqual([]);
+    unmount();
+  });
+
+  it.each([
+    ["missing directory evidence", (user: PresenceUser) => {
+      const missing = { ...user } as Partial<PresenceUser>;
+      delete missing.directory_digest;
+      return missing as PresenceUser;
+    }],
+    ["malformed directory digest", (user: PresenceUser) => ({
+      ...user,
+      directory_digest: `${"A".repeat(42)}B`,
+    })],
+    ["case-colliding usernames", (user: PresenceUser) => user],
+  ] as const)("fails closed on %s presence evidence", async (_label, transform) => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
-      relay?.emit({
-        type: "directs",
-        directs: [
-          { id: "dm_BOB", peer_username: "Mallory" },
-          { id: "dm_bob", peer_username: "Eve" },
-        ],
-      });
-      relay?.emit({
-        type: "directs",
-        directs: [
-          { id: "dm_eve", peer_username: "Eve" },
-          { id: "dm_eve_two", peer_username: "eve" },
-        ],
-      });
-      relay?.emit({
-        type: "directs",
-        directs: [
-          { id: "dm_eve", peer_username: "Eve" },
-          { id: "dm_EVE", peer_username: "Mallory" },
-        ],
-      });
-      relay?.emit({
-        type: "directs",
-        directs: [{ id: "dm_eve", peer_username: "Eve", extra: true } as never],
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
       });
     });
-    expect(result.current.directs).toEqual([{ id: "dm_bob", peer_username: "Bob" }]);
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => relay?.emit({ type: "presence", users: catalog.users }));
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    const users = _label === "case-colliding usernames"
+      ? [catalog.users[0], { ...catalog.users[0], username: "bob" }]
+      : [transform(catalog.users[0])];
+    await act(async () => relay?.emit({ type: "presence", users: users as PresenceUser[] }));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.rooms).toEqual([]);
+    expect(result.current.presence).toEqual([]);
+    unmount();
+  });
+
+  it("fails closed when a catalog conflicts at an already-seen revision", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users }));
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    await act(async () => relay?.emit({
+      type: "presence",
+      users: presenceCatalog(["Bob", "Carol"]).users,
+    }));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.presence).toEqual([]);
+    unmount();
+  });
+
+  it("fails closed when directory evidence is issued by a different node", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const foreign = presenceCatalog(["Bob"], "node-foreign", 1);
+    await act(async () => relay?.emit({ type: "presence", users: foreign.users }));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.presence).toEqual([]);
+    unmount();
+  });
+
+  it("drops authenticated messages carrying an evicted unknown-old directory stamp", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({ type: "rooms", rooms: [room] }));
+    await waitFor(() => expect(result.current.rooms).toHaveLength(1));
+    for (let revision = 1; revision <= 34; revision += 1) {
+      await act(async () => relay?.emit({
+        type: "presence",
+        users: presenceCatalog(["Bob"], DIRECTORY_NODE_ID, revision).users,
+      }));
+      await waitFor(() => expect(result.current.presence[0]?.directory_revision).toBe(revision));
+    }
+    const oldStamp = presenceCatalog(["Bob"], DIRECTORY_NODE_ID, 1).stamp;
+    const frame = stampedFrame({
+      type: "message",
+      chat_id: room.id,
+      version: 9,
+      message_id: "unknown-old-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }, oldStamp);
+    await act(async () => relay?.emit(frame));
+    expect(mocks.FakeCipher.decryptCount).toBe(0);
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(0);
+    expect(result.current.session).not.toBeNull();
+    unmount();
+  });
+
+  it("serializes presence installation before a following message with the same checkpoint", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => relay?.emit({ type: "rooms", rooms: [room] }));
+    await waitFor(() => expect(result.current.rooms).toHaveLength(1));
+    const frame = stampedFrame({
+      type: "message",
+      chat_id: room.id,
+      version: 9,
+      message_id: "ordered-checkpoint-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }, catalog.stamp);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit(frame);
+    });
+    await waitFor(() => expect(result.current.messages[room.id]).toHaveLength(1));
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
+    expect(result.current.session).not.toBeNull();
+    unmount();
+  });
+
+  it("does not install an old queued presence catalog after a relogin", async () => {
+    let signalDigestStarted!: () => void;
+    let releaseDigest!: () => void;
+    const digestStarted = new Promise<void>((resolve) => { signalDigestStarted = resolve; });
+    const digestReleased = new Promise<void>((resolve) => { releaseDigest = resolve; });
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    const digestSpy = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (algorithm, data) => {
+      signalDigestStarted();
+      await digestReleased;
+      return digest(algorithm, data);
+    });
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    try {
+      await act(async () => {
+        await result.current.login({
+          nodeUrl: "https://node.example.test",
+          code: "ABCD-1234",
+          password: "password",
+          retainWhenHidden: true,
+        });
+      });
+      const oldRelay = mocks.getLastRelay();
+      const catalog = presenceCatalog(["Bob"]);
+      await act(async () => oldRelay?.emit({ type: "presence", users: catalog.users }));
+      await digestStarted;
+
+      await act(async () => {
+        await result.current.logout();
+        await result.current.login({
+          nodeUrl: "https://node.example.test",
+          code: "ABCD-1234",
+          password: "password",
+          retainWhenHidden: true,
+        });
+      });
+      const replacementRelay = mocks.getLastRelay();
+      expect(replacementRelay).not.toBe(oldRelay);
+      expect(result.current.session).not.toBeNull();
+      releaseDigest();
+      await waitFor(() => expect(result.current.presence).toEqual([]));
+      expect(result.current.session).not.toBeNull();
+      expect(oldRelay?.closed).toBe(true);
+    } finally {
+      digestSpy.mockRestore();
+      unmount();
+    }
+  });
+
+  it("fails closed on an outer and inner directory evidence mismatch before ACK or publication", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const stamp = presenceCatalog(["Bob"]).stamp;
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    mocks.FakeCipher.plaintextOverride = {
+      kind: "text",
+      id: "mismatched-inner-evidence",
+      sender: "Bob",
+      content: "must not publish",
+      directory_node_id: "node-other",
+      directory_revision: stamp.directory_revision,
+      directory_digest: stamp.directory_digest,
+    };
+    const frame = stampedFrame({
+      type: "message",
+      chat_id: room.id,
+      version: 9,
+      message_id: "mismatched-inner-evidence",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }, stamp);
+    await act(async () => relay?.emit(frame));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.messages).toEqual({});
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(0);
+    unmount();
+  });
+
+  it("rejects a replayed message when its directory evidence changes", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const first = presenceCatalog(["Bob"]);
+    const second = presenceCatalog(["Bob"], DIRECTORY_NODE_ID, 2);
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: first.users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    const base = {
+      type: "message" as const,
+      chat_id: room.id,
+      version: 9,
+      message_id: "replay-evidence-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    };
+    await act(async () => relay?.emit(stampedFrame(base, first.stamp)));
+    await waitFor(() => expect(result.current.messages[room.id]).toHaveLength(1));
+    const ackCount = relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack").length;
+    expect(ackCount).toBe(1);
+    await act(async () => relay?.emit({ type: "presence", users: second.users }));
+    await waitFor(() => expect(result.current.presence[0]?.directory_revision).toBe(2));
+    await act(async () => relay?.emit(stampedFrame(base, second.stamp)));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
     unmount();
   });
 
@@ -532,22 +865,14 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
+    const directoryStamp = presenceCatalog(["Bob"]).stamp;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
     await waitFor(() => expect(result.current.rooms).toHaveLength(1));
 
-    const frame: IncomingFrame = {
+    const frame: IncomingFrame = stampedFrame({
       type: "message",
       chat_id: room.id,
       version: 9,
@@ -561,7 +886,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    };
+    }, directoryStamp);
     await act(async () => relay?.emit(frame));
     await waitFor(() => expect(result.current.messages[room.id]).toHaveLength(1));
     expect(mocks.FakeCipher.decryptCount).toBe(1);
@@ -598,20 +923,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
+    const directoryStamp = presenceCatalog(["Bob"]).stamp;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
-    const frame: IncomingFrame = {
+    const frame: IncomingFrame = stampedFrame({
       type: "message",
       chat_id: room.id,
       version: 9,
@@ -625,7 +942,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    };
+    }, directoryStamp);
     await act(async () => relay?.emit(frame));
     await waitFor(() => expect(resolveAck).toBeDefined());
     expect(result.current.messages).toEqual({});
@@ -664,10 +981,11 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
+    const directoryStamp = presenceCatalog(["Bob"]).stamp;
     await act(async () => relay?.emit({ type: "rooms", rooms: [room] }));
     await waitFor(() => expect(result.current.rooms).toHaveLength(1));
 
-    const baseFrame: IncomingFrame = {
+    const baseFrame: IncomingFrame = stampedFrame({
       type: "message",
       chat_id: room.id,
       version: 9,
@@ -681,35 +999,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    };
+    }, directoryStamp);
     await act(async () => relay?.emit(baseFrame));
     expect(mocks.FakeCipher.decryptCount).toBe(0);
 
-    const retiredIdentityB64 = Buffer.from(new Uint8Array(128).fill(7)).toString("base64url");
-    await act(async () => relay?.emit({
-      type: "presence",
-      users: [{
-        username: "Bob",
-        connected: true,
-        identity_public_b64: retiredIdentityB64,
-        identity_prekey_id: "prekey-one",
-        directory_digest: "A".repeat(43),
-      }],
-    }));
-    expect(result.current.presence).toEqual([]);
-    await act(async () => relay?.emit({ ...baseFrame, version: 8 }));
-    expect(mocks.FakeCipher.decryptCount).toBe(0);
-
-    await act(async () => relay?.emit({
-      type: "presence",
-      users: [{
-        username: "Bob",
-        connected: true,
-        identity_public_b64: validPublicKeyB64,
-        identity_prekey_id: "prekey-one",
-        directory_digest: "A".repeat(43),
-      }],
-    }));
+    await act(async () => relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users }));
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
     const mismatched = new Uint8Array(608).fill(9);
     const mismatchedB64 = Buffer.from(mismatched).toString("base64url");
     await act(async () => relay?.emit({
@@ -747,18 +1042,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay();
     await act(async () => {
       relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
-      relay?.emit({
-        type: "presence",
-        users: ["Bob", "Mallory"].map((username) => ({
-          username,
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        })),
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob", "Mallory"]).users });
     });
-    const frame = (chatId: string, sender: string, messageId: string): IncomingFrame => ({
+    const directoryStamp = presenceCatalog(["Bob", "Mallory"]).stamp;
+    const frame = (chatId: string, sender: string, messageId: string): IncomingFrame => stampedFrame({
       type: "message",
       chat_id: chatId,
       version: 9,
@@ -772,7 +1059,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    });
+    }, directoryStamp);
 
     await act(async () => {
       relay?.emit(frame("dm_bob", "Mallory", "third-party"));
@@ -800,21 +1087,13 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
+    const directoryStamp = presenceCatalog(["Bob"]).stamp;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
     mocks.FakeCipher.payloadIdOverride = "different-id";
-    await act(async () => relay?.emit({
+    await act(async () => relay?.emit(stampedFrame({
       type: "message",
       chat_id: room.id,
       version: 9,
@@ -828,7 +1107,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    }));
+    }, directoryStamp)));
     await waitFor(() => expect(mocks.FakeCipher.decryptCount).toBe(1));
     expect(result.current.messages[room.id]).toBeUndefined();
     expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
@@ -846,20 +1125,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
+    const directoryStamp = presenceCatalog(["Bob"]).stamp;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
-    const frame = (messageId: string): IncomingFrame => ({
+    const frame = (messageId: string): IncomingFrame => stampedFrame({
       type: "message",
       chat_id: room.id,
       version: 9,
@@ -873,7 +1144,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    });
+    }, directoryStamp);
 
     mocks.FakeCipher.decryptError = new Error("malformed ciphertext");
     await act(async () => relay?.emit(frame("ordinary-decrypt-failure")));
@@ -900,25 +1171,18 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
+    const directoryStamp = presenceCatalog(["Bob"]).stamp;
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
     act(() => result.current.openRoom(room.id));
     await act(async () => expect(result.current.sendText("outgoing secret")).resolves.toBe(true));
     const ownMessageId = result.current.messages[room.id]?.[0]?.id;
     expect(ownMessageId).toBeDefined();
 
-    const receiptFrame = (messageId: string): IncomingFrame => ({
+    const receiptFrame = (messageId: string): IncomingFrame => stampedFrame({
       type: "message",
       chat_id: room.id,
       version: 9,
@@ -932,7 +1196,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       identity_public_b64: validPublicKeyB64,
       prekey_id: "prekey-one",
       is_prekey: false,
-    });
+    }, directoryStamp);
     mocks.FakeCipher.plaintextOverride = {
       kind: "read_receipt",
       id: "different-receipt-id",
@@ -948,6 +1212,62 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     };
     await act(async () => relay?.emit(receiptFrame("matching-receipt-id")));
     await waitFor(() => expect(result.current.messages[room.id]?.[0]?.readAtMs).toEqual(expect.any(Number)));
+    unmount();
+  });
+
+  it("binds outbound text, attachment, and read-receipt plaintext to the outer checkpoint", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const stamp = presenceCatalog(["Bob"]).stamp;
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    act(() => result.current.openRoom(room.id));
+    await act(async () => expect(result.current.sendText("checkpoint text")).resolves.toBe(true));
+    await act(async () => expect(result.current.sendAttachment({
+      file: new File([new Uint8Array([1, 2, 3])], "checkpoint.bin", { type: "application/octet-stream" }),
+      options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
+    })).resolves.toBe(true));
+    const inbound = stampedFrame({
+      type: "message",
+      chat_id: room.id,
+      version: 9,
+      message_id: "checkpoint-inbound",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }, stamp);
+    await act(async () => relay?.emit(inbound));
+    await waitFor(() => expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(3));
+    const outboundFrames = relay?.sent.filter(
+      (item) => (item as { type?: string }).type === "message",
+    ) as Array<Record<string, unknown>>;
+    expect(outboundFrames).toHaveLength(3);
+    outboundFrames.forEach((frame, index) => {
+      const inner = JSON.parse(mocks.FakeCipher.encryptedPlaintexts[index] ?? "{}") as Record<string, unknown>;
+      expect(frame.directory_node_id).toBe(inner.directory_node_id);
+      expect(frame.directory_revision).toBe(inner.directory_revision);
+      expect(frame.directory_digest).toBe(inner.directory_digest);
+      expect(frame.directory_node_id).toBe(stamp.directory_node_id);
+      expect(frame.directory_revision).toBe(stamp.directory_revision);
+      expect(frame.directory_digest).toBe(stamp.directory_digest);
+    });
     unmount();
   });
 
@@ -970,13 +1290,11 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       });
     });
     const relay = mocks.getLastRelay();
-    const presenceBatch = (batch: number) => Array.from({ length: 128 }, (_, index) => ({
-      username: `User_${batch}_${index}`,
-      connected: true,
-      identity_public_b64: validPublicKeyB64,
-      identity_prekey_id: "prekey-one",
-      directory_digest: "A".repeat(43),
-    }));
+    const presenceBatch = (batch: number) => presenceCatalog(
+      Array.from({ length: 128 }, (_, index) => `User_${batch}_${index}`),
+      DIRECTORY_NODE_ID,
+      batch + 1,
+    ).users;
 
     for (let batch = 0; batch < 8; batch += 1) {
       await act(async () => relay?.emit({ type: "presence", users: presenceBatch(batch) }));
@@ -1008,22 +1326,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       relay?.emit({ type: "rooms", rooms: [room] });
       relay?.emit({
         type: "presence",
-        users: [
-          {
-            username: "Alice",
-            connected: true,
-            identity_public_b64: validPublicKeyB64,
-            identity_prekey_id: "prekey-one",
-            directory_digest: "A".repeat(43),
-          },
-          {
-            username: "Bob",
-            connected: true,
-            identity_public_b64: validPublicKeyB64,
-            identity_prekey_id: "prekey-two",
-            directory_digest: "A".repeat(43),
-          },
-        ],
+        users: presenceCatalog([
+          "Alice",
+          { username: "Bob", identity_prekey_id: "prekey-two" },
+        ]).users,
       });
     });
 
@@ -1147,17 +1453,9 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay();
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
     act(() => result.current.openRoom(room.id));
     let pending: Promise<boolean> | undefined;
     act(() => {
@@ -1193,17 +1491,9 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay();
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
     act(() => result.current.openRoom(room.id));
     mocks.FakeRelay.encryptedOutcome = "AMBIGUOUS";
     await act(async () => expect(result.current.sendAttachment({
@@ -1228,17 +1518,9 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay();
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({
-        type: "presence",
-        users: [{
-          username: "Bob",
-          connected: true,
-          identity_public_b64: validPublicKeyB64,
-          identity_prekey_id: "prekey-one",
-          directory_digest: "A".repeat(43),
-        }],
-      });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
     });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
     act(() => result.current.openRoom(room.id));
     mocks.FakeCipher.requiredPeers.add("Bob");
     mocks.FakeCipher.encryptError = new FatalCipherError();
@@ -1394,13 +1676,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay();
     await act(async () => {
       relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
-      relay?.emit({ type: "presence", users: [{
-        username: "Bob",
-        connected: true,
-        identity_public_b64: validPublicKeyB64,
-        identity_prekey_id: "catalog-key",
-        directory_digest: "A".repeat(43),
-      }] });
+      relay?.emit({
+        type: "presence",
+        users: presenceCatalog([{ username: "Bob", identity_prekey_id: "catalog-key" }]).users,
+      });
     });
     await waitFor(() => {
       expect(result.current.directs).toHaveLength(1);
@@ -1435,13 +1714,13 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay();
     await act(async () => {
       relay?.emit({ type: "rooms", rooms: [room] });
-      relay?.emit({ type: "presence", users: ["Bob", "Carol"].map((username) => ({
-        username,
-        connected: true,
-        identity_public_b64: validPublicKeyB64,
-        identity_prekey_id: "catalog-key",
-        directory_digest: "A".repeat(43),
-      })) });
+      relay?.emit({
+        type: "presence",
+        users: presenceCatalog([
+          { username: "Bob", identity_prekey_id: "catalog-key" },
+          { username: "Carol", identity_prekey_id: "catalog-key" },
+        ]).users,
+      });
     });
     await waitFor(() => {
       expect(result.current.rooms).toHaveLength(1);

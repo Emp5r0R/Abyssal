@@ -1,6 +1,8 @@
 package com.abyssal.chat.data.network
 
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.DirectoryStamp
+import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
@@ -19,6 +21,9 @@ import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 import java.util.Locale
 import java.nio.charset.StandardCharsets
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -267,6 +272,9 @@ class RealChatTransport(
     private val identityPins = Collections.synchronizedMap(
         LinkedHashMap<String, String>(MAX_PINNED_IDENTITIES, 0.75f, true)
     )
+    private val directoryHistory = LinkedHashMap<String, DirectoryStamp>()
+    private var currentDirectoryNode: String? = null
+    private var highestDirectoryRevision: ULong = 0u
     private val catalogLock = Any()
     private val roomCatalogIds = LinkedHashMap<String, String>()
     private val directCatalogIds = LinkedHashMap<String, String>()
@@ -767,7 +775,18 @@ class RealChatTransport(
                         envelope.signature.size != MESSAGE_SIGNATURE_BYTES ||
                         envelope.prekeyId.isEmpty() != !envelope.isPrekey ||
                         (envelope.prekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(envelope.prekeyId))
-                }
+                } || payload.directoryNodeId.isEmpty() ||
+                !NODE_ID_REGEX.matches(payload.directoryNodeId) ||
+                payload.directoryRevision == 0uL ||
+                payload.directoryRevision > MAX_DIRECTORY_REVISION ||
+                decodeCanonicalBase64Url(payload.directoryDigest, DIRECTORY_DIGEST_BYTES)?.also {
+                    it.fill(0)
+                } == null ||
+                currentDirectoryStamp() != DirectoryStamp(
+                    payload.directoryNodeId,
+                    payload.directoryRevision,
+                    payload.directoryDigest
+                )
             ) {
                 return OutboundSendResult.NOT_SENT
             }
@@ -795,6 +814,9 @@ class RealChatTransport(
                         )
                     }
                 })
+                .put("directory_node_id", payload.directoryNodeId)
+                .put("directory_revision", payload.directoryRevision.toLong())
+                .put("directory_digest", payload.directoryDigest)
                 .toString()
             // Outbound encrypted frames contain ASCII JSON and base64url only, so
             // character count equals wire bytes here.
@@ -1259,13 +1281,16 @@ class RealChatTransport(
                         }
                         "message" -> {
                             if (json.optInt("version") != PROTOCOL_VERSION) return
-                            json.toIncomingPayload(generation)?.let { payload ->
-                                if (!isAuthorizedIncomingPayload(payload)) {
-                                    wipeIncomingPayload(payload)
-                                    return@let
-                                }
-                                enqueueIncomingPayload(webSocket, generation, payload)
+                            val payload = json.toIncomingPayload(generation)
+                            if (payload == null) {
+                                closeCurrentSocket(webSocket, nodeId, "invalid encrypted message")
+                                return
                             }
+                            if (!isAuthorizedIncomingPayload(payload)) {
+                                wipeIncomingPayload(payload)
+                                return
+                            }
+                            enqueueIncomingPayload(webSocket, generation, payload)
                         }
                         "message_result" -> {
                             val parsed = json.toOutboundMessageResult()
@@ -1312,9 +1337,18 @@ class RealChatTransport(
                             )
                         }
                         "presence" -> {
-                            val users = json.optJSONArray("users") ?: return
-                            val catalog = users.toPresenceCatalog() ?: return
-                            if (!acceptPresenceCatalogForSocket(webSocket, generation, catalog)) {
+                            val users = json.optJSONArray("users")
+                            val catalog = users?.toPresenceCatalog()
+                            if (catalog == null) {
+                                closeCurrentSocket(webSocket, nodeId, "invalid directory")
+                                return
+                            }
+                            if (!acceptPresenceCatalogForSocket(
+                                    webSocket,
+                                    generation,
+                                    nodeId,
+                                    catalog
+                                )) {
                                 wipePresence(catalog.entries)
                                 closeCurrentSocket(webSocket, nodeId, "directory changed")
                                 return
@@ -1602,10 +1636,47 @@ class RealChatTransport(
         val previous = _presence.value
         _presence.value = emptyList()
         wipePresence(previous)
+        synchronized(connectionLock) {
+            directoryHistory.clear()
+            currentDirectoryNode = null
+            highestDirectoryRevision = 0u
+        }
     }
 
+    override fun currentDirectoryStamp(): DirectoryStamp? = synchronized(connectionLock) {
+        directoryHistory.values.maxByOrNull { it.revision }
+    }
+
+    override fun directoryEvidenceStatus(stamp: DirectoryStamp): DirectoryEvidenceStatus =
+        synchronized(connectionLock) {
+            val key = "${stamp.nodeId}\u0000${stamp.revision}\u0000${stamp.digest}"
+            if (directoryHistory.containsKey(key)) {
+                DirectoryEvidenceStatus.KNOWN
+            } else if (stamp.nodeId == currentDirectoryNode && stamp.revision < highestDirectoryRevision) {
+                DirectoryEvidenceStatus.UNKNOWN_OLD
+            } else {
+                DirectoryEvidenceStatus.CONFLICT
+            }
+        }
+
     internal fun acceptPresenceCatalog(catalog: PresenceCatalog): Boolean {
+        if (catalog.entries.isEmpty()) return false
         if (catalog.entries.map { it.directoryDigest }.distinct().size > 1) return false
+        val first = catalog.entries.first()
+        if (first.directoryNodeId.isEmpty() || first.directoryRevision == 0uL ||
+            catalog.entries.any {
+                it.directoryNodeId != first.directoryNodeId ||
+                    it.directoryRevision != first.directoryRevision
+            }) return false
+        val expected = directoryDigestV2(
+            first.directoryNodeId,
+            first.directoryRevision,
+            catalog.entries
+        )
+        if (expected != first.directoryDigest) return false
+        if (!rememberDirectoryStamp(
+                DirectoryStamp(first.directoryNodeId, first.directoryRevision, first.directoryDigest)
+            )) return false
         if (!pinIdentities(catalog.identityPins)) return false
         val previousPresence = _presence.value
         _presence.value = catalog.entries
@@ -1613,12 +1684,73 @@ class RealChatTransport(
         return true
     }
 
+    private fun rememberDirectoryStamp(stamp: DirectoryStamp): Boolean = synchronized(connectionLock) {
+        if (currentDirectoryNode != null && currentDirectoryNode != stamp.nodeId) return false
+        val key = "${stamp.nodeId}\u0000${stamp.revision}\u0000${stamp.digest}"
+        if (directoryHistory.containsKey(key)) {
+            return stamp.revision >= highestDirectoryRevision
+        }
+        val sameRevision = directoryHistory.values.firstOrNull { it.revision == stamp.revision }
+        if (sameRevision != null && sameRevision != stamp) return false
+        if (stamp.revision < highestDirectoryRevision) return false
+        if (directoryHistory.size >= MAX_DIRECTORY_HISTORY) {
+            directoryHistory.entries.iterator().let { iterator ->
+                if (iterator.hasNext()) {
+                    iterator.next()
+                    iterator.remove()
+                }
+            }
+        }
+        directoryHistory[key] = stamp
+        currentDirectoryNode = stamp.nodeId
+        if (stamp.revision > highestDirectoryRevision) highestDirectoryRevision = stamp.revision
+        true
+    }
+
+    private fun directoryDigestV2(
+        nodeId: String,
+        revision: ULong,
+        entries: List<UserPresence>
+    ): String {
+        val sorted = entries.sortedBy { it.username }
+        val nodeBytes = nodeId.toByteArray(StandardCharsets.UTF_8)
+        val domain = "ABYSSAL_DIRECTORY_CHECKPOINT_V2".toByteArray(StandardCharsets.UTF_8)
+        val transcriptSize = domain.size + 4 + nodeBytes.size + 8 + 4 + sorted.sumOf {
+            val username = it.username.toByteArray(StandardCharsets.UTF_8)
+            4 + username.size + IDENTITY_FINGERPRINT_BYTES
+        }
+        val transcript = ByteBuffer.allocate(transcriptSize).order(ByteOrder.BIG_ENDIAN)
+        transcript.put(domain)
+        transcript.putInt(nodeBytes.size)
+        transcript.put(nodeBytes)
+        transcript.putLong(revision.toLong())
+        transcript.putInt(sorted.size)
+        sorted.forEach { user ->
+            val username = user.username.toByteArray(StandardCharsets.UTF_8)
+            val publicKey = user.publicKey
+            transcript.putInt(username.size)
+            transcript.put(username)
+            transcript.put(publicKey, 0, IDENTITY_FINGERPRINT_BYTES)
+        }
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256").digest(transcript.array())
+            encode(digest).also { digest.fill(0) }
+        } finally {
+            transcript.array().fill(0)
+            nodeBytes.fill(0)
+            domain.fill(0)
+        }
+    }
+
     private fun acceptPresenceCatalogForSocket(
         socket: WebSocket,
         generation: Long,
+        expectedNodeId: String,
         catalog: PresenceCatalog
     ): Boolean = synchronized(connectionLock) {
-        isCurrentSocket(socket, generation) && acceptPresenceCatalog(catalog)
+        isCurrentSocket(socket, generation) &&
+            catalog.entries.all { it.directoryNodeId == expectedNodeId } &&
+            acceptPresenceCatalog(catalog)
     }
 
     private fun installRoomCatalog(sessions: List<ChatSession>) {
@@ -1783,7 +1915,10 @@ class RealChatTransport(
                 var publicKey: ByteArray? = null
                 try {
                     val user = optJSONObject(index) ?: throw InvalidCatalogException
-                    if (!hasExactKeys(user, PRESENCE_KEYS)) throw InvalidCatalogException
+                    val presenceKeys = user.keys().asSequence().toSet()
+                    if (presenceKeys != PRESENCE_KEYS) {
+                        throw InvalidCatalogException
+                    }
                     val username = user.stringValue("username")
                         ?.takeIf(::isSafeUsername) ?: throw InvalidCatalogException
                     val usernameKey = username.lowercase(Locale.ROOT)
@@ -1799,6 +1934,20 @@ class RealChatTransport(
                     val digestBytes = decodeCanonicalBase64Url(directoryDigest, DIRECTORY_DIGEST_BYTES)
                         ?: throw InvalidCatalogException
                     digestBytes.fill(0)
+                    val directoryNodeId = user.stringValue("directory_node_id")
+                        ?: throw InvalidCatalogException
+                    val directoryRevision = user.opt("directory_revision").let { value ->
+                        when (value) {
+                            is Int -> value.toLong()
+                            is Long -> value
+                            else -> throw InvalidCatalogException
+                        }
+                    }.takeIf { it > 0L }?.toULong() ?: throw InvalidCatalogException
+                    if (!NODE_ID_REGEX.matches(directoryNodeId) ||
+                        directoryRevision > MAX_DIRECTORY_REVISION
+                    ) {
+                        throw InvalidCatalogException
+                    }
                     val connected = user.booleanValue("connected") ?: throw InvalidCatalogException
                     val fingerprintBytes = publicKey.copyOfRange(0, IDENTITY_FINGERPRINT_BYTES)
                     val fingerprint = try {
@@ -1812,7 +1961,9 @@ class RealChatTransport(
                         connected = connected,
                         publicKey = publicKey,
                         prekeyId = prekeyId,
-                        directoryDigest = directoryDigest
+                        directoryDigest = directoryDigest,
+                        directoryNodeId = directoryNodeId,
+                        directoryRevision = directoryRevision
                     )
                     publicKey = null
                 } finally {
@@ -1890,7 +2041,9 @@ class RealChatTransport(
         var identityPublicKey: ByteArray? = null
         var ownershipTransferred = false
         return try {
-            if (keys().asSequence().toSet() != INCOMING_MESSAGE_KEYS || optString("type") != "message") {
+            val incomingKeys = keys().asSequence().toSet()
+            if (incomingKeys != INCOMING_MESSAGE_KEYS ||
+                optString("type") != "message") {
                 return null
             }
             val chatId = stringValue("chat_id")?.takeIf { isSafeIdentifier(it) } ?: return null
@@ -1903,6 +2056,24 @@ class RealChatTransport(
             val isPrekey = booleanValue("is_prekey") ?: return null
             if (isPrekey != prekeyId.isNotEmpty() ||
                 (prekeyId.isNotEmpty() && !PREKEY_ID_REGEX.matches(prekeyId))
+            ) return null
+
+            val directoryNodeId = stringValue("directory_node_id") ?: return null
+            val directoryRevision = opt("directory_revision").let { value ->
+                when (value) {
+                    is Int -> value.toLong()
+                    is Long -> value
+                    else -> return null
+                }
+            }.takeIf { it > 0L }?.toULong() ?: return null
+            val directoryDigest = stringValue("directory_digest") ?: return null
+            val decodedDirectoryDigest = decodeCanonicalBase64Url(
+                directoryDigest,
+                DIRECTORY_DIGEST_BYTES
+            ) ?: return null
+            decodedDirectoryDigest.fill(0)
+            if (!NODE_ID_REGEX.matches(directoryNodeId) ||
+                directoryRevision > MAX_DIRECTORY_REVISION
             ) return null
 
             val decodedNonce = decodeCanonicalBase64UrlValue(
@@ -1952,7 +2123,10 @@ class RealChatTransport(
                 senderPublicKey = decodedSenderPublicKey,
                 prekeyId = prekeyId,
                 isPrekey = isPrekey,
-                connectionGeneration = connectionGeneration
+                connectionGeneration = connectionGeneration,
+                directoryNodeId = directoryNodeId,
+                directoryRevision = directoryRevision,
+                directoryDigest = directoryDigest
             )
             ownershipTransferred = true
             payload
@@ -2073,6 +2247,8 @@ class RealChatTransport(
         const val ROOM_CHANGE_BUFFER_CAPACITY =
             MAX_ROOM_CATALOG_ENTRIES + MAX_DIRECT_CATALOG_ENTRIES
         const val MAX_PINNED_IDENTITIES = 1024
+        const val MAX_DIRECTORY_HISTORY = 32
+        const val MAX_DIRECTORY_REVISION = 65_536uL
         const val MAX_JOINED_CHAT_IDS = 512
         const val MAX_PENDING_OUTBOUND = 64
         const val MAX_PENDING_ACKNOWLEDGEMENTS = 64
@@ -2081,15 +2257,18 @@ class RealChatTransport(
         const val DIRECTORY_DIGEST_BYTES = 32
         const val IDENTITY_FINGERPRINT_BYTES = 64
         val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
+        val NODE_ID_REGEX = Regex("^[A-Za-z0-9._:-]{1,128}$")
         val DIRECT_ID_REGEX = Regex("^dm_[A-Za-z0-9_-]{1,125}$")
         val CANONICAL_BASE64_URL_REGEX = Regex("^[A-Za-z0-9_-]+$")
         val PRESENCE_KEYS = setOf(
-            "username", "connected", "identity_public_b64", "identity_prekey_id", "directory_digest"
+            "username", "connected", "identity_public_b64", "identity_prekey_id", "directory_digest",
+            "directory_node_id", "directory_revision"
         )
         val INCOMING_MESSAGE_KEYS = setOf(
             "type", "chat_id", "version", "message_id", "nonce_b64", "ciphertext_b64",
             "signature_b64", "wrapped_key_b64", "prekey_id", "is_prekey", "sender_username",
-            "sender_public_key_b64", "identity_public_b64"
+            "sender_public_key_b64", "identity_public_b64", "directory_node_id",
+            "directory_revision", "directory_digest"
         )
         val ROOM_KEYS = setOf(
             "id", "name", "owner_username", "self_destruct_timer_sec", "overall_expiry_sec",

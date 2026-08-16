@@ -20,6 +20,7 @@ import type {
   AttachmentOptions,
   ChatMessage,
   ConnectionState,
+  DirectoryStamp,
   DecryptedMedia,
   DirectRecord,
   IncomingFrame,
@@ -74,6 +75,8 @@ const MAX_ROOM_CATALOG = 1024;
 const MAX_DIRECT_CATALOG = 128;
 const MAX_PRESENCE_USERS = 128;
 const MAX_PINNED_IDENTITIES = 1024;
+const MAX_DIRECTORY_HISTORY = 32;
+const MAX_DIRECTORY_REVISION = 65_536;
 const MAX_OWN_MESSAGE_IDS = 10_000;
 const MAX_TIMER_SECONDS = 86_400;
 const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
@@ -88,6 +91,7 @@ const ROOM_KEYS = new Set([
 ]);
 const PRESENCE_KEYS = new Set([
   "username", "connected", "identity_public_b64", "identity_prekey_id", "directory_digest",
+  "directory_node_id", "directory_revision",
 ]);
 const DIRECT_KEYS = new Set(["id", "peer_username"]);
 // Browser downloads can outlive the click event, especially for large files.
@@ -169,8 +173,13 @@ export function useAbyssalSession() {
   const activeRoomRef = useRef<string | null>(null);
   const requestedDirectRef = useRef<string | null>(null);
   const ownMessageIdsRef = useRef(new Set<string>());
-  const receivedFrameIdsRef = useRef(new Set<string>());
+  const receivedFrameIdsRef = useRef(new Map<string, string>());
   const identityPinsRef = useRef(new Map<string, string>());
+  const directoryHistoryRef = useRef(new Map<string, DirectoryStamp>());
+  const directoryStampRef = useRef<DirectoryStamp | null>(null);
+  const directoryNodeRef = useRef<string | null>(null);
+  const directoryRevisionRef = useRef(0);
+  const frameQueueRef = useRef<Promise<void>>(Promise.resolve());
   const sendReadReceiptRef = useRef<(chatId: string, messageId: string) => void>(() => undefined);
   const sessionGenerationRef = useRef(0);
   const cryptoGateRef = useRef(new AsyncCryptoGate());
@@ -295,6 +304,11 @@ export function useAbyssalSession() {
     ownMessageIdsRef.current.clear();
     receivedFrameIdsRef.current.clear();
     identityPinsRef.current.clear();
+    directoryHistoryRef.current.clear();
+    directoryStampRef.current = null;
+    directoryNodeRef.current = null;
+    directoryRevisionRef.current = 0;
+    frameQueueRef.current = Promise.resolve();
     roomsRef.current = [];
     directsRef.current = [];
     presenceRef.current = [];
@@ -335,13 +349,63 @@ export function useAbyssalSession() {
     }
   }, []);
 
+  const rememberDirectoryStamp = useCallback((stamp: DirectoryStamp): boolean => {
+    if (sessionRef.current?.nodeId !== stamp.directory_node_id) return false;
+    const node = directoryNodeRef.current;
+    if (node !== null && node !== stamp.directory_node_id) return false;
+    const key = `${stamp.directory_node_id}\u0000${stamp.directory_revision}\u0000${stamp.directory_digest}`;
+    if (directoryHistoryRef.current.has(key)) {
+      return stamp.directory_revision >= directoryRevisionRef.current;
+    }
+    const sameRevision = [...directoryHistoryRef.current.values()].find(
+      (known) => known.directory_revision === stamp.directory_revision,
+    );
+    if (sameRevision && (
+      sameRevision.directory_node_id !== stamp.directory_node_id ||
+      sameRevision.directory_digest !== stamp.directory_digest
+    )) return false;
+    if (stamp.directory_revision < directoryRevisionRef.current) {
+      return false;
+    }
+    if (directoryHistoryRef.current.size >= MAX_DIRECTORY_HISTORY) {
+      const oldest = directoryHistoryRef.current.keys().next().value;
+      if (oldest) directoryHistoryRef.current.delete(oldest);
+    }
+    directoryHistoryRef.current.set(key, { ...stamp });
+    directoryNodeRef.current = stamp.directory_node_id;
+    directoryRevisionRef.current = Math.max(directoryRevisionRef.current, stamp.directory_revision);
+    directoryStampRef.current = { ...stamp };
+    return true;
+  }, []);
+
+  const knownDirectoryEvidence = useCallback((frame: Extract<IncomingFrame, { type: "message" }>): "accepted" | "unknown-old" | "conflict" => {
+    if (typeof frame.directory_node_id !== "string" ||
+      !/^[A-Za-z0-9._:-]{1,128}$/u.test(frame.directory_node_id) ||
+      typeof frame.directory_revision !== "number" ||
+      !Number.isSafeInteger(frame.directory_revision) ||
+      frame.directory_revision < 1 || frame.directory_revision > MAX_DIRECTORY_REVISION ||
+      typeof frame.directory_digest !== "string" ||
+      !canonicalBase64Bytes(frame.directory_digest, 32)) return "conflict";
+    const key = `${frame.directory_node_id}\u0000${frame.directory_revision}\u0000${frame.directory_digest}`;
+    if (directoryHistoryRef.current.has(key)) return "accepted";
+    if (frame.directory_node_id !== directoryNodeRef.current ||
+      frame.directory_revision > directoryRevisionRef.current) return "conflict";
+    if (frame.directory_revision === directoryRevisionRef.current) return "conflict";
+    return "unknown-old";
+  }, []);
+
   const applyFrame = useCallback(async (frame: IncomingFrame) => {
     if (frame.type === "GLOBAL_WIPE" || frame.type === "global_wipe") {
       clearMemory();
       return;
     }
     if (frame.type === "presence") {
-      if (frame.users.length > MAX_PRESENCE_USERS || frame.users.some((user) => !validPresence(user))) {
+      const presenceGeneration = sessionGenerationRef.current;
+      const presenceToken = sessionRef.current?.token;
+      if (!presenceToken) return;
+      if (frame.users.length === 0 || frame.users.length > MAX_PRESENCE_USERS ||
+        frame.users.some((user) => !validPresence(user))) {
+        clearMemory();
         return;
       }
       const usernames = new Set<string>();
@@ -351,7 +415,10 @@ export function useAbyssalSession() {
         usernames.add(key);
         return true;
       });
-      if (next.length !== frame.users.length) return;
+      if (next.length !== frame.users.length) {
+        clearMemory();
+        return;
+      }
       const newPinCount = [...usernames].reduce(
         (count, username) => count + Number(!identityPinsRef.current.has(username)),
         0,
@@ -361,6 +428,29 @@ export function useAbyssalSession() {
         return;
       }
       if (new Set(next.map((user) => user.directory_digest)).size > 1) {
+        clearMemory();
+        return;
+      }
+      const stamp = presenceDirectoryStamp(next);
+      if (!stamp || new Set(next.map((user) => user.directory_node_id)).size !== 1 ||
+        new Set(next.map((user) => user.directory_revision)).size !== 1) {
+        clearMemory();
+        return;
+      }
+      try {
+        const recomputed = await directoryDigestV2(
+          stamp.directory_node_id,
+          stamp.directory_revision,
+          next,
+        );
+        if (presenceGeneration !== sessionGenerationRef.current ||
+          sessionRef.current?.token !== presenceToken) return;
+        if (recomputed !== stamp.directory_digest || !rememberDirectoryStamp(stamp)) {
+          clearMemory();
+          return;
+        }
+        socketRef.current?.setDirectoryStamp(stamp);
+      } catch {
         clearMemory();
         return;
       }
@@ -460,6 +550,12 @@ export function useAbyssalSession() {
       if (!conversation || (conversation.conversation_type === "direct" &&
         conversation.peer_username?.toLowerCase() !== senderKey)) return;
       if (!presenceRef.current.some((user) => user.username.toLowerCase() === senderKey)) return;
+      const directoryEvidence = knownDirectoryEvidence(frame);
+      if (directoryEvidence === "conflict") {
+        failClosed(currentSession);
+        return;
+      }
+      if (directoryEvidence === "unknown-old") return;
       const pinnedFingerprint = identityPinsRef.current.get(senderKey);
       if (!pinnedFingerprint) return;
       let senderFingerprint = "";
@@ -470,7 +566,13 @@ export function useAbyssalSession() {
       }
       if (senderFingerprint !== pinnedFingerprint) return;
       const replayKey = `${frame.chat_id}\u0000${frame.sender_username}\u0000${frame.message_id}`;
-      if (receivedFrameIdsRef.current.has(replayKey)) {
+      const directoryEvidenceKey = `${frame.directory_node_id}\u0000${frame.directory_revision}\u0000${frame.directory_digest}`;
+      const processedDirectoryEvidence = receivedFrameIdsRef.current.get(replayKey);
+      if (processedDirectoryEvidence !== undefined) {
+        if (processedDirectoryEvidence !== directoryEvidenceKey) {
+          failClosed(currentSession);
+          return;
+        }
         const stateSnapshot = cipherRef.current.stateSnapshot();
         if (!stateSnapshot) {
           clearMemory();
@@ -509,7 +611,7 @@ export function useAbyssalSession() {
         return;
       }
       if (receivedFrameIdsRef.current.size >= 10_000) {
-        const oldest = receivedFrameIdsRef.current.values().next().value;
+        const oldest = receivedFrameIdsRef.current.keys().next().value;
         if (oldest) receivedFrameIdsRef.current.delete(oldest);
       }
       let senderPublicKey: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -543,6 +645,17 @@ export function useAbyssalSession() {
           frame.is_prekey,
           currentSession.username,
         );
+        let decryptedPayload: unknown;
+        try {
+          decryptedPayload = JSON.parse(decrypted) as unknown;
+        } catch {
+          failClosed(currentSession);
+          return;
+        }
+        if (!directoryStampMatches(frame, decryptedPayload)) {
+          failClosed(currentSession);
+          return;
+        }
         const stateSnapshot = cipherRef.current.stateSnapshot();
         if (!stateSnapshot) throw new Error("Identity unavailable");
         let ackOutcome: EncryptedSendOutcome = "NOT_SENT";
@@ -590,7 +703,7 @@ export function useAbyssalSession() {
         operationGeneration !== sessionGenerationRef.current ||
         sessionRef.current?.token !== operationToken
       ) return;
-      receivedFrameIdsRef.current.add(replayKey);
+      receivedFrameIdsRef.current.set(replayKey, directoryEvidenceKey);
       const payload = JSON.parse(decrypted) as Record<string, unknown>;
       if (payload.kind === "read_receipt") {
         if (payload.id !== frame.message_id) return;
@@ -642,7 +755,7 @@ export function useAbyssalSession() {
         // Authentication failure or malformed plaintext stays outside UI state.
       }
     });
-  }, [clearMemory, failClosed, updateMessages]);
+  }, [clearMemory, failClosed, knownDirectoryEvidence, rememberDirectoryStamp, updateMessages]);
 
   const login = useCallback(async (input: LoginInput): Promise<AccountSession> => {
     if (sessionRef.current || loginAbortRef.current) throw new Error("Action unavailable");
@@ -787,7 +900,16 @@ export function useAbyssalSession() {
         candidate,
         (frame) => {
           if (sessionGenerationRef.current !== relayGeneration || sessionRef.current?.token !== candidate.token) return;
-          void applyFrame(frame);
+          frameQueueRef.current = frameQueueRef.current
+            .then(async () => {
+              if (sessionGenerationRef.current !== relayGeneration ||
+                sessionRef.current?.token !== candidate.token) return;
+              await applyFrame(frame);
+            })
+            .catch(() => {
+              if (sessionGenerationRef.current === relayGeneration &&
+                sessionRef.current?.token === candidate.token) failClosed(candidate);
+            });
         },
         (state) => {
           if (sessionRef.current && sessionRef.current.token !== candidate.token) return;
@@ -948,12 +1070,14 @@ export function useAbyssalSession() {
     chatId: string,
     messageId: string,
     recipients: Array<{ username: string; publicKey: Uint8Array; prekeyId: string }>,
-    createPayload: () => EncryptedPayload,
+    createPayload: (directoryStamp: DirectoryStamp) => EncryptedPayload,
   ): Promise<EncryptedSendOutcome> => {
     let encrypted: EncryptedPayload | null = null;
     let staged = false;
     let admissionAttempted = false;
     const acquiredLeases: PrekeyLease[] = [];
+    const directoryStamp = directoryStampRef.current ? { ...directoryStampRef.current } : null;
+    if (!directoryStamp) return "NOT_SENT";
     let leasesReleaseAttempted = false;
     const active = () => generation === sessionGenerationRef.current &&
       sessionRef.current?.token === currentSession.token;
@@ -998,7 +1122,7 @@ export function useAbyssalSession() {
             recipient.prekeyId = lease.prekeyId;
           }
           if (!active()) return "NOT_SENT" as const;
-          encrypted = createPayload();
+          encrypted = createPayload(directoryStamp);
           staged = true;
           const stagedPayload = encrypted;
           const frame = payloadToFrame(stagedPayload);
@@ -1009,6 +1133,7 @@ export function useAbyssalSession() {
               type: "message",
               chat_id: chatId,
               ...frame,
+              ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
             },
           ) ?? Promise.resolve("NOT_SENT" as const));
           if (!active()) return sent;
@@ -1082,11 +1207,14 @@ export function useAbyssalSession() {
       chatId,
       receiptId,
       recipients,
-      () => cipherRef.current.encryptText(
+      (directoryStamp) => cipherRef.current.encryptText(
         chatId,
         receiptId,
         currentSession.username,
-        JSON.stringify({ kind: "read_receipt", id: receiptId, message_id: messageId }),
+        JSON.stringify({
+          kind: "read_receipt", id: receiptId, message_id: messageId,
+          ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
+        }),
         recipients,
       ),
     );
@@ -1127,11 +1255,11 @@ export function useAbyssalSession() {
       chatId,
       message.id,
       recipients,
-      () => cipherRef.current.encryptText(
+      (directoryStamp) => cipherRef.current.encryptText(
         chatId,
         message.id,
         currentSession.username,
-        JSON.stringify(messagePayload(message)),
+        JSON.stringify(messagePayload(message, directoryStamp)),
         recipients,
       ),
     );
@@ -1252,11 +1380,11 @@ export function useAbyssalSession() {
         chatId,
         outgoingMessage.id,
         recipients,
-        () => cipherRef.current.encryptText(
+        (directoryStamp) => cipherRef.current.encryptText(
           chatId,
           outgoingMessage.id,
           currentSession.username,
-          JSON.stringify(messagePayload(outgoingMessage)),
+          JSON.stringify(messagePayload(outgoingMessage, directoryStamp)),
           recipients,
         ),
       );
@@ -1591,7 +1719,8 @@ function validDirectCatalog(directs: unknown[]): directs is DirectRecord[] {
 }
 
 function validPresence(value: unknown): value is PresenceUser {
-  if (!plainRecord(value) || Object.keys(value).some((key) => !PRESENCE_KEYS.has(key))) return false;
+  if (!plainRecord(value) || Object.keys(value).length !== PRESENCE_KEYS.size ||
+    Object.keys(value).some((key) => !PRESENCE_KEYS.has(key))) return false;
   const user = value as Partial<PresenceUser>;
   if (
     typeof user.username !== "string" ||
@@ -1604,8 +1733,84 @@ function validPresence(value: unknown): value is PresenceUser {
   ) {
     return false;
   }
+  if (
+    typeof user.directory_node_id !== "string" ||
+    !/^[A-Za-z0-9._:-]{1,128}$/u.test(user.directory_node_id) ||
+    typeof user.directory_revision !== "number" ||
+    !Number.isSafeInteger(user.directory_revision) ||
+    user.directory_revision < 1 || user.directory_revision > MAX_DIRECTORY_REVISION
+  ) return false;
   return canonicalBase64Bytes(user.identity_public_b64, IDENTITY_PUBLIC_KEY_BYTES) &&
     canonicalBase64Bytes(user.directory_digest, 32);
+}
+
+function presenceDirectoryStamp(users: PresenceUser[]): DirectoryStamp | null {
+  if (users.length > 0 && users.every((user) =>
+    user.directory_node_id === users[0]?.directory_node_id &&
+    user.directory_revision === users[0]?.directory_revision
+  )) {
+    const node = users[0]?.directory_node_id ?? "";
+    const revision = users[0]?.directory_revision ?? 0;
+    if (/^[A-Za-z0-9._:-]{1,128}$/u.test(node) &&
+      Number.isSafeInteger(revision) && revision > 0 && revision <= MAX_DIRECTORY_REVISION) {
+      return { directory_node_id: node, directory_revision: revision, directory_digest: users[0]?.directory_digest ?? "" };
+    }
+  }
+  return null;
+}
+
+function u32(value: number): Uint8Array {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, false);
+  return bytes;
+}
+
+function u64(value: number): Uint8Array {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigUint64(0, BigInt(value), false);
+  return bytes;
+}
+
+async function directoryDigestV2(
+  nodeId: string,
+  revision: number,
+  users: PresenceUser[],
+): Promise<string> {
+  const encoder = new TextEncoder();
+  const entries = users
+    .map((user) => {
+      const decoded = base64ToBytes(user.identity_public_b64);
+      return {
+        username: user.username,
+        identity: decoded.slice(0, 64),
+        decoded,
+      };
+    })
+    .sort((left, right) => left.username < right.username ? -1 : left.username > right.username ? 1 : 0);
+  const parts: Uint8Array[] = [
+    encoder.encode("ABYSSAL_DIRECTORY_CHECKPOINT_V2"),
+    u32(encoder.encode(nodeId).byteLength),
+    encoder.encode(nodeId),
+    u64(revision),
+    u32(entries.length),
+  ];
+  entries.forEach((entry) => {
+    const username = encoder.encode(entry.username);
+    parts.push(u32(username.byteLength), username, entry.identity);
+  });
+  const transcript = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0));
+  let offset = 0;
+  parts.forEach((part) => { transcript.set(part, offset); offset += part.byteLength; });
+  try {
+    return bytesToBase64(new Uint8Array(await crypto.subtle.digest("SHA-256", transcript)));
+  } finally {
+    transcript.fill(0);
+    parts.forEach((part) => part.fill(0));
+    entries.forEach((entry) => {
+      entry.identity.fill(0);
+      entry.decoded.fill(0);
+    });
+  }
 }
 
 function canonicalBase64Bytes(value: string, expectedBytes: number): boolean {
@@ -1780,7 +1985,31 @@ function incomingReadRetention(
   return readRetention(room, mediaType);
 }
 
-function messagePayload(message: ChatMessage): Record<string, unknown> {
+function directoryStampFields(stamp: DirectoryStamp): Record<string, unknown> {
+  return {
+    directory_node_id: stamp.directory_node_id,
+    directory_revision: stamp.directory_revision,
+    directory_digest: stamp.directory_digest,
+  };
+}
+
+function directoryStampMatches(
+  frame: Extract<IncomingFrame, { type: "message" }>,
+  payload: unknown,
+): boolean {
+  if (!plainRecord(payload) ||
+    typeof frame.directory_node_id !== "string" ||
+    typeof frame.directory_revision !== "number" ||
+    typeof frame.directory_digest !== "string") return false;
+  return payload.directory_node_id === frame.directory_node_id &&
+    payload.directory_revision === frame.directory_revision &&
+    payload.directory_digest === frame.directory_digest;
+}
+
+function messagePayload(
+  message: ChatMessage,
+  directoryStamp: DirectoryStamp | null = null,
+): Record<string, unknown> {
   const common: Record<string, unknown> = {
     kind: message.kind,
     id: message.id,
@@ -1788,6 +2017,7 @@ function messagePayload(message: ChatMessage): Record<string, unknown> {
     timestamp_ms: message.createdAtMs,
     self_destruct_sec: message.selfDestructSec,
     absolute_expiry_sec: message.absoluteExpirySec,
+    ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
   };
   if (message.replyToId) common.reply_to_id = message.replyToId;
   if (message.kind === "text") return { ...common, content: message.content };

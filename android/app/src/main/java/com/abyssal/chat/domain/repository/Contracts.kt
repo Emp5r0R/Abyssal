@@ -1,6 +1,8 @@
 package com.abyssal.chat.domain.repository
 
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.DirectoryStamp
+import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
 import com.abyssal.chat.domain.model.AttachmentUploadResult
 import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.DecryptedAttachment
@@ -90,6 +92,17 @@ interface IChatTransport {
     fun getIncomingPayloads(): Flow<IncomingTransportPayload>
     fun getRoomChanges(): Flow<RoomChange>
     fun getPresence(): Flow<List<UserPresence>>
+    /** Latest authenticated directory evidence used to bind encrypted plaintext. */
+    fun currentDirectoryStamp(): DirectoryStamp? = null
+    fun directoryEvidenceStatus(stamp: DirectoryStamp): DirectoryEvidenceStatus {
+        val current = currentDirectoryStamp() ?: return DirectoryEvidenceStatus.CONFLICT
+        if (stamp == current) return DirectoryEvidenceStatus.KNOWN
+        return if (stamp.nodeId == current.nodeId && stamp.revision < current.revision) {
+            DirectoryEvidenceStatus.UNKNOWN_OLD
+        } else {
+            DirectoryEvidenceStatus.CONFLICT
+        }
+    }
     suspend fun joinChat(chatId: String)
     /**
      * Joins [chatId] only when the captured connection epoch is still active.

@@ -1,5 +1,57 @@
 # Project Progress
 
+## Completed Deployment: Directory Equivocation Detection
+
+This deployment closed the next repository-fixable item in `SECURITY.md` after
+protocol-v9 prekey leasing by adding authenticated, monotonic directory
+evidence that clients can compare and gossip without persisting account or
+message state to disk.
+
+### Delivered
+
+- The relay computes a canonical SHA-256 directory checkpoint over the node ID,
+  bounded monotonic account revision, and sorted username-to-long-term-identity
+  map. Presence broadcasts are serialized so an older snapshot cannot follow a
+  newer one, and message admission requires the exact current checkpoint.
+- Web and Android independently recompute checkpoints, retain a bounded
+  32-entry RAM-only history, reject malformed, stale, conflicting, or
+  cross-node evidence, and clear the history with the authenticated session.
+- Text, attachment metadata, and read-receipt plaintext bind the same directory
+  evidence as their encrypted outer frame. Exact mismatch fails before decrypt
+  publication or acknowledgement, while unknown checkpoints evicted from the
+  bounded history are dropped without acknowledgement.
+- Direct peers carry the authenticated checkpoint through existing protocol-v9
+  encryption, making conflicting views detectable whenever those views cross a
+  communicating client boundary. Replay tracking binds each message ID to the
+  exact directory evidence originally accepted.
+- The disposable-relay integration recomputes the Rust transcript, covers text,
+  attachment metadata, read receipts, and offline replay, and verifies that
+  missing or stale evidence is rejected before fanout with ratchet rollback,
+  prekey-lease release/reuse, and an exact-message-ID valid retry.
+
+### Verification
+
+- Final `./scripts/test-all.sh all`: passed after integration-harness migration.
+- Rust: 25 core tests and 134 relay tests passed with rustfmt, locked workspace
+  tests, and warning-denied workspace Clippy.
+- Web: 241 tests in 17 files, zero-warning lint, TypeScript compilation, and the
+  production Vite build passed.
+- Android: 182 JVM unit tests, release lint, and debug/release Kotlin
+  compilation passed without packaging an APK or AAB.
+- Live OPAQUE/E2EE relay integration, generated artifact/source verification,
+  Gradle dependency verification, immutable workflow/container checks, shell
+  syntax checks, npm audit with zero vulnerabilities, and RustSec audit passed.
+
+### Remaining External Limits
+
+Client gossip is not an independent signed witness. A malicious relay that
+permanently partitions inconsistent views can prevent the evidence from
+crossing clients, process/session restart clears the RAM-only history, and the
+32-entry bound can turn very old evidence into a safe availability drop. An
+external transparency witness, persistent rollback anchor, multi-device
+coordination, MLS group protocol, and independent audit remain separate work.
+No package, release, or production deployment was performed.
+
 ## Completed Deployment: Protocol-v9 Initial Prekey Pool
 
 Protocol v9 replaces the single advertised Olm one-time prekey with a bounded,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   decryptAttachment,
@@ -28,14 +28,196 @@ const decoder = new TextDecoder();
 const RESULT_TIMEOUT_MS = 5_000;
 const MAX_PENDING_RESULT_WAITERS = 256;
 const IDENTITY_PUBLIC_BYTES_V9 = 64 + (16 * 32) + 32;
+const MAX_DIRECTORY_REVISION = 65_536;
+const MAX_DIRECTORY_USERS = 117;
+const MAX_DIRECTORY_WAITERS = 4;
+const MAX_NODE_ID_BYTES = 128;
+const DIRECTORY_DIGEST_BYTES = 32;
+const DIRECTORY_TRANSCRIPT_DOMAIN = "ABYSSAL_DIRECTORY_CHECKPOINT_V2";
+const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
+const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
+const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/u;
 
 const encode = (value) => Buffer.from(value).toString("base64url");
 const decode = (value) => new Uint8Array(Buffer.from(value, "base64url"));
 
 const pendingResultWaiters = new Map();
 const releasedPrekeysAwaitingReuse = new Map();
+const directoryTrackers = new WeakMap();
 
 class AmbiguousRelayResult extends Error {}
+
+function exactKeys(value, expected) {
+  assert.deepEqual(Object.keys(value).sort(), [...expected].sort());
+}
+
+function assertCanonicalBytes(value, size, label) {
+  assert.equal(typeof value, "string", `${label} must be a string`);
+  const bytes = decode(value);
+  try {
+    assert.equal(bytes.byteLength, size, `${label} must decode to ${size} bytes`);
+    assert.equal(encode(bytes), value, `${label} must be canonical base64url`);
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function writeU32(hash, value) {
+  const bytes = Buffer.allocUnsafe(4);
+  bytes.writeUInt32BE(value, 0);
+  hash.update(bytes);
+  bytes.fill(0);
+}
+
+function writeU64(hash, value) {
+  const bytes = Buffer.allocUnsafe(8);
+  bytes.writeBigUInt64BE(BigInt(value), 0);
+  hash.update(bytes);
+  bytes.fill(0);
+}
+
+function directoryDigestV2(nodeId, revision, users) {
+  const entries = users.map((user) => {
+    const identity = decode(user.identity_public_b64);
+    try {
+      assert.equal(identity.byteLength, IDENTITY_PUBLIC_BYTES_V9);
+      assert.equal(encode(identity), user.identity_public_b64);
+      return {
+        username: user.username,
+        identity: identity.slice(0, 64),
+      };
+    } finally {
+      identity.fill(0);
+    }
+  });
+  entries.sort((left, right) => left.username < right.username ? -1 : left.username > right.username ? 1 : 0);
+  const hash = createHash("sha256");
+  hash.update(DIRECTORY_TRANSCRIPT_DOMAIN);
+  writeU32(hash, Buffer.byteLength(nodeId));
+  hash.update(nodeId);
+  writeU64(hash, revision);
+  writeU32(hash, entries.length);
+  try {
+    for (const entry of entries) {
+      writeU32(hash, Buffer.byteLength(entry.username));
+      hash.update(entry.username);
+      hash.update(entry.identity);
+    }
+    return encode(hash.digest());
+  } finally {
+    entries.forEach((entry) => entry.identity.fill(0));
+  }
+}
+
+function parseDirectoryPresence(frame, expectedNodeId) {
+  assert.ok(frame && typeof frame === "object" && !Array.isArray(frame));
+  exactKeys(frame, ["type", "users"]);
+  assert.equal(frame.type, "presence");
+  assert.ok(Array.isArray(frame.users));
+  assert.ok(frame.users.length >= 1 && frame.users.length <= MAX_DIRECTORY_USERS);
+  const usernames = new Set();
+  const first = frame.users[0];
+  const users = frame.users;
+  for (const user of users) {
+    assert.ok(user && typeof user === "object" && !Array.isArray(user));
+    exactKeys(user, [
+      "connected",
+      "directory_digest",
+      "directory_node_id",
+      "directory_revision",
+      "identity_prekey_id",
+      "identity_public_b64",
+      "username",
+    ]);
+    assert.match(user.username, USERNAME_PATTERN);
+    const usernameKey = user.username.toLowerCase();
+    assert.equal(usernames.has(usernameKey), false, "presence usernames must be unique");
+    usernames.add(usernameKey);
+    assert.equal(typeof user.connected, "boolean");
+    assert.match(user.directory_node_id, NODE_ID_PATTERN);
+    assert.equal(user.directory_node_id, expectedNodeId);
+    assert.ok(Number.isSafeInteger(user.directory_revision));
+    assert.ok(user.directory_revision >= 1 && user.directory_revision <= MAX_DIRECTORY_REVISION);
+    assertCanonicalBytes(user.directory_digest, DIRECTORY_DIGEST_BYTES, "directory_digest");
+    assert.match(user.identity_prekey_id, PREKEY_ID_PATTERN);
+    assertCanonicalBytes(user.identity_public_b64, IDENTITY_PUBLIC_BYTES_V9, "identity_public_b64");
+    assert.equal(user.directory_node_id, first.directory_node_id);
+    assert.equal(user.directory_revision, first.directory_revision);
+    assert.equal(user.directory_digest, first.directory_digest);
+  }
+  assert.equal(directoryDigestV2(first.directory_node_id, first.directory_revision, users), first.directory_digest);
+  return {
+    directory_node_id: first.directory_node_id,
+    directory_revision: first.directory_revision,
+    directory_digest: first.directory_digest,
+  };
+}
+
+function installDirectoryTracker(socket, expectedNodeId) {
+  assert.match(expectedNodeId, NODE_ID_PATTERN);
+  const tracker = {
+    expectedNodeId,
+    latest: null,
+    error: null,
+    waiters: new Set(),
+  };
+  const fail = (error) => {
+    if (!tracker.error) tracker.error = error;
+    for (const waiter of tracker.waiters) waiter.reject(tracker.error);
+    tracker.waiters.clear();
+  };
+  const onMessage = (event) => {
+    let frame;
+    try {
+      frame = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+    if (frame?.type !== "presence") return;
+    try {
+      const stamp = parseDirectoryPresence(frame, expectedNodeId);
+      if (tracker.latest && (
+        stamp.directory_node_id !== tracker.latest.directory_node_id ||
+        stamp.directory_revision < tracker.latest.directory_revision ||
+        (stamp.directory_revision === tracker.latest.directory_revision &&
+          stamp.directory_digest !== tracker.latest.directory_digest)
+      )) throw new Error("directory presence regressed or conflicted");
+      tracker.latest = stamp;
+      for (const waiter of tracker.waiters) waiter.resolve({ ...stamp });
+      tracker.waiters.clear();
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error("invalid directory presence"));
+    }
+  };
+  socket.addEventListener("message", onMessage);
+  socket.addEventListener("error", () => fail(new Error("directory tracker socket error")));
+  socket.addEventListener("close", () => fail(new Error("directory tracker socket closed")));
+  directoryTrackers.set(socket, tracker);
+}
+
+function waitForDirectoryStamp(socket) {
+  const tracker = directoryTrackers.get(socket);
+  assert.ok(tracker, "directory tracker must be installed before waiting");
+  if (tracker.error) return Promise.reject(tracker.error);
+  if (tracker.latest) return Promise.resolve({ ...tracker.latest });
+  if (tracker.waiters.size >= MAX_DIRECTORY_WAITERS) {
+    return Promise.reject(new Error("directory tracker waiter limit"));
+  }
+  return new Promise((resolve, reject) => tracker.waiters.add({ resolve, reject }));
+}
+
+function latestDirectoryStamp(socket) {
+  const tracker = directoryTrackers.get(socket);
+  assert.ok(tracker?.latest, "directory stamp unavailable");
+  return { ...tracker.latest };
+}
+
+function assertDirectoryStamp(value, stamp) {
+  assert.ok(value && typeof value === "object" && !Array.isArray(value));
+  assert.equal(value.directory_node_id, stamp.directory_node_id);
+  assert.equal(value.directory_revision, stamp.directory_revision);
+  assert.equal(value.directory_digest, stamp.directory_digest);
+}
 
 function installResultWaiter(socket, expectedType, messageId) {
   const key = `${expectedType}:${messageId}`;
@@ -338,7 +520,7 @@ async function requestWsTicket(account) {
   return payload.ticket;
 }
 
-function connectWithTicket(ticket) {
+function connectWithTicket(ticket, expectedNodeId) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(
       `${baseUrl.replace(/^http/, "ws")}/v1/ws`,
@@ -347,6 +529,7 @@ function connectWithTicket(ticket) {
     const timeout = setTimeout(() => reject(new Error("WebSocket connection timed out")), 5_000);
     socket.addEventListener("open", () => {
       clearTimeout(timeout);
+      installDirectoryTracker(socket, expectedNodeId);
       resolve(socket);
     }, { once: true });
     socket.addEventListener("error", () => {
@@ -357,7 +540,7 @@ function connectWithTicket(ticket) {
 }
 
 async function connect(account) {
-  return connectWithTicket(await requestWsTicket(account));
+  return connectWithTicket(await requestWsTicket(account), account.node_id);
 }
 
 function expectWebSocketRejected(protocols) {
@@ -450,11 +633,14 @@ function stageEncryptedFrame(
   recipient,
   chatId,
   messageId,
-  text,
+  plaintextText,
   recipientPublic,
   recipientPrekeyId,
+  directoryStamp,
 ) {
-  const plaintext = encoder.encode(text);
+  const plaintextPayload = JSON.parse(plaintextText);
+  assertDirectoryStamp(plaintextPayload, directoryStamp);
+  const plaintext = encoder.encode(plaintextText);
   let payload;
   try {
     payload = JSON.parse(sender.identity.encrypt(
@@ -485,6 +671,9 @@ function stageEncryptedFrame(
     identity_public_b64: encode(payload.identity_public),
     prekey_id: payload.prekey_id,
     state_signature_b64: encode(payload.state_signature),
+    directory_node_id: directoryStamp.directory_node_id,
+    directory_revision: directoryStamp.directory_revision,
+    directory_digest: directoryStamp.directory_digest,
     envelopes: payload.envelopes.map((envelope) => ({
       recipient_username: envelope.username,
       wrapped_key_b64: encode(envelope.wrapped_key),
@@ -497,6 +686,7 @@ function stageEncryptedFrame(
     frame,
     messageId,
     stateRevision: payload.state_revision,
+    plaintextPayload,
     wipe: () => {
       for (const field of [
         payload.nonce,
@@ -512,8 +702,17 @@ function stageEncryptedFrame(
   };
 }
 
-async function sendEncryptedMessage(sender, recipient, socket, chatId, text, mutate = undefined) {
-  const messageId = randomUUID();
+async function sendEncryptedMessage(
+  sender,
+  recipient,
+  socket,
+  chatId,
+  plaintextText,
+  directoryStamp,
+  options = {},
+) {
+  const messageId = options.messageId ?? randomUUID();
+  const mutate = options.mutate;
   const requiresPrekey = sender.identity.requiresPrekey(recipient.username);
   let lease;
   let recipientPublic;
@@ -540,9 +739,10 @@ async function sendEncryptedMessage(sender, recipient, socket, chatId, text, mut
       recipient,
       chatId,
       messageId,
-      text,
+      plaintextText,
       recipientPublic,
       recipientPrekeyId,
+      directoryStamp,
     );
     assert.equal(staged.frame.envelopes.length, 1);
     assert.equal(staged.frame.envelopes[0].is_prekey, requiresPrekey);
@@ -550,8 +750,9 @@ async function sendEncryptedMessage(sender, recipient, socket, chatId, text, mut
       staged.frame.envelopes[0].prekey_id,
       requiresPrekey ? lease.prekey_id : "",
     );
+    assertDirectoryStamp(staged.frame, directoryStamp);
     const serialized = JSON.stringify(staged.frame);
-    assert.equal(serialized.includes(text), false);
+    assert.equal(serialized.includes(plaintextText), false);
     if (mutate) mutate(staged.frame);
     let outcome = "NOT_SENT";
     try {
@@ -583,22 +784,39 @@ async function sendEncryptedMessage(sender, recipient, socket, chatId, text, mut
   }
 }
 
-function decryptFrame(recipient, frame) {
-  const decrypted = JSON.parse(recipient.identity.decrypt(
-    frame.chat_id,
-    frame.message_id,
-    frame.sender_username,
-    decode(frame.sender_public_key_b64),
-    frame.version,
-    decode(frame.identity_public_b64),
-    decode(frame.nonce_b64),
-    decode(frame.ciphertext_b64),
-    decode(frame.signature_b64),
-    decode(frame.wrapped_key_b64),
-    frame.prekey_id,
-    frame.is_prekey,
-    recipient.username,
-  ));
+function decryptFrame(recipient, frame, directoryStamp) {
+  assertDirectoryStamp(frame, directoryStamp);
+  const senderPublicKey = decode(frame.sender_public_key_b64);
+  const identityPublicInput = decode(frame.identity_public_b64);
+  const nonce = decode(frame.nonce_b64);
+  const ciphertext = decode(frame.ciphertext_b64);
+  const signature = decode(frame.signature_b64);
+  const wrappedKey = decode(frame.wrapped_key_b64);
+  let decrypted;
+  try {
+    decrypted = JSON.parse(recipient.identity.decrypt(
+      frame.chat_id,
+      frame.message_id,
+      frame.sender_username,
+      senderPublicKey,
+      frame.version,
+      identityPublicInput,
+      nonce,
+      ciphertext,
+      signature,
+      wrappedKey,
+      frame.prekey_id,
+      frame.is_prekey,
+      recipient.username,
+    ));
+  } finally {
+    senderPublicKey.fill(0);
+    identityPublicInput.fill(0);
+    nonce.fill(0);
+    ciphertext.fill(0);
+    signature.fill(0);
+    wrappedKey.fill(0);
+  }
   const plaintext = new Uint8Array(decrypted.plaintext);
   const text = decoder.decode(plaintext);
   plaintext.fill(0);
@@ -609,8 +827,11 @@ function decryptFrame(recipient, frame) {
   decrypted.identity_envelope.fill?.(0);
   decrypted.identity_public.fill?.(0);
   decrypted.state_signature.fill?.(0);
+  const payload = JSON.parse(text);
+  assertDirectoryStamp(payload, directoryStamp);
   return {
     text,
+    payload,
     stateRevision: decrypted.state_revision,
     identityEnvelope,
     identityPublic,
@@ -628,22 +849,39 @@ async function acknowledgeFrame(recipient, socket, frame, decrypted) {
   );
   let waiter;
   try {
+    const acknowledgement = {
+      type: "message_ack",
+      chat_id: frame.chat_id,
+      message_id: frame.message_id,
+      sender_username: frame.sender_username,
+      state_revision: decrypted.stateRevision,
+      identity_envelope_b64: encode(decrypted.identityEnvelope),
+      identity_public_b64: encode(decrypted.identityPublic),
+      prekey_id: decrypted.prekeyId,
+      state_signature_b64: encode(decrypted.stateSignature),
+      ack_signature_b64: encode(ackSignature),
+      used_prekey_id: frame.prekey_id,
+    };
+    exactKeys(acknowledgement, [
+      "ack_signature_b64",
+      "chat_id",
+      "identity_envelope_b64",
+      "identity_public_b64",
+      "message_id",
+      "prekey_id",
+      "sender_username",
+      "state_revision",
+      "state_signature_b64",
+      "type",
+      "used_prekey_id",
+    ]);
+    assert.equal("directory_node_id" in acknowledgement, false);
+    assert.equal("directory_revision" in acknowledgement, false);
+    assert.equal("directory_digest" in acknowledgement, false);
     // The ACK result waiter must exist before the acknowledgement is sent.
     waiter = installResultWaiter(socket, "ack_result", frame.message_id);
     try {
-      socket.send(JSON.stringify({
-        type: "message_ack",
-        chat_id: frame.chat_id,
-        message_id: frame.message_id,
-        sender_username: frame.sender_username,
-        state_revision: decrypted.stateRevision,
-        identity_envelope_b64: encode(decrypted.identityEnvelope),
-        identity_public_b64: encode(decrypted.identityPublic),
-        prekey_id: decrypted.prekeyId,
-        state_signature_b64: encode(decrypted.stateSignature),
-        ack_signature_b64: encode(ackSignature),
-        used_prekey_id: frame.prekey_id,
-      }));
+      socket.send(JSON.stringify(acknowledgement));
     } catch {
       waiter.cancel();
     }
@@ -665,11 +903,19 @@ assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
 
 const aliceTicket = await requestWsTicket(alice);
 await expectWebSocketRejected(["abyssal-v1", `bearer.${alice.token}`]);
-const aliceSocket = await connectWithTicket(aliceTicket);
+const aliceSocket = await connectWithTicket(aliceTicket, alice.node_id);
 await expectWebSocketRejected(["abyssal-v1", `ticket.${aliceTicket}`]);
 let bobSocket = await connect(bob);
 let bobReconnect;
 try {
+  const [aliceDirectoryStamp, bobDirectoryStamp] = await Promise.all([
+    waitForDirectoryStamp(aliceSocket),
+    waitForDirectoryStamp(bobSocket),
+  ]);
+  assert.deepEqual(aliceDirectoryStamp, bobDirectoryStamp);
+  assert.equal(aliceDirectoryStamp.directory_node_id, alice.node_id);
+  assert.equal(aliceDirectoryStamp.directory_revision, 2);
+  const directoryStamp = aliceDirectoryStamp;
   const aliceDirect = waitForFrame(
     aliceSocket,
     (frame) => frame.type === "direct_opened" && frame.direct.peer_username === bob.username,
@@ -686,17 +932,58 @@ try {
   aliceSocket.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
   bobSocket.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
 
-  // A deliberately invalid ciphertext must be explicitly rejected and roll
-  // back exactly the staged revision before the next message is encrypted.
-  const rejected = await sendEncryptedMessage(
+  // Empty directory evidence is a deliberately rejected first-contact frame.
+  // Its staged ratchet must roll back and its lease must be released for the
+  // exact valid retry below to reuse.
+  const missingStampMessageId = randomUUID();
+  const missingStampPlaintext = JSON.stringify({
+    kind: "text",
+    id: missingStampMessageId,
+    sender: alice.username,
+    content: "missing directory stamp",
+    ...directoryStamp,
+  });
+  const missingStampOutcome = await sendEncryptedMessage(
     alice,
     bob,
     aliceSocket,
     aliceOpened.direct.id,
-    "rejected secret",
-    (frame) => { frame.ciphertext_b64 = "AA"; },
+    missingStampPlaintext,
+    directoryStamp,
+    {
+      messageId: missingStampMessageId,
+      mutate: (frame) => {
+        frame.directory_node_id = "";
+        frame.directory_revision = 0;
+        frame.directory_digest = "";
+      },
+    },
   );
-  assert.equal(rejected, "REJECTED");
+  assert.equal(missingStampOutcome, "REJECTED");
+  assert.equal(releasedPrekeysAwaitingReuse.size, 1);
+  const missingStampRetryDelivered = waitForFrame(
+    bobSocket,
+    (frame) => frame.type === "message" && frame.message_id === missingStampMessageId,
+  );
+  const missingStampRetryOutcome = await sendEncryptedMessage(
+    alice,
+    bob,
+    aliceSocket,
+    aliceOpened.direct.id,
+    missingStampPlaintext,
+    latestDirectoryStamp(aliceSocket),
+    { messageId: missingStampMessageId },
+  );
+  assert.equal(missingStampRetryOutcome, "ACCEPTED");
+  const missingStampRetryFrame = await missingStampRetryDelivered;
+  const missingStampRetryPlain = decryptFrame(
+    bob,
+    missingStampRetryFrame,
+    latestDirectoryStamp(bobSocket),
+  );
+  assert.equal(missingStampRetryPlain.payload.content, "missing directory stamp");
+  await acknowledgeFrame(bob, bobSocket, missingStampRetryFrame, missingStampRetryPlain);
+  assert.equal(releasedPrekeysAwaitingReuse.size, 0);
 
   // Exercise the attachment relay before the first E2EE message on this direct
   // with the same stateless XChaCha blob and context-bound decrypt path used by
@@ -874,26 +1161,155 @@ try {
   });
   assert.equal(retryGone.status, 404);
 
+  const attachmentMetadataPlaintext = JSON.stringify({
+    kind: "attachment",
+    id: attachmentMessageId,
+    sender: alice.username,
+    timestamp_ms: Date.now(),
+    self_destruct_sec: 5,
+    absolute_expiry_sec: 0,
+    ...directoryStamp,
+    attachment_id: upload.attachment_id,
+    name: "fixture.bin",
+    media_type: "FILE",
+    mime_type: "application/octet-stream",
+    size_bytes: attachmentPlaintext.byteLength,
+    attachment_cipher_version: encryptedAttachment.version,
+    attachment_key_b64: encode(attachmentKey),
+    one_time: false,
+    delete_after_download: false,
+  });
+  const attachmentMetadataDelivered = waitForFrame(
+    bobSocket,
+    (frame) => frame.type === "message" && frame.message_id === attachmentMessageId,
+  );
+  const attachmentMetadataOutcome = await sendEncryptedMessage(
+    alice,
+    bob,
+    aliceSocket,
+    aliceOpened.direct.id,
+    attachmentMetadataPlaintext,
+    latestDirectoryStamp(aliceSocket),
+    { messageId: attachmentMessageId },
+  );
+  assert.equal(attachmentMetadataOutcome, "ACCEPTED");
+  const attachmentMetadataFrame = await attachmentMetadataDelivered;
+  const attachmentMetadataPlain = decryptFrame(
+    bob,
+    attachmentMetadataFrame,
+    latestDirectoryStamp(bobSocket),
+  );
+  assert.equal(attachmentMetadataPlain.payload.kind, "attachment");
+  assert.equal(attachmentMetadataPlain.payload.attachment_id, upload.attachment_id);
+  assert.equal(attachmentMetadataPlain.payload.attachment_key_b64, encode(attachmentKey));
+  await acknowledgeFrame(bob, bobSocket, attachmentMetadataFrame, attachmentMetadataPlain);
+
+  // A stale, otherwise well-formed checkpoint must reject before fanout. The
+  // same message ID then succeeds after the native ratchet rollback.
+  const staleMessageId = randomUUID();
+  const stalePlaintext = JSON.stringify({
+    kind: "text",
+    id: staleMessageId,
+    sender: alice.username,
+    content: "stale directory stamp",
+    ...directoryStamp,
+  });
+  const staleOutcome = await sendEncryptedMessage(
+    alice,
+    bob,
+    aliceSocket,
+    aliceOpened.direct.id,
+    stalePlaintext,
+    directoryStamp,
+    {
+      messageId: staleMessageId,
+      mutate: (frame) => { frame.directory_revision = directoryStamp.directory_revision - 1; },
+    },
+  );
+  assert.equal(staleOutcome, "REJECTED");
+  const staleRetryDelivered = waitForFrame(
+    bobSocket,
+    (frame) => frame.type === "message" && frame.message_id === staleMessageId,
+  );
+  const staleRetryOutcome = await sendEncryptedMessage(
+    alice,
+    bob,
+    aliceSocket,
+    aliceOpened.direct.id,
+    stalePlaintext,
+    latestDirectoryStamp(aliceSocket),
+    { messageId: staleMessageId },
+  );
+  assert.equal(staleRetryOutcome, "ACCEPTED");
+  const staleRetryFrame = await staleRetryDelivered;
+  const staleRetryPlain = decryptFrame(
+    bob,
+    staleRetryFrame,
+    latestDirectoryStamp(bobSocket),
+  );
+  assert.equal(staleRetryPlain.payload.content, "stale directory stamp");
+  await acknowledgeFrame(bob, bobSocket, staleRetryFrame, staleRetryPlain);
+
   attachmentPlaintext.fill(0);
   attachmentKey.fill(0);
   attachmentBytes.fill(0);
+  encryptedAttachment.key.fill?.(0);
+  encryptedAttachment.blob.fill?.(0);
 
+  const textMessageId = randomUUID();
+  const textPlaintext = JSON.stringify({
+    kind: "text",
+    id: textMessageId,
+    sender: alice.username,
+    content: "live secret",
+    ...directoryStamp,
+  });
   const delivered = waitForFrame(
     bobSocket,
-    (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
+    (frame) => frame.type === "message" && frame.message_id === textMessageId,
   );
   const liveOutcome = await sendEncryptedMessage(
     alice,
     bob,
     aliceSocket,
     aliceOpened.direct.id,
-    "live secret",
+    textPlaintext,
+    latestDirectoryStamp(aliceSocket),
+    { messageId: textMessageId },
   );
   assert.equal(liveOutcome, "ACCEPTED");
   const deliveredFrame = await delivered;
-  const deliveredPlain = decryptFrame(bob, deliveredFrame);
-  assert.equal(deliveredPlain.text, "live secret");
+  const deliveredPlain = decryptFrame(bob, deliveredFrame, latestDirectoryStamp(bobSocket));
+  assert.equal(deliveredPlain.payload.content, "live secret");
   await acknowledgeFrame(bob, bobSocket, deliveredFrame, deliveredPlain);
+
+  const controlMessageId = randomUUID();
+  const controlPlaintext = JSON.stringify({
+    kind: "read_receipt",
+    id: controlMessageId,
+    message_id: textMessageId,
+    sender: bob.username,
+    ...latestDirectoryStamp(bobSocket),
+  });
+  const controlDelivered = waitForFrame(
+    aliceSocket,
+    (frame) => frame.type === "message" && frame.message_id === controlMessageId,
+  );
+  const controlOutcome = await sendEncryptedMessage(
+    bob,
+    alice,
+    bobSocket,
+    aliceOpened.direct.id,
+    controlPlaintext,
+    latestDirectoryStamp(bobSocket),
+    { messageId: controlMessageId },
+  );
+  assert.equal(controlOutcome, "ACCEPTED");
+  const controlFrame = await controlDelivered;
+  const controlPlain = decryptFrame(alice, controlFrame, latestDirectoryStamp(aliceSocket));
+  assert.equal(controlPlain.payload.kind, "read_receipt");
+  assert.equal(controlPlain.payload.message_id, textMessageId);
+  await acknowledgeFrame(alice, aliceSocket, controlFrame, controlPlain);
 
   const bobDisconnected = waitForFrame(
     aliceSocket,
@@ -903,24 +1319,36 @@ try {
   );
   bobSocket.close();
   await bobDisconnected;
+  const offlineMessageId = randomUUID();
+  const offlinePlaintext = JSON.stringify({
+    kind: "text",
+    id: offlineMessageId,
+    sender: alice.username,
+    content: "offline secret",
+    ...directoryStamp,
+  });
   const offlineOutcome = await sendEncryptedMessage(
     alice,
     bob,
     aliceSocket,
     aliceOpened.direct.id,
-    "offline secret",
+    offlinePlaintext,
+    latestDirectoryStamp(aliceSocket),
+    { messageId: offlineMessageId },
   );
   assert.equal(offlineOutcome, "ACCEPTED");
 
   bobReconnect = await connect(bob);
+  const bobReconnectStamp = await waitForDirectoryStamp(bobReconnect);
+  assert.deepEqual(bobReconnectStamp, directoryStamp);
   const replayed = waitForFrame(
     bobReconnect,
-    (frame) => frame.type === "message" && frame.chat_id === aliceOpened.direct.id,
+    (frame) => frame.type === "message" && frame.message_id === offlineMessageId,
   );
   bobReconnect.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
   const replayedFrame = await replayed;
-  const replayedPlain = decryptFrame(bob, replayedFrame);
-  assert.equal(replayedPlain.text, "offline secret");
+  const replayedPlain = decryptFrame(bob, replayedFrame, bobReconnectStamp);
+  assert.equal(replayedPlain.payload.content, "offline secret");
   await acknowledgeFrame(bob, bobReconnect, replayedFrame, replayedPlain);
 
   const unauthorizedUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=dm_guessed&media_type=FILE`, {

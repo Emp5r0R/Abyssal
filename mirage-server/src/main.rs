@@ -94,6 +94,12 @@ const MAX_DIRECT_CATALOG_PER_USER: usize = 128;
 const ACCOUNT_BODY_LIMIT_BYTES: usize = 16 * 1024;
 const MAX_CHAT_ID_BYTES: usize = 128;
 const MAX_USERNAME_BYTES: usize = 80;
+const MAX_NODE_ID_BYTES: usize = 128;
+// Directory stamps are deliberately bounded so a peer cannot force an
+// unbounded revision/history allocation.  Once the ceiling is reached the
+// revision saturates; a changed digest at that point is rejected by peers.
+const MAX_DIRECTORY_REVISION: u64 = 65_536;
+const DIRECTORY_DIGEST_BYTES: usize = 32;
 const MAX_CODE_BYTES: usize = 128;
 const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
@@ -167,6 +173,7 @@ struct AppState {
     attachment_max_lifetime_sec: u64,
     max_rooms_per_user: usize,
     conversation_ops: Arc<Mutex<()>>,
+    presence_broadcast_ops: Arc<Mutex<()>>,
     pending_message_ttl_ms: u64,
     web_origins: Vec<String>,
     session_inactivity_ms: u64,
@@ -216,6 +223,13 @@ struct Account {
     state_revision_window: u128,
     connected: bool,
     attachment_uploads: Arc<Semaphore>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectoryStamp {
+    node_id: String,
+    revision: u64,
+    digest: String,
 }
 
 enum OpaqueHandshake {
@@ -662,6 +676,9 @@ enum InboundFrame {
         identity_public_b64: String,
         prekey_id: String,
         state_signature_b64: String,
+        directory_node_id: String,
+        directory_revision: u64,
+        directory_digest: String,
     },
     #[serde(rename = "message_ack")]
     MessageAck {
@@ -735,6 +752,9 @@ enum OutboundFrame {
         sender_username: String,
         sender_public_key_b64: String,
         identity_public_b64: String,
+        directory_node_id: String,
+        directory_revision: u64,
+        directory_digest: String,
     },
     #[serde(rename = "prekey_lease")]
     PrekeyLease {
@@ -777,6 +797,8 @@ impl OutboundFrame {
             sender_username,
             sender_public_key_b64,
             identity_public_b64,
+            directory_node_id,
+            directory_digest,
             ..
         } = self
         {
@@ -789,6 +811,8 @@ impl OutboundFrame {
             sender_username.zeroize();
             sender_public_key_b64.zeroize();
             identity_public_b64.zeroize();
+            directory_node_id.zeroize();
+            directory_digest.zeroize();
         }
         if let Self::PrekeyLease {
             chat_id,
@@ -824,6 +848,8 @@ struct PresenceUser {
     identity_public_b64: String,
     identity_prekey_id: String,
     directory_digest: String,
+    directory_node_id: String,
+    directory_revision: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -983,9 +1009,11 @@ async fn main() {
 impl AppState {
     fn from_env() -> Self {
         let (purge_epoch, _) = watch::channel(0_u64);
-        let node_id = env::var("ABYSSAL_NODE_ID")
-            .or_else(|_| env::var("MIRAGE_NODE_ID"))
-            .unwrap_or_else(|_| format!("abyssal-{}", Uuid::new_v4().simple()));
+        let node_id = match env::var("ABYSSAL_NODE_ID").or_else(|_| env::var("MIRAGE_NODE_ID")) {
+            Ok(value) if valid_node_id(&value) => value,
+            Ok(_) => panic!("ABYSSAL_NODE_ID must be 1-128 ASCII identifier characters"),
+            Err(_) => format!("abyssal-{}", Uuid::new_v4().simple()),
+        };
 
         let min_len = read_usize_env("ABYSSAL_CODE_MIN_LEN", 12).clamp(12, MAX_CODE_BYTES);
         let max_distinct_lengths = MAX_CODE_BYTES - min_len + 1;
@@ -1066,6 +1094,7 @@ impl AppState {
             attachment_max_lifetime_sec,
             max_rooms_per_user,
             conversation_ops: Arc::new(Mutex::new(())),
+            presence_broadcast_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms,
             web_origins,
             session_inactivity_ms,
@@ -1543,7 +1572,7 @@ fn random_unique_username(accounts: &HashMap<CodeId, Account>) -> String {
         let candidate = random_username();
         if accounts
             .values()
-            .all(|account| account.username != candidate)
+            .all(|account| !account.username.eq_ignore_ascii_case(&candidate))
         {
             return candidate;
         }
@@ -1553,7 +1582,7 @@ fn random_unique_username(accounts: &HashMap<CodeId, Account>) -> String {
         let candidate = format!("Abyssal{}", Uuid::new_v4().simple());
         if accounts
             .values()
-            .all(|account| account.username != candidate)
+            .all(|account| !account.username.eq_ignore_ascii_case(&candidate))
         {
             return candidate;
         }
@@ -2633,28 +2662,35 @@ async fn finish_opaque_account(
                     return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await
                 }
             };
-            if let Some(mut removed_code_id) = state.available_codes.lock().await.take(code_id) {
-                removed_code_id.zeroize();
-            }
-            let mut accounts = state.accounts.lock().await;
-            let username = random_unique_username(&accounts);
-            accounts.insert(
-                *code_id,
-                Account {
-                    username: username.clone(),
-                    password_file,
-                    identity_public: std::mem::take(&mut *identity_public),
-                    identity_envelope: std::mem::take(&mut *identity_envelope),
-                    prekey_id,
-                    state_revision: 0,
-                    state_revision_window: 1,
-                    connected: false,
-                    attachment_uploads: Arc::new(Semaphore::new(
-                        MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT,
-                    )),
-                },
-            );
-            drop(accounts);
+            let username = {
+                // Keep the account-map revision and message admission in the
+                // same transaction domain. The outer account guard is already
+                // held, preserving account_ops -> conversation_ops lock order.
+                let _conversation_guard = state.conversation_ops.lock().await;
+                if let Some(mut removed_code_id) = state.available_codes.lock().await.take(code_id)
+                {
+                    removed_code_id.zeroize();
+                }
+                let mut accounts = state.accounts.lock().await;
+                let username = random_unique_username(&accounts);
+                accounts.insert(
+                    *code_id,
+                    Account {
+                        username: username.clone(),
+                        password_file,
+                        identity_public: std::mem::take(&mut *identity_public),
+                        identity_envelope: std::mem::take(&mut *identity_envelope),
+                        prekey_id,
+                        state_revision: 0,
+                        state_revision_window: 1,
+                        connected: false,
+                        attachment_uploads: Arc::new(Semaphore::new(
+                            MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT,
+                        )),
+                    },
+                );
+                username
+            };
             clear_login_limit(&state, code_id).await;
             info!("opaque_account_created");
             let response = issue_session(&state, *code_id, username, true).await;
@@ -2808,6 +2844,14 @@ fn valid_username(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn valid_node_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_NODE_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn valid_identity_public_bundle(public_key: &[u8], prekey_id: &str) -> bool {
@@ -3830,9 +3874,12 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             identity_public_b64,
             prekey_id,
             state_signature_b64,
+            directory_node_id,
+            directory_revision,
+            directory_digest,
         } => {
             let message_id_is_safe = valid_chat_id(&message_id);
-            let route_result = route_encrypted_message(
+            let route_result = route_encrypted_message_with_directory(
                 state,
                 sender_id,
                 chat_id,
@@ -3846,6 +3893,7 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 identity_public_b64,
                 prekey_id,
                 state_signature_b64,
+                directory_evidence(directory_node_id, directory_revision, directory_digest),
             )
             .await;
             if message_id_is_safe {
@@ -4145,6 +4193,7 @@ async fn leave_room(state: &AppState, client_id: Uuid, chat_id: &str) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn route_encrypted_message(
     state: &AppState,
@@ -4161,7 +4210,91 @@ async fn route_encrypted_message(
     prekey_id: String,
     state_signature_b64: String,
 ) -> Result<(), String> {
+    let current_directory = current_directory_evidence(state).await;
+    route_encrypted_message_with_directory(
+        state,
+        sender_id,
+        chat_id,
+        version,
+        message_id,
+        nonce_b64,
+        ciphertext_b64,
+        envelopes,
+        state_revision,
+        identity_envelope_b64,
+        identity_public_b64,
+        prekey_id,
+        state_signature_b64,
+        Some(current_directory),
+    )
+    .await
+}
+
+fn directory_evidence(node_id: String, revision: u64, digest: String) -> Option<DirectoryStamp> {
+    if node_id.is_empty() && revision == 0 && digest.is_empty() {
+        None
+    } else {
+        Some(DirectoryStamp {
+            node_id,
+            revision,
+            digest,
+        })
+    }
+}
+
+async fn validate_directory_evidence(
+    state: &AppState,
+    evidence: Option<DirectoryStamp>,
+) -> Result<DirectoryStamp, String> {
+    let Some(candidate) = evidence else {
+        return Err("directory evidence required".to_string());
+    };
+    if !valid_node_id(&candidate.node_id)
+        || !(1..=MAX_DIRECTORY_REVISION).contains(&candidate.revision)
+    {
+        return Err("directory evidence rejected".to_string());
+    }
+    let _decoded_digest = Zeroizing::new(
+        decode_exact(&candidate.digest, DIRECTORY_DIGEST_BYTES)
+            .map_err(|_| "directory evidence rejected".to_string())?,
+    );
+    let accounts = state.accounts.lock().await;
+    let current = directory_stamp(&state.node_id, &accounts);
+    if candidate.node_id == current.node_id
+        && candidate.revision == current.revision
+        && candidate.digest == current.digest
+    {
+        Ok(current)
+    } else {
+        Err("directory evidence rejected".to_string())
+    }
+}
+
+#[cfg(test)]
+async fn current_directory_evidence(state: &AppState) -> DirectoryStamp {
+    let accounts = state.accounts.lock().await;
+    directory_stamp(&state.node_id, &accounts)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_encrypted_message_with_directory(
+    state: &AppState,
+    sender_id: Uuid,
+    chat_id: String,
+    version: u32,
+    message_id: String,
+    nonce_b64: String,
+    ciphertext_b64: String,
+    envelopes: Vec<InboundRecipientEnvelope>,
+    state_revision: u64,
+    identity_envelope_b64: String,
+    identity_public_b64: String,
+    prekey_id: String,
+    state_signature_b64: String,
+    directory_evidence: Option<DirectoryStamp>,
+) -> Result<(), String> {
     let _conversation_guard = state.conversation_ops.lock().await;
+    let directory_stamp = validate_directory_evidence(state, directory_evidence).await?;
     if version != E2EE_PROTOCOL_VERSION || !valid_chat_id(&chat_id) || !valid_chat_id(&message_id) {
         return Err("encrypted message rejected".to_string());
     }
@@ -4295,6 +4428,9 @@ async fn route_encrypted_message(
             sender_username: sender_username.clone(),
             sender_public_key_b64: sender_public_key_b64.clone(),
             identity_public_b64: sender_public_key_b64.clone(),
+            directory_node_id: directory_stamp.node_id.clone(),
+            directory_revision: directory_stamp.revision,
+            directory_digest: directory_stamp.digest.clone(),
         };
         let frame_bytes = outbound_frame_bytes(&frame);
         transient_fanout_bytes = transient_fanout_bytes
@@ -5532,8 +5668,13 @@ fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
 }
 
 async fn broadcast_presence(state: &AppState) {
+    // Presence computation and fanout are one ordered operation. Without this
+    // guard, concurrent connect/disconnect broadcasts could enqueue an older
+    // snapshot after a newer directory revision and force strict clients to
+    // fail closed on an honest relay.
+    let _broadcast_guard = state.presence_broadcast_ops.lock().await;
     let accounts = state.accounts.lock().await;
-    let directory_digest = identity_directory_digest(&accounts);
+    let stamp = directory_stamp(&state.node_id, &accounts);
     let users = accounts
         .values()
         .map(|account| PresenceUser {
@@ -5541,7 +5682,9 @@ async fn broadcast_presence(state: &AppState) {
             connected: account.connected,
             identity_public_b64: URL_SAFE_NO_PAD.encode(&account.identity_public),
             identity_prekey_id: account.prekey_id.clone(),
-            directory_digest: directory_digest.clone(),
+            directory_digest: stamp.digest.clone(),
+            directory_node_id: stamp.node_id.clone(),
+            directory_revision: stamp.revision,
         })
         .collect::<Vec<_>>();
     drop(accounts);
@@ -5558,20 +5701,52 @@ async fn broadcast_presence(state: &AppState) {
     }
 }
 
+#[cfg(test)]
 fn identity_directory_digest(accounts: &HashMap<CodeId, Account>) -> String {
+    // Kept for existing in-module tests and callers. Production presence uses
+    // the V2 transcript below, bound to the relay node and account revision.
+    identity_directory_digest_v2("", accounts.len() as u64, accounts)
+}
+
+fn directory_stamp(node_id: &str, accounts: &HashMap<CodeId, Account>) -> DirectoryStamp {
+    let revision = (accounts.len() as u64).clamp(1, MAX_DIRECTORY_REVISION);
+    directory_stamp_at_revision(node_id, revision, accounts)
+}
+
+fn directory_stamp_at_revision(
+    node_id: &str,
+    revision: u64,
+    accounts: &HashMap<CodeId, Account>,
+) -> DirectoryStamp {
+    DirectoryStamp {
+        node_id: node_id.to_string(),
+        revision: revision.clamp(1, MAX_DIRECTORY_REVISION),
+        digest: identity_directory_digest_v2(node_id, revision, accounts),
+    }
+}
+
+fn identity_directory_digest_v2(
+    node_id: &str,
+    revision: u64,
+    accounts: &HashMap<CodeId, Account>,
+) -> String {
     let mut entries = accounts
         .values()
         .filter(|account| account.identity_public.len() >= IDENTITY_FINGERPRINT_BYTES)
         .map(|account| {
             (
                 account.username.clone(),
-                account.identity_public[..IDENTITY_FINGERPRINT_BYTES].to_vec(),
+                Zeroizing::new(account.identity_public[..IDENTITY_FINGERPRINT_BYTES].to_vec()),
             )
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = Sha256::new();
-    digest.update(b"ABYSSAL_DIRECTORY_CHECKPOINT_V1");
+    digest.update(b"ABYSSAL_DIRECTORY_CHECKPOINT_V2");
+    digest.update((node_id.len() as u32).to_be_bytes());
+    digest.update(node_id.as_bytes());
+    digest.update(revision.to_be_bytes());
+    digest.update((entries.len() as u32).to_be_bytes());
     for (username, identity_public) in entries {
         digest.update((username.len() as u32).to_be_bytes());
         digest.update(username.as_bytes());
@@ -5934,6 +6109,14 @@ mod tests {
         assert!(!valid_code_shape("ABCD12345678-"));
         assert!(!valid_code_shape("ABCD_12345678"));
         assert!(!valid_code_shape(&"A".repeat(MAX_CODE_BYTES + 1)));
+    }
+
+    #[test]
+    fn directory_node_ids_match_the_client_protocol_boundary() {
+        assert!(valid_node_id("abyssal-node_1:primary"));
+        assert!(!valid_node_id(""));
+        assert!(!valid_node_id("node with spaces"));
+        assert!(!valid_node_id(&"n".repeat(MAX_NODE_ID_BYTES + 1)));
     }
 
     #[test]
@@ -8116,6 +8299,9 @@ mod tests {
             sender_username: "Alice".to_string(),
             sender_public_key_b64: "public".to_string(),
             identity_public_b64: "public".to_string(),
+            directory_node_id: "test-node".to_string(),
+            directory_revision: 1,
+            directory_digest: URL_SAFE_NO_PAD.encode([0_u8; 32]),
         };
         assert!(serialize_outbound_frame(&frame).is_none());
     }
@@ -9764,6 +9950,99 @@ mod tests {
         assert_ne!(first, after_identity_change);
     }
 
+    #[tokio::test]
+    async fn directory_checkpoint_v2_binds_node_revision_and_rejects_stale_evidence() {
+        let state = test_state();
+        add_test_account(&state, "directory-a", "Alice").await;
+        let first = current_directory_evidence(&state).await;
+        assert_eq!(first.node_id, state.node_id);
+        assert_eq!(first.revision, 1);
+        assert_eq!(
+            validate_directory_evidence(&state, Some(first.clone())).await,
+            Ok(first.clone())
+        );
+
+        {
+            let mut accounts = state.accounts.lock().await;
+            accounts
+                .get_mut(&test_code_id("directory-a"))
+                .expect("Alice")
+                .connected = false;
+        }
+        assert_eq!(current_directory_evidence(&state).await, first);
+
+        add_test_account(&state, "directory-b", "Bob").await;
+        let second = current_directory_evidence(&state).await;
+        assert_eq!(second.revision, 2);
+        assert_ne!(second.digest, first.digest);
+        assert!(validate_directory_evidence(&state, Some(first))
+            .await
+            .is_err());
+        assert!(validate_directory_evidence(&state, None).await.is_err());
+        assert_eq!(
+            validate_directory_evidence(&state, Some(second.clone())).await,
+            Ok(second.clone())
+        );
+        for malformed in [
+            DirectoryStamp {
+                node_id: "node with spaces".to_string(),
+                ..second.clone()
+            },
+            DirectoryStamp {
+                revision: 0,
+                ..second.clone()
+            },
+            DirectoryStamp {
+                digest: format!("{}=", second.digest),
+                ..second.clone()
+            },
+        ] {
+            assert!(validate_directory_evidence(&state, Some(malformed))
+                .await
+                .is_err());
+        }
+
+        let accounts = state.accounts.lock().await;
+        let other_node = directory_stamp_at_revision("other-node", second.revision, &accounts);
+        assert_ne!(other_node.digest, second.digest);
+    }
+
+    #[tokio::test]
+    async fn concurrent_presence_broadcasts_emit_only_post_lock_directory_snapshots() {
+        let state = test_state();
+        add_test_account(&state, "presence-a", "Alice").await;
+        let (_, mut receiver) = add_test_client(&state, "presence-a", "Alice").await;
+        let guard = state.presence_broadcast_ops.lock().await;
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move { broadcast_presence(&first_state).await });
+        tokio::task::yield_now().await;
+        add_test_account(&state, "presence-b", "Bob").await;
+        let second_state = state.clone();
+        let second = tokio::spawn(async move { broadcast_presence(&second_state).await });
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        first.await.expect("first broadcast");
+        second.await.expect("second broadcast");
+        for _ in 0..2 {
+            let frame = receiver.recv().await.expect("presence frame");
+            let OutboundFrame::Presence { ref users } = frame else {
+                panic!("expected presence frame");
+            };
+            assert_eq!(users.len(), 2);
+            assert!(users.iter().all(|user| user.directory_revision == 2));
+            assert_eq!(
+                users
+                    .iter()
+                    .map(|user| user.directory_digest.as_str())
+                    .collect::<HashSet<_>>()
+                    .len(),
+                1
+            );
+        }
+    }
+
     #[test]
     fn attachment_ttl_cannot_exceed_enforced_room_policy() {
         let mut room = test_room("forum_policy");
@@ -10250,6 +10529,49 @@ mod tests {
             "prekey_id": "fallback"
         });
         assert!(serde_json::from_value::<InboundFrame>(frame).is_err());
+    }
+
+    #[test]
+    fn inbound_message_requires_complete_directory_evidence() {
+        let frame = serde_json::json!({
+            "type": "message",
+            "chat_id": "dm_a_b",
+            "version": E2EE_PROTOCOL_VERSION,
+            "message_id": "message-directory-1",
+            "nonce_b64": URL_SAFE_NO_PAD.encode([1_u8; MESSAGE_NONCE_BYTES]),
+            "ciphertext_b64": URL_SAFE_NO_PAD.encode([2_u8; 16]),
+            "envelopes": [{
+                "recipient_username": "Bob",
+                "wrapped_key_b64": URL_SAFE_NO_PAD.encode([3_u8; 32]),
+                "prekey_id": "",
+                "is_prekey": false,
+                "signature_b64": URL_SAFE_NO_PAD.encode([4_u8; MESSAGE_SIGNATURE_BYTES])
+            }],
+            "state_revision": 1,
+            "identity_envelope_b64": URL_SAFE_NO_PAD.encode([IDENTITY_ENVELOPE_VERSION; 256]),
+            "identity_public_b64": URL_SAFE_NO_PAD.encode([5_u8; IDENTITY_PUBLIC_BYTES]),
+            "prekey_id": "fallback",
+            "state_signature_b64": URL_SAFE_NO_PAD.encode([6_u8; MESSAGE_SIGNATURE_BYTES]),
+            "directory_node_id": "test-node",
+            "directory_revision": 1,
+            "directory_digest": URL_SAFE_NO_PAD.encode([7_u8; DIRECTORY_DIGEST_BYTES])
+        });
+        assert!(serde_json::from_value::<InboundFrame>(frame.clone()).is_ok());
+        for field in [
+            "directory_node_id",
+            "directory_revision",
+            "directory_digest",
+        ] {
+            let mut incomplete = frame.clone();
+            incomplete
+                .as_object_mut()
+                .expect("message object")
+                .remove(field);
+            assert!(
+                serde_json::from_value::<InboundFrame>(incomplete).is_err(),
+                "missing {field} must fail closed"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11512,6 +11834,7 @@ mod tests {
             attachment_max_lifetime_sec: DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS as u64 * 60 * 60,
             max_rooms_per_user: 2,
             conversation_ops: Arc::new(Mutex::new(())),
+            presence_broadcast_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms: pending_message_ttl_ms_from_value(None),
             web_origins: Vec::new(),
             session_inactivity_ms: 60_000,
@@ -11982,6 +12305,9 @@ mod tests {
             sender_username: sender_username.to_string(),
             sender_public_key_b64: "public".to_string(),
             identity_public_b64: "public".to_string(),
+            directory_node_id: "test-node".to_string(),
+            directory_revision: 1,
+            directory_digest: URL_SAFE_NO_PAD.encode([0_u8; 32]),
         }
     }
 

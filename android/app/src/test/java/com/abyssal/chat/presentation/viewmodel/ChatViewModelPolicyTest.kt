@@ -8,6 +8,8 @@ import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientIdentity
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
+import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
+import com.abyssal.chat.domain.model.DirectoryStamp
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.SessionInactivityPolicy
@@ -59,6 +61,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChatViewModelPolicyTest {
+    private companion object {
+        val TEST_DIRECTORY_STAMP = DirectoryStamp(
+            nodeId = "node-1",
+            revision = 1u,
+            digest = "A".repeat(43)
+        )
+    }
+
     @Before
     fun installMainDispatcherForConstructorFixtures() {
         // Local Android tests do not provide a real android.os.Looper, while
@@ -124,6 +134,39 @@ class ChatViewModelPolicyTest {
         assertFalse(matchesAuthoritativeMessageId(JSONObject().put("id", ""), "message-1"))
         assertFalse(matchesAuthoritativeMessageId(JSONObject(), "message-1"))
         assertFalse(matchesAuthoritativeMessageId(null, "message-1"))
+    }
+
+    @Test
+    fun inboundInnerDirectoryEvidenceMustMatchBeforeAcknowledgement() {
+        val payload = IncomingTransportPayload(
+            chatId = "forum_alpha",
+            messageId = "message-1",
+            version = 9,
+            identityPublicKey = ByteArray(608),
+            nonce = ByteArray(12),
+            ciphertext = byteArrayOf(1),
+            signature = ByteArray(64),
+            wrappedKey = byteArrayOf(2),
+            senderUsername = "Bob",
+            senderPublicKey = ByteArray(608),
+            directoryNodeId = "node-1",
+            directoryRevision = 7u,
+            directoryDigest = "A".repeat(43)
+        )
+        val valid = JSONObject()
+            .put("directory_node_id", "node-1")
+            .put("directory_revision", 7L)
+            .put("directory_digest", "A".repeat(43))
+        assertTrue(invokeMatchesDirectoryStamp(valid, payload))
+        assertFalse(invokeMatchesDirectoryStamp(valid.put("directory_revision", 8L), payload))
+        assertFalse(invokeMatchesDirectoryStamp(valid.put("directory_revision", 7L).put("directory_node_id", "node-2"), payload))
+        assertFalse(invokeMatchesDirectoryStamp(JSONObject().put("directory_node_id", "node-1"), payload))
+        payload.identityPublicKey.fill(0)
+        payload.nonce.fill(0)
+        payload.ciphertext.fill(0)
+        payload.signature.fill(0)
+        payload.wrappedKey.fill(0)
+        payload.senderPublicKey.fill(0)
     }
 
     @Test
@@ -427,7 +470,7 @@ class ChatViewModelPolicyTest {
                     stamp,
                     chatId = "forum_ops",
                     messageId = "message-first",
-                    metadata = "hello",
+                    metadata = textMetadata("message-first"),
                     recipients = listOf(bobRecipient, carolRecipient)
                 )
 
@@ -466,7 +509,7 @@ class ChatViewModelPolicyTest {
                 stamp,
                 chatId = "forum_ops",
                 messageId = "message-partial",
-                metadata = "hello",
+                metadata = textMetadata("message-partial"),
                 recipients = listOf(bobRecipient, carolRecipient)
             )
 
@@ -509,7 +552,7 @@ class ChatViewModelPolicyTest {
                     stamp,
                     chatId = "dm_bob",
                     messageId = messageId,
-                    metadata = "hello",
+                    metadata = textMetadata(messageId),
                     recipients = listOf(bobRecipient)
                 )
 
@@ -547,7 +590,7 @@ class ChatViewModelPolicyTest {
                 stamp,
                 chatId = "dm_bob",
                 messageId = "message-ambiguous",
-                metadata = "hello",
+                metadata = textMetadata("message-ambiguous"),
                 recipients = listOf(bobRecipient)
             )
 
@@ -584,7 +627,7 @@ class ChatViewModelPolicyTest {
                 stamp,
                 chatId = "dm_bob",
                 messageId = "message-established",
-                metadata = "hello",
+                metadata = textMetadata("message-established"),
                 recipients = listOf(bobRecipient)
             )
 
@@ -1055,7 +1098,10 @@ class ChatViewModelPolicyTest {
             senderUsername = senderUsername,
             senderPublicKey = senderPublicKey,
             prekeyId = envelope.prekeyId,
-            isPrekey = envelope.isPrekey
+            isPrekey = envelope.isPrekey,
+            directoryNodeId = payload.directoryNodeId,
+            directoryRevision = payload.directoryRevision,
+            directoryDigest = payload.directoryDigest
         )
     }
 
@@ -1100,6 +1146,8 @@ class ChatViewModelPolicyTest {
         ) { _, method, args ->
             when (method.name) {
                 "currentConnectionGeneration" -> 1L
+                "currentDirectoryStamp" -> TEST_DIRECTORY_STAMP
+                "directoryEvidenceStatus" -> DirectoryEvidenceStatus.KNOWN
                 "getServerStatus" -> flowOf(ServerStatus("CONNECTED", "node", 0))
                 "getPresence" -> flowOf(emptyList<com.abyssal.chat.domain.model.UserPresence>())
                 "getIncomingWipeCommands" -> flowOf<Long>()
@@ -1248,6 +1296,19 @@ class ChatViewModelPolicyTest {
         return method.invoke(viewModel, stamp) as Boolean
     }
 
+    private fun invokeMatchesDirectoryStamp(
+        json: JSONObject,
+        payload: IncomingTransportPayload
+    ): Boolean {
+        val method = ChatViewModel::class.java.getDeclaredMethod(
+            "matchesDirectoryStamp",
+            JSONObject::class.java,
+            IncomingTransportPayload::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(allocateUninitializedViewModel(), json, payload) as Boolean
+    }
+
     private fun sessionStampKey(stamp: Any): ByteArray {
         val field = stamp.javaClass.getDeclaredField("identityPublicKey")
         field.isAccessible = true
@@ -1260,12 +1321,20 @@ class ChatViewModelPolicyTest {
         method.invoke(stamp)
     }
 
+    private fun textMetadata(messageId: String): String = JSONObject()
+        .put("kind", "text")
+        .put("id", messageId)
+        .put("sender", "Alice")
+        .put("content", "hello")
+        .put("timestamp_ms", 1L)
+        .toString()
+
     private suspend fun invokeSendEncryptedMetadata(
         viewModel: ChatViewModel,
         stamp: Any,
         chatId: String = "dm_bob",
         messageId: String = "message-stale",
-        metadata: String = "hello",
+        metadata: String = textMetadata(messageId),
         recipients: List<RecipientIdentity>? = null
     ): Any? = suspendCoroutine { continuation: Continuation<Any?> ->
         try {
@@ -1314,6 +1383,8 @@ class ChatViewModelPolicyTest {
             when (method.name) {
                 "getServerStatus" -> MutableStateFlow(ServerStatus("CONNECTED", "node", 0))
                 "currentConnectionGeneration" -> connectionGeneration.get()
+                "currentDirectoryStamp" -> TEST_DIRECTORY_STAMP
+                "directoryEvidenceStatus" -> DirectoryEvidenceStatus.KNOWN
                 else -> null
             }
         } as IChatTransport

@@ -37,6 +37,20 @@ const session: AccountSession = {
 };
 const WS_TICKET = bytesToBase64(new Uint8Array(32).fill(7));
 const ACK_SIGNATURE = new Uint8Array(64).fill(9);
+const DIRECTORY_STAMP = {
+  directory_node_id: "node-1",
+  directory_revision: 1,
+  directory_digest: bytesToBase64(new Uint8Array(32).fill(3)),
+} as const;
+
+function encryptedFrame(messageId: string): Record<string, unknown> {
+  return {
+    type: "message",
+    chat_id: "dm_123",
+    message_id: messageId,
+    ...DIRECTORY_STAMP,
+  };
+}
 
 function websocketTicketResponse(expiresInSec = 30): Response {
   return new Response(JSON.stringify({
@@ -1008,6 +1022,7 @@ describe("RelaySocket", () => {
       expect(socket.protocols.join(" ")).not.toContain(SESSION_TOKEN);
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
       expect(relay.openDirect("Bob")).toBe(true);
       const pendingAck = relay.acknowledge("dm_123", "message_1", "Alice", {
         revision: 2,
@@ -1057,6 +1072,7 @@ describe("RelaySocket", () => {
       const parserSocket = sockets[1];
       parserSocket.readyState = 1;
       parserSocket.onopen?.(new Event("open"));
+      parserRelay.setDirectoryStamp(DIRECTORY_STAMP);
       parserSocket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
         type: "direct_opened",
         direct: { id: "dm_123", peer_username: "Bob" },
@@ -1067,7 +1083,7 @@ describe("RelaySocket", () => {
       }) }));
       parserSocket.onmessage?.(new MessageEvent("message", { data: "invalid" }));
       expect(frames).toHaveLength(1);
-      expect(states).toEqual(["connecting", "connected", "connecting", "connected"]);
+      expect(states).toEqual(["connecting", "connected", "connecting", "connected", "disconnected"]);
       relay.close();
       parserRelay.close();
     } finally {
@@ -1096,6 +1112,7 @@ describe("RelaySocket", () => {
       const socket = sockets[0];
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
 
       const oversized = { type: "dummy", padding: "x".repeat(MAX_RELAY_TEXT_BYTES) };
       expect(relay.send(oversized)).toBe(false);
@@ -1220,11 +1237,8 @@ describe("RelaySocket", () => {
       const socket = sockets[0];
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
-      const pending = relay.sendEncryptedPayload("message-1", {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: "message-1",
-      });
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
+      const pending = relay.sendEncryptedPayload("message-1", encryptedFrame("message-1"));
       socket.onmessage?.(new MessageEvent("message", {
         data: JSON.stringify({ type: "message_result", message_id: "message-1", accepted: true }),
       }));
@@ -1233,6 +1247,27 @@ describe("RelaySocket", () => {
       relay.close();
     } finally {
       globalThis.WebSocket = original;
+    }
+  });
+
+  it("rejects encrypted sends without an installed or matching directory stamp", async () => {
+    const context = await connectRelay();
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      relay.setDirectoryStamp(null);
+      await expect(relay.sendEncryptedPayload("message-missing-stamp", encryptedFrame("message-missing-stamp")))
+        .resolves.toBe("NOT_SENT");
+      expect(socket.sent).toEqual([]);
+
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
+      await expect(relay.sendEncryptedPayload("message-stale-stamp", {
+        ...encryptedFrame("message-stale-stamp"),
+        directory_revision: DIRECTORY_STAMP.directory_revision + 1,
+      })).resolves.toBe("NOT_SENT");
+      expect(socket.sent).toEqual([]);
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
     }
   });
 
@@ -1256,11 +1291,8 @@ describe("RelaySocket", () => {
       const socket = sockets[0];
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
-      const pending = relay.sendEncryptedPayload("message-rejected", {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: "message-rejected",
-      });
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
+      const pending = relay.sendEncryptedPayload("message-rejected", encryptedFrame("message-rejected"));
       socket.onmessage?.(new MessageEvent("message", {
         data: JSON.stringify({ type: "message_result", message_id: "message-rejected", accepted: false }),
       }));
@@ -1291,11 +1323,8 @@ describe("RelaySocket", () => {
       const socket = sockets[0];
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
-      const pending = relay.sendEncryptedPayload("message-2", {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: "message-2",
-      });
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
+      const pending = relay.sendEncryptedPayload("message-2", encryptedFrame("message-2"));
       socket.onmessage?.(new MessageEvent("message", {
         data: JSON.stringify({
           type: "message_result",
@@ -1331,11 +1360,8 @@ describe("RelaySocket", () => {
       const socket = sockets[0];
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
-      const pending = relay.sendEncryptedPayload("message-3", {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: "message-3",
-      });
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
+      const pending = relay.sendEncryptedPayload("message-3", encryptedFrame("message-3"));
       socket.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
       await expect(pending).resolves.toBe("AMBIGUOUS");
       relay.close();
@@ -1365,11 +1391,13 @@ describe("RelaySocket", () => {
       const first = sockets[0];
       first.readyState = 1;
       first.onopen?.(new Event("open"));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
       first.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
       await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 3_000 });
       const second = sockets[1];
       second.readyState = 1;
       second.onopen?.(new Event("open"));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
       first.onopen?.(new Event("open"));
       first.onmessage?.(new MessageEvent("message", {
         data: JSON.stringify({ type: "direct_opened", direct: { id: "dm_stale", peer_username: "Stale" } }),
@@ -1401,11 +1429,9 @@ describe("RelaySocket", () => {
       const socket = sockets[0];
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
-      const pending = Array.from({ length: 257 }, (_, index) => relay.sendEncryptedPayload(`message-${index}`, {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: `message-${index}`,
-      }));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
+      const pending = Array.from({ length: 257 }, (_, index) =>
+        relay.sendEncryptedPayload(`message-${index}`, encryptedFrame(`message-${index}`)));
       await expect(pending.at(-1)).resolves.toBe("NOT_SENT");
       relay.close();
       await expect(pending[0]).resolves.toBe("AMBIGUOUS");
@@ -1426,6 +1452,11 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
+      const ackFrame = JSON.parse(socket.sent.at(-1) ?? "{}") as Record<string, unknown>;
+      expect(ackFrame.type).toBe("message_ack");
+      expect(ackFrame).not.toHaveProperty("directory_node_id");
+      expect(ackFrame).not.toHaveProperty("directory_revision");
+      expect(ackFrame).not.toHaveProperty("directory_digest");
       socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
         type: "ack_result",
         message_id: "ack-accepted",
@@ -1605,11 +1636,7 @@ describe("RelaySocket", () => {
     const context = await connectRelay();
     const { relay, socket, originalWebSocket } = context;
     try {
-      const message = relay.sendEncryptedPayload("message-close", {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: "message-close",
-      });
+      const message = relay.sendEncryptedPayload("message-close", encryptedFrame("message-close"));
       const ack = relay.acknowledge(
         "dm_123",
         "ack-close",
@@ -1632,11 +1659,7 @@ describe("RelaySocket", () => {
     const context = await connectRelay(() => undefined, () => { purges += 1; });
     const { relay, socket, originalWebSocket } = context;
     try {
-      const message = relay.sendEncryptedPayload("message-purge", {
-        type: "message",
-        chat_id: "dm_123",
-        message_id: "message-purge",
-      });
+      const message = relay.sendEncryptedPayload("message-purge", encryptedFrame("message-purge"));
       const ack = relay.acknowledge(
         "dm_123",
         "ack-purge",
@@ -1705,6 +1728,7 @@ describe("RelaySocket", () => {
       const first = sockets[0];
       first.readyState = 1;
       first.onopen?.(new Event("open"));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
       const pending = relay.acknowledge(
         "dm_123",
         "ack-stale",
@@ -1721,6 +1745,7 @@ describe("RelaySocket", () => {
       const second = sockets[1];
       second.readyState = 1;
       second.onopen?.(new Event("open"));
+      relay.setDirectoryStamp(DIRECTORY_STAMP);
       first.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
         type: "ack_result",
         message_id: "ack-stale",
@@ -1803,5 +1828,6 @@ async function connectRelay(
   const socket = sockets[0];
   socket.readyState = 1;
   socket.onopen?.(new Event("open"));
+  relay.setDirectoryStamp(DIRECTORY_STAMP);
   return { relay, socket, frames, originalWebSocket };
 }

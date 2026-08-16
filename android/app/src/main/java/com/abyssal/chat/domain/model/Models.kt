@@ -97,6 +97,18 @@ data class ServerStatus(
     val latencyMs: Int
 )
 
+data class DirectoryStamp(
+    val nodeId: String,
+    val revision: ULong,
+    val digest: String
+)
+
+enum class DirectoryEvidenceStatus {
+    KNOWN,
+    UNKNOWN_OLD,
+    CONFLICT
+}
+
 data class NodeEndpoint(
     val inputUrl: String,
     val apiBaseUrl: String,
@@ -150,7 +162,10 @@ data class IncomingTransportPayload(
     val senderPublicKey: ByteArray,
     val prekeyId: String = "",
     val isPrekey: Boolean = false,
-    val connectionGeneration: Long = 0L
+    val connectionGeneration: Long = 0L,
+    val directoryNodeId: String = "",
+    val directoryRevision: ULong = 0u,
+    val directoryDigest: String = ""
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -167,7 +182,10 @@ data class IncomingTransportPayload(
             senderPublicKey.contentEquals(other.senderPublicKey) &&
             prekeyId == other.prekeyId &&
             isPrekey == other.isPrekey &&
-            connectionGeneration == other.connectionGeneration
+            connectionGeneration == other.connectionGeneration &&
+            directoryNodeId == other.directoryNodeId &&
+            directoryRevision == other.directoryRevision &&
+            directoryDigest == other.directoryDigest
     }
 
     override fun hashCode(): Int {
@@ -184,6 +202,9 @@ data class IncomingTransportPayload(
         result = 31 * result + prekeyId.hashCode()
         result = 31 * result + isPrekey.hashCode()
         result = 31 * result + connectionGeneration.hashCode()
+        result = 31 * result + directoryNodeId.hashCode()
+        result = 31 * result + directoryRevision.hashCode()
+        result = 31 * result + directoryDigest.hashCode()
         return result
     }
 }
@@ -206,7 +227,10 @@ data class EncryptedTransportPayload(
     val identityEnvelope: ByteArray,
     val identityPublicKey: ByteArray = ByteArray(0),
     val prekeyId: String = "",
-    val stateSignature: ByteArray
+    val stateSignature: ByteArray,
+    val directoryNodeId: String = "",
+    val directoryRevision: ULong = 0u,
+    val directoryDigest: String = ""
 )
 
 data class IdentityStateSnapshot(
@@ -239,7 +263,9 @@ data class UserPresence(
     val connected: Boolean,
     val publicKey: ByteArray,
     val prekeyId: String = "",
-    val directoryDigest: String = ""
+    val directoryDigest: String = "",
+    val directoryNodeId: String = "",
+    val directoryRevision: ULong = 0u
 )
 
 /**

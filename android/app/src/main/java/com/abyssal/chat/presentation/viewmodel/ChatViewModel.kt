@@ -19,6 +19,8 @@ import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
+import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
+import com.abyssal.chat.domain.model.DirectoryStamp
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityValidationResult
@@ -458,7 +460,7 @@ class ChatViewModel(
     private val calculatorInputGeneration = AtomicLong(0L)
     private val calculatorEvaluationGate = Mutex()
     private val ownMessageIds = LinkedHashSet<String>()
-    private val receivedFrameIds = linkedSetOf<String>()
+    private val receivedFrameIds = linkedMapOf<String, String>()
     // All accesses occur on viewModelScope/Main: UI entry points, attachment jobs,
     // logout, and teardown. Network callbacks never touch these collections directly.
     private val activeAttachmentViews = mutableSetOf<String>()
@@ -535,8 +537,29 @@ class ChatViewModel(
                 return@withLock
             }
             val replayKey = "${incoming.chatId}\u0000${incoming.senderUsername}\u0000${incoming.messageId}"
+            val directoryEvidenceKey =
+                "${incoming.directoryNodeId}\u0000${incoming.directoryRevision}\u0000${incoming.directoryDigest}"
             try {
-                if (replayKey in receivedFrameIds) {
+                when (chatTransport.directoryEvidenceStatus(
+                    DirectoryStamp(
+                        incoming.directoryNodeId,
+                        incoming.directoryRevision,
+                        incoming.directoryDigest
+                    )
+                )) {
+                    DirectoryEvidenceStatus.KNOWN -> Unit
+                    DirectoryEvidenceStatus.UNKNOWN_OLD -> return@withLock
+                    DirectoryEvidenceStatus.CONFLICT -> {
+                        failClosedForIncomingAckFailure(stamp)
+                        return@withLock
+                    }
+                }
+                val processedDirectoryEvidence = receivedFrameIds[replayKey]
+                if (processedDirectoryEvidence != null) {
+                    if (processedDirectoryEvidence != directoryEvidenceKey) {
+                        failClosedForIncomingAckFailure(stamp)
+                        return@withLock
+                    }
                     val acknowledgement = acknowledgeIncoming(incoming, stamp)
                     if (acknowledgement != OutboundSendResult.ACCEPTED) {
                         failClosedForIncomingAckFailure(stamp)
@@ -562,6 +585,12 @@ class ChatViewModel(
                         failClosedForIncomingAckFailure(stamp)
                         return@withLock
                     }
+                    val decryptedContent = String(plainBytes, StandardCharsets.UTF_8)
+                    val decryptedStamp = runCatching { JSONObject(decryptedContent) }.getOrNull()
+                    if (decryptedStamp == null || !matchesDirectoryStamp(decryptedStamp, incoming)) {
+                        failClosedForIncomingAckFailure(stamp)
+                        return@withLock
+                    }
                     val acknowledgement = acknowledgeIncoming(incoming, stamp)
                     if (acknowledgement != OutboundSendResult.ACCEPTED) {
                         failClosedForIncomingAckFailure(stamp)
@@ -570,7 +599,6 @@ class ChatViewModel(
                     if (!isSessionStampValid(stamp)) {
                         return@withLock
                     }
-                    val decryptedContent = String(plainBytes, StandardCharsets.UTF_8)
                     val control = runCatching { JSONObject(decryptedContent) }.getOrNull()
                     if (control?.optString("kind") == "read_receipt") {
                         if (!matchesAuthoritativeMessageId(control, incoming.messageId)) return@withLock
@@ -593,7 +621,7 @@ class ChatViewModel(
                         if (!isSessionStampValid(stamp)) {
                             return@withLock
                         }
-                        rememberReceivedFrame(replayKey)
+                        rememberReceivedFrame(replayKey, directoryEvidenceKey)
                         return@withLock
                     }
                     val message = parseIncomingMessage(
@@ -618,7 +646,7 @@ class ChatViewModel(
                         wipeMessageSecrets(message)
                         return@withLock
                     }
-                    rememberReceivedFrame(replayKey)
+                    rememberReceivedFrame(replayKey, directoryEvidenceKey)
                 } finally {
                     plainBytes.fill(0)
                 }
@@ -1989,10 +2017,10 @@ class ChatViewModel(
         }
     }
 
-    private fun rememberReceivedFrame(replayKey: String) {
-        receivedFrameIds.add(replayKey)
+    private fun rememberReceivedFrame(replayKey: String, directoryEvidenceKey: String) {
+        receivedFrameIds[replayKey] = directoryEvidenceKey
         if (receivedFrameIds.size > MAX_RECEIVED_FRAME_IDS) {
-            receivedFrameIds.iterator().run {
+            receivedFrameIds.entries.iterator().run {
                 if (hasNext()) {
                     next()
                     remove()
@@ -2031,13 +2059,23 @@ class ChatViewModel(
         val sessionGenerationSnapshot = sessionStamp?.generation ?: sessionGeneration.get()
         val connectionGeneration = sessionStamp?.connectionGeneration
             ?: chatTransport.currentConnectionGeneration()
+        val directoryStamp = chatTransport.currentDirectoryStamp()
+            ?: return@withLock OutboundSendResult.NOT_SENT
+        val stampedMetadata = runCatching {
+            JSONObject(metadata).apply {
+                put("directory_node_id", directoryStamp.nodeId)
+                put("directory_revision", directoryStamp.revision.toLong())
+                put("directory_digest", directoryStamp.digest)
+            }.toString()
+        }.getOrElse { return@withLock OutboundSendResult.NOT_SENT }
         val prepared = try {
             encryptMetadata(
                 chatId = chatId,
                 messageId = messageId,
-                metadata = metadata,
+                metadata = stampedMetadata,
                 recipientsOverride = recipientsOverride,
-                expectedConnectionGeneration = connectionGeneration
+                expectedConnectionGeneration = connectionGeneration,
+                directoryStamp = directoryStamp
             )
         } catch (_: FatalPayloadCipherException) {
             failClosedAfterAmbiguous()
@@ -2117,7 +2155,8 @@ class ChatViewModel(
         messageId: String,
         metadata: String,
         recipientsOverride: List<RecipientIdentity>? = null,
-        expectedConnectionGeneration: Long = chatTransport.currentConnectionGeneration()
+        expectedConnectionGeneration: Long = chatTransport.currentConnectionGeneration(),
+        directoryStamp: DirectoryStamp
     ): PreparedEncryptedMessage? {
         val sender = currentUser.value ?: return null
         val recipients = recipientsOverride ?: recipientIdentities(chatId, includeSelf = false) ?: return null
@@ -2163,14 +2202,19 @@ class ChatViewModel(
                         )
                     }
                 }
-            PreparedEncryptedMessage(
-                payload = payloadCipher.encrypt(
+            val encrypted = payloadCipher.encrypt(
                     chatId = chatId,
                     messageId = messageId,
                     senderUsername = sender.username,
                     plainBytes = plainBytes,
                     recipients = leasedRecipients
-                ),
+                ).copy(
+                    directoryNodeId = directoryStamp.nodeId,
+                    directoryRevision = directoryStamp.revision,
+                    directoryDigest = directoryStamp.digest
+                )
+            PreparedEncryptedMessage(
+                payload = encrypted,
                 leases = leaseReferences.toList()
             )
         } catch (error: FatalPayloadCipherException) {
@@ -2402,6 +2446,22 @@ class ChatViewModel(
         }
 
         return null
+    }
+
+    private fun matchesDirectoryStamp(
+        json: JSONObject,
+        incoming: IncomingTransportPayload
+    ): Boolean {
+        if (incoming.directoryNodeId.isEmpty() || incoming.directoryRevision == 0uL ||
+            incoming.directoryDigest.isEmpty() ||
+            !json.has("directory_node_id") || !json.has("directory_revision") ||
+            !json.has("directory_digest")
+        ) return false
+        val revision = (json.opt("directory_revision") as? Number)
+            ?.toLong()?.takeIf { it > 0L }?.toULong() ?: return false
+        return json.optString("directory_node_id", "") == incoming.directoryNodeId &&
+            revision == incoming.directoryRevision &&
+            json.optString("directory_digest", "") == incoming.directoryDigest
     }
 
     private fun effectiveRetentionSec(chatId: String, requestedSec: Int, mediaType: String? = null): Int {

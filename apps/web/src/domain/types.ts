@@ -52,6 +52,14 @@ export interface PresenceUser {
   identity_public_b64: string;
   identity_prekey_id: string;
   directory_digest: string;
+  directory_node_id: string;
+  directory_revision: number;
+}
+
+export interface DirectoryStamp {
+  directory_node_id: string;
+  directory_revision: number;
+  directory_digest: string;
 }
 
 export interface RoomRecord {
@@ -136,6 +144,9 @@ export type IncomingFrame =
       identity_public_b64?: string;
       prekey_id: string;
       is_prekey: boolean;
+      directory_node_id: string;
+      directory_revision: number;
+      directory_digest: string;
     }
   | { type: "presence"; users: PresenceUser[] }
   | { type: "GLOBAL_WIPE" | "global_wipe" }
