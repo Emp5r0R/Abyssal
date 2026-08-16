@@ -113,10 +113,10 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.okhttp)
-    implementation("net.java.dev.jna:jna:5.18.1@aar")
+    implementation("net.java.dev.jna:jna:5.19.1@aar")
 
     testImplementation(libs.junit)
-    testImplementation("net.java.dev.jna:jna:5.18.1")
+    testImplementation("net.java.dev.jna:jna:5.19.1")
     testImplementation("org.json:json:20240303")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation(libs.androidx.junit)
