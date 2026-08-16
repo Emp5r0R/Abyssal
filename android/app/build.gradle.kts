@@ -117,7 +117,7 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation("net.java.dev.jna:jna:5.18.1")
-    testImplementation("org.json:json:20240303")
+    testImplementation("org.json:json:20260719")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
