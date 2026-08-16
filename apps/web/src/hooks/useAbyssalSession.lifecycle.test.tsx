@@ -945,6 +945,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     }, directoryStamp);
     await act(async () => relay?.emit(frame));
     await waitFor(() => expect(resolveAck).toBeDefined());
+    await waitFor(() => expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1));
     expect(result.current.messages).toEqual({});
 
     await act(async () => {
@@ -1334,6 +1335,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     });
 
     await waitFor(() => expect(result.current.rooms).toHaveLength(1));
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
     act(() => result.current.openRoom(room.id));
     await act(async () => {
       await result.current.sendText("local secret");
