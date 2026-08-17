@@ -1,5 +1,54 @@
 # Project Progress
 
+## Completed Deployment: Direct Safety-Number Comparison Interlock
+
+This deployment closes the repository-fixable direct-chat verification gap by
+requiring a session-scoped, out-of-band safety-number comparison before either
+client performs sensitive direct actions.
+
+### Delivered
+
+- Android and web direct chats remain `NOT COMPARED` until the user confirms an
+  exact match for the displayed symmetric safety number. Direct text, GIF and
+  media upload, attachment view/export/save, and network read receipts fail
+  closed until that confirmation.
+- Incoming unverified direct text may render and become locally read without
+  emitting a receipt. Rooms retain their existing pairwise behavior and are
+  unaffected by the direct-chat gate.
+- Each client keeps at most 128 confirmations in RAM, bound to the exact direct
+  context, both stable long-term identity prefixes, and the active session and
+  connection generations. Rotating prekeys do not invalidate a confirmation;
+  stable identity changes do.
+- Reconnect, logout, wipe, inactivity expiry, teardown, and bounded-store
+  eviction clear applicable confirmation state. Deferred send and attachment
+  work rechecks the captured session and connection epochs before cryptography,
+  upload, download, decrypt, save, or plaintext exposure.
+- Adversarial tests cover wrong comparison values, unknown and stale chats,
+  identity replacement, prekey-tail rotation, reconnect races, bounded-store
+  eviction, suppressed untrusted receipts, and blocked attachment operations.
+
+### Verification
+
+- Final `./scripts/test-all.sh all`: passed on the integrated tree.
+- Web: 249 tests in 18 files, zero-warning ESLint, TypeScript compilation, and
+  the production Vite build passed.
+- Rust: 25 core tests and 134 relay tests passed with rustfmt, locked workspace
+  tests, and warning-denied workspace Clippy.
+- Android: 188 JVM unit tests, release lint, and debug/release Kotlin
+  compilation passed without packaging an APK or AAB.
+- Live OPAQUE/E2EE relay integration, generated artifact/source verification,
+  Gradle dependency verification, immutable workflow/container checks, shell
+  syntax checks, npm audit with zero vulnerabilities, and the RustSec audit of
+  239 locked dependencies passed.
+
+### Remaining External Limits
+
+The confirmation is a user assertion, not an external transparency witness or
+proof that the peer compared the value. Process restart clears RAM-only trust.
+An external transparency service, a persistent rollback anchor, multi-device
+coordination, MLS group protocol, and independent audit remain separate work.
+No package, release, or production deployment was performed.
+
 ## Completed Deployment: Directory Equivocation Detection
 
 This deployment closed the next repository-fixable item in `SECURITY.md` after

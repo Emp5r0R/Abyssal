@@ -1351,6 +1351,57 @@ button:disabled {
   font-size: 9px;
 }
 
+.trust-status {
+  display: inline-flex;
+  max-width: 100%;
+  margin: 4px 0 0;
+  padding: 0;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: 9px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.trust-status:disabled {
+  cursor: default;
+}
+
+.trust-status.is-unverified {
+  color: var(--amber);
+}
+
+.trust-status.is-verified {
+  color: var(--green);
+}
+
+.trust-status:not(:disabled):focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 3px;
+}
+
+.safety-number-value {
+  margin: 0 0 12px;
+  padding: 14px;
+  overflow-wrap: anywhere;
+  border: 1px solid rgba(0, 229, 134, 0.35);
+  border-radius: 6px;
+  color: var(--green);
+  background: var(--green-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-align: center;
+}
+
 .connection-pill {
   display: flex;
   height: 26px;

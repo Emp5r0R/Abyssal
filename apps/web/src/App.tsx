@@ -217,6 +217,7 @@ function SecureWorkspace({
           username={session.username}
           connected={abyssal.connection === "connected"}
           safetyNumber={abyssal.safetyNumber}
+          directTrust={abyssal.directTrust}
           messages={abyssal.messages[abyssal.activeRoom.id] ?? []}
           users={abyssal.presence}
           upload={abyssal.upload}
@@ -228,6 +229,7 @@ function SecureWorkspace({
           onViewAttachment={abyssal.viewAttachment}
           onExportAttachment={abyssal.exportAttachment}
           onSendGif={sendGif}
+          onVerifySafetyNumber={abyssal.verifyDirectSafetyNumber}
         />
       ) : undefined}
     </AppShell>

@@ -102,6 +102,7 @@ import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
+import com.abyssal.chat.domain.model.DirectTrustStatus
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.ServerStatus
@@ -126,7 +127,6 @@ import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import uniffi.abyssal_core.conversationSafetyNumber
 
 @Composable
 fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
@@ -137,6 +137,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
     val uploadProgress by viewModel.attachmentUploadProgress.collectAsState()
     val currentUser by viewModel.currentUser.collectAsState()
     val presence by viewModel.presence.collectAsState()
+    val directTrust by viewModel.directTrust.collectAsState()
     val attachmentError = viewModel.attachmentError.value
     val currentSession = remember(sessions, sessionId) { sessions.find { it.id == sessionId } }
 
@@ -148,8 +149,8 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         uploadProgress = uploadProgress,
         attachmentError = attachmentError,
         currentUsername = currentUser?.username,
-        currentPublicKey = currentUser?.publicKey,
         presence = presence,
+        directTrust = directTrust,
         onBack = { viewModel.navigateTo(Screen.Dashboard) },
         onSendMessage = viewModel::sendMessage,
         onSendAttachment = viewModel::sendAttachment,
@@ -159,7 +160,8 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         onDismissAttachmentPreview = viewModel::dismissAttachmentPreview,
         onExternalSystemUiStart = viewModel::beginExternalSystemUi,
         onExternalSystemUiEnd = viewModel::endExternalSystemUi,
-        onUserActivity = viewModel::recordUserActivity
+        onUserActivity = viewModel::recordUserActivity,
+        onVerifySafetyNumber = viewModel::verifyDirectSafetyNumber
     )
 }
 
@@ -172,8 +174,8 @@ private fun ChatContent(
     uploadProgress: AttachmentUploadProgress,
     attachmentError: String?,
     currentUsername: String?,
-    currentPublicKey: ByteArray?,
     presence: List<UserPresence>,
+    directTrust: DirectTrustStatus,
     onBack: () -> Unit,
     onSendMessage: (String, Int, String?) -> Unit,
     onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean, String?, String?) -> Unit,
@@ -183,7 +185,8 @@ private fun ChatContent(
     onDismissAttachmentPreview: () -> Unit,
     onExternalSystemUiStart: () -> Long,
     onExternalSystemUiEnd: (Long) -> Boolean,
-    onUserActivity: () -> Unit
+    onUserActivity: () -> Unit,
+    onVerifySafetyNumber: (String) -> Boolean
 ) {
     var textInput by remember { mutableStateOf("") }
     var selectedTimerSec by remember(session) { mutableIntStateOf(session?.selfDestructTimerSec ?: 5) }
@@ -194,6 +197,7 @@ private fun ChatContent(
     var replyingToMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
     var highlightedMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
     var hasPositionedMessageList by remember(session?.id) { mutableStateOf(false) }
+    var showTrustDialog by remember(session?.id) { mutableStateOf(false) }
     val messageListState = remember(session?.id) { LazyListState() }
     val inputFocusRequester = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
@@ -233,18 +237,6 @@ private fun ChatContent(
                 .toList()
         }
     }
-    val safetyNumber = remember(session?.id, currentPublicKey, presence) {
-        if (session?.isForum != false || currentPublicKey == null) {
-            null
-        } else {
-            presence.firstOrNull { it.username.equals(session.name, ignoreCase = true) }
-                ?.publicKey
-                ?.let { peerKey ->
-                    runCatching { conversationSafetyNumber(currentPublicKey, peerKey) }.getOrNull()
-                }
-        }
-    }
-
     LaunchedEffect(replyingToMessageId, replyingToMessage) {
         if (replyingToMessageId != null && replyingToMessage == null) {
             replyingToMessageId = null
@@ -290,7 +282,8 @@ private fun ChatContent(
             ChatHeader(
                 session = session,
                 status = status,
-                safetyNumber = safetyNumber,
+                directTrust = directTrust,
+                onVerifySafetyNumber = { showTrustDialog = true },
                 onBack = onBack
             )
 
@@ -431,6 +424,16 @@ private fun ChatContent(
             )
         }
 
+        if (showTrustDialog && directTrust.active && directTrust.safetyNumber != null) {
+            DirectTrustDialog(
+                safetyNumber = directTrust.safetyNumber,
+                onDismiss = { showTrustDialog = false },
+                onConfirm = {
+                    if (onVerifySafetyNumber(directTrust.safetyNumber)) showTrustDialog = false
+                }
+            )
+        }
+
         if (showAttachmentDialog) {
             AttachmentDialog(
                 session = session,
@@ -492,7 +495,8 @@ private fun ChatContent(
 private fun ChatHeader(
     session: ChatSession?,
     status: ServerStatus,
-    safetyNumber: String?,
+    directTrust: DirectTrustStatus,
+    onVerifySafetyNumber: () -> Unit,
     onBack: () -> Unit
 ) {
     Column {
@@ -523,17 +527,40 @@ private fun ChatHeader(
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     LockIcon(modifier = Modifier.size(10.dp), color = NeonGreen)
-                    Text(
-                        text = safetyNumber?.let { "Safety $it" }
-                            ?: "Encrypted  ${status.latencyMs}ms",
-                        color = NeonGreen,
-                        fontSize = if (safetyNumber == null) 12.sp else 10.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(start = 6.dp),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    if (session?.isForum != false) {
+                        Text(
+                            text = "Encrypted  ${status.latencyMs}ms",
+                            color = NeonGreen,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(start = 6.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    } else {
+                        Text(
+                            text = if (directTrust.verified) {
+                                "Comparison confirmed · Safety ${directTrust.safetyNumber ?: "unavailable"}"
+                            } else {
+                                "Not compared · Safety ${directTrust.safetyNumber ?: "unavailable"}"
+                            },
+                            color = if (directTrust.verified) NeonGreen else SelfDestructAmber,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(start = 6.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
+            }
+
+            if (session?.isForum == false && directTrust.active && directTrust.safetyNumber != null) {
+                MirageSecondaryButton(
+                    text = if (directTrust.verified) "CONFIRMED" else "COMPARE",
+                    onClick = onVerifySafetyNumber,
+                    modifier = Modifier.padding(start = 6.dp),
+                )
             }
         }
         Spacer(
@@ -542,6 +569,46 @@ private fun ChatHeader(
                 .height(1.dp)
                 .background(SteelMuted.copy(alpha = 0.12f))
         )
+    }
+}
+
+@Composable
+private fun DirectTrustDialog(
+    safetyNumber: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    MirageDialog(title = "Verify direct chat", onDismiss = onDismiss, accent = NeonCyan) {
+        Text(
+            text = "Compare this safety number with your peer using a separate trusted channel, such as an in-person exchange or a known voice call.",
+            color = SteelMuted,
+            fontSize = 13.sp,
+            lineHeight = 19.sp
+        )
+        Text(
+            text = safetyNumber,
+            color = NeonGreen,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 16.dp)
+                .semantics { contentDescription = "Safety number $safetyNumber" }
+        )
+        Text(
+            text = "Only confirm when every digit matches. This verification stays in RAM and clears after reconnect, identity change, logout, wipe, or session expiry.",
+            color = SteelMuted,
+            fontSize = 12.sp,
+            lineHeight = 17.sp
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            MirageSecondaryButton(text = "CANCEL", onClick = onDismiss, modifier = Modifier.weight(1f))
+            MiragePrimaryButton(text = "I COMPARED", onClick = onConfirm, modifier = Modifier.weight(1f))
+        }
     }
 }
 
@@ -2119,8 +2186,8 @@ private fun ChatContentPreview() {
         uploadProgress = AttachmentUploadProgress(),
         attachmentError = null,
         currentUsername = "NebulaTiger93",
-        currentPublicKey = ByteArray(608),
         presence = listOf(UserPresence("SilentFox482", true, ByteArray(608))),
+        directTrust = DirectTrustStatus(),
         onBack = {},
         onSendMessage = { _, _, _ -> },
         onSendAttachment = { _, _, _, _, _, _, _, _, _ -> },
@@ -2130,6 +2197,7 @@ private fun ChatContentPreview() {
         onDismissAttachmentPreview = {},
         onExternalSystemUiStart = { 1L },
         onExternalSystemUiEnd = { true },
-        onUserActivity = {}
+        onUserActivity = {},
+        onVerifySafetyNumber = { false }
     )
 }

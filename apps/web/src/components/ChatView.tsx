@@ -21,13 +21,14 @@ import { splitMentionText } from "../domain/messageAttention";
 import { exactReactionShortcut, reactionByShortcode, searchReactions, type ReactionAsset } from "../domain/reactions";
 import type { ChatMessage, PresenceUser, RoomRecord, UploadProgress } from "../domain/types";
 import { GifPicker } from "./GifPicker";
-import { IconButton } from "./Ui";
+import { Dialog, IconButton } from "./Ui";
 
 interface ChatViewProps {
   room: RoomRecord;
   username: string;
   connected: boolean;
   safetyNumber: string | null;
+  directTrust?: { verified: boolean };
   messages: ChatMessage[];
   users: PresenceUser[];
   upload: UploadProgress & { active: boolean; name: string };
@@ -39,6 +40,7 @@ interface ChatViewProps {
   onViewAttachment: (message: ChatMessage) => void;
   onExportAttachment: (message: ChatMessage) => void;
   onSendGif: (reaction: ReactionAsset, replyToId?: string, retentionSec?: number) => Promise<boolean>;
+  onVerifySafetyNumber?: (safetyNumber: string) => boolean;
 }
 
 export function ChatView({
@@ -46,6 +48,7 @@ export function ChatView({
   username,
   connected,
   safetyNumber,
+  directTrust = { verified: false },
   messages,
   users,
   upload,
@@ -57,6 +60,7 @@ export function ChatView({
   onViewAttachment,
   onExportAttachment,
   onSendGif,
+  onVerifySafetyNumber,
 }: ChatViewProps) {
   const isDirect = room.conversation_type === "direct";
   const [draft, setDraft] = useState("");
@@ -65,6 +69,7 @@ export function ChatView({
   const [submitting, setSubmitting] = useState(false);
   const [now, setNow] = useState(0);
   const [flashTargetId, setFlashTargetId] = useState<string | null>(null);
+  const [showTrustDialog, setShowTrustDialog] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wasNearBottom = useRef(true);
@@ -154,9 +159,25 @@ export function ChatView({
         <div className={`room-avatar ${isDirect ? "is-direct" : ""}`}>{isDirect ? "@" : "#"}</div>
         <div className="chat-title">
           <h1>{room.name}</h1>
-          <span>
-            <ShieldCheck size={13} /> {isDirect && safetyNumber ? `Safety ${safetyNumber}` : isDirect ? "Private route" : retentionLabel(room.self_destruct_timer_sec)}
-          </span>
+          {isDirect ? (
+            <button
+              type="button"
+              className={`trust-status ${directTrust.verified ? "is-verified" : "is-unverified"}`}
+              onClick={() => setShowTrustDialog(true)}
+              disabled={!safetyNumber || !onVerifySafetyNumber}
+              aria-label={directTrust.verified
+                ? "Direct chat safety number comparison confirmed"
+                : "Confirm direct chat safety number comparison"}
+            >
+              <ShieldCheck size={13} />
+              {directTrust.verified ? "COMPARISON CONFIRMED" : "NOT COMPARED"}
+              {safetyNumber ? ` · Safety ${safetyNumber}` : " · Safety unavailable"}
+            </button>
+          ) : (
+            <span>
+              <ShieldCheck size={13} /> {retentionLabel(room.self_destruct_timer_sec)}
+            </span>
+          )}
         </div>
         <div className={`connection-pill state-${connected ? "connected" : "disconnected"}`}>
           <span />{connected ? "LIVE" : "OFFLINE"}
@@ -322,6 +343,29 @@ export function ChatView({
           <IconButton className="send-button" label="Send message" disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
         </form>
       </footer>
+      {showTrustDialog && isDirect && safetyNumber && onVerifySafetyNumber ? (
+        <Dialog
+          title="Verify direct chat"
+          description="Compare this safety number with your peer through a separate trusted channel."
+          actions={
+            <>
+              <button className="secondary-button" type="button" onClick={() => setShowTrustDialog(false)}>CANCEL</button>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => {
+                  if (onVerifySafetyNumber(safetyNumber)) setShowTrustDialog(false);
+                }}
+              >
+                I COMPARED — CONFIRM
+              </button>
+            </>
+          }
+        >
+          <p className="safety-number-value" aria-label={`Safety number ${safetyNumber}`}>{safetyNumber}</p>
+          <p>Only confirm when every digit matches. Verification is held in this session and clears after reconnect, identity change, logout, wipe, or expiry.</p>
+        </Dialog>
+      ) : null}
     </section>
   );
 }

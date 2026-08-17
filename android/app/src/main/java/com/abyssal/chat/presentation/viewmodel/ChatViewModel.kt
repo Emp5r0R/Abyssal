@@ -21,6 +21,9 @@ import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
 import com.abyssal.chat.domain.model.DirectoryStamp
+import com.abyssal.chat.domain.model.DirectChatTrustStore
+import com.abyssal.chat.domain.model.DirectTrustContext
+import com.abyssal.chat.domain.model.DirectTrustStatus
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityValidationResult
@@ -69,6 +72,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
@@ -79,6 +83,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import uniffi.abyssal_core.conversationSafetyNumber
 import uniffi.abyssal_core.decryptAttachment as decryptAttachmentBlob
 import uniffi.abyssal_core.encryptAttachment as encryptAttachmentBlob
 
@@ -436,6 +441,10 @@ class ChatViewModel(
     private val _sessionSecurity = MutableStateFlow(SessionSecurityState())
     val sessionSecurity: StateFlow<SessionSecurityState> = _sessionSecurity.asStateFlow()
 
+    private val directTrustStore = DirectChatTrustStore()
+    private val _directTrust = MutableStateFlow(DirectTrustStatus())
+    val directTrust: StateFlow<DirectTrustStatus> = _directTrust.asStateFlow()
+
     private val _roomCreationLimit = MutableStateFlow(DEFAULT_MAX_ROOMS_PER_USER)
     val roomCreationLimit: StateFlow<Int> = _roomCreationLimit.asStateFlow()
 
@@ -674,6 +683,27 @@ class ChatViewModel(
         }
 
         viewModelScope.launch {
+            serverStatus.collect { status ->
+                if (status.state != "CONNECTED") {
+                    directTrustStore.clear()
+                    cancelAttachmentOperations()
+                    activeAttachmentViews.clear()
+                    consumedOneTimeAttachments.clear()
+                    replaceAttachmentPreview(null)
+                }
+                refreshDirectTrust()
+            }
+        }
+
+        viewModelScope.launch {
+            presence.collect { refreshDirectTrust() }
+        }
+
+        viewModelScope.launch {
+            sessions.collect { refreshDirectTrust() }
+        }
+
+        viewModelScope.launch {
             chatTransport.getIncomingPayloads().collect { incoming ->
                 try {
                     processIncomingPayload(incoming)
@@ -701,6 +731,7 @@ class ChatViewModel(
         _currentScreen.value = screen
         if (screen is Screen.Chat) {
             _activeChatId.value = screen.sessionId
+            refreshDirectTrust()
             val connectionGeneration = chatTransport.currentConnectionGeneration()
             viewModelScope.launch {
                 chatTransport.joinChat(screen.sessionId, connectionGeneration)
@@ -869,6 +900,7 @@ class ChatViewModel(
         val chatId = _activeChatId.value ?: return
         if (serverStatus.value.state != "CONNECTED") return
         if (content.isBlank() || content.length > MAX_TEXT_MESSAGE_CHARS) return
+        if (!isDirectChatTrusted(chatId)) return
         val stamp = captureSessionStamp() ?: return
         launchMessageOperation(stamp) sendMessageOperation@{ capturedStamp ->
                 if (!isSessionStampValid(capturedStamp)) return@sendMessageOperation
@@ -937,6 +969,11 @@ class ChatViewModel(
         }
         if (serverStatus.value.state != "CONNECTED") {
             _attachmentError.value = "Wrong information."
+            bytes.fill(0)
+            return
+        }
+        if (!isDirectChatTrusted(chatId)) {
+            _attachmentError.value = "Verify this direct chat's safety number before sending."
             bytes.fill(0)
             return
         }
@@ -1242,6 +1279,7 @@ class ChatViewModel(
         stamp: SessionStamp,
         operationActive: AtomicBoolean
     ): Boolean = operationActive.get() &&
+        serverStatus.value.state == "CONNECTED" &&
         isSessionStampValid(stamp) &&
         nodeConfigService.getActiveSession() == session
 
@@ -1298,8 +1336,14 @@ class ChatViewModel(
     fun viewAttachment(message: Message) {
         val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
+        if (activeMessages.value.none { it.id == message.id && it.attachmentId == attachmentId }) return
+        if (!isDirectChatTrusted(chatId)) {
+            _attachmentError.value = "Verify this direct chat's safety number before opening attachments."
+            return
+        }
         val capturedSession = nodeConfigService.getActiveSession() ?: return
         val generation = sessionGeneration.get()
+        val connectionGeneration = chatTransport.currentConnectionGeneration()
         if (!activeAttachmentViews.add(attachmentId)) return
         if (message.oneTimeView && !consumedOneTimeAttachments.add(attachmentId)) {
             activeAttachmentViews.remove(attachmentId)
@@ -1309,6 +1353,9 @@ class ChatViewModel(
             var plaintext: ByteArray? = null
             var previewInstalled = false
             try {
+                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) {
+                    return@viewAttachmentOperation
+                }
                 _attachmentError.value = null
                 val downloaded = attachmentService.downloadEncryptedAttachment(
                     session = capturedSession,
@@ -1320,11 +1367,11 @@ class ChatViewModel(
                     decryptAndCompleteAttachment(
                         downloaded = encrypted,
                         decrypt = {
-                            if (!isAttachmentGenerationCurrent(capturedSession, generation)) null
+                            if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) null
                             else decryptAttachment(chatId, message, encrypted.bytes)
                         },
                         complete = { claim ->
-                            if (!isAttachmentGenerationCurrent(capturedSession, generation)) false
+                            if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) false
                             else attachmentService.completeAttachmentDownload(
                                 capturedSession,
                                 attachmentId,
@@ -1346,7 +1393,7 @@ class ChatViewModel(
                     return@viewAttachmentOperation
                 }
                 val installed = attachmentSessionGate.withLock {
-                    if (!isAttachmentGenerationCurrent(capturedSession, generation)) {
+                    if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) {
                         false
                     } else {
                         replaceAttachmentPreview(
@@ -1378,15 +1425,24 @@ class ChatViewModel(
     }
 
     fun saveAttachment(message: Message, outputUri: Uri) {
-        if (!AttachmentSavePolicy.canSave(message)) return
         val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
+        if (activeMessages.value.none { it.id == message.id && it.attachmentId == attachmentId }) return
+        if (!isDirectChatTrusted(chatId)) {
+            _attachmentError.value = "Verify this direct chat's safety number before exporting attachments."
+            return
+        }
+        if (!AttachmentSavePolicy.canSave(message)) return
         val capturedSession = nodeConfigService.getActiveSession() ?: return
         val generation = sessionGeneration.get()
+        val connectionGeneration = chatTransport.currentConnectionGeneration()
         launchAttachmentOperation saveAttachmentOperation@{
             _attachmentError.value = null
             var temporaryBytes: ByteArray? = null
             try {
+                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) {
+                    return@saveAttachmentOperation
+                }
                 val cachedAttachment = _attachmentPreview.value?.takeIf { it.messageId == message.id }
                 val attachment = cachedAttachment ?: run {
                     val downloaded = attachmentService.downloadEncryptedAttachment(
@@ -1399,11 +1455,11 @@ class ChatViewModel(
                         decryptAndCompleteAttachment(
                             downloaded = encrypted,
                             decrypt = {
-                                if (!isAttachmentGenerationCurrent(capturedSession, generation)) null
+                                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) null
                                 else decryptAttachment(chatId, message, encrypted.bytes)
                             },
                             complete = { claim ->
-                                if (!isAttachmentGenerationCurrent(capturedSession, generation)) false
+                                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) false
                                 else attachmentService.completeAttachmentDownload(
                                     capturedSession,
                                     attachmentId,
@@ -1437,7 +1493,7 @@ class ChatViewModel(
                     return@saveAttachmentOperation
                 }
                 if (cachedAttachment == null) temporaryBytes = attachment.bytes
-                if (!isAttachmentGenerationCurrent(capturedSession, generation)) {
+                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) {
                     return@saveAttachmentOperation
                 }
                 val saved = attachmentService.saveDecryptedAttachment(attachment, outputUri)
@@ -1459,6 +1515,8 @@ class ChatViewModel(
 
     fun markMessageAsRead(messageId: String) {
         val chatId = _activeChatId.value ?: return
+        if (sessions.value.none { it.id == chatId }) return
+        val trusted = isDirectChatTrusted(chatId)
         val stamp = captureSessionStamp() ?: return
         launchMessageOperation(stamp) markReadOperation@{ capturedStamp ->
             if (!isSessionStampValid(capturedStamp)) return@markReadOperation
@@ -1471,7 +1529,9 @@ class ChatViewModel(
                     )
                 }
             ) return@markReadOperation
-            if (message != null && message.sender != "You" && serverStatus.value.state == "CONNECTED") {
+            if (trusted && isDirectChatTrusted(chatId) && message != null &&
+                message.sender != "You" && serverStatus.value.state == "CONNECTED"
+            ) {
                 val receiptId = UUID.randomUUID().toString()
                 val metadata = JSONObject()
                     .put("kind", "read_receipt")
@@ -1863,6 +1923,8 @@ class ChatViewModel(
         retainSessionInBackground = false
         lastRemoteActivitySignalMs = 0L
         requestedDirectUsername = null
+        directTrustStore.clear()
+        _directTrust.value = DirectTrustStatus()
         _roomCreationLimit.value = DEFAULT_MAX_ROOMS_PER_USER
         updateSessionSecurityState()
         messageRepository.clearAllDataNow()
@@ -1892,6 +1954,14 @@ class ChatViewModel(
         }
     }
 
+    fun verifyDirectSafetyNumber(displayedSafetyNumber: String): Boolean {
+        val context = currentDirectTrustContext() ?: return false
+        val accepted = directTrustStore.markVerified(context, displayedSafetyNumber)
+        wipeDirectTrustContext(context)
+        refreshDirectTrust()
+        return accepted
+    }
+
     private fun expireSessionIfNeeded(): Boolean {
         if (!sessionInactivityPolicy.isExpired()) return false
         val remoteSession = prepareLocalLogout()
@@ -1917,6 +1987,50 @@ class ChatViewModel(
         )
     }
 
+    private fun currentDirectTrustContext(chatId: String? = _activeChatId.value): DirectTrustContext? {
+        val activeChatId = _activeChatId.value
+        val currentUser = currentUser.value
+        if (chatId == null || chatId != activeChatId || currentUser == null ||
+            serverStatus.value.state != "CONNECTED") return null
+        val session = sessions.value.firstOrNull { it.id == chatId } ?: return null
+        if (session.isForum) return null
+        val peer = presence.value.firstOrNull { it.username.equals(session.name, ignoreCase = true) } ?: return null
+        val safetyNumber = runCatching {
+            conversationSafetyNumber(currentUser.publicKey, peer.publicKey)
+        }.getOrNull() ?: return null
+        return DirectTrustContext(
+            chatId = session.id,
+            peerUsername = session.name,
+            safetyNumber = safetyNumber,
+            sessionGeneration = sessionGeneration.get(),
+            connectionGeneration = chatTransport.currentConnectionGeneration(),
+            localIdentity = currentUser.publicKey.copyOf(),
+            peerIdentity = peer.publicKey.copyOf()
+        )
+    }
+
+    private fun refreshDirectTrust() {
+        val context = currentDirectTrustContext()
+        directTrustStore.invalidateIfIdentityChanged(context)
+        _directTrust.value = directTrustStore.status(context)
+        wipeDirectTrustContext(context)
+    }
+
+    private fun isDirectChatTrusted(chatId: String): Boolean {
+        val session = sessions.value.firstOrNull { it.id == chatId } ?: return false
+        if (session.isForum) return true
+        val context = currentDirectTrustContext(chatId)
+        directTrustStore.invalidateIfIdentityChanged(context)
+        val trusted = directTrustStore.isVerified(context)
+        wipeDirectTrustContext(context)
+        return trusted
+    }
+
+    private fun wipeDirectTrustContext(context: DirectTrustContext?) {
+        context?.localIdentity?.fill(0)
+        context?.peerIdentity?.fill(0)
+    }
+
     private fun isSessionGenerationValid(generation: Long): Boolean =
         generation == sessionGeneration.get() &&
             currentUser.value != null &&
@@ -1924,8 +2038,11 @@ class ChatViewModel(
 
     private fun isAttachmentGenerationCurrent(
         session: NodeSession,
-        generation: Long
+        generation: Long,
+        connectionGeneration: Long
     ): Boolean = isSessionGenerationValid(generation) &&
+        serverStatus.value.state == "CONNECTED" &&
+        chatTransport.currentConnectionGeneration() == connectionGeneration &&
         nodeConfigService.getActiveSession() == session
 
     private fun captureSessionStamp(): SessionStamp? {
@@ -2622,6 +2739,8 @@ class ChatViewModel(
         consumedOneTimeAttachments.clear()
         ownMessageIds.clear()
         receivedFrameIds.clear()
+        directTrustStore.clear()
+        _directTrust.value = DirectTrustStatus()
         replaceAttachmentPreview(null)
         messageRepository.clearAllDataNow()
         messageRepository.close()

@@ -139,6 +139,7 @@ const mocks = vi.hoisted(() => {
   class FakeRelay {
     static readonly instances: FakeRelay[] = [];
     static encryptedOutcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS" = "ACCEPTED";
+    static encryptedResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
     static leaseFailureAt: number | null = null;
     static leaseFailureCode: "NOT_SENT" | "AMBIGUOUS" | "CLOSED" = "NOT_SENT";
     static acknowledgeResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
@@ -186,7 +187,7 @@ const mocks = vi.hoisted(() => {
 
     sendEncryptedPayload(_messageId: string, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
       this.send(frame);
-      return Promise.resolve(FakeRelay.encryptedOutcome);
+      return FakeRelay.encryptedResult ?? Promise.resolve(FakeRelay.encryptedOutcome);
     }
 
     requestPrekeyLease(chatId: string, messageId: string, recipientUsername: string) {
@@ -250,6 +251,7 @@ const mocks = vi.hoisted(() => {
     reset: () => {
       FakeRelay.instances.length = 0;
       FakeRelay.encryptedOutcome = "ACCEPTED";
+      FakeRelay.encryptedResult = null;
       FakeRelay.leaseFailureAt = null;
       FakeRelay.leaseFailureCode = "NOT_SENT";
       FakeRelay.acknowledgeResult = null;
@@ -295,6 +297,7 @@ vi.mock("../security/crypto", async () => {
   const actual = await vi.importActual<typeof import("../security/crypto")>("../security/crypto");
   return {
     ...actual,
+    conversationSafetyNumber: vi.fn(() => "1234 5678 9012"),
     startOpaque: vi.fn(async () => ({
       registrationState: new Uint8Array([1]),
       registrationRequest: new Uint8Array([2]),
@@ -1551,6 +1554,13 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         retainWhenHidden: true,
       });
     });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
+    });
+    await waitFor(() => expect(result.current.rooms).toHaveLength(1));
+    act(() => result.current.openRoom(room.id));
     const attachmentMessage = {
       id: "attachment-message",
       chatId: room.id,
@@ -1607,6 +1617,13 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         retainWhenHidden: true,
       });
     });
+    const secondRelay = mocks.getLastRelay();
+    await act(async () => {
+      secondRelay?.emit({ type: "rooms", rooms: [room] });
+      secondRelay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
+    });
+    await waitFor(() => expect(result.current.rooms).toHaveLength(1));
+    act(() => result.current.openRoom(room.id));
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
     await act(async () => result.current.exportAttachment(attachmentMessage));
     expect(URL.revokeObjectURL).not.toHaveBeenCalledWith("blob:decrypted-media");
@@ -1690,6 +1707,8 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     });
     act(() => result.current.openRoom("dm_bob"));
     await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
+    expect(result.current.safetyNumber).toBeTruthy();
+    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
 
     mocks.FakeCipher.requiredPeers.add("Bob");
     await act(async () => expect(await result.current.sendText("first")).toBe(true));
@@ -1700,6 +1719,199 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await act(async () => expect(await result.current.sendText("established")).toBe(true));
     expect(relay?.leasesRequested).toEqual(["Bob"]);
     expect(relay?.leasesReleased).toEqual([]);
+    unmount();
+  });
+
+  it("blocks direct text before IDs or encryption until the exact safety number is confirmed", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    await act(async () => {
+      relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
+      relay?.emit({ type: "presence", users: presenceCatalog(["Bob"]).users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    act(() => result.current.openRoom("dm_bob"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
+
+    await act(async () => expect(await result.current.sendText("blocked")).toBe(false));
+    expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(0);
+    expect(relay?.sent.some((frame) => (frame as { type?: string }).type === "message")).toBe(false);
+    expect(result.current.verifyDirectSafetyNumber("wrong safety number")).toBe(false);
+    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+    await act(async () => expect(await result.current.sendText("allowed")).toBe(true));
+    unmount();
+  });
+
+  it("rejects every unverified direct data path before crypto, prekeys, or network side effects", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
+      relay?.emit({ type: "presence", users: catalog.users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    act(() => result.current.openRoom("dm_bob"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
+
+    const uuidSpy = vi.spyOn(globalThis.crypto, "randomUUID");
+    await act(async () => expect(await result.current.sendText("blocked")).toBe(false));
+    await act(async () => expect(await result.current.sendAttachment({
+      file: new File([new Uint8Array([1, 2, 3])], "secret.bin", { type: "application/octet-stream" }),
+      options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
+    })).toBe(false));
+    const attachmentMessage = {
+      id: "attachment-message",
+      chatId: "dm_bob",
+      sender: "Bob",
+      content: "secret.txt",
+      kind: "attachment" as const,
+      createdAtMs: Date.now(),
+      receivedAtMs: Date.now(),
+      selfDestructSec: 0,
+      absoluteExpirySec: 0,
+      mine: false,
+      attachment: {
+        id: "123e4567-e89b-42d3-a456-426614174000",
+        encryptionVersion: 1,
+        encryptionKey: new Uint8Array(32).fill(9),
+        name: "secret.txt",
+        mediaType: "FILE" as const,
+        mimeType: "text/plain",
+        sizeBytes: 3,
+        oneTime: false,
+        deleteAfterDownload: false,
+      },
+    };
+    await act(async () => {
+      await result.current.viewAttachment(attachmentMessage);
+      await result.current.exportAttachment(attachmentMessage);
+    });
+
+    expect(uuidSpy).not.toHaveBeenCalled();
+    expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(0);
+    expect(mocks.FakeCipher.lastAttachmentPlain).toBeNull();
+    expect(relay?.leasesRequested).toEqual([]);
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message")).toHaveLength(0);
+    expect(mocks.uploadEncryptedAttachment).not.toHaveBeenCalled();
+    expect(mocks.downloadEncryptedAttachment).not.toHaveBeenCalled();
+
+    // An incoming message may be decrypted and acknowledged, but opening the
+    // unverified direct chat must not emit a read receipt. Local read state is
+    // allowed to update independently of that outbound authorization.
+    const incoming = stampedFrame({
+      type: "message",
+      chat_id: "dm_bob",
+      version: 9,
+      message_id: "incoming-direct-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }, catalog.stamp);
+    await act(async () => relay?.emit(incoming));
+    await waitFor(() => expect(result.current.messages.dm_bob).toHaveLength(1));
+    act(() => result.current.openRoom("dm_bob"));
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
+    // The local inbound frame is still rendered/read locally; the security
+    // interlock requirement here is that no encrypted read receipt is sent.
+    expect(result.current.messages.dm_bob?.[0]?.readAtMs).toEqual(expect.any(Number));
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message")).toHaveLength(0);
+    uuidSpy.mockRestore();
+    unmount();
+  });
+
+  it("clears direct verification on reconnect while preserving room and direct catalogs", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
+      relay?.emit({ type: "presence", users: catalog.users });
+    });
+    await waitFor(() => {
+      expect(result.current.rooms).toEqual([room]);
+      expect(result.current.directs).toEqual([{ id: "dm_bob", peer_username: "Bob" }]);
+    });
+    act(() => result.current.openRoom("dm_bob"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
+    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+    await waitFor(() => expect(result.current.directTrust.verified).toBe(true));
+
+    act(() => relay?.close());
+    await waitFor(() => expect(result.current.directTrust.verified).toBe(false));
+    expect(result.current.rooms).toEqual([room]);
+    expect(result.current.directs).toEqual([{ id: "dm_bob", peer_username: "Bob" }]);
+
+    act(() => relay?.connect());
+    await waitFor(() => expect(result.current.connection).toBe("connected"));
+    expect(result.current.directTrust.active).toBe(true);
+    expect(result.current.directTrust.verified).toBe(false);
+    unmount();
+  });
+
+  it("does not publish a verified operation after its connection generation is invalidated", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "directs", directs: [{ id: "dm_bob", peer_username: "Bob" }] });
+      relay?.emit({ type: "presence", users: catalog.users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    act(() => result.current.openRoom("dm_bob"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
+    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+
+    let resolveSend!: (result: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
+    mocks.FakeRelay.encryptedResult = new Promise((resolve) => { resolveSend = resolve; });
+    let pending: Promise<boolean> | undefined;
+    act(() => { pending = result.current.sendText("must not cross reconnect"); });
+    await waitFor(() => expect(relay?.sent.some((item) => (item as { type?: string }).type === "message")).toBe(true));
+
+    act(() => relay?.close());
+    await waitFor(() => expect(result.current.directTrust.verified).toBe(false));
+    act(() => resolveSend("ACCEPTED"));
+    await act(async () => expect(pending).resolves.toBe(false));
+    expect(result.current.messages.dm_bob).toBeUndefined();
     unmount();
   });
 

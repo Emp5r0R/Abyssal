@@ -49,6 +49,11 @@ import {
   wipeOpaqueStart,
 } from "../security/crypto";
 import { attachmentDownloadBlob, attachmentDownloadName } from "../security/attachmentExport";
+import {
+  DirectTrustStore,
+  type DirectTrustContext,
+  type DirectTrustStatus,
+} from "../security/directTrust";
 import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   decryptAndCompleteAttachment,
@@ -121,6 +126,7 @@ interface UploadState extends UploadProgress {
 interface AttachmentOperation {
   controller: AbortController;
   generation: number;
+  connectionGeneration: number;
   wipe: () => void;
 }
 
@@ -158,6 +164,12 @@ export function useAbyssalSession() {
   const [upload, setUpload] = useState<UploadState>(EMPTY_UPLOAD);
   const [media, setMedia] = useState<DecryptedMedia | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [directTrust, setDirectTrust] = useState<DirectTrustStatus>({
+    active: false,
+    peerUsername: null,
+    safetyNumber: null,
+    verified: false,
+  });
   const socketRef = useRef<RelaySocket | null>(null);
   const loginAbortRef = useRef<AbortController | null>(null);
   const cipherRef = useRef(new InMemoryPayloadCipher());
@@ -182,6 +194,8 @@ export function useAbyssalSession() {
   const frameQueueRef = useRef<Promise<void>>(Promise.resolve());
   const sendReadReceiptRef = useRef<(chatId: string, messageId: string) => void>(() => undefined);
   const sessionGenerationRef = useRef(0);
+  const connectionGenerationRef = useRef(0);
+  const directTrustRef = useRef(new DirectTrustStore());
   const cryptoGateRef = useRef(new AsyncCryptoGate());
   const attachmentOperationsRef = useRef(new Set<AttachmentOperation>());
   const exportUrlsRef = useRef(new Map<string, number | null>());
@@ -241,6 +255,7 @@ export function useAbyssalSession() {
     const operation = {
       controller: new AbortController(),
       generation: sessionGenerationRef.current,
+      connectionGeneration: connectionGenerationRef.current,
       wipe,
     };
     attachmentOperationsRef.current.add(operation);
@@ -255,8 +270,71 @@ export function useAbyssalSession() {
   const attachmentOperationActive = useCallback((operation: AttachmentOperation, token: string): boolean => (
     !operation.controller.signal.aborted &&
     operation.generation === sessionGenerationRef.current &&
+    operation.connectionGeneration === connectionGenerationRef.current &&
     sessionRef.current?.token === token
   ), []);
+
+  const clearDirectTrust = useCallback(() => {
+    directTrustRef.current.clear();
+    setDirectTrust(directTrustRef.current.status(null));
+  }, []);
+
+  const activeDirectTrustContext = useCallback((chatId = activeRoomRef.current): DirectTrustContext | null => {
+    const currentSession = sessionRef.current;
+    if (!currentSession || !chatId || chatId !== activeRoomRef.current || connection !== "connected") return null;
+    const direct = directsRef.current.find((candidate) => candidate.id === chatId);
+    if (!direct) return null;
+    const peer = presenceRef.current.find(
+      (user) => user.username.toLowerCase() === direct.peer_username.toLowerCase(),
+    );
+    if (!peer) return null;
+    let peerIdentity: Uint8Array<ArrayBufferLike> | null = null;
+    try {
+      peerIdentity = base64ToBytes(peer.identity_public_b64);
+      const safetyNumber = conversationSafetyNumber(currentSession.identityPublicKey, peerIdentity);
+      return {
+        chatId: direct.id,
+        peerUsername: direct.peer_username,
+        safetyNumber,
+        sessionGeneration: sessionGenerationRef.current,
+        connectionGeneration: connectionGenerationRef.current,
+        localIdentity: currentSession.identityPublicKey.slice(),
+        peerIdentity,
+      };
+    } catch {
+      peerIdentity?.fill(0);
+      return null;
+    }
+  }, [connection]);
+
+  const refreshDirectTrust = useCallback(() => {
+    const context = activeDirectTrustContext();
+    directTrustRef.current.invalidateIfIdentityChanged(context);
+    setDirectTrust(directTrustRef.current.status(context));
+    context?.localIdentity.fill(0);
+    context?.peerIdentity.fill(0);
+  }, [activeDirectTrustContext]);
+
+  const directOperationAllowed = useCallback((chatId: string): boolean => {
+    const context = activeDirectTrustContext(chatId);
+    directTrustRef.current.invalidateIfIdentityChanged(context);
+    const allowed = directTrustRef.current.isVerified(context);
+    context?.localIdentity.fill(0);
+    context?.peerIdentity.fill(0);
+    const isDirect = directsRef.current.some((direct) => direct.id === chatId);
+    const isRoom = roomsRef.current.some((room) => room.id === chatId);
+    return isDirect ? allowed : isRoom;
+  }, [activeDirectTrustContext]);
+
+  const verifyDirectSafetyNumber = useCallback((displayedSafetyNumber: string): boolean => {
+    const context = activeDirectTrustContext();
+    if (!context) return false;
+    const accepted = directTrustRef.current.markVerified(context, displayedSafetyNumber);
+    context.localIdentity.fill(0);
+    context.peerIdentity.fill(0);
+    refreshDirectTrust();
+    return accepted;
+  }, [activeDirectTrustContext, refreshDirectTrust]);
 
   const clearMedia = useCallback(() => {
     const current = mediaRef.current;
@@ -266,9 +344,11 @@ export function useAbyssalSession() {
   }, []);
 
   useEffect(() => {
+    const directTrustStore = directTrustRef.current;
     return () => {
       cancelAttachmentOperations();
       clearExportUrls();
+      directTrustStore.clear();
       const current = mediaRef.current;
       mediaRef.current = null;
       if (current) URL.revokeObjectURL(current.objectUrl);
@@ -308,6 +388,8 @@ export function useAbyssalSession() {
     directoryStampRef.current = null;
     directoryNodeRef.current = null;
     directoryRevisionRef.current = 0;
+    clearDirectTrust();
+    connectionGenerationRef.current += 1;
     frameQueueRef.current = Promise.resolve();
     roomsRef.current = [];
     directsRef.current = [];
@@ -317,7 +399,7 @@ export function useAbyssalSession() {
     retainWhenHiddenRef.current = false;
     lastActivityRef.current = 0;
     lastActivitySignalRef.current = 0;
-  }, [cancelAttachmentOperations, clearExportUrls, clearMedia]);
+  }, [cancelAttachmentOperations, clearDirectTrust, clearExportUrls, clearMedia]);
 
   const clearPrivateView = useCallback(() => {
     clearMedia();
@@ -913,6 +995,13 @@ export function useAbyssalSession() {
         },
         (state) => {
           if (sessionRef.current && sessionRef.current.token !== candidate.token) return;
+          if (state !== "connected") {
+            connectionGenerationRef.current += 1;
+            clearDirectTrust();
+            cancelAttachmentOperations();
+            clearMedia();
+            clearExportUrls();
+          }
           setConnection(state);
         },
         () => {
@@ -953,13 +1042,17 @@ export function useAbyssalSession() {
     } finally {
       if (loginAbortRef.current === loginAbort) loginAbortRef.current = null;
     }
-  }, [applyFrame, failClosed]);
+  }, [applyFrame, cancelAttachmentOperations, clearDirectTrust, clearExportUrls, clearMedia, failClosed]);
 
   useEffect(() => {
     if (connection !== "connected") return;
     rooms.forEach((room) => socketRef.current?.join(room.id));
     directs.forEach((direct) => socketRef.current?.join(direct.id));
   }, [connection, directs, rooms]);
+
+  useEffect(() => {
+    refreshDirectTrust();
+  }, [activeRoomId, connection, presence, refreshDirectTrust, session]);
 
   useEffect(() => {
     if (!session) return;
@@ -993,6 +1086,10 @@ export function useAbyssalSession() {
   }, [clearMemory]);
 
   const markRoomRead = useCallback((chatId: string) => {
+    const trusted = directOperationAllowed(chatId);
+    const knownChat = roomsRef.current.some((room) => room.id === chatId) ||
+      directsRef.current.some((direct) => direct.id === chatId);
+    if (!knownChat) return;
     const now = Date.now();
     const receipts: string[] = [];
     updateMessages((current) => {
@@ -1007,8 +1104,8 @@ export function useAbyssalSession() {
       });
       return changed ? { ...current, [chatId]: nextMessages } : current;
     });
-    receipts.forEach((messageId) => sendReadReceiptRef.current(chatId, messageId));
-  }, [updateMessages]);
+    if (trusted) receipts.forEach((messageId) => sendReadReceiptRef.current(chatId, messageId));
+  }, [directOperationAllowed, updateMessages]);
 
   const openRoom = useCallback((chatId: string | null) => {
     clearMedia();
@@ -1067,6 +1164,7 @@ export function useAbyssalSession() {
   const runOutboundTransaction = useCallback(async (
     currentSession: AccountSession,
     generation: number,
+    connectionGeneration: number,
     chatId: string,
     messageId: string,
     recipients: Array<{ username: string; publicKey: Uint8Array; prekeyId: string }>,
@@ -1080,6 +1178,7 @@ export function useAbyssalSession() {
     if (!directoryStamp) return "NOT_SENT";
     let leasesReleaseAttempted = false;
     const active = () => generation === sessionGenerationRef.current &&
+      connectionGeneration === connectionGenerationRef.current &&
       sessionRef.current?.token === currentSession.token;
     const releaseAcquiredLeases = () => {
       if (leasesReleaseAttempted || !active()) return;
@@ -1136,7 +1235,10 @@ export function useAbyssalSession() {
               ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
             },
           ) ?? Promise.resolve("NOT_SENT" as const));
-          if (!active()) return sent;
+          if (!active()) {
+            if (sent === "ACCEPTED") failClosed(currentSession);
+            return sent === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
+          }
           if (sent === "ACCEPTED") {
             try {
               cipherRef.current.commitOutbound(messageId, stagedPayload.stateRevision);
@@ -1196,14 +1298,17 @@ export function useAbyssalSession() {
 
   const sendReadReceipt = useCallback((chatId: string, messageId: string) => {
     const currentSession = sessionRef.current;
-    if (!currentSession || !validControlId(messageId)) return;
+    if (!currentSession || connection !== "connected" || !validControlId(messageId)) return;
+    if (!directOperationAllowed(chatId)) return;
     const recipients = recipientKeysFor(chatId);
     if (recipients.length === 0) return;
     const generation = sessionGenerationRef.current;
+    const connectionGeneration = connectionGenerationRef.current;
     const receiptId = crypto.randomUUID();
     void runOutboundTransaction(
       currentSession,
       generation,
+      connectionGeneration,
       chatId,
       receiptId,
       recipients,
@@ -1218,7 +1323,7 @@ export function useAbyssalSession() {
         recipients,
       ),
     );
-  }, [recipientKeysFor, runOutboundTransaction]);
+  }, [connection, directOperationAllowed, recipientKeysFor, runOutboundTransaction]);
 
   useEffect(() => {
     sendReadReceiptRef.current = sendReadReceipt;
@@ -1230,6 +1335,12 @@ export function useAbyssalSession() {
     const room = conversationForId(roomsRef.current, directsRef.current, chatId);
     const clean = content.trim();
     if (!currentSession || !chatId || !room || !clean || connection !== "connected") return false;
+    if (!directOperationAllowed(chatId)) {
+      setNotice("Verify this direct chat's safety number before sending.");
+      return false;
+    }
+    const connectionGeneration = connectionGenerationRef.current;
+    if (connectionGeneration !== connectionGenerationRef.current || connection !== "connected") return false;
     const recipients = recipientKeysFor(chatId);
     if (recipients.length === 0) return false;
     const generation = sessionGenerationRef.current;
@@ -1252,6 +1363,7 @@ export function useAbyssalSession() {
     const outcome = await runOutboundTransaction(
       currentSession,
       generation,
+      connectionGeneration,
       chatId,
       message.id,
       recipients,
@@ -1268,7 +1380,7 @@ export function useAbyssalSession() {
       updateMessages((current) => appendBoundedMessage(current, message));
     }
     return outcome === "ACCEPTED";
-  }, [activeRoomId, connection, messages, recipientKeysFor, runOutboundTransaction, updateMessages]);
+  }, [activeRoomId, connection, directOperationAllowed, messages, recipientKeysFor, runOutboundTransaction, updateMessages]);
 
   const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
@@ -1291,6 +1403,10 @@ export function useAbyssalSession() {
       ))
     ) {
       setNotice("Action unavailable.");
+      return false;
+    }
+    if (!directOperationAllowed(chatId)) {
+      setNotice("Verify this direct chat's safety number before sending.");
       return false;
     }
     const recipients = recipientKeysFor(chatId);
@@ -1328,6 +1444,7 @@ export function useAbyssalSession() {
         mediaType,
         plain,
       );
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const ttlSec = absoluteRetention(room, mediaType);
       const attachmentId = await uploadEncryptedAttachment(
         currentSession,
@@ -1377,6 +1494,7 @@ export function useAbyssalSession() {
       const outcome = await runOutboundTransaction(
         currentSession,
         operation.generation,
+        operation.connectionGeneration,
         chatId,
         outgoingMessage.id,
         recipients,
@@ -1401,7 +1519,8 @@ export function useAbyssalSession() {
     } finally {
       finishAttachmentOperation(operation);
       recipients.forEach((recipient) => wipeBytes(recipient.publicKey));
-      if (uploadedAttachmentId && !retainedMessage && !metadataAmbiguous) {
+      if (uploadedAttachmentId && !retainedMessage && !metadataAmbiguous &&
+        operation.connectionGeneration === connectionGenerationRef.current) {
         await deleteUploadedAttachment(currentSession, uploadedAttachmentId).catch(() => undefined);
       }
       if (operation.generation === sessionGenerationRef.current) setUpload(EMPTY_UPLOAD);
@@ -1410,6 +1529,7 @@ export function useAbyssalSession() {
     activeRoomId,
     attachmentOperationActive,
     connection,
+    directOperationAllowed,
     finishAttachmentOperation,
     messages,
     recipientKeysFor,
@@ -1421,7 +1541,14 @@ export function useAbyssalSession() {
   const viewAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
     const attachment = message.attachment;
-    if (!currentSession || !attachment) return;
+    const chatId = activeRoomRef.current;
+    if (!currentSession || !attachment || !chatId || message.chatId !== chatId ||
+      !conversationForId(roomsRef.current, directsRef.current, message.chatId) ||
+      connection !== "connected") return;
+    if (!directOperationAllowed(message.chatId)) {
+      setNotice("Verify this direct chat's safety number before opening attachments.");
+      return;
+    }
     clearMedia();
     let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -1435,6 +1562,7 @@ export function useAbyssalSession() {
       wipeBytes(plain);
     });
     try {
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       if (
         attachment.encryptionVersion !== ATTACHMENT_CIPHER_VERSION ||
         attachment.encryptionKey.byteLength !== 32
@@ -1453,14 +1581,17 @@ export function useAbyssalSession() {
           currentSession,
           attachment.id,
           downloaded,
-          () => cipherRef.current.decryptAttachment(
-            message.chatId,
-            message.id,
-            message.sender,
-            attachment.mediaType,
-            key,
-            encrypted,
-          ),
+          () => {
+            if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
+            return cipherRef.current.decryptAttachment(
+              message.chatId,
+              message.id,
+              message.sender,
+              attachment.mediaType,
+              key,
+              encrypted,
+            );
+          },
           attachmentPlaintextPolicy(attachment),
           operation.controller.signal,
         );
@@ -1471,6 +1602,7 @@ export function useAbyssalSession() {
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const blob = attachmentDownloadBlob(plain, attachment.mimeType);
       objectUrl = URL.createObjectURL(blob);
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const nextMedia: DecryptedMedia = {
         messageId: message.id,
         name: attachment.name,
@@ -1496,6 +1628,8 @@ export function useAbyssalSession() {
   }, [
     attachmentOperationActive,
     clearMedia,
+    connection,
+    directOperationAllowed,
     finishAttachmentOperation,
     markRoomRead,
     startAttachmentOperation,
@@ -1504,7 +1638,14 @@ export function useAbyssalSession() {
   const exportAttachment = useCallback(async (message: ChatMessage): Promise<void> => {
     const currentSession = sessionRef.current;
     const attachment = message.attachment;
-    if (!currentSession || !attachment || attachment.oneTime) return;
+    const chatId = activeRoomRef.current;
+    if (!currentSession || !attachment || attachment.oneTime || !chatId || message.chatId !== chatId ||
+      !conversationForId(roomsRef.current, directsRef.current, message.chatId) ||
+      connection !== "connected") return;
+    if (!directOperationAllowed(message.chatId)) {
+      setNotice("Verify this direct chat's safety number before exporting attachments.");
+      return;
+    }
     let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -1517,6 +1658,7 @@ export function useAbyssalSession() {
       wipeBytes(plain);
     });
     try {
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       if (
         attachment.encryptionVersion !== ATTACHMENT_CIPHER_VERSION ||
         attachment.encryptionKey.byteLength !== 32
@@ -1535,14 +1677,17 @@ export function useAbyssalSession() {
           currentSession,
           attachment.id,
           downloaded,
-          () => cipherRef.current.decryptAttachment(
-            message.chatId,
-            message.id,
-            message.sender,
-            attachment.mediaType,
-            key,
-            encrypted,
-          ),
+          () => {
+            if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
+            return cipherRef.current.decryptAttachment(
+              message.chatId,
+              message.id,
+              message.sender,
+              attachment.mediaType,
+              key,
+              encrypted,
+            );
+          },
           attachmentPlaintextPolicy(attachment),
           operation.controller.signal,
         );
@@ -1552,6 +1697,7 @@ export function useAbyssalSession() {
       if (downloaded.claim) wipeMessageAttachment(message);
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       exportUrl = URL.createObjectURL(attachmentDownloadBlob(plain, attachment.mimeType));
+      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       exportUrlsRef.current.set(exportUrl, null);
       const link = document.createElement("a");
       link.href = exportUrl;
@@ -1577,6 +1723,8 @@ export function useAbyssalSession() {
     }
   }, [
     attachmentOperationActive,
+    connection,
+    directOperationAllowed,
     finishAttachmentOperation,
     markRoomRead,
     revokeExportUrl,
@@ -1623,6 +1771,7 @@ export function useAbyssalSession() {
     activeRoom,
     activeRoomId,
     safetyNumber,
+    directTrust,
     remainingSessionSec,
     upload,
     media,
@@ -1635,6 +1784,7 @@ export function useAbyssalSession() {
     touchActivity,
     openRoom,
     openDirect,
+    verifyDirectSafetyNumber,
     markRoomRead,
     sendText,
     sendAttachment,

@@ -54,4 +54,37 @@ describe("direct message retention", () => {
 
     await waitFor(() => expect(send).toHaveBeenCalledWith("kept in session", undefined, 0));
   });
+
+  it("shows an unverified direct status and requires out-of-band confirmation", async () => {
+    const verify = vi.fn(() => true);
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected
+        safetyNumber="1234 5678 9012"
+        directTrust={{ verified: false }}
+        messages={[]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn().mockResolvedValue(true)}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn().mockResolvedValue(true)}
+        onVerifySafetyNumber={verify}
+      />,
+    );
+
+    const verifyButton = screen.getAllByRole("button", { name: "Confirm direct chat safety number comparison" }).find((button) => !(button as HTMLButtonElement).disabled);
+    expect(verifyButton).toHaveTextContent("NOT COMPARED");
+    fireEvent.click(verifyButton!);
+    expect(screen.getByRole("heading", { name: "Verify direct chat" })).toBeInTheDocument();
+    expect(screen.getByText(/separate trusted channel/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "I COMPARED — CONFIRM" }));
+    await waitFor(() => expect(verify).toHaveBeenCalledWith("1234 5678 9012"));
+  });
 });

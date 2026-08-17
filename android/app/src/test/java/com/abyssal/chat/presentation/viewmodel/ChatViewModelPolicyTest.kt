@@ -3,6 +3,7 @@ package com.abyssal.chat.presentation.viewmodel
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientIdentity
@@ -15,6 +16,7 @@ import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.SessionInactivityPolicy
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
+import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IAppUpdateService
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
@@ -36,6 +38,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -116,6 +119,122 @@ class ChatViewModelPolicyTest {
         assertFalse(isLocalOnlyForum("forum_general", listOf(recipient("Bob"))))
         assertFalse(isLocalOnlyForum("dm_bob", emptyList()))
         assertFalse(isLocalOnlyForum("forum_general", null))
+    }
+
+    @Test
+    fun unverifiedDirectPathsRejectBeforeTransportAndForumsRemainAllowed() = runBlocking {
+        val sender = nativeIdentity(13)
+        val bob = nativeIdentity(14)
+        val user = User("Alice", sender.publicKey(), sender.prekeyId())
+        val direct = ChatSession(
+            id = "dm_bob",
+            name = "Bob",
+            isForum = false,
+            lastMessage = null,
+            unreadCount = 0,
+            selfDestructTimerSec = 5
+        )
+        val forum = direct.copy(id = "forum_ops", name = "Operations", isForum = true)
+        val attachment = attachmentMessage(70).copy(sender = "Bob", receiver = "Alice")
+        val attachmentCalls = AtomicLong(0L)
+        val markReadCalls = AtomicLong(0L)
+        val activeSession = nodeSession("node-dm", "token-dm")
+        val probe = TransactionTransportProbe(
+            cipher = sender,
+            leases = emptyList(),
+            sendResult = OutboundSendResult.ACCEPTED,
+            presence = listOf(UserPresence("Bob", true, bob.publicKey(), bob.prekeyId()))
+        )
+        val viewModel = transactionViewModel(
+            payloadCipher = sender,
+            user = user,
+            probe = probe,
+            sessions = listOf(forum, direct),
+            messages = mapOf("dm_bob" to listOf(attachment)),
+            attachmentCalls = attachmentCalls,
+            markReadCalls = markReadCalls,
+            activeSession = activeSession
+        )
+
+        try {
+            viewModel.sessions.first { it.size == 2 }
+            viewModel.serverStatus.first { it.state == "CONNECTED" }
+            setActiveChatId(viewModel, "dm_bob")
+            viewModel.activeMessages.first { it.singleOrNull()?.id == attachment.id }
+
+            assertFalse(viewModel.directTrust.value.verified)
+            assertFalse(invokeIsDirectChatTrusted(viewModel, "dm_bob"))
+            assertTrue(invokeIsDirectChatTrusted(viewModel, "forum_ops"))
+            assertFalse(invokeIsDirectChatTrusted(viewModel, "dm_missing"))
+
+            viewModel.sendMessage("must be verified", 5)
+            val bytes = byteArrayOf(1, 2, 3)
+            viewModel.sendAttachment(
+                mediaType = "FILE",
+                fileName = "secret.bin",
+                mimeType = "application/octet-stream",
+                bytes = bytes,
+                selfDestructSec = 5,
+                oneTimeView = false,
+                deleteAfterDownload = false
+            )
+            viewModel.viewAttachment(attachment)
+            viewModel.markMessageAsRead(attachment.id)
+            delay(100)
+
+            assertArrayEquals(ByteArray(3), bytes)
+            assertEquals(0L, attachmentCalls.get())
+            assertEquals(1L, markReadCalls.get())
+            assertTrue(probe.events.isEmpty())
+        } finally {
+            viewModel.clear()
+            user.publicKey.fill(0)
+            sender.clear()
+            bob.clear()
+            attachment.attachmentKey?.fill(0)
+            attachment.senderPublicKey?.fill(0)
+        }
+    }
+
+    @Test
+    fun connectionGenerationInvalidationFailsClosedAfterAcceptedTransportResult() = runBlocking {
+        val sender = nativeIdentity(15)
+        val bob = nativeIdentity(16)
+        establishReciprocalSession(sender, bob)
+        val user = User("Alice", sender.publicKey(), sender.prekeyId())
+        val bobRecipient = recipientFromNative("Bob", bob)
+        val connectionGeneration = AtomicLong(1L)
+        val probe = TransactionTransportProbe(
+            cipher = sender,
+            leases = emptyList(),
+            sendResult = OutboundSendResult.ACCEPTED,
+            connectionGeneration = connectionGeneration,
+            invalidateAfterSend = true
+        )
+        val viewModel = transactionViewModel(sender, user, probe)
+        val stamp = invokeCaptureSessionStamp(viewModel)
+
+        try {
+            assertEquals(
+                OutboundSendResult.AMBIGUOUS,
+                invokeSendEncryptedMetadata(
+                    viewModel,
+                    stamp,
+                    chatId = "dm_bob",
+                    messageId = "message-connection-race",
+                    metadata = textMetadata("message-connection-race"),
+                    recipients = listOf(bobRecipient)
+                )
+            )
+            assertEquals(2L, connectionGeneration.get())
+            assertEquals(listOf("send:encrypted", "disconnect"), probe.events)
+            assertNull(viewModel.currentUser.value)
+            assertNull(sender.stateSnapshot())
+        } finally {
+            wipeSessionStamp(stamp)
+            viewModel.clear()
+            wipeUserAndCipher(user, sender, bobRecipient, bob)
+        }
     }
 
     @Test
@@ -952,7 +1071,12 @@ class ChatViewModelPolicyTest {
     private fun transactionViewModel(
         payloadCipher: InMemoryPayloadCipher,
         user: User,
-        probe: TransactionTransportProbe
+        probe: TransactionTransportProbe,
+        sessions: List<com.abyssal.chat.domain.model.ChatSession> = emptyList(),
+        messages: Map<String, List<Message>> = emptyMap(),
+        attachmentCalls: AtomicLong? = null,
+        markReadCalls: AtomicLong? = null,
+        activeSession: NodeSession? = null
     ): ChatViewModel {
         val identityService = proxy(IIdentityService::class.java) { method ->
             when (method.name) {
@@ -963,22 +1087,37 @@ class ChatViewModelPolicyTest {
         }
         val nodeConfig = proxy(INodeConfigService::class.java) { method ->
             when (method.name) {
-                "getActiveSession" -> null
+                "getActiveSession" -> activeSession
                 "normalizeNodeUrl" -> error("normalizeNodeUrl must not run")
                 else -> Unit
             }
         }
-        val repository = proxy(IMessageRepository::class.java) { method ->
-            when (method.name) {
-                "getChatSessions" -> flowOf(emptyList<com.abyssal.chat.domain.model.ChatSession>())
-                "getMessages" -> flowOf(emptyList<Message>())
+        val repository = proxyWithArgs(IMessageRepository::class.java) { method, args ->
+            when {
+                method.name == "getChatSessions" -> flowOf(sessions)
+                method.name == "getMessages" -> flowOf(messages[args?.getOrNull(0) as? String].orEmpty())
+                method.name.startsWith("markAsReadIfCurrent") -> {
+                    markReadCalls?.incrementAndGet()
+                    true
+                }
                 // Kotlin ULong is represented as a primitive/boxed Long at
                 // this Java proxy boundary (the method name is mangled).
                 else -> if (method.name.startsWith("currentEpoch")) 0L else Unit
             }
         }
         val sender = proxy(IMessageSender::class.java) { Unit }
-        val attachmentService = proxy(IEncryptedAttachmentService::class.java) { Unit }
+        val attachmentService = proxy(IEncryptedAttachmentService::class.java) { method ->
+            if (attachmentCalls != null && method.name in setOf(
+                    "uploadEncryptedAttachment",
+                    "downloadEncryptedAttachment",
+                    "deleteUploadedAttachment",
+                    "completeAttachmentDownload",
+                    "releaseAttachmentDownloadClaim",
+                    "saveDecryptedAttachment"
+                )
+            ) attachmentCalls.incrementAndGet()
+            else Unit
+        }
         val disguiseManager = proxy(IDisguiseManager::class.java) { method ->
             when (method.name) {
                 "isDisguiseEnabled" -> false
@@ -1009,6 +1148,16 @@ class ChatViewModelPolicyTest {
             type.classLoader,
             arrayOf(type)
         ) { _, method, _ -> handler(method) } as T
+
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> proxyWithArgs(
+        type: Class<T>,
+        handler: (Method, Array<out Any?>?) -> Any?
+    ): T =
+        Proxy.newProxyInstance(
+            type.classLoader,
+            arrayOf(type)
+        ) { _, method, args -> handler(method, args) } as T
 
     private fun nativeIdentity(fill: Int): InMemoryPayloadCipher = InMemoryPayloadCipher().also {
         val exportKey = ByteArray(64) { fill.toByte() }
@@ -1135,7 +1284,10 @@ class ChatViewModelPolicyTest {
     private class TransactionTransportProbe(
         private val cipher: InMemoryPayloadCipher,
         private val leases: List<PrekeyLease?>,
-        private val sendResult: OutboundSendResult
+        private val sendResult: OutboundSendResult,
+        private val connectionGeneration: AtomicLong = AtomicLong(1L),
+        private val invalidateAfterSend: Boolean = false,
+        private val presence: List<com.abyssal.chat.domain.model.UserPresence> = emptyList()
     ) {
         val events = mutableListOf<String>()
         private var leaseIndex = 0
@@ -1145,11 +1297,20 @@ class ChatViewModelPolicyTest {
             arrayOf(IChatTransport::class.java)
         ) { _, method, args ->
             when (method.name) {
-                "currentConnectionGeneration" -> 1L
+                "currentConnectionGeneration" -> connectionGeneration.get()
+                "runIfConnectionCurrent" -> {
+                    val expected = args?.getOrNull(0) as Long
+                    if (expected == connectionGeneration.get()) {
+                        @Suppress("UNCHECKED_CAST")
+                        (args.getOrNull(1) as Function0<Boolean>).invoke()
+                    } else {
+                        false
+                    }
+                }
                 "currentDirectoryStamp" -> TEST_DIRECTORY_STAMP
                 "directoryEvidenceStatus" -> DirectoryEvidenceStatus.KNOWN
                 "getServerStatus" -> flowOf(ServerStatus("CONNECTED", "node", 0))
-                "getPresence" -> flowOf(emptyList<com.abyssal.chat.domain.model.UserPresence>())
+                "getPresence" -> flowOf(presence)
                 "getIncomingWipeCommands" -> flowOf<Long>()
                 "getIncomingPayloads" -> flowOf<IncomingTransportPayload>()
                 "getRoomChanges" -> flowOf<com.abyssal.chat.domain.model.RoomChange>()
@@ -1173,6 +1334,7 @@ class ChatViewModelPolicyTest {
                         "native encrypt did not stage before relay send"
                     }
                     events += "send:encrypted"
+                    if (invalidateAfterSend) connectionGeneration.incrementAndGet()
                     sendResult
                 }
                 "disconnect" -> {
@@ -1218,6 +1380,22 @@ class ChatViewModelPolicyTest {
         val field = ChatViewModel::class.java.getDeclaredField("sessionGeneration")
         field.isAccessible = true
         field.set(viewModel, AtomicLong(generation))
+    }
+
+    private fun setActiveChatId(viewModel: ChatViewModel, chatId: String?) {
+        val field = ChatViewModel::class.java.getDeclaredField("_activeChatId")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        (field.get(viewModel) as MutableStateFlow<String?>).value = chatId
+    }
+
+    private fun invokeIsDirectChatTrusted(viewModel: ChatViewModel, chatId: String): Boolean {
+        val method = ChatViewModel::class.java.getDeclaredMethod(
+            "isDirectChatTrusted",
+            String::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(viewModel, chatId) as Boolean
     }
 
     private fun setActiveSessionPolicy(viewModel: ChatViewModel) {
