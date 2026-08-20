@@ -772,15 +772,18 @@ export class RelaySocket {
 export function uploadEncryptedAttachment(
   session: AccountSession,
   chatId: string,
+  messageId: string,
   mediaType: string,
   encrypted: Uint8Array,
   options: AttachmentOptions,
   onProgress: (progress: UploadProgress) => void,
   signal?: AbortSignal,
 ): Promise<string> {
+  if (!validUuid(messageId)) return Promise.reject(new Error("Upload rejected"));
   return new Promise((resolve, reject) => {
     const query = new URLSearchParams({
       chat_id: chatId,
+      message_id: messageId,
       media_type: mediaType,
       one_time: String(options.oneTime),
       delete_after_download: String(options.deleteAfterDownload || options.oneTime),

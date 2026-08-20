@@ -153,6 +153,7 @@ class EncryptedAttachmentService(
     override suspend fun uploadEncryptedAttachment(
         session: NodeSession,
         chatId: String,
+        messageId: String,
         mediaType: String,
         encryptedBytes: ByteArray,
         oneTimeView: Boolean,
@@ -161,6 +162,7 @@ class EncryptedAttachmentService(
         onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult = withContext(Dispatchers.IO) {
         if (
+            !messageId.matches(ATTACHMENT_ID_REGEX) ||
             encryptedBytes.isEmpty() ||
             encryptedBytes.size.toLong() > attachmentWireSelectionLimitBytes(mediaType)
         ) {
@@ -168,6 +170,7 @@ class EncryptedAttachmentService(
         }
         val query = listOf(
             "chat_id" to chatId,
+            "message_id" to messageId,
             "media_type" to mediaType.uppercase(),
             "one_time" to oneTimeView.toString(),
             "delete_after_download" to deleteAfterDownload.toString(),

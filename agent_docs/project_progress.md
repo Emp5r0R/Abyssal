@@ -1,5 +1,58 @@
 # Project Progress
 
+## Completed Deployment: Transactional Attachment Publication
+
+This package reduces the remaining encrypted-attachment orphan window without
+adding disk state or weakening ambiguous-message handling. Each upload is bound
+to its already-generated sender/chat/message identity and remains staged under a
+short relay deadline until the relay atomically accepts that exact encrypted
+message transaction.
+
+### Delivered
+
+- Upload admission now requires the valid message ID already generated for
+  ratcheted metadata and rejects duplicate live owner/chat/message bindings
+  without replacing ciphertext.
+- Staged encrypted records consume existing byte and record quotas, are
+  non-downloadable to every account, and require a live 10-minute deadline
+  clamped to final retention. Missing or expired deadlines fail closed; the
+  30-second sweeper bounds normal cleanup to about 10.5 minutes.
+- After replay registration and signed state acceptance, the relay promotes
+  only the matching authenticated owner's staged record before fanout and
+  result emission. Rejected or rolled-back admission cannot publish it, while
+  an accepted message whose result is lost still publishes it.
+- Publication is serialized by the existing conversation/attachment locks and
+  preserves quota, deletion, destructive claim, expiry, restart, and wipe
+  semantics. The upload API requires `message_id`; attachment keys, cipher-v1
+  blobs, and protocol-v9 encrypted-message shapes are unchanged.
+- Web and Android pass the exact generated message ID to upload while retaining
+  the existing captured-session, cancellation, cleanup, and ambiguous-result
+  behavior.
+
+### Verification
+
+- Final `./scripts/test-all.sh all`: passed on the integrated tree.
+- Web: 250 tests in 18 files, zero-warning lint, TypeScript compilation, and the
+  production Vite build passed.
+- Rust: 25 core tests and 143 relay tests passed with rustfmt, locked workspace
+  tests, and warning-denied workspace Clippy.
+- Android: 189 JVM tests with zero skips/failures/errors, release lint, and
+  debug/release Kotlin compilation passed without invoking Android packaging.
+- Disposable-relay OPAQUE/E2EE integration covered pre-admission `404`, exact
+  publication, normal download, destructive completion/release, and access
+  control. Generated-artifact/source, Gradle dependency, deployment, shell,
+  npm, and RustSec checks also passed.
+
+### Remaining External Limits
+
+The pre-publication cleanup window is bounded rather than physically
+instantaneous. In-flight or kernel-delivered bytes cannot be recalled, hostile
+recipients can record decrypted content, and global wipe cannot reach offline
+clients. MLS group state, multi-device coordination, an external transparency
+witness, a persistent rollback anchor, metadata-obscuring transport, and an
+independent audit remain separate disclosed work. No Android package, release,
+or production deployment was performed.
+
 ## Completed Deployment: Direct Safety-Number Comparison Interlock
 
 This deployment closes the repository-fixable direct-chat verification gap by

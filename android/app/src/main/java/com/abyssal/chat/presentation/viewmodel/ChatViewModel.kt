@@ -1127,6 +1127,7 @@ class ChatViewModel(
                     val upload = attachmentService.uploadEncryptedAttachment(
                         session = capturedSession,
                         chatId = chatId,
+                        messageId = messageId,
                         mediaType = normalizedMediaType,
                         encryptedBytes = blob,
                         oneTimeView = oneTimeView,

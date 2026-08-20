@@ -131,6 +131,10 @@ const PREKEY_LEASE_TTL_MS: u64 = 30_000;
 const MAX_PREKEY_LEASES: usize = 4_096;
 const MAX_PREKEY_LEASES_PER_RECIPIENT: usize = PREKEY_POOL_SIZE_V9;
 const ATTACHMENT_CLAIM_TTL_MS: u64 = 10 * 60 * 1000;
+// Uploads remain non-downloadable until the exact encrypted message is
+// admitted. Keep this window short, and always clamp it to the final
+// attachment retention deadline below.
+const ATTACHMENT_STAGING_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_PREKEY_ID_BYTES: usize = 32;
 const DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB: usize = 320;
 const DEFAULT_ATTACHMENT_RECORD_LIMIT: usize = 16 * 1024;
@@ -204,6 +208,10 @@ struct AppState {
     direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
     pending: Arc<Mutex<HashMap<PendingKey, Vec<PendingFrame>>>>,
     pending_bytes: Arc<Mutex<usize>>,
+    // Attachment lifecycle code always locks bindings before attachments and
+    // then per-owner usage. This keeps exact publication lookup bounded while
+    // making cleanup atomic with record removal.
+    attachment_bindings: Arc<Mutex<HashMap<AttachmentBindingKey, Uuid>>>,
     attachments: Arc<Mutex<HashMap<Uuid, AttachmentRecord>>>,
     attachment_bytes_by_code: Arc<Mutex<HashMap<CodeId, usize>>>,
     attachment_downloads: Arc<Semaphore>,
@@ -417,11 +425,45 @@ struct AttachmentBlob {
     _memory_permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct AttachmentBindingKey {
+    owner_code_id: CodeId,
+    chat_id: String,
+    message_id: String,
+}
+
+impl AttachmentBindingKey {
+    fn new(owner_code_id: &CodeId, chat_id: &str, message_id: &str) -> Self {
+        Self {
+            owner_code_id: *owner_code_id,
+            chat_id: chat_id.to_string(),
+            message_id: message_id.to_string(),
+        }
+    }
+
+    fn matches_record(&self, record: &AttachmentRecord) -> bool {
+        self.owner_code_id == record.owner_code_id
+            && self.chat_id == record.chat_id
+            && self.message_id == record.message_id
+    }
+}
+
+impl Drop for AttachmentBindingKey {
+    fn drop(&mut self) {
+        self.owner_code_id.zeroize();
+        self.chat_id.zeroize();
+        self.message_id.zeroize();
+    }
+}
+
 struct AttachmentRecord {
     blob: Arc<AttachmentBlob>,
     chat_id: String,
+    message_id: String,
     media_type: String,
     owner_code_id: CodeId,
+    published: bool,
+    staged_expires_at_ms: Option<u64>,
     one_time: bool,
     delete_after_download: bool,
     expires_at_ms: Option<u64>,
@@ -444,6 +486,7 @@ impl Drop for AttachmentDownloadClaim {
 impl Drop for AttachmentRecord {
     fn drop(&mut self) {
         self.chat_id.zeroize();
+        self.message_id.zeroize();
         self.media_type.zeroize();
         self.owner_code_id.zeroize();
         for mut code_id in self.eligible_recipient_code_ids.drain() {
@@ -455,6 +498,17 @@ impl Drop for AttachmentRecord {
         for mut code_id in self.completed_recipient_code_ids.drain() {
             code_id.zeroize();
         }
+    }
+}
+
+fn remove_attachment_binding_if_matches(
+    bindings: &mut HashMap<AttachmentBindingKey, Uuid>,
+    attachment_id: Uuid,
+    record: &AttachmentRecord,
+) {
+    let key = AttachmentBindingKey::new(&record.owner_code_id, &record.chat_id, &record.message_id);
+    if bindings.get(&key).copied() == Some(attachment_id) {
+        bindings.remove(&key);
     }
 }
 
@@ -592,6 +646,7 @@ impl Drop for OpaqueAccountFinishRequest {
 #[serde(deny_unknown_fields)]
 struct AttachmentQuery {
     chat_id: String,
+    message_id: String,
     media_type: Option<String>,
     one_time: Option<bool>,
     delete_after_download: Option<bool>,
@@ -1122,6 +1177,7 @@ impl AppState {
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_bytes: Arc::new(Mutex::new(0)),
+            attachment_bindings: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
             attachment_bytes_by_code: Arc::new(Mutex::new(HashMap::new())),
             attachment_downloads: Arc::new(Semaphore::new(attachment_download_concurrency)),
@@ -1606,22 +1662,65 @@ async fn attachment_sweeper(state: AppState) {
 }
 
 async fn prune_expired_attachments(state: &AppState) {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    prune_expired_attachments_locked(state).await;
+}
+
+async fn prune_expired_attachments_locked(state: &AppState) {
     let now = now_ms();
+    let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
     let before = attachments.len();
-    attachments.retain(|_, record| {
+    attachments.retain(|attachment_id, record| {
         record
             .download_claims
             .retain(|_, claim| now.saturating_sub(claim.created_at_ms) < ATTACHMENT_CLAIM_TTL_MS);
-        if record.expires_at_ms.is_none_or(|expires| now < expires)
-            || !record.download_claims.is_empty()
-        {
+        let live = if record.published {
+            record.expires_at_ms.is_none_or(|expires| now < expires)
+        } else {
+            // A staged record without an explicit bounded deadline is
+            // malformed and must not survive or become publishable.
+            record
+                .staged_expires_at_ms
+                .is_some_and(|expires| now < expires)
+        };
+        if live || (record.published && !record.download_claims.is_empty()) {
             true
         } else {
+            remove_attachment_binding_if_matches(&mut bindings, *attachment_id, record);
             subtract_attachment_usage(&mut usage, &record.owner_code_id, record.blob.bytes.len());
             false
         }
+    });
+    let stale_bindings = bindings
+        .iter()
+        .filter_map(|(key, attachment_id)| {
+            attachments
+                .get(attachment_id)
+                .filter(|record| !key.matches_record(record))
+                .map(|_| (key.clone(), *attachment_id))
+        })
+        .collect::<Vec<_>>();
+    for (key, attachment_id) in stale_bindings {
+        bindings.remove(&key);
+        if !bindings
+            .values()
+            .any(|candidate_id| *candidate_id == attachment_id)
+        {
+            if let Some(record) = attachments.remove(&attachment_id) {
+                subtract_attachment_usage(
+                    &mut usage,
+                    &record.owner_code_id,
+                    record.blob.bytes.len(),
+                );
+            }
+        }
+    }
+    bindings.retain(|key, attachment_id| {
+        attachments
+            .get(attachment_id)
+            .is_some_and(|record| key.matches_record(record))
     });
     let removed = before.saturating_sub(attachments.len());
     if removed > 0 {
@@ -1630,12 +1729,14 @@ async fn prune_expired_attachments(state: &AppState) {
 }
 
 async fn remove_chat_attachments(state: &AppState, chat_id: &str) {
+    let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
-    attachments.retain(|_, record| {
+    attachments.retain(|attachment_id, record| {
         if record.chat_id != chat_id {
             true
         } else {
+            remove_attachment_binding_if_matches(&mut bindings, *attachment_id, record);
             subtract_attachment_usage(&mut usage, &record.owner_code_id, record.blob.bytes.len());
             false
         }
@@ -2081,6 +2182,162 @@ fn current_attachment_records_for_owner(
         .count()
 }
 
+async fn staged_attachment_for_message(
+    state: &AppState,
+    owner_code_id: &CodeId,
+    chat_id: &str,
+    message_id: &str,
+) -> Result<Option<Uuid>, String> {
+    let key = AttachmentBindingKey::new(owner_code_id, chat_id, message_id);
+    let mut bindings = state.attachment_bindings.lock().await;
+    let Some(attachment_id) = bindings.get(&key).copied() else {
+        return Ok(None);
+    };
+    let mut attachments = state.attachments.lock().await;
+    let now = now_ms();
+    if let Some(record) = attachments.get_mut(&attachment_id) {
+        if key.matches_record(record) {
+            record.download_claims.retain(|_, claim| {
+                now.saturating_sub(claim.created_at_ms) < ATTACHMENT_CLAIM_TTL_MS
+            });
+        }
+    }
+    let action = match attachments.get(&attachment_id) {
+        None => 0_u8,
+        Some(record) if !key.matches_record(record) => 1,
+        Some(record) if record.published => {
+            if record.expires_at_ms.is_some_and(|expires| now >= expires)
+                && record.download_claims.is_empty()
+            {
+                2
+            } else {
+                3
+            }
+        }
+        Some(record)
+            if record
+                .staged_expires_at_ms
+                .is_none_or(|expires| now >= expires)
+                || record.expires_at_ms.is_some_and(|expires| now >= expires) =>
+        {
+            2
+        }
+        Some(_) => 4,
+    };
+    match action {
+        0 => {
+            bindings.remove(&key);
+            Ok(None)
+        }
+        1 => {
+            let orphaned_record = !bindings.iter().any(|(candidate_key, candidate_id)| {
+                candidate_key != &key && *candidate_id == attachment_id
+            });
+            bindings.remove(&key);
+            if orphaned_record {
+                if let Some(record) = attachments.remove(&attachment_id) {
+                    let mut usage = state.attachment_bytes_by_code.lock().await;
+                    subtract_attachment_usage(
+                        &mut usage,
+                        &record.owner_code_id,
+                        record.blob.bytes.len(),
+                    );
+                }
+            }
+            Ok(None)
+        }
+        2 => {
+            if let Some(record) = attachments.remove(&attachment_id) {
+                let mut usage = state.attachment_bytes_by_code.lock().await;
+                remove_attachment_binding_if_matches(&mut bindings, attachment_id, &record);
+                subtract_attachment_usage(
+                    &mut usage,
+                    &record.owner_code_id,
+                    record.blob.bytes.len(),
+                );
+            } else {
+                bindings.remove(&key);
+            }
+            Ok(None)
+        }
+        3 => Err("duplicate attachment message binding".to_string()),
+        _ => Ok(Some(attachment_id)),
+    }
+}
+
+async fn publish_staged_attachment(
+    state: &AppState,
+    attachment_id: Uuid,
+    owner_code_id: &CodeId,
+    chat_id: &str,
+    message_id: &str,
+) {
+    let key = AttachmentBindingKey::new(owner_code_id, chat_id, message_id);
+    let mut bindings = state.attachment_bindings.lock().await;
+    let Some(indexed_id) = bindings.get(&key).copied() else {
+        return;
+    };
+    if indexed_id != attachment_id {
+        bindings.remove(&key);
+        return;
+    }
+    let mut attachments = state.attachments.lock().await;
+    let now = now_ms();
+    let action = match attachments.get(&attachment_id) {
+        Some(record) if key.matches_record(record) && record.published => 0_u8,
+        Some(record)
+            if key.matches_record(record)
+                && record
+                    .staged_expires_at_ms
+                    .is_some_and(|expires| now < expires)
+                && record.expires_at_ms.is_none_or(|expires| now < expires) =>
+        {
+            1
+        }
+        Some(record) if key.matches_record(record) => 2,
+        _ => 3,
+    };
+    match action {
+        0 => {}
+        1 => {
+            if let Some(record) = attachments.get_mut(&attachment_id) {
+                record.published = true;
+                record.staged_expires_at_ms = None;
+            }
+        }
+        2 => {
+            if let Some(record) = attachments.remove(&attachment_id) {
+                let mut usage = state.attachment_bytes_by_code.lock().await;
+                remove_attachment_binding_if_matches(&mut bindings, attachment_id, &record);
+                subtract_attachment_usage(
+                    &mut usage,
+                    &record.owner_code_id,
+                    record.blob.bytes.len(),
+                );
+            }
+        }
+        _ => {
+            let orphaned_record = attachments.get(&attachment_id).is_some_and(|record| {
+                !key.matches_record(record)
+                    && !bindings.iter().any(|(candidate_key, candidate_id)| {
+                        candidate_key != &key && *candidate_id == attachment_id
+                    })
+            });
+            bindings.remove(&key);
+            if orphaned_record {
+                if let Some(record) = attachments.remove(&attachment_id) {
+                    let mut usage = state.attachment_bytes_by_code.lock().await;
+                    subtract_attachment_usage(
+                        &mut usage,
+                        &record.owner_code_id,
+                        record.blob.bytes.len(),
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn attachment_record_capacity_allows(
     used_total: usize,
     used_account: usize,
@@ -2191,12 +2448,18 @@ async fn reserve_attachment_download(
     attachment_id: Uuid,
     requester_code_id: &CodeId,
 ) -> Result<AttachmentDownloadReservation, StatusCode> {
-    prune_expired_attachments(state).await;
+    prune_expired_attachments_locked(state).await;
+    let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
     let Some(record) = attachments.get_mut(&attachment_id) else {
         return Err(StatusCode::NOT_FOUND);
     };
+    // Staged ciphertext is deliberately indistinguishable from a missing
+    // attachment to download callers.
+    if !record.published {
+        return Err(StatusCode::NOT_FOUND);
+    }
     if record
         .expires_at_ms
         .is_some_and(|expires| now_ms() >= expires)
@@ -2206,7 +2469,10 @@ async fn reserve_attachment_download(
         }
         let owner_code_id = record.owner_code_id;
         let encrypted_len = record.blob.bytes.len();
-        attachments.remove(&attachment_id);
+        let Some(record) = attachments.remove(&attachment_id) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        remove_attachment_binding_if_matches(&mut bindings, attachment_id, &record);
         subtract_attachment_usage(&mut usage, &owner_code_id, encrypted_len);
         return Err(StatusCode::NOT_FOUND);
     }
@@ -2262,6 +2528,7 @@ async fn complete_attachment_download_claim(
     requester_code_id: &CodeId,
     claim_id: Uuid,
 ) -> Result<(), StatusCode> {
+    let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
     let Some(record) = attachments.get_mut(&attachment_id) else {
@@ -2289,6 +2556,7 @@ async fn complete_attachment_download_claim(
         let Some(record) = attachments.remove(&attachment_id) else {
             return Err(StatusCode::NOT_FOUND);
         };
+        remove_attachment_binding_if_matches(&mut bindings, attachment_id, &record);
         subtract_attachment_usage(&mut usage, &record.owner_code_id, record.blob.bytes.len());
     }
     Ok(())
@@ -3120,6 +3388,10 @@ async fn upload_attachment(
         Err(status) => return status.into_response(),
     };
     let chat_id = query.chat_id.trim().to_string();
+    let message_id = query.message_id.trim().to_string();
+    if !valid_chat_id(&message_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let media_type = normalize_media_type(query.media_type.as_deref());
     let _initial_access =
         match attachment_conversation_access(&state, &initial_auth.username, &chat_id, &media_type)
@@ -3179,7 +3451,13 @@ async fn upload_attachment(
         &media_type,
         state.attachment_max_lifetime_sec,
     );
-    let ttl_ms = (ttl_ms > 0).then(|| now_ms().saturating_add(ttl_ms.saturating_mul(1000)));
+    let retention_expires_at_ms =
+        (ttl_ms > 0).then(|| now_ms().saturating_add(ttl_ms.saturating_mul(1000)));
+    let staged_expires_at_ms = Some(
+        now_ms()
+            .saturating_add(ATTACHMENT_STAGING_TTL_MS)
+            .min(retention_expires_at_ms.unwrap_or(u64::MAX)),
+    );
     let one_time = query.one_time.unwrap_or(false);
     let delete_after_download = query.delete_after_download.unwrap_or(one_time);
     let destructive = one_time || delete_after_download;
@@ -3192,7 +3470,9 @@ async fn upload_attachment(
     if destructive && eligible_recipient_code_ids.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    prune_expired_attachments(&state).await;
+    prune_expired_attachments_locked(&state).await;
+    let binding_key = AttachmentBindingKey::new(&auth.code_id, &chat_id, &message_id);
+    let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
     let used_bytes = current_attachment_bytes(&attachments);
@@ -3236,6 +3516,15 @@ async fn upload_attachment(
             .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             .into_response();
     }
+    if let Some(existing_id) = bindings.get(&binding_key).copied() {
+        let live_binding = attachments
+            .get(&existing_id)
+            .is_some_and(|record| binding_key.matches_record(record));
+        if live_binding {
+            return StatusCode::CONFLICT.into_response();
+        }
+        bindings.remove(&binding_key);
+    }
     let id = Uuid::new_v4();
     attachments.insert(
         id,
@@ -3245,16 +3534,20 @@ async fn upload_attachment(
                 _memory_permit: Some(memory_permit),
             }),
             chat_id,
+            message_id,
             media_type,
             owner_code_id: auth.code_id,
+            published: false,
+            staged_expires_at_ms,
             one_time,
             delete_after_download,
-            expires_at_ms: ttl_ms,
+            expires_at_ms: retention_expires_at_ms,
             eligible_recipient_code_ids,
             download_claims: HashMap::new(),
             completed_recipient_code_ids: HashSet::new(),
         },
     );
+    bindings.insert(binding_key, id);
     usage.insert(auth.code_id, account_used.saturating_add(encrypted_len));
     drop(attachments);
     drop(usage);
@@ -3288,6 +3581,9 @@ async fn download_attachment(
         let Some(record) = attachments.get(&id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
+        if !record.published {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         record.chat_id.clone()
     };
     if conversation_access(&state, &auth.username, &chat_id)
@@ -3389,6 +3685,7 @@ async fn delete_attachment(
 }
 
 async fn delete_owned_attachment(state: &AppState, id: Uuid, owner_code_id: &CodeId) -> StatusCode {
+    let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let Some(record) = attachments.get(&id) else {
         return StatusCode::NOT_FOUND;
@@ -3399,7 +3696,7 @@ async fn delete_owned_attachment(state: &AppState, id: Uuid, owner_code_id: &Cod
     let Some(record) = attachments.remove(&id) else {
         return StatusCode::NOT_FOUND;
     };
-    drop(attachments);
+    remove_attachment_binding_if_matches(&mut bindings, id, &record);
 
     let mut usage = state.attachment_bytes_by_code.lock().await;
     subtract_attachment_usage(&mut usage, &record.owner_code_id, record.blob.bytes.len());
@@ -4331,6 +4628,10 @@ async fn route_encrypted_message_with_directory(
     let access = conversation_access(state, &sender_username, &chat_id)
         .await
         .ok_or_else(|| "conversation unavailable".to_string())?;
+    // Upload and message admission share conversation_ops. This prevents a
+    // second live record from racing the exact owner/chat/message binding.
+    let staged_attachment_id =
+        staged_attachment_for_message(state, &sender_code_id, &chat_id, &message_id).await?;
     let expected_recipients = match access {
         ConversationAccess::Room(_) => state
             .accounts
@@ -4471,6 +4772,15 @@ async fn route_encrypted_message_with_directory(
         unregister_message_id(state, &chat_id, &sender_username, &message_id).await;
         rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
         return Err(error);
+    }
+
+    // Publication is deliberately after complete encrypted-message
+    // admission, but before fanout. A lost message_result therefore leaves a
+    // successfully admitted attachment downloadable, while rejected or
+    // rolled-back admissions never publish the staged record.
+    if let Some(attachment_id) = staged_attachment_id {
+        publish_staged_attachment(state, attachment_id, &sender_code_id, &chat_id, &message_id)
+            .await;
     }
 
     let joined = state
@@ -5355,7 +5665,10 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     *pending_bytes = 0;
     drop(pending_bytes);
     drop(pending);
-    state.attachments.lock().await.clear();
+    let mut attachment_bindings = state.attachment_bindings.lock().await;
+    let mut attachments = state.attachments.lock().await;
+    attachments.clear();
+    attachment_bindings.clear();
     let mut attachment_usage = state.attachment_bytes_by_code.lock().await;
     zeroize_code_id_map(&mut attachment_usage);
     drop(attachment_usage);
@@ -6473,6 +6786,515 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_attachment_requires_a_live_deadline_for_publication() {
+        let state = test_state();
+        let owner = test_code_id("staged-deadline-owner");
+        let now = now_ms();
+        let missing_deadline = Uuid::new_v4();
+        let expired_deadline = Uuid::new_v4();
+        let valid_deadline = Uuid::new_v4();
+        let records = [
+            (missing_deadline, "missing-deadline", None, vec![1_u8, 2]),
+            (
+                expired_deadline,
+                "expired-deadline",
+                Some(now.saturating_sub(1)),
+                vec![3_u8, 4],
+            ),
+            (
+                valid_deadline,
+                "valid-deadline",
+                Some(now.saturating_add(60_000)),
+                vec![5_u8, 6],
+            ),
+        ];
+        {
+            let mut bindings = state.attachment_bindings.lock().await;
+            let mut attachments = state.attachments.lock().await;
+            for (id, message_id, staged_expires_at_ms, bytes) in records {
+                attachments.insert(
+                    id,
+                    AttachmentRecord {
+                        blob: test_attachment_blob(bytes),
+                        chat_id: "dm_staged".to_string(),
+                        message_id: message_id.to_string(),
+                        media_type: "FILE".to_string(),
+                        owner_code_id: owner,
+                        published: false,
+                        staged_expires_at_ms,
+                        one_time: false,
+                        delete_after_download: false,
+                        expires_at_ms: Some(now.saturating_add(60_000)),
+                        eligible_recipient_code_ids: HashSet::new(),
+                        download_claims: HashMap::new(),
+                        completed_recipient_code_ids: HashSet::new(),
+                    },
+                );
+                bindings.insert(
+                    AttachmentBindingKey::new(&owner, "dm_staged", message_id),
+                    id,
+                );
+            }
+        }
+        state.attachment_bytes_by_code.lock().await.insert(owner, 6);
+
+        prune_expired_attachments(&state).await;
+        let attachments = state.attachments.lock().await;
+        assert!(!attachments.contains_key(&missing_deadline));
+        assert!(!attachments.contains_key(&expired_deadline));
+        assert!(attachments.contains_key(&valid_deadline));
+        drop(attachments);
+        let bindings = state.attachment_bindings.lock().await;
+        assert!(!bindings.contains_key(&AttachmentBindingKey::new(
+            &owner,
+            "dm_staged",
+            "missing-deadline",
+        )));
+        assert!(!bindings.contains_key(&AttachmentBindingKey::new(
+            &owner,
+            "dm_staged",
+            "expired-deadline",
+        )));
+        assert_eq!(
+            bindings.get(&AttachmentBindingKey::new(
+                &owner,
+                "dm_staged",
+                "valid-deadline",
+            )),
+            Some(&valid_deadline)
+        );
+        drop(bindings);
+
+        assert_eq!(
+            staged_attachment_for_message(&state, &owner, "dm_staged", "valid-deadline").await,
+            Ok(Some(valid_deadline))
+        );
+        publish_staged_attachment(
+            &state,
+            valid_deadline,
+            &owner,
+            "dm_staged",
+            "valid-deadline",
+        )
+        .await;
+        let attachments = state.attachments.lock().await;
+        let published = attachments
+            .get(&valid_deadline)
+            .expect("valid staged record");
+        assert!(published.published);
+        assert_eq!(published.staged_expires_at_ms, None);
+        assert_eq!(
+            state.attachment_bytes_by_code.lock().await.get(&owner),
+            Some(&2)
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_message_lookup_only_expires_the_exact_indexed_record() {
+        let state = test_state();
+        let owner = test_code_id("staged-exact-lookup-owner");
+        let exact_id = Uuid::new_v4();
+        let unrelated_id = Uuid::new_v4();
+        let now = now_ms();
+        {
+            let mut bindings = state.attachment_bindings.lock().await;
+            let mut attachments = state.attachments.lock().await;
+            attachments.insert(
+                exact_id,
+                AttachmentRecord {
+                    blob: Arc::new(AttachmentBlob {
+                        bytes: Zeroizing::new(vec![1, 2, 3]),
+                        _memory_permit: Some(
+                            acquire_attachment_memory_permit(&state.attachment_memory, 3)
+                                .expect("exact attachment memory permit"),
+                        ),
+                    }),
+                    chat_id: "dm_exact_lookup".to_string(),
+                    message_id: "exact-message".to_string(),
+                    media_type: "FILE".to_string(),
+                    owner_code_id: owner,
+                    published: false,
+                    staged_expires_at_ms: Some(now.saturating_add(60_000)),
+                    one_time: false,
+                    delete_after_download: false,
+                    expires_at_ms: Some(now.saturating_add(60_000)),
+                    eligible_recipient_code_ids: HashSet::new(),
+                    download_claims: HashMap::new(),
+                    completed_recipient_code_ids: HashSet::new(),
+                },
+            );
+            attachments.insert(
+                unrelated_id,
+                AttachmentRecord {
+                    blob: test_attachment_blob(vec![4, 5, 6]),
+                    chat_id: "dm_exact_lookup".to_string(),
+                    message_id: "unrelated-message".to_string(),
+                    media_type: "FILE".to_string(),
+                    owner_code_id: owner,
+                    published: false,
+                    staged_expires_at_ms: Some(now.saturating_sub(1)),
+                    one_time: false,
+                    delete_after_download: false,
+                    expires_at_ms: Some(now.saturating_add(60_000)),
+                    eligible_recipient_code_ids: HashSet::new(),
+                    download_claims: HashMap::new(),
+                    completed_recipient_code_ids: HashSet::new(),
+                },
+            );
+            bindings.insert(
+                AttachmentBindingKey::new(&owner, "dm_exact_lookup", "exact-message"),
+                exact_id,
+            );
+            bindings.insert(
+                AttachmentBindingKey::new(&owner, "dm_exact_lookup", "unrelated-message"),
+                unrelated_id,
+            );
+        }
+        state.attachment_bytes_by_code.lock().await.insert(owner, 6);
+
+        assert_eq!(
+            staged_attachment_for_message(&state, &owner, "dm_exact_lookup", "exact-message").await,
+            Ok(Some(exact_id))
+        );
+        assert_eq!(
+            state.attachment_memory.available_permits(),
+            8 * 1024 * 1024 - 3
+        );
+        assert!(state.attachments.lock().await.contains_key(&unrelated_id));
+        assert_eq!(
+            state
+                .attachment_bindings
+                .lock()
+                .await
+                .get(&AttachmentBindingKey::new(
+                    &owner,
+                    "dm_exact_lookup",
+                    "unrelated-message",
+                )),
+            Some(&unrelated_id)
+        );
+
+        state
+            .attachments
+            .lock()
+            .await
+            .get_mut(&exact_id)
+            .expect("exact staged record")
+            .staged_expires_at_ms = Some(now_ms().saturating_sub(1));
+        assert_eq!(
+            staged_attachment_for_message(&state, &owner, "dm_exact_lookup", "exact-message").await,
+            Ok(None)
+        );
+        assert!(!state.attachments.lock().await.contains_key(&exact_id));
+        assert!(state.attachments.lock().await.contains_key(&unrelated_id));
+        assert_eq!(
+            state
+                .attachment_bindings
+                .lock()
+                .await
+                .get(&AttachmentBindingKey::new(
+                    &owner,
+                    "dm_exact_lookup",
+                    "unrelated-message",
+                )),
+            Some(&unrelated_id)
+        );
+        assert_eq!(
+            state.attachment_bytes_by_code.lock().await.get(&owner),
+            Some(&3)
+        );
+        assert_eq!(state.attachment_memory.available_permits(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn attachment_upload_requires_message_binding_and_rejects_live_duplicate() {
+        let state = test_state();
+        add_test_account(&state, "staged-upload-owner", "Alice").await;
+        let owner = test_code_id("staged-upload-owner");
+        let room_id = "staged_upload_room";
+        state.room_catalog.lock().await.insert(
+            room_id.to_string(),
+            RoomEntry {
+                room: test_room(room_id),
+                owner_code_id: owner,
+            },
+        );
+        state.sessions.lock().await.insert(
+            SessionToken::new("staged-upload-token".to_string()),
+            AuthSession {
+                code_id: owner,
+                username: "Alice".to_string(),
+                last_activity_ms: now_ms(),
+            },
+        );
+
+        let upload = |message_id: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer staged-upload-token"),
+            );
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+            upload_attachment(
+                State(state.clone()),
+                Query(AttachmentQuery {
+                    chat_id: room_id.to_string(),
+                    message_id: message_id.to_string(),
+                    media_type: Some("FILE".to_string()),
+                    one_time: Some(false),
+                    delete_after_download: Some(false),
+                    ttl_sec: Some(1),
+                }),
+                headers,
+                Body::from(vec![
+                    ATTACHMENT_BLOB_VERSION;
+                    ATTACHMENT_WIRE_OVERHEAD_BYTES
+                ]),
+            )
+        };
+
+        assert_eq!(
+            upload("").await.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state.attachments.lock().await.is_empty());
+        assert_eq!(
+            upload("staged-upload-message")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::OK
+        );
+        let (attachment_id, original_expiry) = {
+            let attachments = state.attachments.lock().await;
+            let (id, record) = attachments.iter().next().expect("staged upload");
+            assert!(!record.published);
+            assert!(
+                record.staged_expires_at_ms.expect("staging deadline")
+                    <= record.expires_at_ms.expect("retention deadline")
+            );
+            (*id, record.expires_at_ms)
+        };
+        assert_eq!(
+            upload("staged-upload-message")
+                .await
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(state.attachments.lock().await.len(), 1);
+
+        publish_staged_attachment(
+            &state,
+            attachment_id,
+            &owner,
+            room_id,
+            "staged-upload-message",
+        )
+        .await;
+        let attachments = state.attachments.lock().await;
+        let published = attachments.get(&attachment_id).expect("published upload");
+        assert!(published.published);
+        assert_eq!(published.expires_at_ms, original_expiry);
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_is_a_generic_not_found_to_owner_and_recipient() {
+        let state = test_state();
+        add_test_account(&state, "staged-download-owner", "Alice").await;
+        add_test_account(&state, "staged-download-recipient", "Bob").await;
+        let owner = test_code_id("staged-download-owner");
+        let room_id = "staged_download_room";
+        state.room_catalog.lock().await.insert(
+            room_id.to_string(),
+            RoomEntry {
+                room: test_room(room_id),
+                owner_code_id: owner,
+            },
+        );
+        state.sessions.lock().await.extend([
+            (
+                SessionToken::new("staged-owner-token".to_string()),
+                AuthSession {
+                    code_id: owner,
+                    username: "Alice".to_string(),
+                    last_activity_ms: now_ms(),
+                },
+            ),
+            (
+                SessionToken::new("staged-recipient-token".to_string()),
+                AuthSession {
+                    code_id: test_code_id("staged-download-recipient"),
+                    username: "Bob".to_string(),
+                    last_activity_ms: now_ms(),
+                },
+            ),
+        ]);
+        let attachment_id = Uuid::new_v4();
+        state.attachments.lock().await.insert(
+            attachment_id,
+            AttachmentRecord {
+                blob: test_attachment_blob(vec![
+                    ATTACHMENT_BLOB_VERSION;
+                    ATTACHMENT_WIRE_OVERHEAD_BYTES
+                ]),
+                chat_id: room_id.to_string(),
+                message_id: "staged-download-message".to_string(),
+                media_type: "FILE".to_string(),
+                owner_code_id: owner,
+                published: false,
+                staged_expires_at_ms: Some(now_ms().saturating_add(60_000)),
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: Some(now_ms().saturating_add(60_000)),
+                eligible_recipient_code_ids: HashSet::new(),
+                download_claims: HashMap::new(),
+                completed_recipient_code_ids: HashSet::new(),
+            },
+        );
+        state.attachment_bindings.lock().await.insert(
+            AttachmentBindingKey::new(&owner, room_id, "staged-download-message"),
+            attachment_id,
+        );
+
+        for token in ["staged-owner-token", "staged-recipient-token"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).expect("test bearer"),
+            );
+            let response = download_attachment(State(state.clone()), Path(attachment_id), headers)
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn staged_publication_is_exactly_bound_and_rejected_or_rolled_back_admission_never_promotes(
+    ) {
+        let state = test_state();
+        add_test_account(&state, "publication-owner", "Alice").await;
+        add_test_account(&state, "publication-other", "Bob").await;
+        let (alice_id, _) = add_test_client(&state, "publication-owner", "Alice").await;
+        let room_id = "staged_publication_room";
+        state.room_catalog.lock().await.insert(
+            room_id.to_string(),
+            RoomEntry {
+                room: test_room(room_id),
+                owner_code_id: test_code_id("publication-owner"),
+            },
+        );
+        let now = now_ms();
+        let bindings = [
+            (
+                "matching",
+                test_code_id("publication-owner"),
+                room_id,
+                "publication-message",
+            ),
+            (
+                "wrong-owner",
+                test_code_id("publication-other"),
+                room_id,
+                "publication-message",
+            ),
+            (
+                "wrong-chat",
+                test_code_id("publication-owner"),
+                "other-publication-room",
+                "publication-message",
+            ),
+            (
+                "wrong-message",
+                test_code_id("publication-owner"),
+                room_id,
+                "other-publication-message",
+            ),
+        ];
+        let mut ids = HashMap::new();
+        {
+            let mut attachment_bindings = state.attachment_bindings.lock().await;
+            let mut attachments = state.attachments.lock().await;
+            for (label, owner, chat_id, message_id) in bindings {
+                let id = Uuid::new_v4();
+                ids.insert(label, id);
+                attachments.insert(
+                    id,
+                    AttachmentRecord {
+                        blob: test_attachment_blob(vec![1, 2]),
+                        chat_id: chat_id.to_string(),
+                        message_id: message_id.to_string(),
+                        media_type: "FILE".to_string(),
+                        owner_code_id: owner,
+                        published: false,
+                        staged_expires_at_ms: Some(now.saturating_add(60_000)),
+                        one_time: false,
+                        delete_after_download: false,
+                        expires_at_ms: Some(now.saturating_add(60_000)),
+                        eligible_recipient_code_ids: HashSet::new(),
+                        download_claims: HashMap::new(),
+                        completed_recipient_code_ids: HashSet::new(),
+                    },
+                );
+                attachment_bindings
+                    .insert(AttachmentBindingKey::new(&owner, chat_id, message_id), id);
+            }
+        }
+
+        assert!(route_test_message_with_envelopes(
+            &state,
+            alice_id,
+            room_id,
+            E2EE_PROTOCOL_VERSION,
+            "publication-message",
+            Vec::new(),
+        )
+        .await
+        .is_err());
+        assert!(state
+            .attachments
+            .lock()
+            .await
+            .values()
+            .all(|record| !record.published));
+
+        state.replay_ids.lock().await.insert(
+            ReplayKey {
+                chat_id: room_id.to_string(),
+                sender_username: "Alice".to_string(),
+                message_id: "publication-message".to_string(),
+            },
+            now_ms(),
+        );
+        assert!(route_test_message_with_id(
+            &state,
+            alice_id,
+            room_id,
+            &["Bob"],
+            "publication-message",
+        )
+        .await
+        .is_err());
+        assert!(state
+            .attachments
+            .lock()
+            .await
+            .values()
+            .all(|record| !record.published));
+        state.replay_ids.lock().await.clear();
+
+        route_test_message_with_id(&state, alice_id, room_id, &["Bob"], "publication-message")
+            .await
+            .expect("exact accepted message publishes attachment");
+        let attachments = state.attachments.lock().await;
+        assert!(attachments[&ids["matching"]].published);
+        assert!(!attachments[&ids["wrong-owner"]].published);
+        assert!(!attachments[&ids["wrong-chat"]].published);
+        assert!(!attachments[&ids["wrong-message"]].published);
+    }
+
+    #[tokio::test]
     async fn uploaded_attachment_cleanup_is_owner_only_and_releases_usage() {
         let mut state = test_state();
         state.attachment_record_limit = 1;
@@ -6485,8 +7307,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![1, 2, 3, 4]),
                 chat_id: "dm_cleanup".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -6494,6 +7319,10 @@ mod tests {
                 download_claims: HashMap::new(),
                 completed_recipient_code_ids: HashSet::new(),
             },
+        );
+        state.attachment_bindings.lock().await.insert(
+            AttachmentBindingKey::new(&owner, "dm_cleanup", "test-message"),
+            attachment_id,
         );
         state.attachment_bytes_by_code.lock().await.insert(owner, 4);
         {
@@ -6515,8 +7344,177 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert!(!state.attachments.lock().await.contains_key(&attachment_id));
+        assert!(state.attachment_bindings.lock().await.is_empty());
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
         assert!(attachment_record_capacity_available(&state, &owner).await);
+    }
+
+    #[tokio::test]
+    async fn attachment_binding_index_cleans_destructive_completion() {
+        let state = test_state();
+        let owner = test_code_id("binding-completion-owner");
+        let recipient = test_code_id("binding-completion-recipient");
+        let attachment_id = Uuid::new_v4();
+        let claim_id = Uuid::new_v4();
+        {
+            let mut bindings = state.attachment_bindings.lock().await;
+            let mut attachments = state.attachments.lock().await;
+            attachments.insert(
+                attachment_id,
+                AttachmentRecord {
+                    blob: test_attachment_blob(vec![1, 2, 3]),
+                    chat_id: "dm_binding_completion".to_string(),
+                    message_id: "binding-completion-message".to_string(),
+                    media_type: "FILE".to_string(),
+                    owner_code_id: owner,
+                    published: true,
+                    staged_expires_at_ms: None,
+                    one_time: true,
+                    delete_after_download: true,
+                    expires_at_ms: None,
+                    eligible_recipient_code_ids: HashSet::from([recipient]),
+                    download_claims: HashMap::from([(
+                        claim_id,
+                        AttachmentDownloadClaim {
+                            recipient_code_id: recipient,
+                            created_at_ms: now_ms(),
+                        },
+                    )]),
+                    completed_recipient_code_ids: HashSet::new(),
+                },
+            );
+            bindings.insert(
+                AttachmentBindingKey::new(
+                    &owner,
+                    "dm_binding_completion",
+                    "binding-completion-message",
+                ),
+                attachment_id,
+            );
+        }
+        state.attachment_bytes_by_code.lock().await.insert(owner, 3);
+
+        complete_attachment_download_claim(&state, attachment_id, &recipient, claim_id)
+            .await
+            .expect("destructive completion");
+        assert!(!state.attachments.lock().await.contains_key(&attachment_id));
+        assert!(state.attachment_bindings.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_staged_publication_removes_record_binding_and_usage() {
+        let state = test_state();
+        let owner = test_code_id("expired-publication-owner");
+        let attachment_id = Uuid::new_v4();
+        {
+            let mut bindings = state.attachment_bindings.lock().await;
+            let mut attachments = state.attachments.lock().await;
+            attachments.insert(
+                attachment_id,
+                AttachmentRecord {
+                    blob: test_attachment_blob(vec![1, 2, 3]),
+                    chat_id: "dm_expired_publication".to_string(),
+                    message_id: "expired-publication-message".to_string(),
+                    media_type: "FILE".to_string(),
+                    owner_code_id: owner,
+                    published: false,
+                    staged_expires_at_ms: Some(now_ms().saturating_sub(1)),
+                    one_time: false,
+                    delete_after_download: false,
+                    expires_at_ms: Some(now_ms().saturating_add(60_000)),
+                    eligible_recipient_code_ids: HashSet::new(),
+                    download_claims: HashMap::new(),
+                    completed_recipient_code_ids: HashSet::new(),
+                },
+            );
+            bindings.insert(
+                AttachmentBindingKey::new(
+                    &owner,
+                    "dm_expired_publication",
+                    "expired-publication-message",
+                ),
+                attachment_id,
+            );
+        }
+        state.attachment_bytes_by_code.lock().await.insert(owner, 3);
+
+        publish_staged_attachment(
+            &state,
+            attachment_id,
+            &owner,
+            "dm_expired_publication",
+            "expired-publication-message",
+        )
+        .await;
+        assert!(!state.attachments.lock().await.contains_key(&attachment_id));
+        assert!(state.attachment_bindings.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_attachment_binding_cannot_leave_an_orphan_record() {
+        let state = test_state();
+        let owner = test_code_id("mismatch-binding-owner");
+        let attachment_id = Uuid::new_v4();
+        {
+            let mut bindings = state.attachment_bindings.lock().await;
+            let mut attachments = state.attachments.lock().await;
+            attachments.insert(
+                attachment_id,
+                AttachmentRecord {
+                    blob: test_attachment_blob(vec![1, 2, 3]),
+                    chat_id: "dm_mismatch_binding".to_string(),
+                    message_id: "actual-message".to_string(),
+                    media_type: "FILE".to_string(),
+                    owner_code_id: owner,
+                    published: false,
+                    staged_expires_at_ms: Some(now_ms().saturating_add(60_000)),
+                    one_time: false,
+                    delete_after_download: false,
+                    expires_at_ms: Some(now_ms().saturating_add(60_000)),
+                    eligible_recipient_code_ids: HashSet::new(),
+                    download_claims: HashMap::new(),
+                    completed_recipient_code_ids: HashSet::new(),
+                },
+            );
+            bindings.insert(
+                AttachmentBindingKey::new(&owner, "dm_mismatch_binding", "indexed-message"),
+                attachment_id,
+            );
+        }
+        state.attachment_bytes_by_code.lock().await.insert(owner, 3);
+
+        assert_eq!(
+            staged_attachment_for_message(
+                &state,
+                &owner,
+                "dm_mismatch_binding",
+                "indexed-message",
+            )
+            .await,
+            Ok(None)
+        );
+        assert!(!state.attachments.lock().await.contains_key(&attachment_id));
+        assert!(state.attachment_bindings.lock().await.is_empty());
+        assert!(state.attachment_bytes_by_code.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_sweeper_pruning_serializes_with_message_admission() {
+        let state = test_state();
+        let conversation_guard = state.conversation_ops.lock().await;
+        let prune_state = state.clone();
+        let mut prune_task = tokio::spawn(async move {
+            prune_expired_attachments(&prune_state).await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut prune_task)
+                .await
+                .is_err()
+        );
+        drop(conversation_guard);
+        prune_task.await.expect("prune task");
     }
 
     #[tokio::test]
@@ -6598,6 +7596,7 @@ mod tests {
             State(state),
             Query(AttachmentQuery {
                 chat_id: "dm_unknown".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: Some("FILE".to_string()),
                 one_time: None,
                 delete_after_download: None,
@@ -6651,6 +7650,7 @@ mod tests {
                 State(request_state),
                 Query(AttachmentQuery {
                     chat_id: "slow_upload_room".to_string(),
+                    message_id: "test-message".to_string(),
                     media_type: Some("FILE".to_string()),
                     one_time: None,
                     delete_after_download: None,
@@ -6713,6 +7713,7 @@ mod tests {
                 State(request_state),
                 Query(AttachmentQuery {
                     chat_id: "wipe_upload_room".to_string(),
+                    message_id: "test-message".to_string(),
                     media_type: Some("FILE".to_string()),
                     one_time: None,
                     delete_after_download: None,
@@ -6765,8 +7766,11 @@ mod tests {
             AttachmentRecord {
                 blob: Arc::clone(&bytes),
                 chat_id: "dm_shared".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -6798,8 +7802,11 @@ mod tests {
             AttachmentRecord {
                 blob: Arc::clone(&blob),
                 chat_id: "dm_blob_lifetime".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -6988,8 +7995,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(expected.clone()),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: true,
                 delete_after_download: true,
                 expires_at_ms: None,
@@ -7050,8 +8060,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(expected.clone()),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: true,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -7122,8 +8135,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![8, 9]),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: true,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -7172,8 +8188,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![1, 2, 3]),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: true,
                 expires_at_ms: None,
@@ -7213,8 +8232,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![4, 5, 6]),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: true,
                 delete_after_download: true,
                 expires_at_ms: None,
@@ -7252,8 +8274,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![7, 8, 9]),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "IMAGE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: true,
                 delete_after_download: true,
                 expires_at_ms: None,
@@ -7291,8 +8316,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![10, 11, 12]),
                 chat_id: "forum_shared".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: true,
                 expires_at_ms: None,
@@ -7494,6 +8522,7 @@ mod tests {
             State(state),
             Query(AttachmentQuery {
                 chat_id: "forum_solo".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: Some("FILE".to_string()),
                 one_time: Some(true),
                 delete_after_download: Some(true),
@@ -7538,8 +8567,11 @@ mod tests {
                     ATTACHMENT_WIRE_OVERHEAD_BYTES
                 ]),
                 chat_id: "record_limit_room".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -7563,6 +8595,7 @@ mod tests {
             State(state.clone()),
             Query(AttachmentQuery {
                 chat_id: "record_limit_room".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: Some("FILE".to_string()),
                 one_time: None,
                 delete_after_download: None,
@@ -7627,6 +8660,7 @@ mod tests {
                     State(state.clone()),
                     Query(AttachmentQuery {
                         chat_id: "record_race_room".to_string(),
+                        message_id: "test-message".to_string(),
                         media_type: Some("FILE".to_string()),
                         one_time: None,
                         delete_after_download: None,
@@ -7711,6 +8745,7 @@ mod tests {
                 State(state.clone()),
                 Query(AttachmentQuery {
                     chat_id: room_id.to_string(),
+                    message_id: "test-message".to_string(),
                     media_type: Some("FILE".to_string()),
                     one_time: None,
                     delete_after_download: None,
@@ -7767,6 +8802,7 @@ mod tests {
 
         remove_chat_attachments(&state, room_id).await;
         assert!(state.attachments.lock().await.is_empty());
+        assert!(state.attachment_bindings.lock().await.is_empty());
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
         assert_eq!(state.attachment_memory.available_permits(), 8 * 1024 * 1024);
         assert_eq!(
@@ -7812,6 +8848,7 @@ mod tests {
                 State(state),
                 Query(AttachmentQuery {
                     chat_id: room_id.to_string(),
+                    message_id: "test-message".to_string(),
                     media_type: Some("FILE".to_string()),
                     one_time: None,
                     delete_after_download: None,
@@ -7832,6 +8869,7 @@ mod tests {
         assert_eq!(state.attachments.lock().await.len(), 1);
         wipe_relay_state(&state, false).await;
         assert!(state.attachments.lock().await.is_empty());
+        assert!(state.attachment_bindings.lock().await.is_empty());
         assert!(state.attachment_bytes_by_code.lock().await.is_empty());
         assert_eq!(state.attachment_memory.available_permits(), 8 * 1024 * 1024);
 
@@ -9446,8 +10484,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![1, 2, 3]),
                 chat_id: room.id.clone(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: test_code_id("code-a"),
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: false,
                 expires_at_ms: None,
@@ -9837,8 +10878,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![1, 2, 3]),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: false,
                 delete_after_download: false,
                 expires_at_ms: Some(0),
@@ -9875,8 +10919,11 @@ mod tests {
             AttachmentRecord {
                 blob: test_attachment_blob(vec![4, 5, 6]),
                 chat_id: "dm_alice_bob".to_string(),
+                message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
                 one_time: true,
                 delete_after_download: false,
                 expires_at_ms: Some(0),
@@ -11861,6 +12908,7 @@ mod tests {
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             pending_bytes: Arc::new(Mutex::new(0)),
+            attachment_bindings: Arc::new(Mutex::new(HashMap::new())),
             attachments: Arc::new(Mutex::new(HashMap::new())),
             attachment_bytes_by_code: Arc::new(Mutex::new(HashMap::new())),
             attachment_downloads: Arc::new(Semaphore::new(DEFAULT_ATTACHMENT_DOWNLOAD_CONCURRENCY)),

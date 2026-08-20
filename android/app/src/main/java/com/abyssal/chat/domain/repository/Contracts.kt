@@ -203,6 +203,7 @@ interface IEncryptedAttachmentService {
     suspend fun uploadEncryptedAttachment(
         session: NodeSession,
         chatId: String,
+        messageId: String,
         mediaType: String,
         encryptedBytes: ByteArray,
         oneTimeView: Boolean,

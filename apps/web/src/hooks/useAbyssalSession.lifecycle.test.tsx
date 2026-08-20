@@ -1442,8 +1442,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("aborts an in-flight attachment upload and promptly wipes its plaintext and cipher buffers", async () => {
     let uploadSignal: AbortSignal | undefined;
+    let uploadMessageId: string | undefined;
     mocks.uploadEncryptedAttachment.mockImplementationOnce((...args: unknown[]) => new Promise<string>((_resolve, reject) => {
-      uploadSignal = args[6] as AbortSignal;
+      uploadMessageId = args[2] as string;
+      uploadSignal = args[7] as AbortSignal;
       uploadSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
     }));
     const { result, unmount } = renderHook(() => useAbyssalSession());
@@ -1469,7 +1471,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
       });
     });
-    await waitFor(() => expect(uploadSignal).toBeDefined());
+    await waitFor(() => {
+      expect(uploadMessageId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      expect(uploadSignal).toBeDefined();
+    });
 
     act(() => result.current.clearMemory());
     await act(async () => expect(pending).resolves.toBe(false));

@@ -198,6 +198,7 @@ class EncryptedAttachmentServiceTest {
             val upload = service.uploadEncryptedAttachment(
                 session = capturedSession,
                 chatId = "dm_bob",
+                messageId = ATTACHMENT_ID,
                 mediaType = "FILE",
                 encryptedBytes = byteArrayOf(1),
                 oneTimeView = false,
@@ -206,10 +207,9 @@ class EncryptedAttachmentServiceTest {
                 onProgress = { _, _ -> }
             )
             assertTrue(upload.accepted)
-            assertEquals(
-                "Bearer captured-token",
-                capturedServer.takeRequest().getHeader("Authorization")
-            )
+            val uploadRequest = capturedServer.takeRequest()
+            assertEquals("Bearer captured-token", uploadRequest.getHeader("Authorization"))
+            assertTrue(uploadRequest.path.orEmpty().contains("message_id=$ATTACHMENT_ID"))
 
             assertTrue(service.deleteUploadedAttachment(capturedSession, ATTACHMENT_ID))
             assertEquals(
@@ -220,6 +220,29 @@ class EncryptedAttachmentServiceTest {
         } finally {
             activeServer.shutdown()
             capturedServer.shutdown()
+        }
+    }
+
+    @Test
+    fun invalidMessageBindingIsRejectedBeforeNetwork() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val result = service().uploadEncryptedAttachment(
+                session = sessionFor(server),
+                chatId = "dm_bob",
+                messageId = "not-a-uuid",
+                mediaType = "FILE",
+                encryptedBytes = byteArrayOf(1),
+                oneTimeView = false,
+                deleteAfterDownload = false,
+                ttlSec = 60,
+                onProgress = { _, _ -> }
+            )
+            assertFalse(result.accepted)
+            assertEquals(0, server.requestCount)
+        } finally {
+            server.shutdown()
         }
     }
 
@@ -358,6 +381,7 @@ class EncryptedAttachmentServiceTest {
             service.uploadEncryptedAttachment(
                 session = session,
                 chatId = "dm_bob",
+                messageId = ATTACHMENT_ID,
                 mediaType = "FILE",
                 encryptedBytes = byteArrayOf(1),
                 oneTimeView = false,

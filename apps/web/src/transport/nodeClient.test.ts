@@ -696,6 +696,7 @@ describe("account transport", () => {
   it("passes the encrypted upload view to XHR without making a full copy", async () => {
     const original = globalThis.XMLHttpRequest;
     let sent: unknown;
+    let openedUrl = "";
     class TestXmlHttpRequest {
       readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
       responseType = "";
@@ -705,7 +706,9 @@ describe("account transport", () => {
       onabort: (() => void) | null = null;
       onload: (() => void) | null = null;
 
-      open(): void {}
+      open(_method: string, url: string): void {
+        openedUrl = url;
+      }
 
       setRequestHeader(): void {}
 
@@ -722,12 +725,39 @@ describe("account transport", () => {
       await expect(uploadEncryptedAttachment(
         session,
         "dm_Alice_Bob",
+        ATTACHMENT_PRIMARY,
         "FILE",
         encrypted,
         { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
         () => undefined,
       )).resolves.toBe(ATTACHMENT_PRIMARY);
       expect(sent).toBe(encrypted);
+      expect(openedUrl).toContain(`message_id=${ATTACHMENT_PRIMARY}`);
+    } finally {
+      globalThis.XMLHttpRequest = original;
+    }
+  });
+
+  it("rejects an upload without a valid message binding before opening XHR", async () => {
+    const original = globalThis.XMLHttpRequest;
+    let opened = false;
+    class UnusedXmlHttpRequest {
+      open(): void {
+        opened = true;
+      }
+    }
+    globalThis.XMLHttpRequest = UnusedXmlHttpRequest as unknown as typeof XMLHttpRequest;
+    try {
+      await expect(uploadEncryptedAttachment(
+        session,
+        "dm_Alice_Bob",
+        "not-a-uuid",
+        "FILE",
+        new Uint8Array([1, 2, 3]),
+        { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
+        () => undefined,
+      )).rejects.toThrow("Upload rejected");
+      expect(opened).toBe(false);
     } finally {
       globalThis.XMLHttpRequest = original;
     }
@@ -764,6 +794,7 @@ describe("account transport", () => {
       const pending = uploadEncryptedAttachment(
         session,
         "dm_Alice_Bob",
+        ATTACHMENT_PRIMARY,
         "FILE",
         new Uint8Array([1, 2, 3]),
         { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
@@ -819,6 +850,7 @@ describe("account transport", () => {
     const upload = () => uploadEncryptedAttachment(
       session,
       "dm_Alice_Bob",
+      ATTACHMENT_PRIMARY,
       "FILE",
       new Uint8Array([1, 2, 3]),
       { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },

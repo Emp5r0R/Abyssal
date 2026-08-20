@@ -1449,6 +1449,7 @@ export function useAbyssalSession() {
       const attachmentId = await uploadEncryptedAttachment(
         currentSession,
         chatId,
+        messageId,
         mediaType,
         encrypted.blob,
         { ...options, ttlSec },
