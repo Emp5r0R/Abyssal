@@ -114,10 +114,7 @@ function validateIncomingMessagePadding(frame) {
   assert.equal(typeof frame.padding, "string");
   assert.match(frame.padding, MESSAGE_PADDING_PATTERN);
 
-  const base = {};
-  for (const [key, value] of Object.entries(frame)) {
-    if (key !== "padding_bucket" && key !== "padding") base[key] = value;
-  }
+  const { padding_bucket: receivedBucket, padding: receivedPadding, ...base } = frame;
   let canonical;
   let emptyBytes;
   for (const bucket of MESSAGE_TRANSPORT_BUCKETS) {
@@ -129,8 +126,8 @@ function validateIncomingMessagePadding(frame) {
       break;
     }
   }
-  assert.equal(frame.padding_bucket, canonical);
-  assert.equal(frame.padding.length, canonical - emptyBytes);
+  assert.equal(receivedBucket, canonical);
+  assert.equal(receivedPadding.length, canonical - emptyBytes);
   assert.equal(Buffer.byteLength(raw, "utf8"), canonical);
   assert.equal(raw, JSON.stringify(frame), "relay message JSON must be canonical");
   delete frame.padding_bucket;

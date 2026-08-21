@@ -141,10 +141,9 @@ function safePositiveInteger(value: unknown): value is number {
 }
 
 function withoutPadding(frame: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(frame)) {
-    if (key !== "padding_bucket" && key !== "padding") result[key] = value;
-  }
+  const result = { ...frame };
+  delete result.padding_bucket;
+  delete result.padding;
   return result;
 }
 

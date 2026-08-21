@@ -118,10 +118,14 @@ describe("message transport padding", () => {
   it("validates and strips canonical incoming transport fields", () => {
     const padded = paddedIncoming(incomingFrame());
     expect(padded).not.toBeNull();
+    const expected = { ...padded!.frame };
+    delete expected.padding_bucket;
+    delete expected.padding;
     expect(validateAndStripIncomingMessagePadding(padded!.text, padded!.frame)).toBe(true);
     expect(padded!.frame).not.toHaveProperty("padding_bucket");
     expect(padded!.frame).not.toHaveProperty("padding");
     expect(padded!.frame.ciphertext_b64).toBe("ciphertext");
+    expect(padded!.frame).toEqual(expected);
   });
 
   it("validates incoming Unicode by UTF-8 bytes", () => {
