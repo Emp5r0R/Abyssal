@@ -817,10 +817,9 @@ class RealChatTransport(
                 .put("directory_node_id", payload.directoryNodeId)
                 .put("directory_revision", payload.directoryRevision.toLong())
                 .put("directory_digest", payload.directoryDigest)
-                .toString()
-            // Outbound encrypted frames contain ASCII JSON and base64url only, so
-            // character count equals wire bytes here.
-            if (frame.length > MAX_WEBSOCKET_FRAME_BYTES) {
+                .padOutgoingMessage()
+                ?: return OutboundSendResult.NOT_SENT
+            if (!MessageTransportPadding.isCanonicalWireText(frame)) {
                 return OutboundSendResult.NOT_SENT
             }
             val result = CompletableDeferred<OutboundSendResult>()
@@ -1280,7 +1279,10 @@ class RealChatTransport(
                             }
                         }
                         "message" -> {
-                            if (json.optInt("version") != PROTOCOL_VERSION) return
+                            if (!json.validateAndStripIncomingMessagePadding(text)) {
+                                closeCurrentSocket(webSocket, nodeId, "invalid message padding")
+                                return
+                            }
                             val payload = json.toIncomingPayload(generation)
                             if (payload == null) {
                                 closeCurrentSocket(webSocket, nodeId, "invalid encrypted message")

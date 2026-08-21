@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomFillSync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   decryptAttachment,
@@ -37,6 +37,22 @@ const DIRECTORY_TRANSCRIPT_DOMAIN = "ABYSSAL_DIRECTORY_CHECKPOINT_V2";
 const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
 const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/u;
+const MESSAGE_TRANSPORT_BUCKETS = [4096, 16_384, 65_536, 262_144, 1_048_576];
+const MESSAGE_PADDING_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const MESSAGE_PADDING_PATTERN = /^[A-Za-z0-9_-]*$/u;
+const OUTGOING_MESSAGE_KEYS = [
+  "type", "chat_id", "version", "message_id", "nonce_b64", "ciphertext_b64",
+  "state_revision", "identity_envelope_b64", "identity_public_b64", "prekey_id",
+  "state_signature_b64", "envelopes", "directory_node_id", "directory_revision",
+  "directory_digest",
+];
+const INCOMING_MESSAGE_KEYS = [
+  "type", "chat_id", "version", "message_id", "nonce_b64", "ciphertext_b64",
+  "signature_b64", "wrapped_key_b64", "prekey_id", "is_prekey", "sender_username",
+  "sender_public_key_b64", "identity_public_b64", "directory_node_id",
+  "directory_revision", "directory_digest", "padding_bucket", "padding",
+];
 
 const encode = (value) => Buffer.from(value).toString("base64url");
 const decode = (value) => new Uint8Array(Buffer.from(value, "base64url"));
@@ -44,11 +60,82 @@ const decode = (value) => new Uint8Array(Buffer.from(value, "base64url"));
 const pendingResultWaiters = new Map();
 const releasedPrekeysAwaitingReuse = new Map();
 const directoryTrackers = new WeakMap();
+const rawFrameText = new WeakMap();
 
 class AmbiguousRelayResult extends Error {}
 
 function exactKeys(value, expected) {
   assert.deepEqual(Object.keys(value).sort(), [...expected].sort());
+}
+
+function randomMessagePadding(length) {
+  assert.ok(Number.isSafeInteger(length) && length >= 0);
+  assert.ok(length <= MESSAGE_TRANSPORT_BUCKETS.at(-1));
+  const bytes = Buffer.allocUnsafe(length);
+  try {
+    randomFillSync(bytes);
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = MESSAGE_PADDING_ALPHABET.charCodeAt(bytes[index] & 63);
+    }
+    return bytes.toString("ascii");
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function padOutgoingMessageFrame(frame) {
+  assert.ok(frame && typeof frame === "object" && !Array.isArray(frame));
+  exactKeys(frame, OUTGOING_MESSAGE_KEYS);
+  assert.equal(frame.type, "message");
+  assert.equal(frame.version, 9);
+  for (const bucket of MESSAGE_TRANSPORT_BUCKETS) {
+    const empty = JSON.stringify({ ...frame, padding_bucket: bucket, padding: "" });
+    const emptyBytes = Buffer.byteLength(empty, "utf8");
+    if (emptyBytes > bucket) continue;
+    const serialized = JSON.stringify({
+      ...frame,
+      padding_bucket: bucket,
+      padding: randomMessagePadding(bucket - emptyBytes),
+    });
+    assert.equal(Buffer.byteLength(serialized, "utf8"), bucket);
+    assert.equal(JSON.stringify(JSON.parse(serialized)), serialized);
+    return serialized;
+  }
+  throw new Error("encrypted message exceeds the largest transport bucket");
+}
+
+function validateIncomingMessagePadding(frame) {
+  const raw = rawFrameText.get(frame);
+  assert.equal(typeof raw, "string", "raw relay message frame is unavailable");
+  exactKeys(frame, INCOMING_MESSAGE_KEYS);
+  assert.equal(frame.type, "message");
+  assert.equal(frame.version, 9);
+  assert.ok(MESSAGE_TRANSPORT_BUCKETS.includes(frame.padding_bucket));
+  assert.equal(typeof frame.padding, "string");
+  assert.match(frame.padding, MESSAGE_PADDING_PATTERN);
+
+  const base = {};
+  for (const [key, value] of Object.entries(frame)) {
+    if (key !== "padding_bucket" && key !== "padding") base[key] = value;
+  }
+  let canonical;
+  let emptyBytes;
+  for (const bucket of MESSAGE_TRANSPORT_BUCKETS) {
+    const empty = JSON.stringify({ ...base, padding_bucket: bucket, padding: "" });
+    const bytes = Buffer.byteLength(empty, "utf8");
+    if (bytes <= bucket) {
+      canonical = bucket;
+      emptyBytes = bytes;
+      break;
+    }
+  }
+  assert.equal(frame.padding_bucket, canonical);
+  assert.equal(frame.padding.length, canonical - emptyBytes);
+  assert.equal(Buffer.byteLength(raw, "utf8"), canonical);
+  assert.equal(raw, JSON.stringify(frame), "relay message JSON must be canonical");
+  delete frame.padding_bucket;
+  delete frame.padding;
+  return canonical;
 }
 
 function assertCanonicalBytes(value, size, label) {
@@ -345,13 +432,17 @@ function waitForFrame(socket, predicate) {
       socket.removeEventListener("close", onClose);
     };
     const onMessage = (event) => {
+      const raw = String(event.data);
       let frame;
       try {
-        frame = JSON.parse(String(event.data));
+        frame = JSON.parse(raw);
       } catch {
         return;
       }
       if (!predicate(frame)) return;
+      if (frame && typeof frame === "object" && !Array.isArray(frame)) {
+        rawFrameText.set(frame, raw);
+      }
       cleanup();
       resolve(frame);
     };
@@ -751,14 +842,14 @@ async function sendEncryptedMessage(
       requiresPrekey ? lease.prekey_id : "",
     );
     assertDirectoryStamp(staged.frame, directoryStamp);
-    const serialized = JSON.stringify(staged.frame);
-    assert.equal(serialized.includes(plaintextText), false);
     if (mutate) mutate(staged.frame);
+    const serialized = padOutgoingMessageFrame(staged.frame);
+    assert.equal(serialized.includes(plaintextText), false);
     let outcome = "NOT_SENT";
     try {
       // Install the correlated result sink before handing the frame to the socket.
       waiter = installResultWaiter(socket, "message_result", staged.messageId);
-      socket.send(JSON.stringify(staged.frame));
+      socket.send(serialized);
       outcome = await waiter.promise;
     } catch (error) {
       if (waiter && !(error instanceof AmbiguousRelayResult)) waiter.cancel();
@@ -785,6 +876,7 @@ async function sendEncryptedMessage(
 }
 
 function decryptFrame(recipient, frame, directoryStamp) {
+  validateIncomingMessagePadding(frame);
   assertDirectoryStamp(frame, directoryStamp);
   const senderPublicKey = decode(frame.sender_public_key_b64);
   const identityPublicInput = decode(frame.identity_public_b64);

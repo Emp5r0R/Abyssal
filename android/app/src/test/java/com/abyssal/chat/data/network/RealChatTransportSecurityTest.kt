@@ -569,6 +569,9 @@ class RealChatTransportSecurityTest {
         }
         awaitSent(currentSocket, 1)
         val sentPayload = JSONObject(currentSocket.sentTexts.single())
+        assertEquals(4096, currentSocket.sentTexts.single().toByteArray(StandardCharsets.UTF_8).size)
+        assertEquals(4096, sentPayload.getInt("padding_bucket"))
+        assertTrue(sentPayload.getString("padding").matches(Regex("^[A-Za-z0-9_-]*$")))
         assertEquals("node-1", sentPayload.getString("directory_node_id"))
         assertEquals(1L, sentPayload.getLong("directory_revision"))
         assertEquals(directoryDigest("Alice"), sentPayload.getString("directory_digest"))
@@ -865,11 +868,26 @@ class RealChatTransportSecurityTest {
         } ?: error("test presence must parse")
         assertTrue(with(transport) { acceptPresenceCatalog(catalog) })
 
-        listener.onMessage(socket, inboundMessageFrame())
+        listener.onMessage(socket, paddedInboundMessageFrame())
 
         assertNull(withTimeoutOrNull(100L) { transport.getIncomingPayloads().first() })
         assertNull(socket.closeCode)
         assertEquals(60L, transport.currentConnectionGeneration())
+    }
+
+    @Test
+    fun missingIncomingMessagePaddingClosesCurrentSocketFailClosed() = runBlocking {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket, generation = 61L)
+
+        listener.onMessage(socket, inboundMessageFrame())
+
+        assertNull(withTimeoutOrNull(100L) { transport.getIncomingPayloads().first() })
+        assertEquals(1008, socket.closeCode)
+        assertEquals("invalid message padding", socket.closeReason)
+        assertEquals("DISCONNECTED", transport.getServerStatus().first().state)
+        assertTrue(transport.currentConnectionGeneration() > 61L)
     }
 
     @Test
@@ -1283,6 +1301,22 @@ class RealChatTransportSecurityTest {
         .put("directory_revision", 1L)
         .put("directory_digest", directoryDigest("Alice"))
         .toString()
+
+    private fun paddedInboundMessageFrame(chatId: String = "dm_alice"): String {
+        val base = JSONObject(inboundMessageFrame(chatId))
+        for (bucket in listOf(4096, 16_384, 65_536, 262_144, 1_048_576)) {
+            val frame = JSONObject(base.toString())
+                .put("padding_bucket", bucket)
+                .put("padding", "")
+            val emptyBytes = frame.toString().toByteArray(StandardCharsets.UTF_8).size
+            if (emptyBytes > bucket) continue
+            frame.put("padding", "A".repeat(bucket - emptyBytes))
+            return frame.toString().also {
+                check(it.toByteArray(StandardCharsets.UTF_8).size == bucket)
+            }
+        }
+        error("test message exceeds transport buckets")
+    }
 
     private fun outboundPayload(messageId: String): EncryptedTransportPayload =
         EncryptedTransportPayload(

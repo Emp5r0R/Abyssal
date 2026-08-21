@@ -1,5 +1,58 @@
 # Project Progress
 
+## Completed Deployment: Canonical WebSocket Envelope Padding
+
+This package reduces exact encrypted-message length leakage on the TLS path by
+requiring every protocol-v9 `message` WebSocket frame to occupy the smallest
+canonical wire bucket that can contain it. It does not claim sender anonymity,
+cover traffic, attachment-size hiding, or protection from the relay or TLS
+terminator.
+
+### Delivered
+
+- Sender-to-relay and relay-to-recipient `message` frames use exact 4 KiB,
+  16 KiB, 64 KiB, 256 KiB, or 1 MiB serialized UTF-8 buckets with bounded
+  random ASCII filler.
+- Relay, web, and Android independently select and validate the smallest
+  canonical bucket; missing, malformed, noncanonical, truncated, or oversized
+  padding fails closed before message admission or publication.
+- Padding is transport-only and does not alter protocol-v9 ciphertext,
+  signatures, ratchet state, attachment cipher-v1 bytes, or generated crypto
+  bindings.
+- Existing inbound rate limits, per-client/global outbound byte reservations,
+  transient fanout budgets, pending queues, session generations, and purge
+  behavior account for the complete padded frame.
+- Cohesive Rust, web, Android, and disposable-relay integration tests cover
+  bucket boundaries, distinct plaintexts in the same bucket, tampering,
+  overflow, accounting, and lifecycle invalidation.
+- This outer envelope is mandatory for matching clients but remains separate
+  from the protocol-v9 cryptographic payload. Older builds that omit the two
+  transport fields are wire-incompatible.
+
+### Verification
+
+- Final `./scripts/test-all.sh all`: passed on the integrated tree.
+- Web: 258 tests in 19 files, zero-warning lint, TypeScript compilation, and
+  production Vite build passed.
+- Rust: 25 core tests and 149 relay tests passed with rustfmt, locked workspace
+  tests, and warning-denied workspace Clippy.
+- Android: 197 JVM tests with zero skips/failures/errors, release lint, and
+  debug/release Kotlin compilation passed without packaging an APK or AAB.
+- Disposable-relay OPAQUE/E2EE integration covered first-contact prekeys,
+  padded text and attachment metadata, read receipts, rollback, and offline
+  replay. Generated-artifact, dependency-verification, deployment, shell,
+  npm, and RustSec checks passed.
+
+### Remaining External Limits
+
+The buckets reduce exact encrypted-message application-frame length leakage,
+not traffic analysis generally. Timing, counts, routing, participants, control
+frames, attachment sizes, bucket selection, and relay/TLS-terminator visibility
+remain exposed. Sealed sender, batching, private contact discovery, optional
+cover traffic, MLS, multi-device coordination, an external transparency
+witness, a persistent rollback anchor, and an independent audit remain separate
+work. No Android package, release, or production deployment was performed.
+
 ## Completed Deployment: Transactional Attachment Publication
 
 This package reduces the remaining encrypted-attachment orphan window without

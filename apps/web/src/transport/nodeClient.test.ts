@@ -47,9 +47,49 @@ function encryptedFrame(messageId: string): Record<string, unknown> {
   return {
     type: "message",
     chat_id: "dm_123",
+    version: 9,
     message_id: messageId,
+    nonce_b64: "nonce",
+    ciphertext_b64: "ciphertext",
+    state_revision: 1,
+    identity_envelope_b64: "identity-envelope",
+    identity_public_b64: "identity-public",
+    prekey_id: "prekey",
+    state_signature_b64: "state-signature",
+    envelopes: [{
+      recipient_username: "Bob",
+      wrapped_key_b64: "wrapped",
+      prekey_id: "",
+      is_prekey: false,
+      signature_b64: "signature",
+    }],
     ...DIRECTORY_STAMP,
   };
+}
+
+function paddedRelayMessage(): { text: string; frame: Record<string, unknown> } {
+  const base = {
+    type: "message",
+    chat_id: "dm_123",
+    version: 9,
+    message_id: "incoming-1",
+    nonce_b64: "nonce",
+    ciphertext_b64: "ciphertext",
+    signature_b64: "signature",
+    wrapped_key_b64: "wrapped",
+    prekey_id: "",
+    is_prekey: false,
+    sender_username: "Bob",
+    sender_public_key_b64: "sender-public",
+    identity_public_b64: "sender-public",
+    ...DIRECTORY_STAMP,
+  };
+  const bucket = 4096;
+  const empty = JSON.stringify({ ...base, padding_bucket: bucket, padding: "" });
+  const padding = "A".repeat(bucket - new TextEncoder().encode(empty).byteLength);
+  const text = JSON.stringify({ ...base, padding_bucket: bucket, padding });
+  if (new TextEncoder().encode(text).byteLength !== bucket) throw new Error("bad padded fixture");
+  return { text, frame: JSON.parse(text) as Record<string, unknown> };
 }
 
 function websocketTicketResponse(expiresInSec = 30): Response {
@@ -1271,6 +1311,13 @@ describe("RelaySocket", () => {
       socket.onopen?.(new Event("open"));
       relay.setDirectoryStamp(DIRECTORY_STAMP);
       const pending = relay.sendEncryptedPayload("message-1", encryptedFrame("message-1"));
+      const sentFrame = socket.sent.at(-1) ?? "";
+      expect(new TextEncoder().encode(sentFrame).byteLength).toBe(4096);
+      expect(JSON.parse(sentFrame)).toMatchObject({
+        type: "message",
+        message_id: "message-1",
+        padding_bucket: 4096,
+      });
       socket.onmessage?.(new MessageEvent("message", {
         data: JSON.stringify({ type: "message_result", message_id: "message-1", accepted: true }),
       }));
@@ -1279,6 +1326,27 @@ describe("RelaySocket", () => {
       relay.close();
     } finally {
       globalThis.WebSocket = original;
+    }
+  });
+
+  it("strips canonical incoming padding and fails closed on noncanonical padding", async () => {
+    const frames: IncomingFrame[] = [];
+    const context = await connectRelay((frame) => frames.push(frame));
+    const { relay, socket, originalWebSocket } = context;
+    try {
+      const canonical = paddedRelayMessage();
+      socket.onmessage?.(new MessageEvent("message", { data: canonical.text }));
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).not.toHaveProperty("padding_bucket");
+      expect(frames[0]).not.toHaveProperty("padding");
+
+      const noncanonical = { ...canonical.frame, padding_bucket: 16_384 };
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify(noncanonical) }));
+      expect(frames).toHaveLength(1);
+      expect(socket.readyState).toBe(3);
+    } finally {
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
     }
   });
 
@@ -1295,6 +1363,12 @@ describe("RelaySocket", () => {
       await expect(relay.sendEncryptedPayload("message-stale-stamp", {
         ...encryptedFrame("message-stale-stamp"),
         directory_revision: DIRECTORY_STAMP.directory_revision + 1,
+      })).resolves.toBe("NOT_SENT");
+      expect(socket.sent).toEqual([]);
+
+      await expect(relay.sendEncryptedPayload("message-invalid-shape", {
+        ...encryptedFrame("message-invalid-shape"),
+        unexpected: true,
       })).resolves.toBe("NOT_SENT");
       expect(socket.sent).toEqual([]);
     } finally {

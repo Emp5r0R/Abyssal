@@ -56,6 +56,14 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod transport_padding;
+
+use transport_padding::{
+    json_array_len, json_bool_len, json_field_len, json_number_len, json_object_len,
+    json_string_field_len, random_message_transport_padding, valid_message_transport_padding,
+    MESSAGE_TRANSPORT_BUCKETS, MESSAGE_TRANSPORT_MAX_BUCKET,
+};
+
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 const FILE_ATTACHMENT_LIMIT_BYTES: usize = 200 * 1024 * 1024;
@@ -734,6 +742,8 @@ enum InboundFrame {
         directory_node_id: String,
         directory_revision: u64,
         directory_digest: String,
+        padding_bucket: usize,
+        padding: String,
     },
     #[serde(rename = "message_ack")]
     MessageAck {
@@ -771,7 +781,7 @@ enum InboundFrame {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InboundRecipientEnvelope {
     recipient_username: String,
@@ -810,6 +820,8 @@ enum OutboundFrame {
         directory_node_id: String,
         directory_revision: u64,
         directory_digest: String,
+        padding_bucket: usize,
+        padding: String,
     },
     #[serde(rename = "prekey_lease")]
     PrekeyLease {
@@ -840,6 +852,29 @@ enum OutboundFrame {
     AckResult { message_id: String, accepted: bool },
 }
 
+#[cfg(test)]
+#[derive(Serialize)]
+struct InboundMessageWire<'a> {
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    chat_id: &'a str,
+    version: u32,
+    message_id: &'a str,
+    nonce_b64: &'a str,
+    ciphertext_b64: &'a str,
+    envelopes: &'a [InboundRecipientEnvelope],
+    state_revision: u64,
+    identity_envelope_b64: &'a str,
+    identity_public_b64: &'a str,
+    prekey_id: &'a str,
+    state_signature_b64: &'a str,
+    directory_node_id: &'a str,
+    directory_revision: u64,
+    directory_digest: &'a str,
+    padding_bucket: usize,
+    padding: &'a str,
+}
+
 impl OutboundFrame {
     fn zeroize_sensitive(&mut self) {
         if let Self::Message {
@@ -854,6 +889,7 @@ impl OutboundFrame {
             identity_public_b64,
             directory_node_id,
             directory_digest,
+            padding,
             ..
         } = self
         {
@@ -868,6 +904,7 @@ impl OutboundFrame {
             identity_public_b64.zeroize();
             directory_node_id.zeroize();
             directory_digest.zeroize();
+            padding.zeroize();
         }
         if let Self::PrekeyLease {
             chat_id,
@@ -4112,6 +4149,7 @@ async fn check_ws_frame_allowed(
 
 async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(), String> {
     let frame: InboundFrame = serde_json::from_str(text).map_err(|err| err.to_string())?;
+    validate_inbound_message_padding(text, &frame)?;
     match frame {
         InboundFrame::Activity => {
             touch_activity(state).await;
@@ -4149,8 +4187,7 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             .await
         }
         InboundFrame::Dummy { padding_b64, bytes } => {
-            let _discarded_hint =
-                padding_b64.as_deref().map(str::len).unwrap_or(0) + bytes.unwrap_or_default();
+            let _discarded_hint = discarded_dummy_hint(padding_b64.as_deref(), bytes);
             Ok(())
         }
         InboundFrame::Join { chat_id } => {
@@ -4174,6 +4211,8 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             directory_node_id,
             directory_revision,
             directory_digest,
+            padding_bucket: _,
+            padding: _,
         } => {
             let message_id_is_safe = valid_chat_id(&message_id);
             let route_result = route_encrypted_message_with_directory(
@@ -4716,7 +4755,7 @@ async fn route_encrypted_message_with_directory(
         let envelope = envelope_map
             .get(recipient_username)
             .ok_or_else(|| "recipient envelope rejected".to_string())?;
-        let frame = OutboundFrame::Message {
+        let mut frame = OutboundFrame::Message {
             chat_id: chat_id.clone(),
             version,
             message_id: message_id.clone(),
@@ -4732,10 +4771,18 @@ async fn route_encrypted_message_with_directory(
             directory_node_id: directory_stamp.node_id.clone(),
             directory_revision: directory_stamp.revision,
             directory_digest: directory_stamp.digest.clone(),
+            padding_bucket: 0,
+            padding: String::new(),
         };
-        let frame_bytes = outbound_frame_bytes(&frame);
+        prepare_outbound_message_padding(&mut frame)?;
+        let frame_bytes = validated_outbound_frame_bytes(&frame)
+            .ok_or_else(|| "fanout preparation budget full".to_string())?;
         transient_fanout_bytes = transient_fanout_bytes
-            .checked_add(frame_bytes.saturating_add(recipient_username.len()))
+            .checked_add(
+                frame_bytes
+                    .checked_add(recipient_username.len())
+                    .ok_or_else(|| "fanout preparation budget full".to_string())?,
+            )
             .ok_or_else(|| "fanout preparation budget full".to_string())?;
         if transient_fanout_bytes > MAX_TRANSIENT_FANOUT_BYTES {
             return Err("fanout preparation budget full".to_string());
@@ -4953,29 +5000,37 @@ fn prekey_lease_details(frame: &OutboundFrame) -> Option<(String, String, String
 }
 
 fn outbound_frame_bytes(frame: &OutboundFrame) -> usize {
-    match frame {
-        OutboundFrame::Message {
-            chat_id,
-            message_id,
-            nonce_b64,
-            ciphertext_b64,
-            signature_b64,
-            wrapped_key_b64,
-            sender_username,
-            sender_public_key_b64,
-            identity_public_b64,
-            ..
-        } => 256usize
-            .saturating_add(chat_id.len())
-            .saturating_add(message_id.len())
-            .saturating_add(nonce_b64.len())
-            .saturating_add(ciphertext_b64.len())
-            .saturating_add(signature_b64.len())
-            .saturating_add(wrapped_key_b64.len())
-            .saturating_add(sender_username.len())
-            .saturating_add(sender_public_key_b64.len())
-            .saturating_add(identity_public_b64.len()),
-        _ => 0,
+    let OutboundFrame::Message {
+        padding_bucket,
+        padding,
+        ..
+    } = frame
+    else {
+        return 0;
+    };
+    let Some((canonical_bucket, empty_len)) = canonical_outbound_message_bucket(frame) else {
+        return WS_MAX_FRAME_BYTES.saturating_add(1);
+    };
+    let Some(expected_padding_len) = canonical_bucket.checked_sub(empty_len) else {
+        return WS_MAX_FRAME_BYTES.saturating_add(1);
+    };
+    if *padding_bucket != canonical_bucket || expected_padding_len != padding.len() {
+        WS_MAX_FRAME_BYTES.saturating_add(1)
+    } else {
+        // Relay-created frames already received CSPRNG URL-safe filler. Avoid
+        // rescanning up to 1 MiB every time a pending queue is simulated or
+        // accounted. The single serialization boundary still revalidates the
+        // filler alphabet before bytes reach the socket.
+        canonical_bucket
+    }
+}
+
+fn validated_outbound_frame_bytes(frame: &OutboundFrame) -> Option<usize> {
+    let bytes = outbound_frame_bytes(frame);
+    if matches!(frame, OutboundFrame::Message { .. }) && bytes > WS_MAX_FRAME_BYTES {
+        None
+    } else {
+        Some(bytes)
     }
 }
 
@@ -5002,8 +5057,12 @@ async fn preflight_pending_frames(
     let transient_fanout_bytes = frames
         .iter()
         .try_fold(0usize, |total, (recipient, frame)| {
+            let frame_and_recipient = validated_outbound_frame_bytes(frame)
+                .ok_or_else(|| "fanout preparation budget full".to_string())?
+                .checked_add(recipient.len())
+                .ok_or_else(|| "fanout preparation budget full".to_string())?;
             total
-                .checked_add(outbound_frame_bytes(frame).saturating_add(recipient.len()))
+                .checked_add(frame_and_recipient)
                 .filter(|bytes| *bytes <= MAX_TRANSIENT_FANOUT_BYTES)
                 .ok_or_else(|| "fanout preparation budget full".to_string())
         })?;
@@ -5019,12 +5078,11 @@ async fn preflight_pending_frames(
             queue
                 .iter()
                 .map(|pending_frame| {
-                    (
-                        outbound_frame_bytes(&pending_frame.frame),
-                        is_prekey_frame(&pending_frame.frame),
-                    )
+                    let bytes = validated_outbound_frame_bytes(&pending_frame.frame)?;
+                    Some((bytes, is_prekey_frame(&pending_frame.frame)))
                 })
-                .collect(),
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "pending frame rejected".to_string())?,
         );
     }
     let mut plan = Vec::with_capacity(frames.len());
@@ -5047,11 +5105,15 @@ async fn preflight_pending_frames(
         } else {
             None
         };
-        let incoming_bytes = outbound_frame_bytes(frame);
-        if projected_bytes.saturating_add(incoming_bytes) > MAX_PENDING_BYTES {
+        let incoming_bytes = validated_outbound_frame_bytes(frame)
+            .ok_or_else(|| "pending frame rejected".to_string())?;
+        let Some(projected_next) = projected_bytes.checked_add(incoming_bytes) else {
+            return Err("pending message budget full".to_string());
+        };
+        if projected_next > MAX_PENDING_BYTES {
             return Err("pending message budget full".to_string());
         }
-        projected_bytes = projected_bytes.saturating_add(incoming_bytes);
+        projected_bytes = projected_next;
         queue.push((incoming_bytes, is_prekey_frame(frame)));
         plan.push(PendingQueuePlan {
             key,
@@ -5088,12 +5150,11 @@ async fn commit_pending_frames(
             queue
                 .iter()
                 .map(|pending_frame| {
-                    (
-                        outbound_frame_bytes(&pending_frame.frame),
-                        is_prekey_frame(&pending_frame.frame),
-                    )
+                    let bytes = validated_outbound_frame_bytes(&pending_frame.frame)?;
+                    Some((bytes, is_prekey_frame(&pending_frame.frame)))
                 })
-                .collect(),
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "pending queue changed during commit".to_string())?,
         );
     }
     for ((_, frame), queue_plan) in frames.iter().zip(plan.iter()) {
@@ -5114,11 +5175,15 @@ async fn commit_pending_frames(
         if queue_plan.evicted.is_some() {
             return Err("pending frame plan already committed".to_string());
         }
-        let incoming_bytes = outbound_frame_bytes(frame);
-        if projected_bytes.saturating_add(incoming_bytes) > MAX_PENDING_BYTES {
+        let incoming_bytes = validated_outbound_frame_bytes(frame)
+            .ok_or_else(|| "pending frame rejected".to_string())?;
+        let Some(projected_next) = projected_bytes.checked_add(incoming_bytes) else {
+            return Err("pending message budget changed during commit".to_string());
+        };
+        if projected_next > MAX_PENDING_BYTES {
             return Err("pending message budget changed during commit".to_string());
         }
-        projected_bytes = projected_bytes.saturating_add(incoming_bytes);
+        projected_bytes = projected_next;
         queue.push((incoming_bytes, is_prekey_frame(frame)));
     }
 
@@ -5137,9 +5202,13 @@ async fn commit_pending_frames(
         } else if queue_plan.eviction_index.is_some() {
             return Err("pending queue changed during commit".to_string());
         }
-        let incoming_bytes = outbound_frame_bytes(frame);
+        let incoming_bytes = validated_outbound_frame_bytes(frame)
+            .ok_or_else(|| "pending frame rejected".to_string())?;
+        let Some(next_pending_bytes) = pending_bytes.checked_add(incoming_bytes) else {
+            return Err("pending message budget changed during commit".to_string());
+        };
         queue.push(PendingFrame::new(frame.clone(), now));
-        *pending_bytes = pending_bytes.saturating_add(incoming_bytes);
+        *pending_bytes = next_pending_bytes;
     }
     Ok(())
 }
@@ -6038,6 +6107,13 @@ fn directory_stamp_at_revision(
     }
 }
 
+fn discarded_dummy_hint(padding_b64: Option<&str>, bytes: Option<usize>) -> usize {
+    padding_b64
+        .map(str::len)
+        .unwrap_or_default()
+        .saturating_add(bytes.unwrap_or_default())
+}
+
 fn identity_directory_digest_v2(
     node_id: &str,
     revision: u64,
@@ -6081,12 +6157,281 @@ async fn broadcast_to_all(state: &AppState, frame: &OutboundFrame) {
     }
 }
 
+fn inbound_recipient_envelope_wire_len(envelope: &InboundRecipientEnvelope) -> Option<usize> {
+    json_object_len(&[
+        json_string_field_len("recipient_username", &envelope.recipient_username)?,
+        json_string_field_len("wrapped_key_b64", &envelope.wrapped_key_b64)?,
+        json_string_field_len("prekey_id", &envelope.prekey_id)?,
+        json_field_len("is_prekey", json_bool_len(envelope.is_prekey))?,
+        json_string_field_len("signature_b64", &envelope.signature_b64)?,
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inbound_message_wire_len(
+    chat_id: &str,
+    version: u32,
+    message_id: &str,
+    nonce_b64: &str,
+    ciphertext_b64: &str,
+    envelopes: &[InboundRecipientEnvelope],
+    state_revision: u64,
+    identity_envelope_b64: &str,
+    identity_public_b64: &str,
+    prekey_id: &str,
+    state_signature_b64: &str,
+    directory_node_id: &str,
+    directory_revision: u64,
+    directory_digest: &str,
+    padding_bucket: usize,
+    padding: &str,
+) -> Option<usize> {
+    let envelopes_len = json_array_len(envelopes.iter().map(inbound_recipient_envelope_wire_len))?;
+    json_object_len(&[
+        json_string_field_len("type", "message")?,
+        json_string_field_len("chat_id", chat_id)?,
+        json_field_len("version", json_number_len(version)?)?,
+        json_string_field_len("message_id", message_id)?,
+        json_string_field_len("nonce_b64", nonce_b64)?,
+        json_string_field_len("ciphertext_b64", ciphertext_b64)?,
+        json_field_len("envelopes", envelopes_len)?,
+        json_field_len("state_revision", json_number_len(state_revision)?)?,
+        json_string_field_len("identity_envelope_b64", identity_envelope_b64)?,
+        json_string_field_len("identity_public_b64", identity_public_b64)?,
+        json_string_field_len("prekey_id", prekey_id)?,
+        json_string_field_len("state_signature_b64", state_signature_b64)?,
+        json_string_field_len("directory_node_id", directory_node_id)?,
+        json_field_len("directory_revision", json_number_len(directory_revision)?)?,
+        json_string_field_len("directory_digest", directory_digest)?,
+        json_field_len("padding_bucket", json_number_len(padding_bucket)?)?,
+        json_string_field_len("padding", padding)?,
+    ])
+}
+
+fn validate_inbound_message_padding(text: &str, frame: &InboundFrame) -> Result<(), String> {
+    let InboundFrame::Message {
+        chat_id,
+        version,
+        message_id,
+        nonce_b64,
+        ciphertext_b64,
+        envelopes,
+        state_revision,
+        identity_envelope_b64,
+        identity_public_b64,
+        prekey_id,
+        state_signature_b64,
+        directory_node_id,
+        directory_revision,
+        directory_digest,
+        padding_bucket,
+        padding,
+    } = frame
+    else {
+        return Ok(());
+    };
+    if text.len() > MESSAGE_TRANSPORT_MAX_BUCKET || !valid_message_transport_padding(padding) {
+        return Err("message transport padding rejected".to_string());
+    }
+    let canonical = MESSAGE_TRANSPORT_BUCKETS.iter().find_map(|bucket| {
+        inbound_message_wire_len(
+            chat_id,
+            *version,
+            message_id,
+            nonce_b64,
+            ciphertext_b64,
+            envelopes,
+            *state_revision,
+            identity_envelope_b64,
+            identity_public_b64,
+            prekey_id,
+            state_signature_b64,
+            directory_node_id,
+            *directory_revision,
+            directory_digest,
+            *bucket,
+            "",
+        )
+        .filter(|empty_len| *empty_len <= *bucket)
+        .map(|empty_len| (*bucket, empty_len))
+    });
+    let Some((canonical_bucket, empty_len)) = canonical else {
+        return Err("message transport padding unavailable".to_string());
+    };
+    if *padding_bucket != canonical_bucket {
+        return Err("message transport padding bucket rejected".to_string());
+    }
+    let expected_padding_len = canonical_bucket
+        .checked_sub(empty_len)
+        .ok_or_else(|| "message transport padding length rejected".to_string())?;
+    if padding.len() != expected_padding_len {
+        return Err("message transport padding length rejected".to_string());
+    }
+    let serialized_len = inbound_message_wire_len(
+        chat_id,
+        *version,
+        message_id,
+        nonce_b64,
+        ciphertext_b64,
+        envelopes,
+        *state_revision,
+        identity_envelope_b64,
+        identity_public_b64,
+        prekey_id,
+        state_signature_b64,
+        directory_node_id,
+        *directory_revision,
+        directory_digest,
+        *padding_bucket,
+        padding,
+    )
+    .ok_or_else(|| "message transport padding serialization failed".to_string())?;
+    if serialized_len != canonical_bucket || text.len() != canonical_bucket {
+        return Err("message transport padding length rejected".to_string());
+    }
+    Ok(())
+}
+
+fn outbound_message_wire_len(
+    frame: &OutboundFrame,
+    padding_bucket: usize,
+    padding: &str,
+) -> Option<usize> {
+    let OutboundFrame::Message {
+        chat_id,
+        version,
+        message_id,
+        nonce_b64,
+        ciphertext_b64,
+        signature_b64,
+        wrapped_key_b64,
+        prekey_id,
+        is_prekey,
+        sender_username,
+        sender_public_key_b64,
+        identity_public_b64,
+        directory_node_id,
+        directory_revision,
+        directory_digest,
+        ..
+    } = frame
+    else {
+        return None;
+    };
+    json_object_len(&[
+        json_string_field_len("type", "message")?,
+        json_string_field_len("chat_id", chat_id)?,
+        json_field_len("version", json_number_len(*version)?)?,
+        json_string_field_len("message_id", message_id)?,
+        json_string_field_len("nonce_b64", nonce_b64)?,
+        json_string_field_len("ciphertext_b64", ciphertext_b64)?,
+        json_string_field_len("signature_b64", signature_b64)?,
+        json_string_field_len("wrapped_key_b64", wrapped_key_b64)?,
+        json_string_field_len("prekey_id", prekey_id)?,
+        json_field_len("is_prekey", json_bool_len(*is_prekey))?,
+        json_string_field_len("sender_username", sender_username)?,
+        json_string_field_len("sender_public_key_b64", sender_public_key_b64)?,
+        json_string_field_len("identity_public_b64", identity_public_b64)?,
+        json_string_field_len("directory_node_id", directory_node_id)?,
+        json_field_len("directory_revision", json_number_len(*directory_revision)?)?,
+        json_string_field_len("directory_digest", directory_digest)?,
+        json_field_len("padding_bucket", json_number_len(padding_bucket)?)?,
+        json_string_field_len("padding", padding)?,
+    ])
+}
+
+fn canonical_outbound_message_bucket(frame: &OutboundFrame) -> Option<(usize, usize)> {
+    MESSAGE_TRANSPORT_BUCKETS.iter().find_map(|bucket| {
+        outbound_message_wire_len(frame, *bucket, "")
+            .filter(|empty_len| *empty_len <= *bucket)
+            .map(|empty_len| (*bucket, empty_len))
+    })
+}
+
+fn outbound_message_padding_is_canonical(frame: &OutboundFrame, serialized_len: usize) -> bool {
+    let OutboundFrame::Message {
+        padding_bucket,
+        padding,
+        ..
+    } = frame
+    else {
+        return true;
+    };
+    if !MESSAGE_TRANSPORT_BUCKETS.contains(padding_bucket)
+        || !valid_message_transport_padding(padding)
+    {
+        return false;
+    }
+    let Some((canonical_bucket, empty_len)) = canonical_outbound_message_bucket(frame) else {
+        return false;
+    };
+    let Some(expected_padding_len) = canonical_bucket.checked_sub(empty_len) else {
+        return false;
+    };
+    *padding_bucket == canonical_bucket
+        && expected_padding_len == padding.len()
+        && serialized_len == canonical_bucket
+}
+
+fn prepare_outbound_message_padding(frame: &mut OutboundFrame) -> Result<(), String> {
+    if let OutboundFrame::Message {
+        padding_bucket,
+        padding,
+        ..
+    } = frame
+    {
+        padding.zeroize();
+        *padding_bucket = 0;
+    } else {
+        return Ok(());
+    }
+    let Some((canonical_bucket, empty_len)) = canonical_outbound_message_bucket(frame) else {
+        return Err("message transport padding unavailable".to_string());
+    };
+    let filler_len = canonical_bucket
+        .checked_sub(empty_len)
+        .ok_or_else(|| "message transport padding length rejected".to_string())?;
+    let filler = random_message_transport_padding(filler_len)?;
+    if let OutboundFrame::Message {
+        padding_bucket,
+        padding,
+        ..
+    } = frame
+    {
+        *padding_bucket = canonical_bucket;
+        *padding = filler;
+    }
+    let serialized_len = serde_json::to_string(frame)
+        .ok()
+        .map(|serialized| serialized.len())
+        .ok_or_else(|| "message transport padding serialization failed".to_string())?;
+    if serialized_len != canonical_bucket {
+        if let OutboundFrame::Message {
+            padding_bucket,
+            padding,
+            ..
+        } = frame
+        {
+            padding.zeroize();
+            *padding_bucket = 0;
+        }
+        return Err("message transport padding length rejected".to_string());
+    }
+    Ok(())
+}
+
 fn serialize_outbound_frame(frame: &OutboundFrame) -> Option<String> {
     let serialized = serde_json::to_string(frame).ok()?;
+    if !outbound_message_padding_is_canonical(frame, serialized.len()) {
+        return None;
+    }
     (serialized.len() <= WS_MAX_FRAME_BYTES).then_some(serialized)
 }
 
 fn outbound_queue_bytes(frame: &OutboundFrame) -> usize {
+    if matches!(frame, OutboundFrame::Message { .. }) {
+        return outbound_frame_bytes(frame);
+    }
     serialize_outbound_frame(frame)
         .map(|serialized| serialized.len())
         .unwrap_or(WS_MAX_FRAME_BYTES.saturating_add(1))
@@ -9340,8 +9685,186 @@ mod tests {
             directory_node_id: "test-node".to_string(),
             directory_revision: 1,
             directory_digest: URL_SAFE_NO_PAD.encode([0_u8; 32]),
+            padding_bucket: 0,
+            padding: String::new(),
         };
         assert!(serialize_outbound_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn message_transport_padding_hits_bucket_boundaries_exactly() {
+        let first_randomized = test_message_frame("forum_test", "random-a", "Alice", "", false);
+        let second_randomized = test_message_frame("forum_test", "random-a", "Alice", "", false);
+        assert!(matches!(
+            (&first_randomized, &second_randomized),
+            (
+                OutboundFrame::Message { padding: left, .. },
+                OutboundFrame::Message { padding: right, .. }
+            ) if !left.is_empty() && left != right
+        ));
+
+        let mut at_boundary = test_message_frame("forum_test", "boundary", "Alice", "", false);
+        let current_ciphertext_len = match &at_boundary {
+            OutboundFrame::Message { ciphertext_b64, .. } => ciphertext_b64.len(),
+            _ => unreachable!("test message frame"),
+        };
+        let empty_len = outbound_message_wire_len(&at_boundary, MESSAGE_TRANSPORT_BUCKETS[0], "")
+            .expect("empty message wire length");
+        if let OutboundFrame::Message {
+            ciphertext_b64,
+            padding_bucket,
+            padding,
+            ..
+        } = &mut at_boundary
+        {
+            *ciphertext_b64 = "x".repeat(
+                MESSAGE_TRANSPORT_BUCKETS[0]
+                    .checked_sub(empty_len)
+                    .expect("boundary capacity")
+                    .saturating_add(current_ciphertext_len),
+            );
+            padding.zeroize();
+            *padding_bucket = 0;
+        }
+        prepare_outbound_message_padding(&mut at_boundary).expect("exact first bucket");
+        assert!(matches!(
+            at_boundary,
+            OutboundFrame::Message {
+                padding_bucket: 4096,
+                ref padding,
+                ..
+            } if padding.is_empty()
+        ));
+        assert_eq!(
+            serialize_outbound_frame(&at_boundary)
+                .expect("boundary frame")
+                .len(),
+            MESSAGE_TRANSPORT_BUCKETS[0]
+        );
+
+        let mut next_bucket = at_boundary.clone();
+        if let OutboundFrame::Message {
+            ciphertext_b64,
+            padding_bucket,
+            padding,
+            ..
+        } = &mut next_bucket
+        {
+            ciphertext_b64.push('x');
+            padding.zeroize();
+            *padding_bucket = 0;
+        }
+        prepare_outbound_message_padding(&mut next_bucket).expect("next bucket");
+        assert!(matches!(
+            next_bucket,
+            OutboundFrame::Message {
+                padding_bucket: 16_384,
+                ..
+            }
+        ));
+        assert_eq!(
+            serialize_outbound_frame(&next_bucket)
+                .expect("next bucket frame")
+                .len(),
+            MESSAGE_TRANSPORT_BUCKETS[1]
+        );
+    }
+
+    #[test]
+    fn message_transport_padding_rejects_tampering_and_noncanonical_input() {
+        let envelopes = Vec::new();
+        let empty_len = inbound_message_wire_len(
+            "dm_a_b",
+            E2EE_PROTOCOL_VERSION,
+            "message-1",
+            "nonce",
+            "ciphertext",
+            &envelopes,
+            1,
+            "identity-envelope",
+            "identity-public",
+            "fallback",
+            "state-signature",
+            "test-node",
+            1,
+            &URL_SAFE_NO_PAD.encode([7_u8; DIRECTORY_DIGEST_BYTES]),
+            MESSAGE_TRANSPORT_BUCKETS[0],
+            "",
+        )
+        .expect("inbound empty wire length");
+        let padding = "A".repeat(
+            MESSAGE_TRANSPORT_BUCKETS[0]
+                .checked_sub(empty_len)
+                .expect("inbound bucket capacity"),
+        );
+        let directory_digest = URL_SAFE_NO_PAD.encode([7_u8; DIRECTORY_DIGEST_BYTES]);
+        let text = serde_json::to_string(&InboundMessageWire {
+            frame_type: "message",
+            chat_id: "dm_a_b",
+            version: E2EE_PROTOCOL_VERSION,
+            message_id: "message-1",
+            nonce_b64: "nonce",
+            ciphertext_b64: "ciphertext",
+            envelopes: &envelopes,
+            state_revision: 1,
+            identity_envelope_b64: "identity-envelope",
+            identity_public_b64: "identity-public",
+            prekey_id: "fallback",
+            state_signature_b64: "state-signature",
+            directory_node_id: "test-node",
+            directory_revision: 1,
+            directory_digest: &directory_digest,
+            padding_bucket: MESSAGE_TRANSPORT_BUCKETS[0],
+            padding: &padding,
+        })
+        .expect("inbound padded frame");
+        let frame: InboundFrame = serde_json::from_str(&text).expect("inbound message");
+        validate_inbound_message_padding(&text, &frame).expect("canonical inbound padding");
+
+        let mut wrong_bucket =
+            serde_json::from_str::<InboundFrame>(&text).expect("inbound message");
+        if let InboundFrame::Message { padding_bucket, .. } = &mut wrong_bucket {
+            *padding_bucket = MESSAGE_TRANSPORT_BUCKETS[1];
+        }
+        assert!(validate_inbound_message_padding(&text, &wrong_bucket).is_err());
+
+        let mut shortened = serde_json::from_str::<InboundFrame>(&text).expect("inbound message");
+        if let InboundFrame::Message { padding, .. } = &mut shortened {
+            padding.pop();
+        }
+        assert!(validate_inbound_message_padding(&text, &shortened).is_err());
+
+        let mut tampered = frame;
+        if let InboundFrame::Message { padding, .. } = &mut tampered {
+            padding.replace_range(0..1, "!");
+        }
+        assert!(validate_inbound_message_padding(&text, &tampered).is_err());
+
+        let mut noncanonical = text.clone();
+        noncanonical.push(' ');
+        let parsed: InboundFrame = serde_json::from_str(&noncanonical).expect("whitespace parse");
+        assert!(validate_inbound_message_padding(&noncanonical, &parsed).is_err());
+    }
+
+    #[test]
+    fn dummy_padding_hint_saturates_without_overflow() {
+        assert_eq!(
+            discarded_dummy_hint(Some("padding"), Some(usize::MAX)),
+            usize::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_accounting_uses_complete_padded_message_frame() {
+        let state = test_state();
+        let frame = test_message_frame("dm_a_b", "accounted", "Alice", "", false);
+        let expected = serialize_outbound_frame(&frame)
+            .expect("padded message serialization")
+            .len();
+        queue_pending_frame(&state, "dm_a_b", "Bob".to_string(), frame)
+            .await
+            .expect("pending admission");
+        assert_eq!(*state.pending_bytes.lock().await, expected);
     }
 
     #[test]
@@ -9974,8 +10497,10 @@ mod tests {
     #[tokio::test]
     async fn pending_preflight_rejects_transient_fanout_above_global_budget() {
         let state = test_state();
-        let payload = "x".repeat(1024 * 1024);
-        let frame_count = MAX_TRANSIENT_FANOUT_BYTES / payload.len() + 1;
+        // Force every otherwise-valid frame into the 1 MiB transport bucket,
+        // then exceed the 64 MiB transient fanout budget by exactly one frame.
+        let payload = "x".repeat(300_000);
+        let frame_count = MAX_TRANSIENT_FANOUT_BYTES / WS_MAX_FRAME_BYTES + 1;
         let frames = (0..frame_count)
             .map(|index| {
                 let mut frame = test_message_frame(
@@ -9988,6 +10513,8 @@ mod tests {
                 if let OutboundFrame::Message { ciphertext_b64, .. } = &mut frame {
                     *ciphertext_b64 = payload.clone();
                 }
+                prepare_outbound_message_padding(&mut frame)
+                    .expect("large test frame remains canonically pad-able");
                 (format!("recipient-{index}"), frame)
             })
             .collect::<Vec<_>>();
@@ -10011,6 +10538,7 @@ mod tests {
         if let OutboundFrame::Message { nonce_b64, .. } = &mut old_duplicate {
             *nonce_b64 = "old-frame".to_string();
         }
+        prepare_outbound_message_padding(&mut old_duplicate).expect("old duplicate padding");
         let mut queue = vec![PendingFrame::new(old_duplicate, now_ms())];
         queue.extend((0..MAX_PENDING_FRAMES_PER_ROOM - 1).map(|index| {
             PendingFrame::new(
@@ -10036,6 +10564,7 @@ mod tests {
         if let OutboundFrame::Message { nonce_b64, .. } = &mut new_duplicate {
             *nonce_b64 = "new-frame".to_string();
         }
+        prepare_outbound_message_padding(&mut new_duplicate).expect("new duplicate padding");
         let frames = vec![("Bob".to_string(), new_duplicate)];
         let mut plan = preflight_pending_frames(&state, &frames)
             .await
@@ -11601,7 +12130,9 @@ mod tests {
             "state_signature_b64": URL_SAFE_NO_PAD.encode([6_u8; MESSAGE_SIGNATURE_BYTES]),
             "directory_node_id": "test-node",
             "directory_revision": 1,
-            "directory_digest": URL_SAFE_NO_PAD.encode([7_u8; DIRECTORY_DIGEST_BYTES])
+            "directory_digest": URL_SAFE_NO_PAD.encode([7_u8; DIRECTORY_DIGEST_BYTES]),
+            "padding_bucket": 4096,
+            "padding": ""
         });
         assert!(serde_json::from_value::<InboundFrame>(frame.clone()).is_ok());
         for field in [
@@ -13340,7 +13871,7 @@ mod tests {
         prekey_id: &str,
         is_prekey: bool,
     ) -> OutboundFrame {
-        OutboundFrame::Message {
+        let mut frame = OutboundFrame::Message {
             chat_id: chat_id.to_string(),
             version: E2EE_PROTOCOL_VERSION,
             message_id: message_id.to_string(),
@@ -13356,7 +13887,11 @@ mod tests {
             directory_node_id: "test-node".to_string(),
             directory_revision: 1,
             directory_digest: URL_SAFE_NO_PAD.encode([0_u8; 32]),
-        }
+            padding_bucket: 0,
+            padding: String::new(),
+        };
+        prepare_outbound_message_padding(&mut frame).expect("test message transport padding");
+        frame
     }
 
     fn test_room(id: &str) -> RoomRecord {

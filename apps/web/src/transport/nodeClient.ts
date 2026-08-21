@@ -19,6 +19,10 @@ import {
   type IdentityStateSnapshot,
   wipeBytes,
 } from "../security/crypto";
+import {
+  padOutgoingMessageFrame,
+  validateAndStripIncomingMessagePadding,
+} from "./messagePadding";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 const ATTACHMENT_CLAIM_HEADER = "X-Abyssal-Attachment-Claim";
@@ -328,7 +332,7 @@ export class RelaySocket {
     if (!stamp || !frameDirectoryStampMatches(frame, stamp)) {
       return Promise.resolve("NOT_SENT");
     }
-    const serialized = serializeRelayFrame(frame);
+    const serialized = padOutgoingMessageFrame(frame);
     if (serialized === null) return Promise.resolve("NOT_SENT");
     const socket = this.#socket;
     const generation = this.#socketGeneration;
@@ -1313,6 +1317,9 @@ function parseRelayFrame(text: string): ParsedRelayFrame {
         accepted: frame.accepted,
       },
     };
+  }
+  if (frame.type === "message" && !validateAndStripIncomingMessagePadding(text, frame)) {
+    return { kind: "invalid-result" };
   }
   const parsed = parseIncomingFrameValue(frame);
   if (parsed) return { kind: "frame", frame: parsed };
