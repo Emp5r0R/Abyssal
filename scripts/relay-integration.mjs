@@ -367,15 +367,25 @@ function waitForNoMlsFrame(socket, predicate, timeoutMs = 350) {
 
 function waitForSocketClose(socket, timeoutMs = RESULT_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Expected WebSocket close timed out")), timeoutMs);
-    socket.addEventListener("close", (event) => {
+    let sawError = false;
+    const cleanup = () => {
       clearTimeout(timer);
+      socket.removeEventListener("close", onClose);
+      socket.removeEventListener("error", onError);
+    };
+    const onClose = (event) => {
+      cleanup();
       resolve(event);
-    }, { once: true });
-    socket.addEventListener("error", () => {
-      clearTimeout(timer);
-      reject(new Error("WebSocket errored before close"));
-    }, { once: true });
+    };
+    // Undici may emit `error` before the subsequent `close` when the peer
+    // terminates a rejected frame. The assertion still requires that close.
+    const onError = () => { sawError = true; };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Expected WebSocket close timed out${sawError ? " after error" : ""}`));
+    }, timeoutMs);
+    socket.addEventListener("close", onClose, { once: true });
+    socket.addEventListener("error", onError, { once: true });
   });
 }
 
