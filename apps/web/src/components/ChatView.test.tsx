@@ -1,6 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import type { RoomRecord } from "../domain/types";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChatMessage, RoomRecord } from "../domain/types";
 import { ChatView } from "./ChatView";
 
 const direct: RoomRecord = {
@@ -86,5 +86,97 @@ describe("direct message retention", () => {
     expect(screen.getByText(/separate trusted channel/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "I COMPARED — CONFIRM" }));
     await waitFor(() => expect(verify).toHaveBeenCalledWith("1234 5678 9012"));
+  });
+});
+
+describe("sender-client origin badges", () => {
+  afterEach(cleanup);
+
+  const baseMessage = (overrides: Partial<ChatMessage>): ChatMessage => ({
+    id: "message-one",
+    chatId: direct.id,
+    sender: "Peer",
+    content: "hello",
+    kind: "text",
+    createdAtMs: 1_000,
+    receivedAtMs: 1_000,
+    selfDestructSec: 0,
+    absoluteExpirySec: 0,
+    mine: false,
+    ...overrides,
+  });
+
+  it("warns on each message sent from the web client", () => {
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected
+        safetyNumber={null}
+        messages={[baseMessage({ senderClient: "web" })]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn()}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("img", { name: /sent from the web client/i })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: /screenshot/i })).toBeInTheDocument();
+  });
+
+  it("marks messages sent from the hardened Android app without the warning styling", () => {
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected
+        safetyNumber={null}
+        messages={[baseMessage({ senderClient: "android" })]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn()}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("img", { name: /sent from the android app/i })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /web client/i })).toBeNull();
+  });
+
+  it("never decorates own locally composed messages with an origin badge", () => {
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected
+        safetyNumber={null}
+        messages={[baseMessage({ mine: true, sender: "Self", senderClient: "web" })]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn()}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("img", { name: /sent from/i })).toBeNull();
   });
 });

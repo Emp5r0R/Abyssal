@@ -9,6 +9,7 @@ import {
   readRetention,
 } from "../domain/messagePolicy";
 import { mentionsUsername, replyTargetsCurrentUser } from "../domain/messageAttention";
+import { LOCAL_SENDER_CLIENT, parseSenderClient } from "../domain/senderClient";
 import {
   appendBoundedMessage,
   wipeEvictedMessage,
@@ -1536,6 +1537,7 @@ export function useAbyssalSession() {
       absoluteExpirySec: absoluteRetention(room),
       replyToId: validReplyId(messages[chatId], replyToId),
       mine: true,
+      senderClient: LOCAL_SENDER_CLIENT,
     };
     if (isMlsRoom) {
       let plaintext = new Uint8Array(0);
@@ -1670,6 +1672,7 @@ export function useAbyssalSession() {
         absoluteExpirySec: ttlSec,
         replyToId: validReplyId(messages[chatId], replyToId),
         mine: true,
+        senderClient: LOCAL_SENDER_CLIENT,
         senderPublicKeyB64: bytesToBase64(currentSession.identityPublicKey),
         attachment: {
           id: attachmentId,
@@ -2320,6 +2323,8 @@ function parsePayload(
   const receivedAtMs = Date.now();
   const sentAt = safeTimestamp(payload.timestamp_ms, receivedAtMs);
   const replyToId = cleanString(payload.reply_to_id, 128) || undefined;
+  const senderClient = parseSenderClient(payload.sender_client);
+  if (!senderClient) return null;
 
   if (kind === "text") {
     const content = cleanString(payload.content, 8_000);
@@ -2339,6 +2344,7 @@ function parsePayload(
       mentionsCurrentUser: sender !== currentUsername && mentionsUsername(content, currentUsername),
       repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
       senderPublicKeyB64: authoritativeSenderPublicKeyB64,
+      senderClient,
     };
   }
 
@@ -2382,6 +2388,7 @@ function parsePayload(
     mine: sender === currentUsername,
     repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
     senderPublicKeyB64: authoritativeSenderPublicKeyB64,
+    senderClient,
     attachment: {
       id: attachmentId,
       encryptionVersion,
@@ -2440,6 +2447,7 @@ function messagePayload(
     timestamp_ms: message.createdAtMs,
     self_destruct_sec: message.selfDestructSec,
     absolute_expiry_sec: message.absoluteExpirySec,
+    sender_client: LOCAL_SENDER_CLIENT,
     ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
   };
   if (message.replyToId) common.reply_to_id = message.replyToId;

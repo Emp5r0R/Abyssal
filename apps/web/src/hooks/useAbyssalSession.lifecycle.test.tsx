@@ -108,6 +108,7 @@ const mocks = vi.hoisted(() => {
       return {
         plaintext: new TextEncoder().encode(JSON.stringify({
           kind: "text", id: frame.message_id, sender: "Bob", content: "incoming MLS", timestamp_ms: Date.now(),
+          sender_client: "android",
         })),
         snapshot: {
           roomId: frame.room_id, messageId: frame.message_id, revision: 3n, nativePending: true,
@@ -214,6 +215,7 @@ const mocks = vi.hoisted(() => {
         sender: "Bob",
         content: "incoming secret",
         timestamp_ms: Date.now(),
+        sender_client: "web",
       };
       return JSON.stringify({ ...FakeCipher.directoryStamp, ...payload });
     }
@@ -833,6 +835,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       id: "mismatched-inner-evidence",
       sender: "Bob",
       content: "must not publish",
+      sender_client: "web",
       directory_node_id: "node-other",
       directory_revision: stamp.directory_revision,
       directory_digest: stamp.directory_digest,
@@ -901,6 +904,117 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await act(async () => relay?.emit(stampedFrame(base, second.stamp)));
     await waitFor(() => expect(result.current.session).toBeNull());
     expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
+    unmount();
+  });
+
+  it("fails closed on inbound text missing or unknowning its sender-client tag", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: catalog.users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    const base = {
+      type: "message" as const,
+      chat_id: room.id,
+      version: 9,
+      message_id: "untagged-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    };
+
+    mocks.FakeCipher.plaintextOverride = {
+      kind: "text",
+      id: "untagged-message",
+      sender: "Bob",
+      content: "no origin disclosed",
+      timestamp_ms: Date.now(),
+    };
+    await act(async () => relay?.emit(stampedFrame(base, catalog.stamp)));
+    expect(mocks.FakeCipher.decryptCount).toBeGreaterThan(0);
+    expect(result.current.messages[room.id]).toBeUndefined();
+    // The relay-level acknowledgement precedes plaintext validation, so the
+    // pending frame is consumed while the message is never published.
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(1);
+
+    mocks.FakeCipher.decryptCount = 0;
+    mocks.FakeCipher.plaintextOverride = {
+      kind: "text",
+      id: "unknown-origin-message",
+      sender: "Bob",
+      content: "unknown origin",
+      timestamp_ms: Date.now(),
+      sender_client: "desktop",
+    };
+    await act(async () => relay?.emit(stampedFrame({
+      ...base,
+      message_id: "unknown-origin-message",
+    }, catalog.stamp)));
+    expect(mocks.FakeCipher.decryptCount).toBeGreaterThan(0);
+    expect(result.current.messages[room.id]).toBeUndefined();
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message_ack")).toHaveLength(2);
+    unmount();
+  });
+
+  it("publishes inbound text carrying the exact android sender-client tag", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        nodeUrl: "https://node.example.test",
+        code: "ABCD-1234",
+        password: "password",
+        retainWhenHidden: true,
+      });
+    });
+    const relay = mocks.getLastRelay();
+    const catalog = presenceCatalog(["Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "rooms", rooms: [room] });
+      relay?.emit({ type: "presence", users: catalog.users });
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(1));
+    mocks.FakeCipher.plaintextOverride = {
+      kind: "text",
+      id: "android-tagged-message",
+      sender: "Bob",
+      content: "from the hardened client",
+      timestamp_ms: Date.now(),
+      sender_client: "android",
+    };
+    await act(async () => relay?.emit(stampedFrame({
+      type: "message",
+      chat_id: room.id,
+      version: 9,
+      message_id: "android-tagged-message",
+      nonce_b64: "AQ",
+      ciphertext_b64: "Ag",
+      signature_b64: "Aw",
+      wrapped_key_b64: "BA",
+      sender_username: "Bob",
+      sender_public_key_b64: validPublicKeyB64,
+      identity_public_b64: validPublicKeyB64,
+      prekey_id: "prekey-one",
+      is_prekey: false,
+    }, catalog.stamp)));
+    await waitFor(() => expect(result.current.messages[room.id]).toHaveLength(1));
+    expect(result.current.messages[room.id]?.[0]?.senderClient).toBe("android");
     unmount();
   });
 
@@ -1381,6 +1495,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(outboundFrames).toHaveLength(3);
     outboundFrames.forEach((frame, index) => {
       const inner = JSON.parse(mocks.FakeCipher.encryptedPlaintexts[index] ?? "{}") as Record<string, unknown>;
+      if (inner.kind !== "read_receipt") expect(inner.sender_client).toBe("web");
       expect(frame.directory_node_id).toBe(inner.directory_node_id);
       expect(frame.directory_revision).toBe(inner.directory_revision);
       expect(frame.directory_digest).toBe(inner.directory_digest);

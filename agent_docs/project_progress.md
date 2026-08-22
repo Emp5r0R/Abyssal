@@ -1,5 +1,52 @@
 # Project Progress
 
+## Completed Deployment: Sender-Client Origin Disclosure
+
+This package makes the web-versus-Android security asymmetry visible per
+message instead of only in documentation. Text and attachment-metadata
+plaintexts now carry a sender-client tag validated strictly by both clients,
+and each client renders a per-message origin badge for received messages.
+
+### Delivered
+
+- Direct protocol-v9 and protocol-v10 MLS text and attachment metadata carry a
+  `sender_client` field (`android` or `web`) inside the authenticated
+  encrypted payload. The relay never sees it and cannot forge or strip it.
+- Both clients fail closed on missing, mistyped, or unknown tags: the frame is
+  dropped before publication or read-receipt emission. This is
+  wire-incompatible with older untagged builds per existing deployment rules;
+  read receipts remain untagged control frames.
+- Android shows a small amber warning icon beside every web-origin message
+  (tap for the full screenshot/memory-limit explanation); the web client shows
+  a warning badge for web-origin messages and an informational badge for
+  Android-origin ones. Own composed messages are never badged.
+- Domain-owned allowlist modules (`domain/senderClient.ts`,
+  `SenderClient.kt`) are the single validation source for both directions,
+  keeping parsing, transport, and presentation decoupled.
+
+### Verification
+
+- Final `./scripts/test-all.sh all`: passed on the integrated tree.
+- Web: 327 tests in 22 files, zero-warning ESLint, TypeScript compilation, and
+  the production Vite build passed.
+- Rust: rustfmt, locked workspace tests (53 core, 210 relay), and
+  warning-denied Clippy passed; core and relay behavior is unchanged.
+- Android: 227 JVM unit tests with zero skips/failures/errors, release lint,
+  and debug/release Kotlin compilation passed without packaging an APK or AAB.
+- Live relay integration (OPAQUE, v9 E2EE DM, v10 MLS rooms, offline
+  recovery/replay, access control), generated-artifact/deployment checks, and
+  zero-vulnerability npm/RustSec audits passed.
+
+### Remaining External Limits
+
+The tag is self-reported inside the decrypted plaintext, not an attestation;
+a maliciously modified client build can mislabel itself. It adds no cover
+traffic, does not change ratchet or attachment semantics, and cannot prevent
+a hostile recipient from recording content. All previously disclosed limits
+(web origin trust, metadata visibility, no external transparency witness,
+persistent rollback anchor, multi-device coordination, independent audit)
+remain separate work in `SECURITY.md`.
+
 ## Active Deployment: Protocol-v10 MLS Rooms
 
 This breaking package replaces pairwise room fanout with RFC 9420 MLS while

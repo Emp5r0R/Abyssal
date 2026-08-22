@@ -15,6 +15,7 @@ import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.SessionInactivityPolicy
 import com.abyssal.chat.domain.model.ServerStatus
+import com.abyssal.chat.domain.model.SenderClient
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IAppUpdateService
@@ -297,6 +298,50 @@ class ChatViewModelPolicyTest {
 
         assertTrue(matchesAuthoritativeMessageId(receipt, "receipt-1"))
         assertFalse(matchesAuthoritativeMessageId(receipt, "receipt-2"))
+    }
+
+    @Test
+    fun inboundTextRequiresExactSenderClientTagAndPreservesOrigin() {
+        val viewModel = allocateUninitializedViewModel()
+        setCurrentUser(viewModel, User(username = "Alice", publicKey = ByteArray(608)))
+        setOwnMessageIds(viewModel)
+        setSessions(viewModel, emptyList())
+
+        fun taggedPayload(senderClient: String?): JSONObject =
+            JSONObject()
+                .put("kind", "text")
+                .put("id", "message-1")
+                .put("sender", "Bob")
+                .put("content", "origin probe")
+                .apply { senderClient?.let { put("sender_client", it) } }
+
+        val webTagged = invokeParseIncomingMessage(
+            viewModel, "dm_bob", "message-1", taggedPayload("web").toString(), "Bob", ByteArray(608)
+        )
+        assertNotNull(webTagged)
+        assertEquals(SenderClient.WEB, webTagged?.senderClient)
+
+        val androidTagged = invokeParseIncomingMessage(
+            viewModel, "dm_bob", "message-1", taggedPayload("android").toString(), "Bob", ByteArray(608)
+        )
+        assertNotNull(androidTagged)
+        assertEquals(SenderClient.ANDROID, androidTagged?.senderClient)
+
+        assertNull(
+            invokeParseIncomingMessage(
+                viewModel, "dm_bob", "message-1", taggedPayload(null).toString(), "Bob", ByteArray(608)
+            )
+        )
+        assertNull(
+            invokeParseIncomingMessage(
+                viewModel, "dm_bob", "message-1", taggedPayload("desktop").toString(), "Bob", ByteArray(608)
+            )
+        )
+        assertNull(
+            invokeParseIncomingMessage(
+                viewModel, "dm_bob", "message-1", taggedPayload("WEB").toString(), "Bob", ByteArray(608)
+            )
+        )
     }
 
     @Test
@@ -1060,6 +1105,7 @@ class ChatViewModelPolicyTest {
 
             assertEquals("attachment", json.optString("kind"))
             assertEquals(message.id, json.optString("id"))
+            assertEquals("android", json.optString("sender_client"))
             assertEquals(ATTACHMENT_CIPHER_VERSION, json.optInt("attachment_cipher_version"))
             assertTrue(json.optString("attachment_key_b64").matches(Regex("^[A-Za-z0-9_-]{43}$")))
             assertFalse(json.has("attachment_crypto_id"))
@@ -1387,6 +1433,38 @@ class ChatViewModelPolicyTest {
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
         (field.get(viewModel) as MutableStateFlow<String?>).value = chatId
+    }
+
+    private fun setOwnMessageIds(viewModel: ChatViewModel) {
+        val field = ChatViewModel::class.java.getDeclaredField("ownMessageIds")
+        field.isAccessible = true
+        field.set(viewModel, LinkedHashSet<String>())
+    }
+
+    private fun setSessions(viewModel: ChatViewModel, sessions: List<ChatSession>) {
+        val field = ChatViewModel::class.java.getDeclaredField("sessions")
+        field.isAccessible = true
+        field.set(viewModel, MutableStateFlow(sessions))
+    }
+
+    private fun invokeParseIncomingMessage(
+        viewModel: ChatViewModel,
+        chatId: String,
+        messageId: String,
+        decryptedContent: String,
+        senderUsername: String,
+        senderPublicKey: ByteArray
+    ): Message? {
+        val method = ChatViewModel::class.java.getDeclaredMethod(
+            "parseIncomingMessage",
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            ByteArray::class.java
+        )
+        method.isAccessible = true
+        return method.invoke(viewModel, chatId, messageId, decryptedContent, senderUsername, senderPublicKey) as Message?
     }
 
     private fun invokeIsDirectChatTrusted(viewModel: ChatViewModel, chatId: String): Boolean {

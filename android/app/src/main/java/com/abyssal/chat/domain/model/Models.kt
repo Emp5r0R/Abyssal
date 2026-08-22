@@ -46,7 +46,8 @@ data class Message(
     val reactionShortcode: String? = null,
     val mentionsCurrentUser: Boolean = false,
     val repliesToCurrentUser: Boolean = false,
-    val senderPublicKey: ByteArray? = null
+    val senderPublicKey: ByteArray? = null,
+    val senderClient: SenderClient = SenderClient.ANDROID
 ) {
     val isExpired: Boolean
         get() {

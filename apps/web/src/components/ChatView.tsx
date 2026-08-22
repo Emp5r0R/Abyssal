@@ -11,13 +11,16 @@ import {
   Play,
   Send,
   ShieldCheck,
+  Smartphone,
   SmilePlus,
+  TriangleAlert,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { remainingSeconds } from "../domain/messagePolicy";
 import { formatBytes } from "../domain/format";
 import { splitMentionText } from "../domain/messageAttention";
+import { isWebSender, senderOriginNotice } from "../domain/senderClient";
 import { exactReactionShortcut, reactionByShortcode, searchReactions, type ReactionAsset } from "../domain/reactions";
 import type { ChatMessage, PresenceUser, RoomRecord, UploadProgress } from "../domain/types";
 import { GifPicker } from "./GifPicker";
@@ -217,6 +220,16 @@ export function ChatView({
                   </button>
                 )}
                 <time>{formatTime(message.createdAtMs)}</time>
+                {!message.mine && message.senderClient ? (
+                  <span
+                    className={`origin-badge ${isWebSender(message.senderClient) ? "is-web" : "is-android"}`}
+                    title={senderOriginNotice(message.senderClient)}
+                    aria-label={senderOriginNotice(message.senderClient)}
+                    role="img"
+                  >
+                    {isWebSender(message.senderClient) ? <TriangleAlert size={11} /> : <Smartphone size={11} />}
+                  </span>
+                ) : null}
                 {attention ? (
                   <span className="attention-badge">
                     {message.mentionsCurrentUser ? <AtSign size={11} /> : <MessageSquareReply size={11} />}

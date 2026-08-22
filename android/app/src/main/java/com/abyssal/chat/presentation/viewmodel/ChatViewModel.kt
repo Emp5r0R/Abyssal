@@ -42,6 +42,7 @@ import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientIdentity
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
+import com.abyssal.chat.domain.model.SenderClient
 import com.abyssal.chat.domain.model.SessionInactivityPolicy
 import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
@@ -340,6 +341,7 @@ internal fun attachmentMetadataJson(message: Message, senderUsername: String): J
         .put("kind", "attachment")
         .put("id", message.id)
         .put("sender", senderUsername)
+        .put("sender_client", SenderClient.ANDROID.wireName)
         .put("attachment_id", message.attachmentId)
         .put("attachment_cipher_version", message.attachmentCipherVersion)
         .put("attachment_key_b64", message.attachmentKey?.let(::encodeAttachmentKey))
@@ -2797,6 +2799,7 @@ class ChatViewModel(
         if (authoritativeSender.isBlank() ||
             !matchesAuthoritativeMessageId(json, authoritativeMessageId)
         ) return null
+        val senderClient = SenderClient.fromWire(json.optString("sender_client")) ?: return null
         val sender = authoritativeSender
         if (sender.equals(currentUser.value?.username, ignoreCase = true)) return null
         val replyToMessageId = json.replyToMessageId()
@@ -2847,7 +2850,8 @@ class ChatViewModel(
                         mimeType
                     ),
                     repliesToCurrentUser = repliesToCurrentUser,
-                    senderPublicKey = retainedSenderPublicKey
+                    senderPublicKey = retainedSenderPublicKey,
+                    senderClient = senderClient
                 ).also { ownershipTransferred = true }
             } finally {
                 if (!ownershipTransferred) {
@@ -2877,7 +2881,8 @@ class ChatViewModel(
                     currentUser.value?.username
                 ),
                 repliesToCurrentUser = repliesToCurrentUser,
-                senderPublicKey = retainedSenderPublicKey
+                senderPublicKey = retainedSenderPublicKey,
+                senderClient = senderClient
             )
         }
 
@@ -2953,7 +2958,8 @@ class ChatViewModel(
         replyToMessageId: String? = null,
         reactionShortcode: String? = null,
         repliesToCurrentUser: Boolean = false,
-        senderPublicKey: ByteArray? = null
+        senderPublicKey: ByteArray? = null,
+        senderClient: SenderClient = SenderClient.ANDROID
     ): Message {
         val safeName = AttachmentSavePolicy.sanitizedFileName(fileName)
         val safeMediaType = mediaType.uppercase(Locale.ROOT).takeIf { it in SUPPORTED_MEDIA_TYPES } ?: "FILE"
@@ -2981,7 +2987,8 @@ class ChatViewModel(
             replyToMessageId = replyToMessageId,
             reactionShortcode = reactionShortcode,
             repliesToCurrentUser = repliesToCurrentUser,
-            senderPublicKey = senderPublicKey
+            senderPublicKey = senderPublicKey,
+            senderClient = senderClient
         )
     }
 
@@ -2993,6 +3000,7 @@ class ChatViewModel(
             .put("kind", "text")
             .put("id", message.id)
             .put("sender", senderUsername)
+            .put("sender_client", SenderClient.ANDROID.wireName)
             .put("content", message.content)
             .put("self_destruct_sec", message.selfDestructDurationSec)
             .put("absolute_expiry_sec", message.absoluteExpirySec)

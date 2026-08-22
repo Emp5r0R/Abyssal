@@ -1501,6 +1501,27 @@ button:disabled {
   background: rgba(245, 184, 70, 0.08);
 }
 
+.origin-badge {
+  display: inline-flex;
+  min-height: 20px;
+  padding: 0 5px;
+  align-items: center;
+  border-radius: 4px;
+  cursor: help;
+}
+
+.origin-badge.is-web {
+  border: 1px solid rgba(245, 184, 70, 0.32);
+  color: var(--amber) !important;
+  background: rgba(245, 184, 70, 0.08);
+}
+
+.origin-badge.is-android {
+  border: 1px solid rgba(110, 231, 183, 0.22);
+  color: var(--green) !important;
+  background: rgba(0, 229, 134, 0.06);
+}
+
 .is-mine .message-meta {
   justify-content: flex-end;
 }

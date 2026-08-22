@@ -14,6 +14,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.ViewGroup
 import android.widget.ImageView
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -105,6 +106,7 @@ import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DirectTrustStatus
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
+import com.abyssal.chat.domain.model.SenderClient
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.data.network.BoundedInputReader
@@ -1413,15 +1415,23 @@ private fun MessageBubbleItem(
         horizontalAlignment = if (isMine) Alignment.End else Alignment.Start
     ) {
         if (!isMine) {
-            Text(
-                text = message.sender,
-                color = SteelMuted,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier
-                    .padding(start = 8.dp, bottom = 4.dp)
-                    .clickable(role = Role.Button) { onMentionSender(message.sender) }
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(bottom = 4.dp)
+            ) {
+                Text(
+                    text = message.sender,
+                    color = SteelMuted,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .padding(start = 8.dp)
+                        .clickable(role = Role.Button) { onMentionSender(message.sender) }
+                )
+                if (message.senderClient == SenderClient.WEB) {
+                    WebOriginBadge(notice = message.senderClient.originNotice())
+                }
+            }
         }
 
         AnimatedVisibility(
@@ -1507,6 +1517,19 @@ private fun attentionLabel(message: Message): String {
         message.mentionsCurrentUser -> "MENTIONED YOU"
         else -> "REPLIED TO YOU"
     }
+}
+
+@Composable
+private fun WebOriginBadge(notice: String) {
+    val context = LocalContext.current
+    HazardIcon(
+        modifier = Modifier
+            .padding(start = 5.dp)
+            .size(11.dp)
+            .clickable(role = Role.Button) { Toast.makeText(context, notice, Toast.LENGTH_LONG).show() }
+            .semantics { contentDescription = notice },
+        color = SelfDestructAmber
+    )
 }
 
 @Composable

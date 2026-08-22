@@ -1,3 +1,5 @@
+import type { SenderClient } from "./senderClient";
+
 export type ConnectionState = "connecting" | "connected" | "disconnected";
 export type MediaType = "IMAGE" | "VIDEO" | "FILE";
 
@@ -110,6 +112,8 @@ export interface ChatMessage {
   mentionsCurrentUser?: boolean;
   repliesToCurrentUser?: boolean;
   senderPublicKeyB64?: string;
+  /** Platform of the sending client, asserted inside the encrypted payload. */
+  senderClient?: SenderClient;
   attachment?: {
     id: string;
     encryptionVersion: number;
