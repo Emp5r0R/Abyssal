@@ -116,6 +116,35 @@ describe("AppShell direct-message navigation", () => {
     expect(props.onDeleteRoom).toHaveBeenCalledWith(room.id);
   });
 
+  it("exposes a member leave action without merging it into room navigation", () => {
+    const onLeaveRoom = vi.fn(() => true);
+    renderShell({ username: "Bob", onLeaveRoom });
+    fireEvent.click(screen.getByRole("button", { name: "Leave room" }));
+    expect(onLeaveRoom).toHaveBeenCalledWith(room.id);
+  });
+
+  it("shows owner leave requests without exposing stable identity material", () => {
+    const props = renderShell({
+      pendingRoomLeaves: [{ roomId: room.id, requestId: "leave-request", username: "Bob" }],
+      onAcceptRoomLeave: vi.fn(async () => true),
+      onRejectRoomLeave: vi.fn(() => true),
+    });
+    expect(screen.getByLabelText("Pending room leaves")).toHaveTextContent("Bob");
+    expect(screen.getByLabelText("Pending room leaves")).not.toHaveTextContent("stable_identity");
+    fireEvent.click(screen.getByRole("button", { name: "REMOVE" }));
+    expect(props.onAcceptRoomLeave).toHaveBeenCalledWith("leave-request");
+  });
+
+  it("does not render owner controls for the member's own pending leave", () => {
+    renderShell({
+      username: "Bob",
+      pendingRoomLeaves: [{ roomId: room.id, requestId: "leave-request", username: "Bob" }],
+    });
+    expect(screen.getByLabelText("Leave requests pending")).toHaveTextContent("LEAVE REQUEST PENDING");
+    expect(screen.queryByRole("button", { name: "REMOVE" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "KEEP" })).not.toBeInTheDocument();
+  });
+
   it("never renders room or direct message plaintext on the dashboard", () => {
     renderShell({
       messages: {

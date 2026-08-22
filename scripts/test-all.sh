@@ -88,6 +88,10 @@ run_shell() {
       echo "Stale crypto artifact: $artifact" >&2
       exit 1
     fi
+    if ! grep -aFq "ABYSSAL-MLS-STATE-V10" "$artifact"; then
+      echo "Stale MLS protocol v10 artifact: $artifact" >&2
+      exit 1
+    fi
   done
 }
 

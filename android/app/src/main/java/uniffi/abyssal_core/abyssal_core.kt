@@ -687,15 +687,59 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_func_opaque_client_start(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_epoch(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_group_id(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_member_count(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_membership_digest(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_message_id(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_revision(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_room_id(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_state_envelope(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_add_member(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_commit_outbound(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_decrypt_application(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_encrypt_application(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_join_welcome(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_key_package(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_process_control(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_remove_member(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_rollback_outbound(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_room_info(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_mlsroom_seal_state(
+    ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_create_mls_room(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_decrypt(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_encrypt(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_pending_mls_join(
+    ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_prekey_id(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_public_key(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_e2eesession_recover_mls_room(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_requires_prekey(
     ): Int
@@ -729,6 +773,52 @@ internal object UniffiLib {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "abyssal_core"))
 
     }
+    external fun uniffi_abyssal_core_fn_clone_mlsprocessedcontrol(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_free_mlsprocessedcontrol(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_epoch(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_group_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_member_count(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_membership_digest(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_message_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_revision(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_room_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsprocessedcontrol_state_envelope(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_clone_mlsroom(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_free_mlsroom(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_method_mlsroom_add_member(`ptr`: Long,`keyPackage`: RustBuffer.ByValue,`expectedUsername`: RustBuffer.ByValue,`expectedStableIdentity`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_commit_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_method_mlsroom_decrypt_application(`ptr`: Long,`ciphertext`: RustBuffer.ByValue,`expectedEpoch`: Long,`messageId`: RustBuffer.ByValue,`expectedAuthenticatedData`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_encrypt_application(`ptr`: Long,`messageId`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`authenticatedData`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_join_welcome(`ptr`: Long,`welcome`: RustBuffer.ByValue,`expectedMembers`: RustBuffer.ByValue,`expectedDigest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_key_package(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_process_control(`ptr`: Long,`control`: RustBuffer.ByValue,`expectedFromEpoch`: Long,`expectedToEpoch`: Long,`expectedMembers`: RustBuffer.ByValue,`expectedDigest`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`expectedAuthenticatedData`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_mlsroom_remove_member(`ptr`: Long,`expectedUsername`: RustBuffer.ByValue,`expectedStableIdentity`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_rollback_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_method_mlsroom_room_info(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_mlsroom_seal_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_clone_e2eesession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     external fun uniffi_abyssal_core_fn_free_e2eesession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
@@ -739,14 +829,20 @@ internal object UniffiLib {
     ): Long
     external fun uniffi_abyssal_core_fn_method_e2eesession_commit_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+    external fun uniffi_abyssal_core_fn_method_e2eesession_create_mls_room(`ptr`: Long,`roomId`: RustBuffer.ByValue,`username`: RustBuffer.ByValue,`nodeContext`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
     external fun uniffi_abyssal_core_fn_method_e2eesession_decrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`senderPublicKey`: RustBuffer.ByValue,`version`: Int,`identityPublic`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,`wrappedKey`: RustBuffer.ByValue,`recipientPrekeyId`: RustBuffer.ByValue,`isPrekey`: Byte,`recipientUsername`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_encrypt(`ptr`: Long,`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,`recipients`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_e2eesession_pending_mls_join(`ptr`: Long,`roomId`: RustBuffer.ByValue,`username`: RustBuffer.ByValue,`nodeContext`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
     external fun uniffi_abyssal_core_fn_method_e2eesession_prekey_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_public_key(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_e2eesession_recover_mls_room(`ptr`: Long,`roomId`: RustBuffer.ByValue,`username`: RustBuffer.ByValue,`nodeContext`: RustBuffer.ByValue,`groupId`: RustBuffer.ByValue,`envelope`: RustBuffer.ByValue,`expectedActive`: Byte,`expectedEpoch`: Long,`expectedRevision`: Long,`expectedMembers`: RustBuffer.ByValue,`expectedDigest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
     external fun uniffi_abyssal_core_fn_method_e2eesession_requires_prekey(`ptr`: Long,`peer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Byte
     external fun uniffi_abyssal_core_fn_method_e2eesession_rollback_outbound(`ptr`: Long,`messageId`: RustBuffer.ByValue,`revision`: Long,uniffi_out_err: UniffiRustCallStatus,
@@ -906,7 +1002,67 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_opaque_client_start() != 26876) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_epoch() != 9281) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_group_id() != 48205) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_member_count() != 37252) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_membership_digest() != 39916) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_message_id() != 11258) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_revision() != 59022) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_room_id() != 34867) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_state_envelope() != 17746) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_add_member() != 39878) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_commit_outbound() != 12058) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_decrypt_application() != 52154) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_encrypt_application() != 23152) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_join_welcome() != 46237) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_key_package() != 323) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_process_control() != 14763) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_remove_member() != 64210) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_rollback_outbound() != 1255) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_room_info() != 56142) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_mlsroom_seal_state() != 74) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound() != 39282) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_create_mls_room() != 47649) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_decrypt() != 7898) {
@@ -915,10 +1071,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_encrypt() != 11964) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_pending_mls_join() != 24614) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_prekey_id() != 25023) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_public_key() != 3928) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_e2eesession_recover_mls_room() != 39350) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_requires_prekey() != 44097) {
@@ -1349,13 +1511,30 @@ public interface E2eeSessionInterface {
      */
     fun `commitOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
 
+    /**
+     * Create an account-scoped MLS room. MLS identity material is derived
+     * and signed here so no root, stable private key, or detached credential
+     * proof crosses the public API.
+     */
+    fun `createMlsRoom`(`roomId`: kotlin.String, `username`: kotlin.String, `nodeContext`: kotlin.ByteArray, `groupId`: kotlin.ByteArray): MlsRoom
+
     fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `version`: kotlin.UInt, `identityPublic`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption
 
     fun `encrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `plaintext`: kotlin.ByteArray, `recipients`: List<RecipientPublicKey>): E2eePayload
 
+    /**
+     * Create a pending account-scoped MLS join room.
+     */
+    fun `pendingMlsJoin`(`roomId`: kotlin.String, `username`: kotlin.String, `nodeContext`: kotlin.ByteArray, `groupId`: kotlin.ByteArray): MlsRoom
+
     fun `prekeyId`(): kotlin.String
 
     fun `publicKey`(): kotlin.ByteArray
+
+    /**
+     * Recover an account-scoped MLS room from its authenticated state.
+     */
+    fun `recoverMlsRoom`(`roomId`: kotlin.String, `username`: kotlin.String, `nodeContext`: kotlin.ByteArray, `groupId`: kotlin.ByteArray, `envelope`: kotlin.ByteArray, `expectedActive`: kotlin.Boolean, `expectedEpoch`: kotlin.ULong, `expectedRevision`: kotlin.ULong, `expectedMembers`: List<MlsRosterMember>, `expectedDigest`: kotlin.ByteArray): MlsRoom
 
     /**
      * Returns whether the next outbound message to `peer` must use an
@@ -1518,6 +1697,29 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
 
 
 
+    /**
+     * Create an account-scoped MLS room. MLS identity material is derived
+     * and signed here so no root, stable private key, or detached credential
+     * proof crosses the public API.
+     */
+    @Throws(AbyssalException::class)override fun `createMlsRoom`(`roomId`: kotlin.String, `username`: kotlin.String, `nodeContext`: kotlin.ByteArray, `groupId`: kotlin.ByteArray): MlsRoom {
+            return FfiConverterTypeMlsRoom.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_create_mls_room(
+        it,
+
+        FfiConverterString.lower(`roomId`),
+        FfiConverterString.lower(`username`),
+        FfiConverterByteArray.lower(`nodeContext`),
+        FfiConverterByteArray.lower(`groupId`),_status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(AbyssalException::class)override fun `decrypt`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `senderPublicKey`: kotlin.ByteArray, `version`: kotlin.UInt, `identityPublic`: kotlin.ByteArray, `nonce`: kotlin.ByteArray, `ciphertext`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `wrappedKey`: kotlin.ByteArray, `recipientPrekeyId`: kotlin.String, `isPrekey`: kotlin.Boolean, `recipientUsername`: kotlin.String): E2eeDecryption {
             return FfiConverterTypeE2eeDecryption.lift(
     callWithHandle {
@@ -1563,6 +1765,27 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
     }
 
 
+
+    /**
+     * Create a pending account-scoped MLS join room.
+     */
+    @Throws(AbyssalException::class)override fun `pendingMlsJoin`(`roomId`: kotlin.String, `username`: kotlin.String, `nodeContext`: kotlin.ByteArray, `groupId`: kotlin.ByteArray): MlsRoom {
+            return FfiConverterTypeMlsRoom.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_pending_mls_join(
+        it,
+
+        FfiConverterString.lower(`roomId`),
+        FfiConverterString.lower(`username`),
+        FfiConverterByteArray.lower(`nodeContext`),
+        FfiConverterByteArray.lower(`groupId`),_status)
+}
+    }
+    )
+    }
+
+
     override fun `prekeyId`(): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
@@ -1583,6 +1806,33 @@ open class E2eeSession: Disposable, AutoCloseable, E2eeSessionInterface
     UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_public_key(
         it,
         _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Recover an account-scoped MLS room from its authenticated state.
+     */
+    @Throws(AbyssalException::class)override fun `recoverMlsRoom`(`roomId`: kotlin.String, `username`: kotlin.String, `nodeContext`: kotlin.ByteArray, `groupId`: kotlin.ByteArray, `envelope`: kotlin.ByteArray, `expectedActive`: kotlin.Boolean, `expectedEpoch`: kotlin.ULong, `expectedRevision`: kotlin.ULong, `expectedMembers`: List<MlsRosterMember>, `expectedDigest`: kotlin.ByteArray): MlsRoom {
+            return FfiConverterTypeMlsRoom.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_e2eesession_recover_mls_room(
+        it,
+
+        FfiConverterString.lower(`roomId`),
+        FfiConverterString.lower(`username`),
+        FfiConverterByteArray.lower(`nodeContext`),
+        FfiConverterByteArray.lower(`groupId`),
+        FfiConverterByteArray.lower(`envelope`),
+        FfiConverterBoolean.lower(`expectedActive`),
+        FfiConverterULong.lower(`expectedEpoch`),
+        FfiConverterULong.lower(`expectedRevision`),
+        FfiConverterSequenceTypeMlsRosterMember.lower(`expectedMembers`),
+        FfiConverterByteArray.lower(`expectedDigest`),_status)
 }
     }
     )
@@ -1766,6 +2016,824 @@ public object FfiConverterTypeE2eeSession: FfiConverter<E2eeSession, Long> {
 }
 
 
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+public interface MlsProcessedControlInterface {
+
+    fun `epoch`(): kotlin.ULong
+
+    fun `groupId`(): kotlin.ByteArray
+
+    fun `memberCount`(): kotlin.UInt
+
+    fun `membershipDigest`(): kotlin.ByteArray
+
+    fun `messageId`(): kotlin.String
+
+    fun `revision`(): kotlin.ULong
+
+    fun `roomId`(): kotlin.String
+
+    fun `stateEnvelope`(): kotlin.ByteArray
+
+    companion object
+}
+
+open class MlsProcessedControl: Disposable, AutoCloseable, MlsProcessedControlInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_abyssal_core_fn_free_mlsprocessedcontrol(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_abyssal_core_fn_clone_mlsprocessedcontrol(handle, status)
+        }
+    }
+
+    override fun `epoch`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_epoch(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `groupId`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_group_id(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `memberCount`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_member_count(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `membershipDigest`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_membership_digest(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `messageId`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_message_id(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `revision`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_revision(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `roomId`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_room_id(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `stateEnvelope`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsprocessedcontrol_state_envelope(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+
+
+
+    /**
+     * @suppress
+     */
+    companion object
+
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsProcessedControl: FfiConverter<MlsProcessedControl, Long> {
+    override fun lower(value: MlsProcessedControl): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): MlsProcessedControl {
+        return MlsProcessedControl(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): MlsProcessedControl {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: MlsProcessedControl) = 8UL
+
+    override fun write(value: MlsProcessedControl, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+public interface MlsRoomInterface {
+
+    /**
+     * Add a member. MLS state is advanced locally and held behind an exact
+     * outbound checkpoint until the relay acknowledges the same revision.
+     */
+    fun `addMember`(`keyPackage`: kotlin.ByteArray, `expectedUsername`: kotlin.String, `expectedStableIdentity`: kotlin.ByteArray, `messageId`: kotlin.String): MlsCommit
+
+    fun `commitOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+
+    fun `decryptApplication`(`ciphertext`: kotlin.ByteArray, `expectedEpoch`: kotlin.ULong, `messageId`: kotlin.String, `expectedAuthenticatedData`: kotlin.ByteArray): MlsApplicationMessage
+
+    fun `encryptApplication`(`messageId`: kotlin.String, `plaintext`: kotlin.ByteArray, `authenticatedData`: kotlin.ByteArray): MlsEncryptedApplication
+
+    fun `joinWelcome`(`welcome`: kotlin.ByteArray, `expectedMembers`: List<MlsRosterMember>, `expectedDigest`: kotlin.ByteArray): MlsRoomInfo
+
+    fun `keyPackage`(): kotlin.ByteArray
+
+    fun `processControl`(`control`: kotlin.ByteArray, `expectedFromEpoch`: kotlin.ULong, `expectedToEpoch`: kotlin.ULong, `expectedMembers`: List<MlsRosterMember>, `expectedDigest`: kotlin.ByteArray, `messageId`: kotlin.String, `expectedAuthenticatedData`: kotlin.ByteArray): MlsProcessedControl
+
+    /**
+     * Remove a member by its expected stable identity, never by a caller-
+     * supplied mutable leaf index.
+     */
+    fun `removeMember`(`expectedUsername`: kotlin.String, `expectedStableIdentity`: kotlin.ByteArray, `messageId`: kotlin.String): MlsCommit
+
+    fun `rollbackOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+
+    fun `roomInfo`(): MlsRoomInfo
+
+    fun `sealState`(): kotlin.ByteArray
+
+    companion object
+}
+
+open class MlsRoom: Disposable, AutoCloseable, MlsRoomInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_abyssal_core_fn_free_mlsroom(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_abyssal_core_fn_clone_mlsroom(handle, status)
+        }
+    }
+
+
+    /**
+     * Add a member. MLS state is advanced locally and held behind an exact
+     * outbound checkpoint until the relay acknowledges the same revision.
+     */
+    @Throws(AbyssalException::class)override fun `addMember`(`keyPackage`: kotlin.ByteArray, `expectedUsername`: kotlin.String, `expectedStableIdentity`: kotlin.ByteArray, `messageId`: kotlin.String): MlsCommit {
+            return FfiConverterTypeMlsCommit.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_add_member(
+        it,
+
+        FfiConverterByteArray.lower(`keyPackage`),
+        FfiConverterString.lower(`expectedUsername`),
+        FfiConverterByteArray.lower(`expectedStableIdentity`),
+        FfiConverterString.lower(`messageId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `commitOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_commit_outbound(
+        it,
+
+        FfiConverterString.lower(`messageId`),
+        FfiConverterULong.lower(`revision`),_status)
+}
+    }
+
+
+
+
+    @Throws(AbyssalException::class)override fun `decryptApplication`(`ciphertext`: kotlin.ByteArray, `expectedEpoch`: kotlin.ULong, `messageId`: kotlin.String, `expectedAuthenticatedData`: kotlin.ByteArray): MlsApplicationMessage {
+            return FfiConverterTypeMlsApplicationMessage.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_decrypt_application(
+        it,
+
+        FfiConverterByteArray.lower(`ciphertext`),
+        FfiConverterULong.lower(`expectedEpoch`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterByteArray.lower(`expectedAuthenticatedData`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `encryptApplication`(`messageId`: kotlin.String, `plaintext`: kotlin.ByteArray, `authenticatedData`: kotlin.ByteArray): MlsEncryptedApplication {
+            return FfiConverterTypeMlsEncryptedApplication.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_encrypt_application(
+        it,
+
+        FfiConverterString.lower(`messageId`),
+        FfiConverterByteArray.lower(`plaintext`),
+        FfiConverterByteArray.lower(`authenticatedData`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `joinWelcome`(`welcome`: kotlin.ByteArray, `expectedMembers`: List<MlsRosterMember>, `expectedDigest`: kotlin.ByteArray): MlsRoomInfo {
+            return FfiConverterTypeMlsRoomInfo.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_join_welcome(
+        it,
+
+        FfiConverterByteArray.lower(`welcome`),
+        FfiConverterSequenceTypeMlsRosterMember.lower(`expectedMembers`),
+        FfiConverterByteArray.lower(`expectedDigest`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `keyPackage`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_key_package(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `processControl`(`control`: kotlin.ByteArray, `expectedFromEpoch`: kotlin.ULong, `expectedToEpoch`: kotlin.ULong, `expectedMembers`: List<MlsRosterMember>, `expectedDigest`: kotlin.ByteArray, `messageId`: kotlin.String, `expectedAuthenticatedData`: kotlin.ByteArray): MlsProcessedControl {
+            return FfiConverterTypeMlsProcessedControl.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_process_control(
+        it,
+
+        FfiConverterByteArray.lower(`control`),
+        FfiConverterULong.lower(`expectedFromEpoch`),
+        FfiConverterULong.lower(`expectedToEpoch`),
+        FfiConverterSequenceTypeMlsRosterMember.lower(`expectedMembers`),
+        FfiConverterByteArray.lower(`expectedDigest`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterByteArray.lower(`expectedAuthenticatedData`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Remove a member by its expected stable identity, never by a caller-
+     * supplied mutable leaf index.
+     */
+    @Throws(AbyssalException::class)override fun `removeMember`(`expectedUsername`: kotlin.String, `expectedStableIdentity`: kotlin.ByteArray, `messageId`: kotlin.String): MlsCommit {
+            return FfiConverterTypeMlsCommit.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_remove_member(
+        it,
+
+        FfiConverterString.lower(`expectedUsername`),
+        FfiConverterByteArray.lower(`expectedStableIdentity`),
+        FfiConverterString.lower(`messageId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `rollbackOutbound`(`messageId`: kotlin.String, `revision`: kotlin.ULong)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_rollback_outbound(
+        it,
+
+        FfiConverterString.lower(`messageId`),
+        FfiConverterULong.lower(`revision`),_status)
+}
+    }
+
+
+
+
+    @Throws(AbyssalException::class)override fun `roomInfo`(): MlsRoomInfo {
+            return FfiConverterTypeMlsRoomInfo.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_room_info(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `sealState`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_mlsroom_seal_state(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+
+
+
+    /**
+     * @suppress
+     */
+    companion object
+
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsRoom: FfiConverter<MlsRoom, Long> {
+    override fun lower(value: MlsRoom): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): MlsRoom {
+        return MlsRoom(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): MlsRoom {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: MlsRoom) = 8UL
+
+    override fun write(value: MlsRoom, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
 
 data class AttachmentCiphertext (
     var `version`: kotlin.UInt
@@ -1941,6 +3009,336 @@ public object FfiConverterTypeE2eePayload: FfiConverterRustBuffer<E2eePayload> {
             FfiConverterByteArray.write(value.`identityPublic`, buf)
             FfiConverterString.write(value.`prekeyId`, buf)
             FfiConverterByteArray.write(value.`stateSignature`, buf)
+    }
+}
+
+
+
+data class MlsApplicationMessage (
+    var `messageId`: kotlin.String
+    ,
+    var `plaintext`: kotlin.ByteArray
+    ,
+    var `senderIndex`: kotlin.UInt
+    ,
+    var `epoch`: kotlin.ULong
+    ,
+    var `groupId`: kotlin.ByteArray
+    ,
+    var `membershipDigest`: kotlin.ByteArray
+    ,
+    var `revision`: kotlin.ULong
+    ,
+    var `stateEnvelope`: kotlin.ByteArray
+    ,
+    var `authenticatedData`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsApplicationMessage: FfiConverterRustBuffer<MlsApplicationMessage> {
+    override fun read(buf: ByteBuffer): MlsApplicationMessage {
+        return MlsApplicationMessage(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MlsApplicationMessage) = (
+            FfiConverterString.allocationSize(value.`messageId`) +
+            FfiConverterByteArray.allocationSize(value.`plaintext`) +
+            FfiConverterUInt.allocationSize(value.`senderIndex`) +
+            FfiConverterULong.allocationSize(value.`epoch`) +
+            FfiConverterByteArray.allocationSize(value.`groupId`) +
+            FfiConverterByteArray.allocationSize(value.`membershipDigest`) +
+            FfiConverterULong.allocationSize(value.`revision`) +
+            FfiConverterByteArray.allocationSize(value.`stateEnvelope`) +
+            FfiConverterByteArray.allocationSize(value.`authenticatedData`)
+    )
+
+    override fun write(value: MlsApplicationMessage, buf: ByteBuffer) {
+            FfiConverterString.write(value.`messageId`, buf)
+            FfiConverterByteArray.write(value.`plaintext`, buf)
+            FfiConverterUInt.write(value.`senderIndex`, buf)
+            FfiConverterULong.write(value.`epoch`, buf)
+            FfiConverterByteArray.write(value.`groupId`, buf)
+            FfiConverterByteArray.write(value.`membershipDigest`, buf)
+            FfiConverterULong.write(value.`revision`, buf)
+            FfiConverterByteArray.write(value.`stateEnvelope`, buf)
+            FfiConverterByteArray.write(value.`authenticatedData`, buf)
+    }
+}
+
+
+
+data class MlsCommit (
+    var `messageId`: kotlin.String
+    ,
+    var `revision`: kotlin.ULong
+    ,
+    var `groupId`: kotlin.ByteArray
+    ,
+    var `fromEpoch`: kotlin.ULong
+    ,
+    var `toEpoch`: kotlin.ULong
+    ,
+    var `fromMembershipDigest`: kotlin.ByteArray
+    ,
+    var `membershipDigest`: kotlin.ByteArray
+    ,
+    var `roster`: List<MlsRosterMember>
+    ,
+    var `stateEnvelope`: kotlin.ByteArray
+    ,
+    var `authenticatedData`: kotlin.ByteArray
+    ,
+    var `commit`: kotlin.ByteArray
+    ,
+    var `welcome`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsCommit: FfiConverterRustBuffer<MlsCommit> {
+    override fun read(buf: ByteBuffer): MlsCommit {
+        return MlsCommit(
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterSequenceTypeMlsRosterMember.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MlsCommit) = (
+            FfiConverterString.allocationSize(value.`messageId`) +
+            FfiConverterULong.allocationSize(value.`revision`) +
+            FfiConverterByteArray.allocationSize(value.`groupId`) +
+            FfiConverterULong.allocationSize(value.`fromEpoch`) +
+            FfiConverterULong.allocationSize(value.`toEpoch`) +
+            FfiConverterByteArray.allocationSize(value.`fromMembershipDigest`) +
+            FfiConverterByteArray.allocationSize(value.`membershipDigest`) +
+            FfiConverterSequenceTypeMlsRosterMember.allocationSize(value.`roster`) +
+            FfiConverterByteArray.allocationSize(value.`stateEnvelope`) +
+            FfiConverterByteArray.allocationSize(value.`authenticatedData`) +
+            FfiConverterByteArray.allocationSize(value.`commit`) +
+            FfiConverterByteArray.allocationSize(value.`welcome`)
+    )
+
+    override fun write(value: MlsCommit, buf: ByteBuffer) {
+            FfiConverterString.write(value.`messageId`, buf)
+            FfiConverterULong.write(value.`revision`, buf)
+            FfiConverterByteArray.write(value.`groupId`, buf)
+            FfiConverterULong.write(value.`fromEpoch`, buf)
+            FfiConverterULong.write(value.`toEpoch`, buf)
+            FfiConverterByteArray.write(value.`fromMembershipDigest`, buf)
+            FfiConverterByteArray.write(value.`membershipDigest`, buf)
+            FfiConverterSequenceTypeMlsRosterMember.write(value.`roster`, buf)
+            FfiConverterByteArray.write(value.`stateEnvelope`, buf)
+            FfiConverterByteArray.write(value.`authenticatedData`, buf)
+            FfiConverterByteArray.write(value.`commit`, buf)
+            FfiConverterByteArray.write(value.`welcome`, buf)
+    }
+}
+
+
+
+data class MlsEncryptedApplication (
+    var `messageId`: kotlin.String
+    ,
+    var `revision`: kotlin.ULong
+    ,
+    var `ciphertext`: kotlin.ByteArray
+    ,
+    var `stateEnvelope`: kotlin.ByteArray
+    ,
+    var `groupId`: kotlin.ByteArray
+    ,
+    var `epoch`: kotlin.ULong
+    ,
+    var `membershipDigest`: kotlin.ByteArray
+    ,
+    var `senderIndex`: kotlin.UInt
+    ,
+    var `authenticatedData`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsEncryptedApplication: FfiConverterRustBuffer<MlsEncryptedApplication> {
+    override fun read(buf: ByteBuffer): MlsEncryptedApplication {
+        return MlsEncryptedApplication(
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MlsEncryptedApplication) = (
+            FfiConverterString.allocationSize(value.`messageId`) +
+            FfiConverterULong.allocationSize(value.`revision`) +
+            FfiConverterByteArray.allocationSize(value.`ciphertext`) +
+            FfiConverterByteArray.allocationSize(value.`stateEnvelope`) +
+            FfiConverterByteArray.allocationSize(value.`groupId`) +
+            FfiConverterULong.allocationSize(value.`epoch`) +
+            FfiConverterByteArray.allocationSize(value.`membershipDigest`) +
+            FfiConverterUInt.allocationSize(value.`senderIndex`) +
+            FfiConverterByteArray.allocationSize(value.`authenticatedData`)
+    )
+
+    override fun write(value: MlsEncryptedApplication, buf: ByteBuffer) {
+            FfiConverterString.write(value.`messageId`, buf)
+            FfiConverterULong.write(value.`revision`, buf)
+            FfiConverterByteArray.write(value.`ciphertext`, buf)
+            FfiConverterByteArray.write(value.`stateEnvelope`, buf)
+            FfiConverterByteArray.write(value.`groupId`, buf)
+            FfiConverterULong.write(value.`epoch`, buf)
+            FfiConverterByteArray.write(value.`membershipDigest`, buf)
+            FfiConverterUInt.write(value.`senderIndex`, buf)
+            FfiConverterByteArray.write(value.`authenticatedData`, buf)
+    }
+}
+
+
+
+data class MlsRoomInfo (
+    var `roomId`: kotlin.String
+    ,
+    var `groupId`: kotlin.ByteArray
+    ,
+    var `epoch`: kotlin.ULong
+    ,
+    var `memberCount`: kotlin.UInt
+    ,
+    var `revision`: kotlin.ULong
+    ,
+    var `membershipDigest`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsRoomInfo: FfiConverterRustBuffer<MlsRoomInfo> {
+    override fun read(buf: ByteBuffer): MlsRoomInfo {
+        return MlsRoomInfo(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MlsRoomInfo) = (
+            FfiConverterString.allocationSize(value.`roomId`) +
+            FfiConverterByteArray.allocationSize(value.`groupId`) +
+            FfiConverterULong.allocationSize(value.`epoch`) +
+            FfiConverterUInt.allocationSize(value.`memberCount`) +
+            FfiConverterULong.allocationSize(value.`revision`) +
+            FfiConverterByteArray.allocationSize(value.`membershipDigest`)
+    )
+
+    override fun write(value: MlsRoomInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`roomId`, buf)
+            FfiConverterByteArray.write(value.`groupId`, buf)
+            FfiConverterULong.write(value.`epoch`, buf)
+            FfiConverterUInt.write(value.`memberCount`, buf)
+            FfiConverterULong.write(value.`revision`, buf)
+            FfiConverterByteArray.write(value.`membershipDigest`, buf)
+    }
+}
+
+
+
+data class MlsRosterMember (
+    var `username`: kotlin.String
+    ,
+    var `stableIdentity`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMlsRosterMember: FfiConverterRustBuffer<MlsRosterMember> {
+    override fun read(buf: ByteBuffer): MlsRosterMember {
+        return MlsRosterMember(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MlsRosterMember) = (
+            FfiConverterString.allocationSize(value.`username`) +
+            FfiConverterByteArray.allocationSize(value.`stableIdentity`)
+    )
+
+    override fun write(value: MlsRosterMember, buf: ByteBuffer) {
+            FfiConverterString.write(value.`username`, buf)
+            FfiConverterByteArray.write(value.`stableIdentity`, buf)
     }
 }
 
@@ -2224,6 +3622,34 @@ public object FfiConverterTypeAbyssalError : FfiConverterRustBuffer<AbyssalExcep
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMlsRosterMember: FfiConverterRustBuffer<List<MlsRosterMember>> {
+    override fun read(buf: ByteBuffer): List<MlsRosterMember> {
+        val len = buf.getInt()
+        return List<MlsRosterMember>(len) {
+            FfiConverterTypeMlsRosterMember.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MlsRosterMember>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMlsRosterMember.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MlsRosterMember>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMlsRosterMember.write(it, buf)
+        }
+    }
 }
 
 

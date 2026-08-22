@@ -207,6 +207,14 @@ function SecureWorkspace({
       onOpenDirect={(username) => { setReplyTarget(null); setShowAttachment(false); abyssal.openDirect(username); }}
       onCreateRoom={() => setShowCreateRoom(true)}
       onDeleteRoom={abyssal.deleteRoom}
+      pendingRoomJoins={(abyssal.pendingMlsJoins ?? []).map((join) => ({ requestId: join.requestId, roomId: join.roomId, username: join.username }))}
+      pendingRoomLeaves={(abyssal.pendingMlsLeaves ?? []).map((leave) => ({ requestId: leave.requestId, roomId: leave.roomId, username: leave.username }))}
+      onJoinRoom={abyssal.joinRoom}
+      onAcceptRoomJoin={abyssal.acceptRoomJoin}
+      onRejectRoomJoin={abyssal.rejectRoomJoin}
+      onLeaveRoom={abyssal.leaveRoom}
+      onAcceptRoomLeave={abyssal.acceptRoomLeave}
+      onRejectRoomLeave={abyssal.rejectRoomLeave}
       onLock={onLock}
       onLogout={() => void resetLocal()}
       onWipe={() => { abyssal.wipeRelay(); void resetLocal(); }}

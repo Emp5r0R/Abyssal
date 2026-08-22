@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
-import { Brand, Dialog, IconButton } from "./Ui";
+import { Brand, Dialog, Field, IconButton } from "./Ui";
 
 interface AppShellProps {
   username: string;
@@ -34,6 +34,14 @@ interface AppShellProps {
   onOpenDirect: (username: string) => void;
   onCreateRoom: () => void;
   onDeleteRoom: (chatId: string) => void;
+  pendingRoomJoins?: Array<{ requestId: string; roomId: string; username: string }>;
+  pendingRoomLeaves?: Array<{ requestId: string; roomId: string; username: string }>;
+  onJoinRoom?: (roomId: string) => boolean;
+  onAcceptRoomJoin?: (requestId: string) => Promise<boolean>;
+  onRejectRoomJoin?: (requestId: string) => boolean;
+  onLeaveRoom?: (roomId: string) => boolean;
+  onAcceptRoomLeave?: (requestId: string) => Promise<boolean>;
+  onRejectRoomLeave?: (requestId: string) => boolean;
   onLock: () => void;
   onLogout: () => void;
   onWipe: () => void;
@@ -56,6 +64,14 @@ export function AppShell({
   onOpenDirect,
   onCreateRoom,
   onDeleteRoom,
+  pendingRoomJoins = [],
+  pendingRoomLeaves = [],
+  onJoinRoom = () => false,
+  onAcceptRoomJoin = async () => false,
+  onRejectRoomJoin = () => false,
+  onLeaveRoom = () => false,
+  onAcceptRoomLeave = async () => false,
+  onRejectRoomLeave = () => false,
   onLock,
   onLogout,
   onWipe,
@@ -179,6 +195,14 @@ export function AppShell({
             onOpenRoom={onOpenRoom}
             onCreateRoom={onCreateRoom}
             onDeleteRoom={onDeleteRoom}
+            pendingRoomJoins={pendingRoomJoins}
+            pendingRoomLeaves={pendingRoomLeaves}
+            onJoinRoom={onJoinRoom}
+            onAcceptRoomJoin={onAcceptRoomJoin}
+            onRejectRoomJoin={onRejectRoomJoin}
+            onLeaveRoom={onLeaveRoom}
+            onAcceptRoomLeave={onAcceptRoomLeave}
+            onRejectRoomLeave={onRejectRoomLeave}
           />
         )}
       </section>
@@ -231,6 +255,14 @@ function Dashboard({
   onOpenRoom,
   onCreateRoom,
   onDeleteRoom,
+  pendingRoomJoins,
+  pendingRoomLeaves,
+  onJoinRoom,
+  onAcceptRoomJoin,
+  onRejectRoomJoin,
+  onLeaveRoom,
+  onAcceptRoomLeave,
+  onRejectRoomLeave,
 }: {
   username: string;
   rooms: RoomRecord[];
@@ -240,8 +272,21 @@ function Dashboard({
   onOpenRoom: (id: string) => void;
   onCreateRoom: () => void;
   onDeleteRoom: (id: string) => void;
+  pendingRoomJoins: Array<{ requestId: string; roomId: string; username: string }>;
+  pendingRoomLeaves: Array<{ requestId: string; roomId: string; username: string }>;
+  onJoinRoom: (roomId: string) => boolean;
+  onAcceptRoomJoin: (requestId: string) => Promise<boolean>;
+  onRejectRoomJoin: (requestId: string) => boolean;
+  onLeaveRoom: (roomId: string) => boolean;
+  onAcceptRoomLeave: (requestId: string) => Promise<boolean>;
+  onRejectRoomLeave: (requestId: string) => boolean;
 }) {
   const owned = rooms.filter((room) => room.owner_username === username).length;
+  const [joinId, setJoinId] = useState("");
+  const ownerLeaveRequests = pendingRoomLeaves.filter((request) =>
+    rooms.some((room) => room.id === request.roomId && room.owner_username === username && request.username !== username),
+  );
+  const ownLeaveRequests = pendingRoomLeaves.filter((request) => request.username === username);
   return (
     <section className="dashboard">
       <header className="dashboard-header">
@@ -254,6 +299,32 @@ function Dashboard({
         <div><span>OWNED</span><strong>{owned}/{maxRooms}</strong></div>
         <div><span>RELAY</span><strong className={`text-${connection}`}>{connection.toUpperCase()}</strong></div>
       </div>
+
+      <form className="room-join-form" onSubmit={(event) => { event.preventDefault(); if (onJoinRoom(joinId.trim())) setJoinId(""); }}>
+        <Field label="Join room ID" value={joinId} maxLength={128} placeholder="forum_..." onChange={(event) => setJoinId(event.target.value)} />
+        <button className="secondary-button" type="submit" disabled={connection !== "connected" || !joinId.trim()}>JOIN</button>
+      </form>
+
+      {pendingRoomJoins.length > 0 ? <div className="pending-room-joins" aria-label="Pending room joins">
+        {pendingRoomJoins.map((request) => <div key={request.requestId}>
+          <span><strong>{request.username}</strong><small>{request.roomId}</small></span>
+          <button className="secondary-button" type="button" onClick={() => void onAcceptRoomJoin(request.requestId)}>ACCEPT</button>
+          <button className="danger-button" type="button" onClick={() => onRejectRoomJoin(request.requestId)}>REJECT</button>
+        </div>)}
+      </div> : null}
+
+      {ownerLeaveRequests.length > 0 ? <div className="pending-room-joins" aria-label="Pending room leaves">
+        {ownerLeaveRequests.map((request) => <div key={request.requestId}>
+          <span><strong>{request.username}</strong><small>{request.roomId}</small></span>
+          <button className="danger-button" type="button" onClick={() => void onAcceptRoomLeave(request.requestId)}>REMOVE</button>
+          <button className="secondary-button" type="button" onClick={() => onRejectRoomLeave(request.requestId)}>KEEP</button>
+        </div>)}
+      </div> : null}
+      {ownLeaveRequests.length > 0 ? <div className="pending-room-joins" aria-label="Leave requests pending">
+        {ownLeaveRequests.map((request) => <div key={request.requestId}>
+          <span><strong>LEAVE REQUEST PENDING</strong><small>{request.roomId}</small></span>
+        </div>)}
+      </div> : null}
 
       <div className="dashboard-section-heading">
         <div><MessageCircle size={16} /><span>DIRECT MESSAGES</span></div>
@@ -294,7 +365,12 @@ function Dashboard({
               </button>
               {owner ? (
                 <IconButton label="Delete room" onClick={() => onDeleteRoom(room.id)}><Trash2 size={17} /></IconButton>
-              ) : <span className="room-owner">{room.owner_username || "NODE"}</span>}
+              ) : (
+                <span className="room-row-actions">
+                  <span className="room-owner">{room.owner_username || "NODE"}</span>
+                  <IconButton label="Leave room" onClick={() => onLeaveRoom(room.id)}><DoorOpen size={17} /></IconButton>
+                </span>
+              )}
             </div>
           );
         })}

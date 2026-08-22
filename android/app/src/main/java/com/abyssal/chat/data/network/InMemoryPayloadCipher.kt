@@ -11,12 +11,14 @@ import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.abyssal_core.E2eeSession
+import uniffi.abyssal_core.MlsRoom
+import uniffi.abyssal_core.MlsRosterMember
 import uniffi.abyssal_core.RecipientPublicKey
 
 internal class FatalPayloadCipherException(cause: Throwable) :
     IllegalStateException("Identity unavailable", cause)
 
-class InMemoryPayloadCipher {
+class InMemoryPayloadCipher : MlsSessionBridge {
     private var session: E2eeSession? = null
     /** State visible after the last committed encrypt/decrypt operation. */
     private var committedState: IdentityStateSnapshot? = null
@@ -474,6 +476,47 @@ class InMemoryPayloadCipher {
         // cannot leave this wrapper looking usable after a fatal transition.
         activeSession?.close()
     }
+
+    @Synchronized
+    override fun createMlsRoom(
+        roomId: String,
+        username: String,
+        nodeContext: ByteArray,
+        groupId: ByteArray
+    ): MlsRoom = requireSession().createMlsRoom(roomId, username, nodeContext, groupId)
+
+    @Synchronized
+    override fun pendingMlsJoin(
+        roomId: String,
+        username: String,
+        nodeContext: ByteArray,
+        groupId: ByteArray
+    ): MlsRoom = requireSession().pendingMlsJoin(roomId, username, nodeContext, groupId)
+
+    @Synchronized
+    override fun recoverMlsRoom(
+        roomId: String,
+        username: String,
+        nodeContext: ByteArray,
+        groupId: ByteArray,
+        envelope: ByteArray,
+        expectedActive: Boolean,
+        expectedEpoch: ULong,
+        expectedRevision: ULong,
+        expectedMembers: List<MlsRosterMember>,
+        expectedDigest: ByteArray
+    ): MlsRoom = requireSession().recoverMlsRoom(
+        roomId,
+        username,
+        nodeContext,
+        groupId,
+        envelope,
+        expectedActive,
+        expectedEpoch,
+        expectedRevision,
+        expectedMembers,
+        expectedDigest
+    )
 
     private fun requireSession(): E2eeSession =
         session ?: throw IllegalStateException("Identity unavailable")

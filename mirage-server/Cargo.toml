@@ -6,7 +6,7 @@ license = "MPL-2.0"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
-futures-util = "=0.3.33"
+futures-util = "=0.3.34"
 hmac = "0.13"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

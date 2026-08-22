@@ -1,3 +1,4 @@
+pub mod mls_protocol;
 pub mod secure_protocol;
 
 #[derive(Debug, PartialEq, thiserror::Error, uniffi::Error)]

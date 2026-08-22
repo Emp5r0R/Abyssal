@@ -438,23 +438,20 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun catalogChangesCarryConnectionGeneration() = runBlocking {
+    fun mlsFramesCarryConnectionGeneration() = runBlocking {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket, generation = 7L)
 
         listener.onMessage(
             socket,
-            JSONObject()
-                .put("type", "rooms")
-                .put("rooms", JSONArray().put(room("forum_generation")))
-                .toString()
+            mlsRoomDeletedFrame("forum_generation")
         )
 
-        val change = transport.getRoomChanges().first()
+        val change = transport.getIncomingMlsFrames().first()
         assertEquals(7L, transport.currentConnectionGeneration())
-        assertEquals(7L, change.connectionGeneration)
-        assertEquals("forum_generation", change.session?.id)
+        assertEquals(7L, change.generation)
+        assertEquals("forum_generation", (change.frame as com.abyssal.chat.domain.model.MlsIncomingFrame.RoomDeleted).roomId)
     }
 
     @Test
@@ -465,17 +462,14 @@ class RealChatTransportSecurityTest {
 
         listener.onMessage(
             socket,
-            JSONObject()
-                .put("type", "rooms")
-                .put("rooms", JSONArray().put(room("forum_stale")))
-                .toString()
+            mlsRoomDeletedFrame("forum_stale")
         )
         transport.disconnect()
 
         assertEquals(9L, transport.currentConnectionGeneration())
         assertNull(
             withTimeoutOrNull(100L) {
-                transport.getRoomChanges().first()
+                transport.getIncomingMlsFrames().first()
             }
         )
     }
@@ -491,11 +485,6 @@ class RealChatTransportSecurityTest {
             oldSocket,
             JSONObject().put("type", "presence")
                 .put("users", JSONArray().put(presence("Alice"))).toString()
-        )
-        oldListener.onMessage(
-            oldSocket,
-            JSONObject().put("type", "rooms")
-                .put("rooms", JSONArray().put(room("forum_catalog"))).toString()
         )
         oldListener.onMessage(
             oldSocket,
@@ -534,8 +523,8 @@ class RealChatTransportSecurityTest {
                 .put("users", JSONArray().put(presence("Alice"))).toString()
         )
 
-        oldListener.onMessage(oldSocket, roomsFrame("forum_stale_callback"))
-        assertNull(withTimeoutOrNull(100L) { transport.getRoomChanges().first() })
+        oldListener.onMessage(oldSocket, mlsRoomDeletedFrame("forum_stale_callback"))
+        assertNull(withTimeoutOrNull(100L) { transport.getIncomingMlsFrames().first() })
 
         oldListener.onFailure(oldSocket, IllegalStateException("late failure"), null)
         assertEquals(51L, transport.currentConnectionGeneration())
@@ -543,10 +532,10 @@ class RealChatTransportSecurityTest {
         assertEquals("CONNECTED", transport.getServerStatus().first().state)
         assertEquals(listOf("Alice"), transport.getPresence().first().map { it.username })
 
-        currentListener.onMessage(currentSocket, roomsFrame("forum_current_callback"))
-        val change = transport.getRoomChanges().first()
-        assertEquals(51L, change.connectionGeneration)
-        assertEquals("forum_current_callback", change.session?.id)
+        currentListener.onMessage(currentSocket, mlsRoomDeletedFrame("forum_current_callback"))
+        val change = transport.getIncomingMlsFrames().first()
+        assertEquals(51L, change.generation)
+        assertEquals("forum_current_callback", (change.frame as com.abyssal.chat.domain.model.MlsIncomingFrame.RoomDeleted).roomId)
     }
 
     @Test
@@ -891,25 +880,15 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun catalogQueueOverflowClosesCurrentSocketFailClosed() = runBlocking {
+    fun mlsQueueOverflowClosesCurrentSocketFailClosed() = runBlocking {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket, generation = 10L)
 
-        fun roomsFrame(prefix: String): String = JSONObject()
-            .put("type", "rooms")
-            .put("rooms", JSONArray().apply {
-                repeat(1024) { index -> put(room("forum_${prefix}_$index")) }
-            })
-            .toString()
-
-        listener.onMessage(socket, roomsFrame("first"))
-        assertNull(socket.closeCode)
-
-        listener.onMessage(socket, roomsFrame("second"))
+        repeat(129) { listener.onMessage(socket, mlsRoomDeletedFrame("forum_$it")) }
 
         assertEquals(1008, socket.closeCode)
-        assertEquals("catalog consumer stalled", socket.closeReason)
+        assertEquals("MLS consumer stalled", socket.closeReason)
         assertEquals("DISCONNECTED", transport.getServerStatus().first().state)
     }
 
@@ -1250,7 +1229,7 @@ class RealChatTransportSecurityTest {
             senderPublicKey = ByteArray(1)
         )
 
-        assertTrue(with(transport) { isAuthorizedIncomingPayload(payload("forum_alpha", "Alice")) })
+        assertFalse(with(transport) { isAuthorizedIncomingPayload(payload("forum_alpha", "Alice")) })
         assertFalse(with(transport) { isAuthorizedIncomingPayload(payload("forum_unknown", "Alice")) })
         assertTrue(with(transport) { isAuthorizedIncomingPayload(payload("dm_alice", "alice")) })
         assertFalse(with(transport) { isAuthorizedIncomingPayload(payload("dm_alice", "Mallory")) })
@@ -1278,10 +1257,18 @@ class RealChatTransportSecurityTest {
         .put("accepted", accepted)
         .toString()
 
-    private fun roomsFrame(id: String): String = JSONObject()
-        .put("type", "rooms")
-        .put("rooms", JSONArray().put(room(id)))
+    private fun mlsRoomDeletedFrame(id: String): String = JSONObject()
+        .put("type", "mls_room_deleted")
+        .put("protocol_version", 10)
+        .put("room_id", id)
         .toString()
+
+    private fun outboundMlsApplicationFrame(messageId: String, revision: String): JSONObject = JSONObject()
+        .put("type", "mls_application").put("protocol_version", 10).put("room_id", "forum_alpha")
+        .put("message_id", messageId).put("group_id_b64", encode(ByteArray(32))).put("epoch", "0")
+        .put("revision", revision).put("membership_digest_b64", encode(ByteArray(32) { 1 }))
+        .put("ciphertext_b64", encode(byteArrayOf(1))).put("authenticated_data_b64", encode(byteArrayOf(2)))
+        .put("state_envelope_b64", encode(byteArrayOf(3)))
 
     private fun inboundMessageFrame(chatId: String = "dm_alice"): String = JSONObject()
         .put("type", "message")
@@ -1393,6 +1380,60 @@ class RealChatTransportSecurityTest {
         val field = target.javaClass.getDeclaredField(name)
         field.isAccessible = true
         return field.get(target)
+    }
+
+    @Test
+    fun mlsTransactionAcceptsOnlyExactGenerationRoomRevisionAndResultType() = runBlocking {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket, generation = 7L)
+        val frame = outboundMlsApplicationFrame("message_1", "9")
+        val pending = async(start = CoroutineStart.UNDISPATCHED) {
+            transport.sendMlsTransaction("forum_alpha", "message_1", 9uL, frame, 7L)
+        }
+        awaitSent(socket, 1)
+        val wrong = JSONObject().put("type", "mls_snapshot_result").put("protocol_version", 10)
+            .put("room_id", "forum_alpha").put("message_id", "message_1").put("revision", "9").put("accepted", true)
+        listener.onMessage(socket, wrong.toString())
+        assertEquals(1008, socket.closeCode)
+        assertEquals(OutboundSendResult.AMBIGUOUS, pending.await())
+    }
+
+    @Test
+    fun mlsTransactionCompletesForExactAuthenticatedTuple() = runBlocking {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket, generation = 3L)
+        val frame = outboundMlsApplicationFrame("message_2", "4")
+        val pending = async(start = CoroutineStart.UNDISPATCHED) {
+            transport.sendMlsTransaction("forum_alpha", "message_2", 4uL, frame, 3L)
+        }
+        awaitSent(socket, 1)
+        val result = JSONObject().put("type", "mls_room_result").put("protocol_version", 10)
+            .put("room_id", "forum_alpha").put("message_id", "message_2").put("revision", "4").put("accepted", true)
+        listener.onMessage(socket, result.toString())
+        assertEquals(OutboundSendResult.ACCEPTED, pending.await())
+        assertNull(socket.closeCode)
+    }
+
+    @Test
+    fun malformedMlsFrameFailsClosedInsteadOfFallingThroughLegacyRoomParser() {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+        listener.onMessage(socket, JSONObject().put("type", "mls_application").put("protocol_version", 10).put("room_id", "forum_alpha").toString())
+        assertEquals(1008, socket.closeCode)
+        assertEquals("DISCONNECTED", runBlocking { transport.getServerStatus().first() }.state)
+    }
+
+    @Test
+    fun legacyRoomCatalogFailsClosedAndCannotAuthorizeProtocolV9RoomPayloads() {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+        listener.onMessage(socket, JSONObject().put("type", "rooms").put("rooms", JSONArray()).toString())
+        assertEquals(1008, socket.closeCode)
+        assertEquals("legacy room protocol", socket.closeReason)
     }
 
     private suspend fun awaitSent(socket: RecordingWebSocket, expected: Int) {

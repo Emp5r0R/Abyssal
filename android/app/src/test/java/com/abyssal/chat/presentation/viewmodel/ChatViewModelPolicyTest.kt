@@ -576,8 +576,8 @@ class ChatViewModelPolicyTest {
             val carolRecipient = recipientFromNative("Carol", carol)
             val probe = TransactionTransportProbe(
                 cipher = sender,
-                leases = listOf(leaseFor("forum_ops", "message-first", "Bob", bob),
-                    leaseFor("forum_ops", "message-first", "Carol", carol)),
+                leases = listOf(leaseFor("dm_ops", "message-first", "Bob", bob),
+                    leaseFor("dm_ops", "message-first", "Carol", carol)),
                 sendResult = OutboundSendResult.ACCEPTED
             )
             val viewModel = transactionViewModel(sender, user, probe)
@@ -587,7 +587,7 @@ class ChatViewModelPolicyTest {
                 val result = invokeSendEncryptedMetadata(
                     viewModel,
                     stamp,
-                    chatId = "forum_ops",
+                    chatId = "dm_ops",
                     messageId = "message-first",
                     metadata = textMetadata("message-first"),
                     recipients = listOf(bobRecipient, carolRecipient)
@@ -616,7 +616,7 @@ class ChatViewModelPolicyTest {
         val carolRecipient = recipientFromNative("Carol", carol)
         val probe = TransactionTransportProbe(
             cipher = sender,
-            leases = listOf(leaseFor("forum_ops", "message-partial", "Bob", bob), null),
+            leases = listOf(leaseFor("dm_ops", "message-partial", "Bob", bob), null),
             sendResult = OutboundSendResult.ACCEPTED
         )
         val viewModel = transactionViewModel(sender, user, probe)
@@ -626,7 +626,7 @@ class ChatViewModelPolicyTest {
             val result = invokeSendEncryptedMetadata(
                 viewModel,
                 stamp,
-                chatId = "forum_ops",
+                chatId = "dm_ops",
                 messageId = "message-partial",
                 metadata = textMetadata("message-partial"),
                 recipients = listOf(bobRecipient, carolRecipient)

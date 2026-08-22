@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+WASM_GENERATED_DIR="$ROOT_DIR/apps/web/src/generated/abyssal_core"
 WASM_BINDGEN_BIN="${WASM_BINDGEN_BIN:-$(command -v wasm-bindgen || true)}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ROOT_DIR/android-sdk/ndk/27.3.13750724}"
 LLVM_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
@@ -127,12 +128,19 @@ cargo build \
   --release \
   --locked \
   --target wasm32-unknown-unknown
+[[ "$WASM_GENERATED_DIR" == "$ROOT_DIR/apps/web/src/generated/abyssal_core" ]] || {
+  echo "Refusing to clean unexpected WASM generated directory: $WASM_GENERATED_DIR" >&2
+  exit 1
+}
+mkdir -p "$WASM_GENERATED_DIR"
+find "$WASM_GENERATED_DIR" -mindepth 1 -depth -delete
 "$WASM_BINDGEN_BIN" \
   --target web \
   --typescript \
-  --out-dir "$ROOT_DIR/apps/web/src/generated/abyssal_core" \
+  --out-dir "$WASM_GENERATED_DIR" \
   "$ROOT_DIR/target/wasm32-unknown-unknown/release/abyssal_core.wasm"
-chmod 0644 "$ROOT_DIR"/apps/web/src/generated/abyssal_core/*
+find "$WASM_GENERATED_DIR" -type d -exec chmod 0755 {} +
+find "$WASM_GENERATED_DIR" -type f -exec chmod 0644 {} +
 
 ANDROID_NDK_HOME="$ANDROID_NDK_HOME" cargo ndk \
   --manifest-path "$ROOT_DIR/Cargo.toml" \
@@ -145,13 +153,71 @@ ANDROID_NDK_HOME="$ANDROID_NDK_HOME" cargo ndk \
 for library in "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
   "$LLVM_STRIP" --strip-unneeded "$library"
 done
-chmod 0644 "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so
+find "$ROOT_DIR/android/app/src/main/jniLibs" -type d -exec chmod 0755 {} +
+find "$ROOT_DIR/android/app/src/main/jniLibs" -type f -exec chmod 0644 {} +
 
-for artifact in \
-  "$ROOT_DIR"/apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
-  "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
+binary_artifacts=(
+  "$ROOT_DIR/apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm"
+  "$ROOT_DIR/android/app/src/main/jniLibs/arm64-v8a/libabyssal_core.so"
+  "$ROOT_DIR/android/app/src/main/jniLibs/armeabi-v7a/libabyssal_core.so"
+  "$ROOT_DIR/android/app/src/main/jniLibs/x86/libabyssal_core.so"
+  "$ROOT_DIR/android/app/src/main/jniLibs/x86_64/libabyssal_core.so"
+)
+for artifact in "${binary_artifacts[@]}"; do
   if ! grep -aFq "ABYSSAL_E2EE_PAYLOAD_V9" "$artifact"; then
     echo "Generated crypto artifact does not contain protocol v9: $artifact" >&2
+    exit 1
+  fi
+  if ! grep -aFq "ABYSSAL-MLS-STATE-V10" "$artifact"; then
+    echo "Generated crypto artifact does not contain MLS protocol v10: $artifact" >&2
+    exit 1
+  fi
+done
+
+artifact_paths=(
+  apps/web/src/generated/abyssal_core/abyssal_core.js
+  apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm
+)
+while IFS= read -r -d '' snippet; do
+  artifact_paths+=("${snippet#"$ROOT_DIR/"}")
+done < <(
+  find "$ROOT_DIR/apps/web/src/generated/abyssal_core/snippets" \
+    -type f -name '*.js' -print0 2>/dev/null | sort -z
+)
+artifact_paths+=(
+  android/app/src/main/jniLibs/arm64-v8a/libabyssal_core.so
+  android/app/src/main/jniLibs/armeabi-v7a/libabyssal_core.so
+  android/app/src/main/jniLibs/x86/libabyssal_core.so
+  android/app/src/main/jniLibs/x86_64/libabyssal_core.so
+)
+
+WASM_TYPESCRIPT="$ROOT_DIR/apps/web/src/generated/abyssal_core/abyssal_core.d.ts"
+for symbol in \
+  "mlsCreateRoom" \
+  "mlsRecoverRoom" \
+  "mlsPendingJoin" \
+  "class WasmMlsRoom" \
+  "class WasmMlsCommit" \
+  "class WasmMlsApplicationMessage" \
+  "class WasmMlsProcessedControl" \
+  "): WasmMlsProcessedControl;" \
+  "class WasmMlsEncryptedApplication"; do
+  if ! grep -Fq "$symbol" "$WASM_TYPESCRIPT"; then
+    echo "Generated WASM TypeScript API is missing $symbol" >&2
+    exit 1
+  fi
+done
+
+KOTLIN_BINDINGS="$ROOT_DIR/android/app/src/main/java/uniffi/abyssal_core/abyssal_core.kt"
+for symbol in \
+  'fun `createMlsRoom`' \
+  'fun `recoverMlsRoom`' \
+  'fun `pendingMlsJoin`' \
+  'open class MlsRoom' \
+  'open class MlsProcessedControl' \
+  '): MlsProcessedControl'; do
+  if ! grep -Fq "$symbol" "$KOTLIN_BINDINGS"; then
+    echo "Generated Kotlin API is missing $symbol" >&2
     exit 1
   fi
 done
@@ -164,9 +230,8 @@ for build_path in \
   # A path of / would match every artifact byte and is not a useful remap
   # target; the configured project/toolchain paths are always more specific.
   [[ -n "$build_path" && "$build_path" != "/" ]] || continue
-  for artifact in \
-    "$ROOT_DIR"/apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
-    "$ROOT_DIR"/android/app/src/main/jniLibs/*/libabyssal_core.so; do
+  for relative_artifact in "${artifact_paths[@]}"; do
+    artifact="$ROOT_DIR/$relative_artifact"
     if grep -aFq -- "$build_path" "$artifact"; then
       printf 'Generated crypto artifact leaks build path %s: %s\n' \
         "$build_path" "$artifact" >&2
@@ -177,13 +242,7 @@ done
 
 (
   cd "$ROOT_DIR"
-  sha256sum \
-    apps/web/src/generated/abyssal_core/abyssal_core_bg.wasm \
-    android/app/src/main/jniLibs/arm64-v8a/libabyssal_core.so \
-    android/app/src/main/jniLibs/armeabi-v7a/libabyssal_core.so \
-    android/app/src/main/jniLibs/x86/libabyssal_core.so \
-    android/app/src/main/jniLibs/x86_64/libabyssal_core.so \
-    > rust-core/generated-artifacts.sha256
+  sha256sum "${artifact_paths[@]}" > rust-core/generated-artifacts.sha256
 )
 
 "$ROOT_DIR/scripts/crypto-source-digest.sh" > \

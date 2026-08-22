@@ -5,6 +5,8 @@ import com.abyssal.chat.domain.model.DirectoryStamp
 import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
+import com.abyssal.chat.domain.model.MlsInboundEnvelope
+import com.abyssal.chat.domain.model.MlsIncomingFrame
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
@@ -13,6 +15,7 @@ import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.repository.IChatTransport
+import com.abyssal.chat.domain.repository.IMlsTransport
 import com.abyssal.chat.domain.repository.INodeConfigService
 import com.abyssal.chat.domain.repository.OutboundSendResult
 import java.util.Collections
@@ -229,7 +232,7 @@ class RealChatTransport(
     private val nodeConfigService: INodeConfigService,
     private val client: OkHttpClient,
     private val callFactory: Call.Factory = client
-) : IChatTransport {
+) : IChatTransport, IMlsTransport {
     private data class PendingOperation(
         val generation: Long,
         val result: CompletableDeferred<OutboundSendResult>
@@ -238,12 +241,21 @@ class RealChatTransport(
     private data class DrainedPendingOperations(
         val outbound: List<CompletableDeferred<OutboundSendResult>>,
         val acknowledgements: List<CompletableDeferred<OutboundSendResult>>,
-        val prekeyLeases: List<CompletableDeferred<PrekeyLease?>>
+        val prekeyLeases: List<CompletableDeferred<PrekeyLease?>>,
+        val mls: List<CompletableDeferred<OutboundSendResult>>
     )
 
     private data class PendingPrekeyLease(
         val generation: Long,
         val result: CompletableDeferred<PrekeyLease?>
+    )
+
+    private data class PendingMlsOperation(
+        val generation: Long,
+        val roomId: String,
+        val revision: ULong,
+        val snapshot: Boolean,
+        val result: CompletableDeferred<OutboundSendResult>
     )
 
     private data class SocketSnapshot(
@@ -263,6 +275,7 @@ class RealChatTransport(
         onUndeliveredElement = ::wipeIncomingPayload
     )
     private val _roomChanges = Channel<RoomChange>(capacity = ROOM_CHANGE_BUFFER_CAPACITY)
+    private val _incomingMls = Channel<MlsInboundEnvelope>(capacity = MLS_INBOUND_BUFFER_CAPACITY)
     private val _presence = MutableStateFlow<List<UserPresence>>(emptyList())
     private val _serverStatus = MutableStateFlow(ServerStatus("DISCONNECTED", "No node", 0))
     private val connecting = AtomicBoolean(false)
@@ -291,6 +304,7 @@ class RealChatTransport(
     private val pendingAcknowledgements =
         LinkedHashMap<String, PendingOperation>()
     private val pendingPrekeyLeases = LinkedHashMap<PrekeyLeaseTuple, PendingPrekeyLease>()
+    private val pendingMls = LinkedHashMap<String, PendingMlsOperation>()
 
     override fun connect() {
         val session = nodeConfigService.getActiveSession()
@@ -402,6 +416,8 @@ class RealChatTransport(
     override fun getIncomingWipeCommands(): Flow<Long> = _wipeCommands.receiveAsFlow()
 
     override fun getIncomingPayloads(): Flow<IncomingTransportPayload> = _incomingPayloads.receiveAsFlow()
+
+    override fun getIncomingMlsFrames(): Flow<MlsInboundEnvelope> = _incomingMls.receiveAsFlow()
 
     override fun currentConnectionGeneration(): Long = connectionGeneration.get()
 
@@ -516,6 +532,7 @@ class RealChatTransport(
             // Catalog changes are scoped to the invalidated connection epoch.
         }
         drainIncomingPayloadsLocked()
+        while (_incomingMls.tryReceive().isSuccess) Unit
         while (_wipeCommands.tryReceive().isSuccess) {
             // Purge commands from the invalidated epoch cannot be applied to a
             // replacement session. A purge close publishes a fresh command
@@ -544,7 +561,19 @@ class RealChatTransport(
             }
             drained
         }
-        return DrainedPendingOperations(outbound, acknowledgements, prekeyLeases)
+        val mls = synchronized(pendingMls) {
+            val drained = ArrayList<CompletableDeferred<OutboundSendResult>>(pendingMls.size)
+            val iterator = pendingMls.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.value.generation != currentGeneration) {
+                    drained += entry.value.result
+                    iterator.remove()
+                }
+            }
+            drained
+        }
+        return DrainedPendingOperations(outbound, acknowledgements, prekeyLeases, mls)
     }
 
     /** Must be called under [connectionLock]. */
@@ -680,6 +709,71 @@ class RealChatTransport(
         }
     }
 
+    override suspend fun sendMlsControl(frame: JSONObject, expectedConnectionGeneration: Long): Boolean {
+        if (!MlsWireCodec.isStrictControl(frame)) return false
+        val text = frame.toString()
+        if (exceedsUtf8ByteLimit(text, MlsWireCodec.MAX_FRAME_BYTES)) return false
+        return sendCommandFrame(text, expectedConnectionGeneration)
+    }
+
+    override suspend fun sendMlsTransaction(
+        roomId: String,
+        messageId: String,
+        revision: ULong,
+        frame: JSONObject,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult = sendMlsResultBoundFrame(roomId, messageId, revision, frame, expectedConnectionGeneration, snapshot = false)
+
+    override suspend fun sendMlsSnapshot(
+        roomId: String,
+        messageId: String,
+        revision: ULong,
+        frame: JSONObject,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult = sendMlsResultBoundFrame(roomId, messageId, revision, frame, expectedConnectionGeneration, snapshot = true)
+
+    private suspend fun sendMlsResultBoundFrame(
+        roomId: String,
+        messageId: String,
+        revision: ULong,
+        frame: JSONObject,
+        expectedGeneration: Long,
+        snapshot: Boolean
+    ): OutboundSendResult {
+        if (!isSafeProtocolIdentifier(roomId) || !isSafeProtocolIdentifier(messageId) ||
+            frame.opt("protocol_version") != com.abyssal.chat.domain.model.MLS_PROTOCOL_VERSION ||
+            frame.opt("room_id") != roomId || frame.opt("message_id") != messageId ||
+            MlsWireCodec.canonicalU64(frame.opt("revision")) != revision ||
+            (if (snapshot) !MlsWireCodec.isStrictSnapshot(frame) else !MlsWireCodec.isStrictTransaction(frame))
+        ) return OutboundSendResult.NOT_SENT
+        val text = frame.toString()
+        if (exceedsUtf8ByteLimit(text, MlsWireCodec.MAX_FRAME_BYTES)) return OutboundSendResult.NOT_SENT
+        val result = CompletableDeferred<OutboundSendResult>()
+        val socket: WebSocket
+        val generation: Long
+        synchronized(connectionLock) {
+            socket = webSocket ?: return OutboundSendResult.NOT_SENT
+            generation = connectionGeneration.get()
+            if (generation != expectedGeneration) return OutboundSendResult.NOT_SENT
+            synchronized(pendingMls) {
+                if (pendingMls.size >= MAX_PENDING_MLS || pendingMls.containsKey(messageId)) return OutboundSendResult.NOT_SENT
+                pendingMls[messageId] = PendingMlsOperation(generation, roomId, revision, snapshot, result)
+            }
+        }
+        val sent = synchronized(connectionLock) { isCurrentSocket(socket, generation) && runCatching { socket.send(text) }.getOrDefault(false) }
+        if (!sent) {
+            synchronized(pendingMls) { pendingMls.remove(messageId) }
+            return OutboundSendResult.NOT_SENT
+        }
+        return try {
+            withTimeout(OUTBOUND_RESULT_TIMEOUT_MS) { result.await() }
+        } catch (_: Exception) {
+            synchronized(pendingMls) { pendingMls.remove(messageId) }
+            if (isCurrentSocket(socket, generation)) closeCurrentSocket(socket, _serverStatus.value.nodeId, "MLS result unavailable", 1001)
+            OutboundSendResult.AMBIGUOUS
+        }
+    }
+
     override suspend fun createForum(session: ChatSession) {
         createForumInternal(session, expectedGeneration = null)
     }
@@ -692,11 +786,8 @@ class RealChatTransport(
     }
 
     private fun createForumInternal(session: ChatSession, expectedGeneration: Long?) {
-        val frame = JSONObject()
-            .put("type", "create_room")
-            .put("room", session.toRoomJson())
-            .toString()
-        sendCommandFrame(frame, expectedGeneration)
+        // Protocol-v10 room creation is available only through IMlsTransport.
+        @Suppress("UNUSED_VARIABLE") val rejectedLegacyRequest = session.id to expectedGeneration
     }
 
     override suspend fun deleteForum(chatId: String) {
@@ -708,11 +799,8 @@ class RealChatTransport(
     }
 
     private fun deleteForumInternal(chatId: String, expectedGeneration: Long?) {
-        val frame = JSONObject()
-            .put("type", "delete_room")
-            .put("chat_id", chatId)
-            .toString()
-        sendCommandFrame(frame, expectedGeneration)
+        // Protocol-v10 room deletion is available only through IMlsTransport.
+        @Suppress("UNUSED_VARIABLE") val rejectedLegacyRequest = chatId to expectedGeneration
     }
 
     override suspend fun openDirect(peerUsername: String) {
@@ -1233,10 +1321,45 @@ class RealChatTransport(
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (!isCurrentSocket(webSocket, generation)) return
-                if (disconnectForOversizedTextFrame(webSocket, text, nodeId)) return
+                val appearsMls = text.take(160).trimStart().startsWith("{\"type\":\"mls_")
+                val limit = if (appearsMls) MlsWireCodec.MAX_FRAME_BYTES else MAX_WEBSOCKET_FRAME_BYTES
+                if (exceedsUtf8ByteLimit(text, limit)) {
+                    closeCurrentSocket(webSocket, nodeId, "message too big", closeCode = 1009)
+                    return
+                }
                 runCatching {
                     val json = JSONObject(text)
                     when (json.optString("type")) {
+                        "mls_room_result", "mls_snapshot_result" -> {
+                            val frame = MlsWireCodec.parse(json) as? MlsIncomingFrame.RoomResult ?: run {
+                                closeCurrentSocket(webSocket, nodeId, "invalid MLS result")
+                                return
+                            }
+                            val pending = synchronized(connectionLock) {
+                                if (!isCurrentSocket(webSocket, generation)) null else synchronized(pendingMls) {
+                                    pendingMls[frame.messageId]?.takeIf {
+                                        it.generation == generation && it.roomId == frame.roomId && it.revision == frame.revision && it.snapshot == frame.snapshot
+                                    }?.also { pendingMls.remove(frame.messageId) }
+                                }
+                            }
+                            if (pending == null) {
+                                closeCurrentSocket(webSocket, nodeId, "unexpected MLS result")
+                                return
+                            }
+                            pending.result.complete(if (frame.accepted) OutboundSendResult.ACCEPTED else OutboundSendResult.REJECTED)
+                        }
+                        "mls_rooms", "mls_room_created", "mls_room_discovered", "mls_join_requested",
+                        "mls_join_rejected", "mls_leave_requested", "mls_leave_pending", "mls_leave_rejected",
+                        "mls_left", "mls_membership", "mls_application", "mls_room_deleted" -> {
+                            val frame = MlsWireCodec.parse(json) ?: run {
+                                closeCurrentSocket(webSocket, nodeId, "invalid MLS frame")
+                                return
+                            }
+                            if (!_incomingMls.trySend(MlsInboundEnvelope(generation, frame)).isSuccess) {
+                                closeCurrentSocket(webSocket, nodeId, "MLS consumer stalled")
+                            }
+                            Unit
+                        }
                         "GLOBAL_WIPE", "global_wipe" -> signalPurgeForSocket(webSocket, generation)
                         "prekey_lease" -> {
                             val lease = json.toPrekeyLease() ?: run {
@@ -1358,31 +1481,16 @@ class RealChatTransport(
                             Unit
                         }
                         "rooms" -> {
-                            val rooms = json.optJSONArray("rooms") ?: return
-                            val sessions = rooms.toChatSessions(MAX_ROOM_CATALOG_ENTRIES) ?: return
-                            if (!installRoomCatalogForSocket(webSocket, generation, sessions)) return
-                            sessions.forEach { session ->
-                                if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
-                                    emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
-                                }
-                            }
+                            closeCurrentSocket(webSocket, nodeId, "legacy room protocol")
+                            return
                         }
                         "room_created" -> {
-                            json.optJSONObject("room")?.toChatSession()
-                                ?.takeIf { acceptDynamicRoomForSocket(webSocket, generation, it) }
-                                ?.let { session ->
-                                    if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
-                                        emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
-                                    }
-                                }
+                            closeCurrentSocket(webSocket, nodeId, "legacy room protocol")
+                            return
                         }
                         "room_deleted" -> {
-                            val chatId = json.optString("chat_id")
-                                .takeIf { it.startsWith("forum_") && isSafeIdentifier(it) } ?: return
-                            if (removeJoinedChatForSocket(webSocket, generation, chatId)) {
-                                emitRoomChange(webSocket, generation, RoomChange("delete", chatId = chatId))
-                            }
-                            Unit
+                            closeCurrentSocket(webSocket, nodeId, "legacy room protocol")
+                            return
                         }
                         "directs" -> {
                             val directs = json.optJSONArray("directs") ?: return
@@ -1482,6 +1590,7 @@ class RealChatTransport(
         drained.outbound.forEach { it.complete(result) }
         drained.acknowledgements.forEach { it.complete(result) }
         drained.prekeyLeases.forEach { it.complete(null) }
+        drained.mls.forEach { it.complete(result) }
     }
 
     private fun abortPendingOutbound(
@@ -1868,7 +1977,7 @@ class RealChatTransport(
         val idKey = payload.chatId.lowercase(Locale.ROOT)
         synchronized(catalogLock) {
             return when {
-                idKey.startsWith("forum_") -> roomCatalogIds.containsKey(idKey)
+                idKey.startsWith("forum_") -> false
                 idKey.startsWith("dm_") -> directCatalogPeerById[idKey]
                     ?.equals(payload.senderUsername, ignoreCase = true) == true
                 else -> false
@@ -2255,6 +2364,8 @@ class RealChatTransport(
         const val MAX_PENDING_OUTBOUND = 64
         const val MAX_PENDING_ACKNOWLEDGEMENTS = 64
         const val MAX_PENDING_PREKEY_LEASES = 64
+        const val MAX_PENDING_MLS = 64
+        const val MLS_INBOUND_BUFFER_CAPACITY = 128
         const val MAX_RECIPIENT_ENVELOPES = 256
         const val DIRECTORY_DIGEST_BYTES = 32
         const val IDENTITY_FINGERPRINT_BYTES = 64

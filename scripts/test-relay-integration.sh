@@ -25,7 +25,7 @@ coproc RELAY_PROCESS {
   ABYSSAL_CODE_MAX_LEN=17 \
   ABYSSAL_SESSION_INACTIVITY_MINUTES=5 \
   ABYSSAL_WEB_ROOT="$TMP_DIR/no-web" \
-  RUST_LOG=mirage_server=warn \
+  RUST_LOG="${RUST_LOG:-mirage_server=warn}" \
     "$ROOT_DIR/target/debug/mirage-server" 2>&1
 }
 RELAY_PID="$RELAY_PROCESS_PID"
@@ -51,6 +51,17 @@ if [[ ${#codes[@]} -ne 2 ]]; then
   exit 1
 fi
 
+# Drain non-secret relay diagnostics after capturing the one-time invite lines.
+# Duplicating the coprocess descriptor keeps it available to the background job.
+exec 3<&"$RELAY_FD"
+{
+  while IFS= read -r -u 3 line; do
+    if [[ "$line" != "ABYSSAL_CODE code="* ]]; then
+      printf '%s\n' "$line" >&2
+    fi
+  done
+} &
+
 for _ in {1..80}; do
   if curl --fail --silent "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     break
@@ -66,4 +77,4 @@ curl --fail --silent --show-error "http://127.0.0.1:$PORT/health" >/dev/null
 ABYSSAL_TEST_BASE_URL="http://127.0.0.1:$PORT" \
 ABYSSAL_TEST_CODE_A="${codes[0]}" \
 ABYSSAL_TEST_CODE_B="${codes[1]}" \
-  node "$ROOT_DIR/scripts/relay-integration.mjs"
+  node --trace-uncaught "$ROOT_DIR/scripts/relay-integration.mjs"

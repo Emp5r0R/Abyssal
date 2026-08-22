@@ -1872,6 +1872,45 @@ describe("RelaySocket", () => {
       globalThis.WebSocket = originalWebSocket;
     }
   });
+
+  it("binds MLS results to room, message, revision, and result domain", async () => {
+    const { relay, socket, originalWebSocket } = await connectRelay();
+    try {
+      const frame = { type: "mls_application", protocol_version: 10, room_id: "forum_alpha", message_id: "mls-message", revision: "7" };
+      const pending = relay.sendMlsTransaction("forum_alpha", "mls-message", 7n, frame);
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "mls_room_result", protocol_version: 10, room_id: "forum_alpha", message_id: "mls-message", revision: "7", accepted: true,
+      }) }));
+      await expect(pending).resolves.toBe("ACCEPTED");
+      expect(JSON.parse(socket.sent.at(-1)!)).toEqual(frame);
+
+      const snapshot = relay.sendMlsSnapshot("forum_alpha", "snapshot-message", 8n, {
+        type: "mls_state_snapshot", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-message", revision: "8",
+      });
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "mls_room_result", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-message", revision: "8", accepted: true,
+      }) }));
+      await expect(snapshot).resolves.toBe("AMBIGUOUS");
+      expect(socket.readyState).toBe(3);
+    } finally { relay.close(); globalThis.WebSocket = originalWebSocket; }
+  });
+
+  it("accepts exact snapshot rejection and fails closed on noncanonical counters", async () => {
+    const { relay, socket, originalWebSocket } = await connectRelay();
+    try {
+      const pending = relay.sendMlsSnapshot("forum_alpha", "snapshot-ok", 9n, {
+        type: "mls_state_snapshot", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-ok", revision: "9",
+      });
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "mls_snapshot_result", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-ok", revision: "9", accepted: false,
+      }) }));
+      await expect(pending).resolves.toBe("REJECTED");
+      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "mls_snapshot_result", protocol_version: 10, room_id: "forum_alpha", message_id: "bad", revision: "09", accepted: true,
+      }) }));
+      expect(socket.readyState).toBe(3);
+    } finally { relay.close(); globalThis.WebSocket = originalWebSocket; }
+  });
 });
 
 class FakeWebSocket {

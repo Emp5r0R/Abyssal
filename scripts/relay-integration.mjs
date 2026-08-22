@@ -61,6 +61,12 @@ const pendingResultWaiters = new Map();
 const releasedPrekeysAwaitingReuse = new Map();
 const directoryTrackers = new WeakMap();
 const rawFrameText = new WeakMap();
+const mlsTrackers = new WeakMap();
+
+const MLS_PROTOCOL_VERSION = 10;
+const MLS_MAX_ROSTER = 117;
+const MLS_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
+const MLS_USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
 
 class AmbiguousRelayResult extends Error {}
 
@@ -277,6 +283,100 @@ function installDirectoryTracker(socket, expectedNodeId) {
   socket.addEventListener("error", () => fail(new Error("directory tracker socket error")));
   socket.addEventListener("close", () => fail(new Error("directory tracker socket closed")));
   directoryTrackers.set(socket, tracker);
+}
+
+function installMlsTracker(socket) {
+  const tracker = { queue: [], waiters: [], closed: false };
+  const fail = (error) => {
+    tracker.closed = true;
+    for (const waiter of tracker.waiters.splice(0)) waiter.reject(error);
+  };
+  const onMessage = (event) => {
+    let frame;
+    try {
+      frame = JSON.parse(String(event.data));
+    } catch {
+      return;
+    }
+    if (!frame || typeof frame !== "object" || Array.isArray(frame) ||
+      typeof frame.type !== "string" || !frame.type.startsWith("mls_")) return;
+    rawFrameText.set(frame, String(event.data));
+    for (let index = tracker.waiters.length - 1; index >= 0; index -= 1) {
+      const waiter = tracker.waiters[index];
+      let matched = false;
+      try { matched = waiter.predicate(frame); } catch (error) {
+        tracker.waiters.splice(index, 1);
+        waiter.reject(error instanceof Error ? error : new Error("invalid MLS frame"));
+        continue;
+      }
+      if (matched) {
+        tracker.waiters.splice(index, 1);
+        waiter.resolve(frame);
+        return;
+      }
+    }
+    tracker.queue.push(frame);
+    if (tracker.queue.length > 256) tracker.queue.shift();
+  };
+  socket.addEventListener("message", onMessage);
+  socket.addEventListener("error", () => fail(new Error("MLS tracker socket error")));
+  socket.addEventListener("close", () => fail(new Error("MLS tracker socket closed")));
+  mlsTrackers.set(socket, tracker);
+}
+
+function waitForMlsFrame(socket, predicate, timeoutMs = RESULT_TIMEOUT_MS) {
+  const tracker = mlsTrackers.get(socket);
+  assert.ok(tracker, "MLS tracker must be installed before waiting");
+  const queued = tracker.queue.findIndex((frame) => {
+    try { return predicate(frame); } catch { return false; }
+  });
+  if (queued >= 0) return Promise.resolve(tracker.queue.splice(queued, 1)[0]);
+  if (tracker.closed) return Promise.reject(new Error("MLS tracker socket closed"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const index = tracker.waiters.indexOf(waiter);
+      if (index >= 0) tracker.waiters.splice(index, 1);
+      reject(new Error("Expected MLS relay frame timed out"));
+    }, timeoutMs);
+    const waiter = {
+      predicate,
+      resolve: (frame) => { clearTimeout(timer); resolve(frame); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    };
+    tracker.waiters.push(waiter);
+  });
+}
+
+function waitForNoMlsFrame(socket, predicate, timeoutMs = 350) {
+  const tracker = mlsTrackers.get(socket);
+  assert.ok(tracker, "MLS tracker must be installed before waiting");
+  const queued = tracker.queue.findIndex((frame) => {
+    try { return predicate(frame); } catch { return false; }
+  });
+  if (queued >= 0) return Promise.reject(new Error("unexpected MLS frame"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    const waiter = {
+      predicate,
+      resolve: (frame) => { clearTimeout(timer); reject(new Error(`unexpected MLS frame ${frame.type}`)); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    };
+    tracker.waiters.push(waiter);
+  });
+}
+
+function waitForSocketClose(socket, timeoutMs = RESULT_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Expected WebSocket close timed out")), timeoutMs);
+    socket.addEventListener("close", (event) => {
+      clearTimeout(timer);
+      resolve(event);
+    }, { once: true });
+    socket.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error("WebSocket errored before close"));
+    }, { once: true });
+  });
 }
 
 function waitForDirectoryStamp(socket) {
@@ -618,11 +718,17 @@ function connectWithTicket(ticket, expectedNodeId) {
     socket.addEventListener("open", () => {
       clearTimeout(timeout);
       installDirectoryTracker(socket, expectedNodeId);
+      installMlsTracker(socket);
       resolve(socket);
     }, { once: true });
-    socket.addEventListener("error", () => {
+    socket.addEventListener("error", (event) => {
       clearTimeout(timeout);
-      reject(new Error("WebSocket connection failed"));
+      const detail = event?.error instanceof Error
+        ? event.error.message
+        : typeof event?.message === "string" && event.message.length > 0
+          ? event.message
+          : "unknown upgrade error";
+      reject(new Error(`WebSocket connection failed: ${detail}`));
     }, { once: true });
   });
 }
@@ -985,6 +1091,813 @@ async function acknowledgeFrame(recipient, socket, frame, decrypted) {
   }
 }
 
+function readMlsRoomInfo(handle) {
+  const info = handle.roomInfo();
+  let groupId = new Uint8Array(0);
+  let membershipDigest = new Uint8Array(0);
+  try {
+    groupId = info.groupId;
+    membershipDigest = info.membershipDigest;
+    return {
+      roomId: info.roomId,
+      groupId,
+      epoch: info.epoch,
+      memberCount: info.memberCount,
+      revision: info.revision,
+      membershipDigest,
+    };
+  } catch (error) {
+    groupId.fill(0);
+    membershipDigest.fill(0);
+    throw error;
+  } finally {
+    info.free();
+  }
+}
+
+function readMlsCommit(commit) {
+  const result = {
+    authenticatedData: commit.authenticatedData,
+    commit: commit.commit,
+    fromEpoch: commit.fromEpoch,
+    fromMembershipDigest: commit.fromMembershipDigest,
+    groupId: commit.groupId,
+    membershipDigest: commit.membershipDigest,
+    messageId: commit.messageId,
+    revision: commit.revision,
+    rosterJson: commit.rosterJson,
+    stateEnvelope: commit.stateEnvelope,
+    toEpoch: commit.toEpoch,
+    welcome: commit.welcome,
+  };
+  commit.free();
+  return result;
+}
+
+function wipeMlsCommit(commit) {
+  for (const field of [
+    commit.authenticatedData,
+    commit.commit,
+    commit.fromMembershipDigest,
+    commit.groupId,
+    commit.membershipDigest,
+    commit.stateEnvelope,
+    commit.welcome,
+  ]) field?.fill?.(0);
+}
+
+function mlsRosterJson(roster) {
+  const identities = [];
+  try {
+    for (const member of roster) {
+      exactKeys(member, ["username", "stable_identity_b64"]);
+      assert.match(member.username, MLS_USERNAME_PATTERN);
+      const identity = decode(member.stable_identity_b64);
+      assert.equal(identity.byteLength, 64);
+      identities.push(identity);
+    }
+    return JSON.stringify(roster.map((member, index) => ({
+      username: member.username,
+      stable_identity: [...identities[index]],
+    })));
+  } finally {
+    identities.forEach((identity) => identity.fill(0));
+  }
+}
+
+function mlsRosterFromNative(rosterJson) {
+  const roster = JSON.parse(rosterJson);
+  assert.ok(Array.isArray(roster));
+  assert.ok(roster.length > 0 && roster.length <= MLS_MAX_ROSTER);
+  const seen = new Set();
+  return roster.map((member) => {
+    assert.ok(member && typeof member === "object" && !Array.isArray(member));
+    exactKeys(member, ["username", "stable_identity"]);
+    assert.match(member.username, MLS_USERNAME_PATTERN);
+    const username = member.username.toLowerCase();
+    assert.equal(seen.has(username), false);
+    seen.add(username);
+    assert.ok(Array.isArray(member.stable_identity));
+    assert.equal(member.stable_identity.length, 64);
+    assert.ok(member.stable_identity.every((value) => Number.isInteger(value) && value >= 0 && value <= 255));
+    const stableIdentity = Uint8Array.from(member.stable_identity);
+    try {
+      return { username: member.username, stable_identity_b64: encode(stableIdentity) };
+    } finally {
+      stableIdentity.fill(0);
+    }
+  });
+}
+
+function assertMlsRoomWire(room, expectedRoomId, expectedOwner) {
+  exactKeys(room, [
+    "room_id", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision",
+    "membership_digest_b64", "roster", "recovery_snapshot", "policy",
+  ]);
+  assert.equal(room.room_id, expectedRoomId);
+  assert.equal(room.owner_username, expectedOwner);
+  assert.equal(typeof room.active, "boolean");
+  assert.equal(typeof room.synchronized, "boolean");
+  assert.match(room.group_id_b64, /^[A-Za-z0-9_-]{43}$/u);
+  assert.match(room.epoch, /^(?:0|[1-9][0-9]*)$/u);
+  assert.match(room.revision, /^(?:0|[1-9][0-9]*)$/u);
+  assert.ok(Array.isArray(room.roster));
+  assert.ok(room.roster.length <= MLS_MAX_ROSTER);
+  if (room.roster.length === 0) {
+    assert.equal(room.active, false);
+    assert.equal(room.synchronized, false);
+    assert.equal(room.epoch, "0");
+    assert.equal(room.revision, "0");
+    assert.equal(room.membership_digest_b64, "");
+  } else {
+    assertCanonicalBytes(room.membership_digest_b64, 32, "MLS membership digest");
+  }
+  const usernames = new Set();
+  for (const member of room.roster) {
+    exactKeys(member, ["username", "stable_identity_b64"]);
+    assert.match(member.username, MLS_USERNAME_PATTERN);
+    assert.equal(usernames.has(member.username.toLowerCase()), false);
+    usernames.add(member.username.toLowerCase());
+    assertCanonicalBytes(member.stable_identity_b64, 64, "MLS stable identity");
+  }
+  assert.ok(room.recovery_snapshot && typeof room.recovery_snapshot === "object");
+  exactKeys(room.recovery_snapshot, ["active", "epoch", "revision", "membership_digest_b64", "state_envelope_b64", "roster"]);
+  assert.equal(room.recovery_snapshot.active, room.active);
+  assert.match(room.recovery_snapshot.epoch, /^(?:0|[1-9][0-9]*)$/u);
+  assert.match(room.recovery_snapshot.revision, /^(?:0|[1-9][0-9]*)$/u);
+  assert.ok(Array.isArray(room.recovery_snapshot.roster));
+  assert.ok(room.recovery_snapshot.roster.length <= MLS_MAX_ROSTER);
+  if (room.recovery_snapshot.active) {
+    assertCanonicalBytes(room.recovery_snapshot.membership_digest_b64, 32, "MLS recovery digest");
+    assert.ok(room.recovery_snapshot.roster.length > 0);
+  } else {
+    assert.equal(room.recovery_snapshot.epoch, "0");
+    assert.equal(room.recovery_snapshot.revision, "0");
+    assert.equal(room.recovery_snapshot.membership_digest_b64, "");
+    assert.deepEqual(room.recovery_snapshot.roster, []);
+  }
+  const recoveryNames = new Set();
+  for (const member of room.recovery_snapshot.roster) {
+    exactKeys(member, ["username", "stable_identity_b64"]);
+    assert.match(member.username, MLS_USERNAME_PATTERN);
+    assert.equal(recoveryNames.has(member.username.toLowerCase()), false);
+    recoveryNames.add(member.username.toLowerCase());
+    assertCanonicalBytes(member.stable_identity_b64, 64, "MLS recovery identity");
+  }
+  if (room.synchronized) {
+    assert.equal(room.active, true);
+    assert.equal(room.recovery_snapshot.epoch, room.epoch);
+    assert.equal(room.recovery_snapshot.revision, room.revision);
+    assert.equal(room.recovery_snapshot.membership_digest_b64, room.membership_digest_b64);
+    assert.deepEqual(
+      room.recovery_snapshot.roster.map((member) => [member.username.toLowerCase(), member.stable_identity_b64]).sort(),
+      room.roster.map((member) => [member.username.toLowerCase(), member.stable_identity_b64]).sort(),
+    );
+  }
+  assert.ok(room.recovery_snapshot.state_envelope_b64.length > 0);
+  assert.ok(room.policy && typeof room.policy === "object");
+  exactKeys(room.policy, [
+    "self_destruct_timer_sec", "overall_expiry_sec", "allow_images", "allow_videos", "allow_files",
+    "enforce_text_absolute_expiry", "image_read_timer_sec", "image_overall_expiry_sec",
+    "enforce_image_absolute_expiry", "video_read_timer_sec", "video_overall_expiry_sec",
+    "enforce_video_absolute_expiry", "file_read_timer_sec", "file_overall_expiry_sec",
+    "enforce_file_absolute_expiry",
+  ]);
+}
+
+async function sendMlsRoomTransaction(socket, frame) {
+  const result = waitForMlsFrame(
+    socket,
+    (candidate) => candidate.type === "mls_room_result" &&
+      candidate.room_id === frame.room_id && candidate.message_id === frame.message_id,
+  );
+  socket.send(JSON.stringify(frame));
+  const outcome = await result;
+  exactKeys(outcome, ["type", "protocol_version", "room_id", "message_id", "revision", "accepted"]);
+  assert.equal(outcome.protocol_version, MLS_PROTOCOL_VERSION);
+  assert.equal(outcome.revision, frame.revision);
+  assert.equal(typeof outcome.accepted, "boolean");
+  return outcome.accepted ? "ACCEPTED" : "REJECTED";
+}
+
+async function sendMlsSnapshot(socket, frame) {
+  const result = waitForMlsFrame(
+    socket,
+    (candidate) => candidate.type === "mls_snapshot_result" &&
+      candidate.room_id === frame.room_id && candidate.message_id === frame.message_id,
+  );
+  socket.send(JSON.stringify(frame));
+  const outcome = await result;
+  exactKeys(outcome, ["type", "protocol_version", "room_id", "message_id", "revision", "accepted"]);
+  assert.equal(outcome.protocol_version, MLS_PROTOCOL_VERSION);
+  assert.equal(outcome.revision, frame.revision);
+  assert.equal(typeof outcome.accepted, "boolean");
+  return outcome.accepted ? "ACCEPTED" : "REJECTED";
+}
+
+function mlsApplicationAad(roomId, messageId, sender) {
+  const fields = [
+    encoder.encode("ABYSSAL-MLS-V10-APPLICATION"),
+    encoder.encode(roomId),
+    encoder.encode(messageId),
+    encoder.encode(sender),
+  ];
+  const output = new Uint8Array(fields.reduce((size, field) => size + 4 + field.byteLength, 0));
+  const view = new DataView(output.buffer);
+  let offset = 0;
+  for (const field of fields) {
+    view.setUint32(offset, field.byteLength, false);
+    offset += 4;
+    output.set(field, offset);
+    offset += field.byteLength;
+    field.fill(0);
+  }
+  return output;
+}
+
+function mlsNative(stage, operation) {
+  try {
+    return operation();
+  } catch (error) {
+    throw new Error(`MLS native ${stage} failed: ${String(error)}`);
+  }
+}
+
+async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
+  let aliceRoom;
+  let bobRoom;
+  let alicePostDelete;
+  let oversizedSocket;
+  let replacementBobSocket;
+  let aliceStable = new Uint8Array(0);
+  let bobStable = new Uint8Array(0);
+  let groupId = new Uint8Array(0);
+  let nodeContext = new Uint8Array(0);
+  let initialDigest = new Uint8Array(0);
+  let initialState = new Uint8Array(0);
+  try {
+    // A non-canonical frame above the legacy parser ceiling must be rejected
+    // before JSON allocation. Use a disposable authenticated socket so the
+    // two lifecycle sockets remain valid for the rest of this test.
+    const bobDisconnected = waitForFrame(
+      aliceSocket,
+      (frame) => frame.type === "presence" && frame.users.some(
+        (user) => user.username === bob.username && user.connected === false,
+      ),
+    );
+    bobSocket.close();
+    await bobDisconnected;
+    oversizedSocket = await connect(bob);
+    const oversizedDisconnected = waitForFrame(
+      aliceSocket,
+      (frame) => frame.type === "presence" && frame.users.some(
+        (user) => user.username === bob.username && user.connected === false,
+      ),
+    );
+    const oversizedClose = waitForSocketClose(oversizedSocket);
+    oversizedSocket.send("x".repeat(1_048_577));
+    await oversizedClose;
+    await oversizedDisconnected;
+    oversizedSocket = null;
+    replacementBobSocket = await connect(bob);
+    bobSocket = replacementBobSocket;
+
+    const [aliceCatalog, bobCatalog] = await Promise.all([
+      waitForMlsFrame(aliceSocket, (frame) => frame.type === "mls_rooms"),
+      waitForMlsFrame(bobSocket, (frame) => frame.type === "mls_rooms"),
+    ]);
+    for (const catalog of [aliceCatalog, bobCatalog]) {
+      exactKeys(catalog, ["type", "protocol_version", "rooms"]);
+      assert.equal(catalog.protocol_version, MLS_PROTOCOL_VERSION);
+      assert.deepEqual(catalog.rooms, [], "fresh relay must not create a default MLS room");
+    }
+
+    const roomId = `room_${randomUUID().replaceAll("-", "")}`;
+    assert.match(roomId, MLS_ID_PATTERN);
+    const policy = {
+      self_destruct_timer_sec: "5", overall_expiry_sec: "0", allow_images: true,
+      allow_videos: true, allow_files: true, enforce_text_absolute_expiry: false,
+      image_read_timer_sec: "5", image_overall_expiry_sec: "0", enforce_image_absolute_expiry: false,
+      video_read_timer_sec: "5", video_overall_expiry_sec: "0", enforce_video_absolute_expiry: false,
+      file_read_timer_sec: "5", file_overall_expiry_sec: "0", enforce_file_absolute_expiry: false,
+    };
+    const policyKeys = Object.keys(policy);
+    assert.equal(policyKeys.length, 15);
+    aliceStable = alice.identity.publicKey().slice(0, 64);
+    bobStable = bob.identity.publicKey().slice(0, 64);
+    groupId = new Uint8Array(32);
+    randomFillSync(groupId);
+    nodeContext = encoder.encode(`ABYSSAL-MLS-V10-NODE:${alice.node_id}`);
+    aliceRoom = mlsNative("create room", () => alice.identity.mlsCreateRoom(roomId, alice.username, nodeContext, groupId));
+    const createdInfo = readMlsRoomInfo(aliceRoom);
+    assert.equal(createdInfo.epoch, 0n);
+    assert.equal(createdInfo.revision, 0n);
+    assert.equal(createdInfo.memberCount, 1);
+    assert.deepEqual(createdInfo.groupId, groupId);
+    initialDigest = createdInfo.membershipDigest.slice();
+    initialState = mlsNative("seal initial room", () => aliceRoom.sealState());
+    createdInfo.groupId.fill(0);
+    createdInfo.membershipDigest.fill(0);
+    const createFrame = {
+      type: "mls_create_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+      group_id_b64: encode(groupId), epoch: "0", revision: "0",
+      membership_digest_b64: encode(initialDigest), stable_identity_b64: encode(aliceStable),
+      state_envelope_b64: encode(initialState), policy,
+    };
+    exactKeys(createFrame, [
+      "type", "protocol_version", "room_id", "group_id_b64", "epoch", "revision",
+      "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy",
+    ]);
+    const created = waitForMlsFrame(aliceSocket, (frame) => frame.type === "mls_room_created" && frame.room?.room_id === roomId);
+    aliceSocket.send(JSON.stringify(createFrame));
+    const createdFrame = await created;
+    exactKeys(createdFrame, ["type", "protocol_version", "room"]);
+    assert.equal(createdFrame.protocol_version, MLS_PROTOCOL_VERSION);
+    assertMlsRoomWire(createdFrame.room, roomId, alice.username);
+
+    const discoveredOnBob = waitForMlsFrame(bobSocket, (frame) => frame.type === "mls_room_discovered" && frame.room_id === roomId);
+    bobSocket.send(JSON.stringify({ type: "mls_discover_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId }));
+    const discoveredFrame = await discoveredOnBob;
+    exactKeys(discoveredFrame, ["type", "protocol_version", "room_id", "group_id_b64", "owner_username"]);
+    assert.equal(discoveredFrame.protocol_version, MLS_PROTOCOL_VERSION);
+    assert.equal(discoveredFrame.owner_username, alice.username);
+    assert.deepEqual(decode(discoveredFrame.group_id_b64), groupId);
+
+    bobRoom = mlsNative("pending join", () => bob.identity.mlsPendingJoin(roomId, bob.username, nodeContext, groupId));
+    const bobKeyPackage = mlsNative("create key package", () => bobRoom.keyPackage());
+    const bobPendingState = mlsNative("seal pending join", () => bobRoom.sealState());
+    const joinRequestId = randomUUID();
+    const joinFrame = {
+      type: "mls_join_request", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+      request_id: joinRequestId, stable_identity_b64: encode(bobStable),
+      key_package_b64: encode(bobKeyPackage), state_envelope_b64: encode(bobPendingState),
+    };
+    const joinRequested = waitForMlsFrame(aliceSocket, (frame) => frame.type === "mls_join_requested" && frame.request_id === joinRequestId);
+    bobSocket.send(JSON.stringify(joinFrame));
+    const joinRequestedFrame = await joinRequested;
+    exactKeys(joinRequestedFrame, ["type", "protocol_version", "room_id", "request_id", "username", "stable_identity_b64", "key_package_b64"]);
+    assert.equal(joinRequestedFrame.protocol_version, MLS_PROTOCOL_VERSION);
+    assert.equal(joinRequestedFrame.username, bob.username);
+    assert.equal(joinRequestedFrame.stable_identity_b64, encode(bobStable));
+    assert.equal(joinRequestedFrame.key_package_b64, encode(bobKeyPackage));
+
+    // A non-owner rejection is dropped by the relay; the pending request remains
+    // available to the owner and the exact valid commit below still succeeds.
+    bobSocket.send(JSON.stringify({ type: "mls_join_reject", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId, request_id: joinRequestId }));
+    const invalidMembership = {
+      type: "mls_membership_commit", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+      message_id: randomUUID(), request_id: randomUUID(), from_epoch: "0", to_epoch: "1",
+      revision: "1", group_id_b64: encode(groupId), from_membership_digest_b64: encode(initialDigest),
+      membership_digest_b64: encode(initialDigest), roster: [{ username: alice.username, stable_identity_b64: encode(aliceStable) }],
+      control_b64: encode(new Uint8Array([1])), welcome_b64: encode(new Uint8Array([1])),
+      authenticated_data_b64: encode(new Uint8Array([1])), state_envelope_b64: encode(initialState),
+    };
+    const invalidOutcome = await sendMlsRoomTransaction(aliceSocket, invalidMembership);
+    assert.equal(invalidOutcome, "REJECTED", "mismatched membership request must not mutate room authority");
+
+    const membershipMessageId = randomUUID();
+    const commitWrapper = mlsNative("add member", () => aliceRoom.addMember(bobKeyPackage, bob.username, bobStable, membershipMessageId));
+    const commit = readMlsCommit(commitWrapper);
+    let commitRoster;
+    try {
+      commitRoster = mlsRosterFromNative(commit.rosterJson);
+      assert.equal(commit.messageId, membershipMessageId);
+      assert.equal(commit.fromEpoch, 0n);
+      assert.equal(commit.toEpoch, 1n);
+      assert.equal(commit.revision, 1n);
+      assert.equal(commitRoster.length, 2);
+      assert.deepEqual(commit.groupId, groupId);
+      assert.deepEqual(commit.fromMembershipDigest, initialDigest);
+      assert.notDeepEqual(commit.membershipDigest, initialDigest);
+      assert.ok(commit.commit.byteLength > 0);
+      assert.ok(commit.welcome.byteLength > 0);
+      const membershipFrame = {
+        type: "mls_membership_commit", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+        message_id: membershipMessageId, request_id: joinRequestId,
+        from_epoch: commit.fromEpoch.toString(), to_epoch: commit.toEpoch.toString(), revision: commit.revision.toString(),
+        group_id_b64: encode(commit.groupId), from_membership_digest_b64: encode(commit.fromMembershipDigest),
+        membership_digest_b64: encode(commit.membershipDigest), roster: commitRoster,
+        control_b64: encode(commit.commit), welcome_b64: encode(commit.welcome),
+        authenticated_data_b64: encode(commit.authenticatedData), state_envelope_b64: encode(commit.stateEnvelope),
+      };
+      const membershipOnBob = waitForMlsFrame(bobSocket, (frame) => frame.type === "mls_membership" && frame.message_id === membershipMessageId);
+      assert.equal(await sendMlsRoomTransaction(aliceSocket, membershipFrame), "ACCEPTED");
+      mlsNative("commit added member", () => aliceRoom.commitOutbound(membershipMessageId, commit.revision));
+      const membershipFrameOnBob = await membershipOnBob;
+      exactKeys(membershipFrameOnBob, [
+        "type", "protocol_version", "room_id", "message_id", "from_epoch", "to_epoch", "revision",
+        "from_membership_digest_b64", "group_id_b64", "membership_digest_b64", "roster", "control_b64",
+        "welcome_b64", "authenticated_data_b64",
+      ]);
+      assert.equal(membershipFrameOnBob.protocol_version, MLS_PROTOCOL_VERSION);
+      assert.equal(membershipFrameOnBob.welcome_b64, encode(commit.welcome));
+      assert.equal(membershipFrameOnBob.control_b64, "");
+      assert.deepEqual(membershipFrameOnBob.roster, commitRoster);
+
+      const expectedMembersJson = mlsRosterJson(commitRoster);
+      const bobMembershipDigest = decode(membershipFrameOnBob.membership_digest_b64);
+      const bobWelcome = decode(membershipFrameOnBob.welcome_b64);
+      const bobInfo = mlsNative("join Welcome", () => bobRoom.joinWelcome(bobWelcome, expectedMembersJson, bobMembershipDigest));
+      const bobState = mlsNative("seal joined room", () => bobRoom.sealState());
+      assert.equal(bobInfo.epoch, 1n);
+      assert.equal(bobInfo.revision, 0n);
+      assert.equal(bobInfo.memberCount, 2);
+      const joinSnapshot = {
+        type: "mls_state_snapshot", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+        message_id: membershipMessageId, epoch: bobInfo.epoch.toString(), revision: bobInfo.revision.toString(),
+        membership_digest_b64: encode(bobMembershipDigest), state_envelope_b64: encode(bobState),
+      };
+      assert.equal(await sendMlsSnapshot(bobSocket, joinSnapshot), "ACCEPTED");
+      bobInfo.groupId.fill(0);
+      bobInfo.membershipDigest.fill(0);
+      bobMembershipDigest.fill(0);
+      bobWelcome.fill(0);
+      bobState.fill(0);
+    } finally {
+      wipeMlsCommit(commit);
+      bobKeyPackage.fill(0);
+      bobPendingState.fill(0);
+    }
+
+    const probeMessageId = randomUUID();
+    const probePlaintext = encoder.encode("MLS local state probe");
+    const probeAad = mlsApplicationAad(roomId, probeMessageId, alice.username);
+    let probeEncrypted;
+    let probeDecrypted;
+    try {
+      probeEncrypted = mlsNative("encrypt local probe", () => aliceRoom.encryptApplication(probeMessageId, probePlaintext, probeAad));
+      probeDecrypted = mlsNative("decrypt local probe", () => bobRoom.decryptApplication(
+        probeEncrypted.ciphertext,
+        probeEncrypted.epoch,
+        probeMessageId,
+        probeEncrypted.authenticatedData,
+      ));
+      assert.deepEqual(probeDecrypted.plaintext, probePlaintext);
+      mlsNative("rollback local probe recipient", () => bobRoom.rollbackOutbound(probeMessageId, probeDecrypted.revision));
+      mlsNative("rollback local probe sender", () => aliceRoom.rollbackOutbound(probeMessageId, probeEncrypted.revision));
+    } finally {
+      probePlaintext.fill(0);
+      probeAad.fill(0);
+      for (const field of [
+        probeEncrypted?.authenticatedData, probeEncrypted?.ciphertext, probeEncrypted?.groupId,
+        probeEncrypted?.membershipDigest, probeEncrypted?.stateEnvelope, probeDecrypted?.authenticatedData,
+        probeDecrypted?.groupId, probeDecrypted?.membershipDigest, probeDecrypted?.plaintext,
+        probeDecrypted?.stateEnvelope,
+      ]) field?.fill?.(0);
+      probeEncrypted?.free?.();
+      probeDecrypted?.free?.();
+    }
+
+    const sendAliceApplicationFrame = async (plaintext, messageId) => {
+      const aad = mlsApplicationAad(roomId, messageId, alice.username);
+      const nativePlaintext = plaintext.slice();
+      let wrapper;
+      let encrypted;
+      try {
+        wrapper = mlsNative("encrypt application", () => aliceRoom.encryptApplication(messageId, nativePlaintext, aad));
+        encrypted = {
+          authenticatedData: wrapper.authenticatedData,
+          ciphertext: wrapper.ciphertext,
+          epoch: wrapper.epoch,
+          groupId: wrapper.groupId,
+          membershipDigest: wrapper.membershipDigest,
+          messageId: wrapper.messageId,
+          revision: wrapper.revision,
+          stateEnvelope: wrapper.stateEnvelope,
+        };
+      } finally {
+        nativePlaintext.fill(0);
+        aad.fill(0);
+        wrapper?.free();
+      }
+      try {
+        const frame = {
+          type: "mls_application", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+          message_id: encrypted.messageId, group_id_b64: encode(encrypted.groupId), epoch: encrypted.epoch.toString(),
+          revision: encrypted.revision.toString(), membership_digest_b64: encode(encrypted.membershipDigest),
+          ciphertext_b64: encode(encrypted.ciphertext), authenticated_data_b64: encode(encrypted.authenticatedData),
+          state_envelope_b64: encode(encrypted.stateEnvelope),
+        };
+        exactKeys(frame, [
+          "type", "protocol_version", "room_id", "message_id", "group_id_b64", "epoch", "revision",
+          "membership_digest_b64", "ciphertext_b64", "authenticated_data_b64", "state_envelope_b64",
+        ]);
+        assert.equal(await sendMlsRoomTransaction(aliceSocket, frame), "ACCEPTED");
+        mlsNative("commit application", () => aliceRoom.commitOutbound(messageId, encrypted.revision));
+        return frame;
+      } finally {
+        for (const field of [
+          encrypted.authenticatedData, encrypted.ciphertext, encrypted.groupId,
+          encrypted.membershipDigest, encrypted.stateEnvelope,
+        ]) field.fill(0);
+      }
+    };
+
+    const processBobApplication = async (received, plaintext, expectedFrame) => {
+      exactKeys(received, [
+        "type", "protocol_version", "room_id", "message_id", "sender_username", "epoch", "revision",
+        "membership_digest_b64", "ciphertext_b64", "authenticated_data_b64",
+      ]);
+      assert.equal(received.protocol_version, MLS_PROTOCOL_VERSION);
+      assert.equal(received.room_id, roomId);
+      assert.equal(received.sender_username, alice.username);
+      assert.equal(received.message_id, expectedFrame.message_id);
+      assert.equal(received.epoch, expectedFrame.epoch);
+      assert.equal(received.membership_digest_b64, expectedFrame.membership_digest_b64);
+      assert.equal(received.ciphertext_b64, expectedFrame.ciphertext_b64);
+      assert.equal(received.authenticated_data_b64, expectedFrame.authenticated_data_b64);
+      const receiveAad = decode(received.authenticated_data_b64);
+      const receivedCiphertext = decode(received.ciphertext_b64);
+      let decrypted;
+      try {
+        decrypted = mlsNative("decrypt application", () => bobRoom.decryptApplication(
+          receivedCiphertext,
+          BigInt(received.epoch),
+          received.message_id,
+          receiveAad,
+        ));
+        assert.deepEqual(decrypted.plaintext, plaintext);
+        assert.equal(decrypted.messageId, received.message_id);
+        assert.deepEqual(decrypted.groupId, groupId);
+        assert.equal(encode(decrypted.membershipDigest), received.membership_digest_b64);
+        const snapshot = {
+          type: "mls_state_snapshot", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+          message_id: received.message_id, epoch: decrypted.epoch.toString(), revision: decrypted.revision.toString(),
+          membership_digest_b64: encode(decrypted.membershipDigest), state_envelope_b64: encode(decrypted.stateEnvelope),
+        };
+        assert.equal(await sendMlsSnapshot(bobSocket, snapshot), "ACCEPTED");
+        mlsNative("commit received application", () => bobRoom.commitOutbound(received.message_id, decrypted.revision));
+        return snapshot;
+      } finally {
+        receiveAad.fill(0);
+        receivedCiphertext.fill(0);
+        for (const field of [
+          decrypted?.plaintext, decrypted?.groupId, decrypted?.membershipDigest,
+          decrypted?.stateEnvelope, decrypted?.authenticatedData,
+        ]) field?.fill?.(0);
+        decrypted?.free?.();
+      }
+    };
+
+    const sendAliceApplication = async (plaintext, messageId) => {
+      const applicationOnBob = waitForMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_application" && candidate.message_id === messageId,
+      );
+      const frame = await sendAliceApplicationFrame(plaintext, messageId);
+      await processBobApplication(await applicationOnBob, plaintext, frame);
+      return frame;
+    };
+
+    const firstMessageId = randomUUID();
+    const firstPlaintext = encoder.encode(JSON.stringify({ kind: "text", content: "MLS application secret", id: firstMessageId }));
+    let firstFrame;
+    try {
+      firstFrame = await sendAliceApplication(firstPlaintext, firstMessageId);
+      assert.equal(JSON.stringify(firstFrame).includes("MLS application secret"), false);
+      const replayResult = await sendMlsRoomTransaction(aliceSocket, firstFrame);
+      assert.equal(replayResult, "REJECTED", "duplicate MLS application must be rejected");
+    } finally {
+      firstPlaintext.fill(0);
+    }
+
+    const bobOffline = waitForFrame(
+      aliceSocket,
+      (frame) => frame.type === "presence" && frame.users.some(
+        (user) => user.username === bob.username && user.connected === false,
+      ),
+    );
+    bobSocket.close();
+    await bobOffline;
+
+    const offlineAId = randomUUID();
+    const offlineBId = randomUUID();
+    const offlineAPlaintext = encoder.encode(JSON.stringify({ kind: "text", content: "MLS offline A", id: offlineAId }));
+    const offlineBPlaintext = encoder.encode(JSON.stringify({ kind: "text", content: "MLS offline B", id: offlineBId }));
+    let offlineAFrame;
+    let offlineBFrame;
+    try {
+      offlineAFrame = await sendAliceApplicationFrame(offlineAPlaintext, offlineAId);
+      offlineBFrame = await sendAliceApplicationFrame(offlineBPlaintext, offlineBId);
+
+      replacementBobSocket = await connect(bob);
+      bobSocket = replacementBobSocket;
+      const recoveryCatalog = await waitForMlsFrame(bobSocket, (candidate) => candidate.type === "mls_rooms");
+      const recoveredRoom = recoveryCatalog.rooms.find((room) => room.room_id === roomId);
+      assert.ok(recoveredRoom, "offline MLS room missing from recovery catalog");
+      assertMlsRoomWire(recoveredRoom, roomId, alice.username);
+      assert.equal(recoveredRoom.active, true);
+      assert.equal(recoveredRoom.synchronized, false);
+      assert.equal(recoveredRoom.recovery_snapshot.revision, recoveredRoom.revision);
+
+      const receivedA = await waitForMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_application" && candidate.message_id === offlineAId,
+      );
+      const receivedB = await waitForMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_application" && candidate.message_id === offlineBId,
+      );
+      await processBobApplication(receivedA, offlineAPlaintext, offlineAFrame);
+      await waitForNoMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_application" && candidate.message_id === offlineAId,
+      );
+
+      let replayAad = decode(receivedA.authenticated_data_b64);
+      let replayCiphertext = decode(receivedA.ciphertext_b64);
+      try {
+        assert.throws(
+          () => mlsNative("replay application", () => bobRoom.decryptApplication(
+            replayCiphertext,
+            BigInt(receivedA.epoch),
+            receivedA.message_id,
+            replayAad,
+          )),
+          /Payload unavailable/u,
+        );
+      } finally {
+        replayAad.fill(0);
+        replayCiphertext.fill(0);
+        replayAad = new Uint8Array(0);
+        replayCiphertext = new Uint8Array(0);
+      }
+
+      await processBobApplication(receivedB, offlineBPlaintext, offlineBFrame);
+      const synchronizedCatalog = await waitForMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_rooms" && candidate.rooms.some(
+          (room) => room.room_id === roomId && room.synchronized === true,
+        ),
+      );
+      assertMlsRoomWire(
+        synchronizedCatalog.rooms.find((room) => room.room_id === roomId),
+        roomId,
+        alice.username,
+      );
+
+      const bobAgainOffline = waitForFrame(
+        aliceSocket,
+        (frame) => frame.type === "presence" && frame.users.some(
+          (user) => user.username === bob.username && user.connected === false,
+        ),
+      );
+      bobSocket.close();
+      await bobAgainOffline;
+      replacementBobSocket = await connect(bob);
+      bobSocket = replacementBobSocket;
+      const cleanCatalog = await waitForMlsFrame(bobSocket, (candidate) => candidate.type === "mls_rooms");
+      const cleanRoom = cleanCatalog.rooms.find((room) => room.room_id === roomId);
+      assert.ok(cleanRoom, "acknowledged MLS room missing after reconnect");
+      assertMlsRoomWire(cleanRoom, roomId, alice.username);
+      assert.equal(cleanRoom.synchronized, true);
+      await waitForNoMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_application" &&
+          (candidate.message_id === offlineAId || candidate.message_id === offlineBId),
+      );
+    } finally {
+      offlineAPlaintext.fill(0);
+      offlineBPlaintext.fill(0);
+    }
+
+    const attachmentMessageId = randomUUID();
+    const attachmentPlaintext = new Uint8Array([9, 8, 7, 6]);
+    const encryptedAttachment = JSON.parse(encryptAttachment(roomId, attachmentMessageId, alice.username, "FILE", attachmentPlaintext));
+    const attachmentKey = new Uint8Array(encryptedAttachment.key);
+    const attachmentBlob = new Uint8Array(encryptedAttachment.blob);
+    try {
+      const uploadResponse = await fetch(
+        `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(roomId)}&message_id=${encodeURIComponent(attachmentMessageId)}&media_type=FILE`,
+        { method: "POST", headers: { authorization: `Bearer ${alice.token}` }, body: attachmentBlob },
+      );
+      assert.equal(uploadResponse.status, 200);
+      const upload = await uploadResponse.json();
+      assert.equal(upload.accepted, true);
+      const staged = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
+      assert.equal(staged.status, 404, "staged MLS attachment must not be downloadable");
+      const keyB64 = encode(attachmentKey);
+      const metadata = encoder.encode(JSON.stringify({
+        kind: "attachment", id: attachmentMessageId, attachment_id: upload.attachment_id,
+        name: "fixture.bin", media_type: "FILE", mime_type: "application/octet-stream",
+        size_bytes: attachmentPlaintext.byteLength, attachment_key_b64: keyB64,
+      }));
+      const frame = await sendAliceApplication(metadata, attachmentMessageId);
+      assert.equal(JSON.stringify(frame).includes(keyB64), false, "attachment key must stay inside E2EE application ciphertext");
+      const downloaded = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
+      assert.equal(downloaded.status, 200);
+      const downloadedBytes = new Uint8Array(await downloaded.arrayBuffer());
+      assert.ok(downloadedBytes.byteLength > 0);
+      assert.deepEqual(downloadedBytes, attachmentBlob);
+      assert.deepEqual(decryptAttachment(roomId, attachmentMessageId, alice.username, "FILE", attachmentKey, downloadedBytes), attachmentPlaintext);
+      downloadedBytes.fill(0);
+
+      const leaveRequestId = randomUUID();
+      const leaveRequested = waitForMlsFrame(aliceSocket, (candidate) => candidate.type === "mls_leave_requested" && candidate.request_id === leaveRequestId);
+      const leavePending = waitForMlsFrame(bobSocket, (candidate) => candidate.type === "mls_leave_pending" && candidate.request_id === leaveRequestId);
+      bobSocket.send(JSON.stringify({ type: "mls_leave_request", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId, request_id: leaveRequestId }));
+      const [leaveRequestedFrame] = await Promise.all([leaveRequested, leavePending]);
+      exactKeys(leaveRequestedFrame, ["type", "protocol_version", "room_id", "request_id", "username", "stable_identity_b64"]);
+      assert.equal(leaveRequestedFrame.username, bob.username);
+      assert.equal(leaveRequestedFrame.stable_identity_b64, encode(bobStable));
+
+      const leaveMessageId = randomUUID();
+      const removeWrapper = mlsNative("remove member", () => aliceRoom.removeMember(bob.username, bobStable, leaveMessageId));
+      const removal = readMlsCommit(removeWrapper);
+      try {
+        const removalRoster = mlsRosterFromNative(removal.rosterJson);
+        assert.equal(removalRoster.length, 1);
+        assert.equal(removal.toEpoch, 2n);
+        const removalFrame = {
+          type: "mls_membership_commit", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+          message_id: leaveMessageId, request_id: leaveRequestId,
+          from_epoch: removal.fromEpoch.toString(), to_epoch: removal.toEpoch.toString(), revision: removal.revision.toString(),
+          group_id_b64: encode(removal.groupId), from_membership_digest_b64: encode(removal.fromMembershipDigest),
+          membership_digest_b64: encode(removal.membershipDigest), roster: removalRoster,
+          control_b64: encode(removal.commit), welcome_b64: "",
+          authenticated_data_b64: encode(removal.authenticatedData), state_envelope_b64: encode(removal.stateEnvelope),
+        };
+        const leftOnBob = waitForMlsFrame(bobSocket, (candidate) => candidate.type === "mls_left" && candidate.room_id === roomId);
+        assert.equal(await sendMlsRoomTransaction(aliceSocket, removalFrame), "ACCEPTED");
+        mlsNative("commit member removal", () => aliceRoom.commitOutbound(leaveMessageId, removal.revision));
+        await leftOnBob;
+        const removedDownload = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
+        assert.equal(removedDownload.status, 403, "removed member must lose MLS attachment access");
+        bobRoom.free();
+        bobRoom = null;
+
+        // With no Bob roster entry, the next valid application has no Bob delivery.
+        const afterLeaveId = randomUUID();
+        const afterLeavePlaintext = encoder.encode("post-leave application");
+        const afterLeaveAad = mlsApplicationAad(roomId, afterLeaveId, alice.username);
+        let afterLeaveWrapper;
+        try {
+          afterLeaveWrapper = mlsNative("encrypt post-leave application", () => aliceRoom.encryptApplication(afterLeaveId, afterLeavePlaintext, afterLeaveAad));
+          const afterLeaveFrame = {
+            type: "mls_application", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
+            message_id: afterLeaveWrapper.messageId, group_id_b64: encode(afterLeaveWrapper.groupId), epoch: afterLeaveWrapper.epoch.toString(),
+            revision: afterLeaveWrapper.revision.toString(), membership_digest_b64: encode(afterLeaveWrapper.membershipDigest),
+            ciphertext_b64: encode(afterLeaveWrapper.ciphertext), authenticated_data_b64: encode(afterLeaveWrapper.authenticatedData),
+            state_envelope_b64: encode(afterLeaveWrapper.stateEnvelope),
+          };
+          assert.equal(await sendMlsRoomTransaction(aliceSocket, afterLeaveFrame), "ACCEPTED");
+          mlsNative("commit post-leave application", () => aliceRoom.commitOutbound(afterLeaveId, afterLeaveWrapper.revision));
+          await waitForNoMlsFrame(bobSocket, (candidate) => candidate.type === "mls_application" && candidate.message_id === afterLeaveId);
+        } finally {
+          afterLeavePlaintext.fill(0);
+          afterLeaveAad.fill(0);
+          afterLeaveWrapper?.authenticatedData?.fill?.(0);
+          afterLeaveWrapper?.ciphertext?.fill?.(0);
+          afterLeaveWrapper?.groupId?.fill?.(0);
+          afterLeaveWrapper?.membershipDigest?.fill?.(0);
+          afterLeaveWrapper?.stateEnvelope?.fill?.(0);
+          afterLeaveWrapper?.free?.();
+        }
+      } finally {
+        attachmentPlaintext.fill(0);
+        attachmentKey.fill(0);
+        attachmentBlob.fill(0);
+        for (const field of [encryptedAttachment.key, encryptedAttachment.blob]) field?.fill?.(0);
+      }
+    } finally {
+      // The room is owner-controlled; deletion must remove it for every later catalog.
+      const deleted = waitForMlsFrame(aliceSocket, (candidate) => candidate.type === "mls_room_deleted" && candidate.room_id === roomId);
+      aliceSocket.send(JSON.stringify({ type: "mls_delete_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId }));
+      await deleted;
+      aliceSocket.close();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      let lastConnectError;
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        try {
+          alicePostDelete = await connect(alice);
+          lastConnectError = undefined;
+          break;
+        } catch (error) {
+          lastConnectError = error;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+      if (!alicePostDelete) throw lastConnectError ?? new Error("post-delete reconnect failed");
+      const postDeleteCatalog = await waitForMlsFrame(alicePostDelete, (candidate) => candidate.type === "mls_rooms");
+      assert.equal(postDeleteCatalog.protocol_version, MLS_PROTOCOL_VERSION);
+      assert.equal(postDeleteCatalog.rooms.some((room) => room.room_id === roomId), false);
+      alicePostDelete.close();
+    }
+  } finally {
+    alicePostDelete?.close();
+    oversizedSocket?.close();
+    replacementBobSocket?.close();
+    aliceRoom?.free();
+    bobRoom?.free();
+    aliceStable.fill(0);
+    bobStable.fill(0);
+    groupId.fill(0);
+    nodeContext.fill(0);
+    initialDigest.fill(0);
+    initialState.fill(0);
+  }
+}
+
 const alice = await register(aliceCode, "alice-password");
 const bob = await register(bobCode, "bob-password");
 assert.equal(await opaqueStartStatus(aliceCode, "alice-password"), 409);
@@ -992,7 +1905,7 @@ assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
 
 const aliceTicket = await requestWsTicket(alice);
 await expectWebSocketRejected(["abyssal-v1", `bearer.${alice.token}`]);
-const aliceSocket = await connectWithTicket(aliceTicket, alice.node_id);
+let aliceSocket = await connectWithTicket(aliceTicket, alice.node_id);
 await expectWebSocketRejected(["abyssal-v1", `ticket.${aliceTicket}`]);
 let bobSocket = await connect(bob);
 let bobReconnect;
@@ -1519,6 +2432,18 @@ try {
     },
   );
   assert.equal(unauthorizedUpload.status, 403);
+
+  const aliceDisconnected = waitForFrame(
+    bobReconnect,
+    (frame) => frame.type === "presence" && frame.users.some(
+      (user) => user.username === alice.username && user.connected === false,
+    ),
+  );
+  aliceSocket.close();
+  await aliceDisconnected;
+  aliceSocket = await connect(alice);
+  await waitForDirectoryStamp(aliceSocket);
+  await runMlsIntegration(alice, bob, aliceSocket, bobReconnect);
 } finally {
   aliceSocket.close();
   bobSocket.close();
@@ -1529,4 +2454,6 @@ try {
 
 assert.equal(releasedPrekeysAwaitingReuse.size, 0);
 
-console.log("relay integration passed: OPAQUE auth, E2EE DM, offline replay, and access control");
+console.log(
+  "relay integration passed: OPAQUE auth, v9 E2EE DM, v10 MLS rooms, offline recovery/replay, and access control",
+);

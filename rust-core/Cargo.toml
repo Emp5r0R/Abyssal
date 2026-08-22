@@ -35,12 +35,27 @@ serde_json = "1"
 thiserror = "1"
 vodozemac = { version = "0.10.0", features = ["experimental-session-config"] }
 
+# MLS room protocol v10.  Keep the provider deliberately scoped to the
+# ChaCha ciphersuite and disable provider defaults so no storage backend is
+# pulled into the client.
+mls-rs = { version = "=0.55.4", default-features = false, features = [
+    "std",
+    "rfc_compliant",
+    "private_message",
+    "prior_epoch",
+    "out_of_order",
+    "serde",
+] }
+mls-rs-core = "=0.27.0"
+mls-rs-crypto-rustcrypto = { version = "=0.22.1", default-features = false, features = ["std", "browser"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+
 # UniFFI for Kotlin bindings generation
 uniffi = { version = "0.32", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
-wasm-bindgen = "0.2"
+wasm-bindgen = "=0.2.126"
 
 [build-dependencies]
 uniffi = { version = "0.32", default-features = false, features = ["build"] }

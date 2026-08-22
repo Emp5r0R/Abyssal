@@ -12,6 +12,7 @@ import com.abyssal.chat.domain.model.EncryptedAttachmentDownload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MlsInboundEnvelope
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.PrekeyLease
@@ -197,6 +198,26 @@ interface IChatTransport {
     suspend fun broadcastGlobalWipe(expectedConnectionGeneration: Long) {
         broadcastGlobalWipe()
     }
+}
+
+/** Protocol-v10 room transport. Pairwise protocol-v9 remains on [IChatTransport]. */
+interface IMlsTransport {
+    fun getIncomingMlsFrames(): Flow<MlsInboundEnvelope>
+    suspend fun sendMlsControl(frame: org.json.JSONObject, expectedConnectionGeneration: Long): Boolean
+    suspend fun sendMlsTransaction(
+        roomId: String,
+        messageId: String,
+        revision: ULong,
+        frame: org.json.JSONObject,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult
+    suspend fun sendMlsSnapshot(
+        roomId: String,
+        messageId: String,
+        revision: ULong,
+        frame: org.json.JSONObject,
+        expectedConnectionGeneration: Long
+    ): OutboundSendResult
 }
 
 interface IEncryptedAttachmentService {

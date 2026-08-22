@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use sha2_legacy::Sha512;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard,
+    },
 };
 use vodozemac::{
     olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle},
@@ -26,6 +29,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+use crate::mls_protocol::WasmMlsRoom;
 
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
 const ONE_TIME_KEY_BYTES: usize = 32;
@@ -63,6 +69,7 @@ const REGISTRATION_CHALLENGE_BYTES: usize = 32;
 const PROTOCOL_VERSION: u32 = 9;
 const IDENTITY_ENVELOPE_VERSION: u8 = 5;
 const KEY_VALIDATION_SCALAR: [u8; 32] = [0x42; 32];
+const MLS_ROOT_DOMAIN: &[u8] = b"ABYSSAL-MLS-V10-ACCOUNT-ROOT";
 
 pub struct AbyssalOpaqueSuite;
 
@@ -203,6 +210,35 @@ struct SealingMaterial {
     context: Vec<u8>,
 }
 
+pub(crate) struct AccountLifetime {
+    revoked: AtomicBool,
+    gate: RwLock<()>,
+}
+
+impl AccountLifetime {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            revoked: AtomicBool::new(false),
+            gate: RwLock::new(()),
+        })
+    }
+
+    pub(crate) fn revoke(&self) {
+        match self.gate.write() {
+            Ok(_guard) => self.revoked.store(true, Ordering::Release),
+            Err(_) => self.revoked.store(true, Ordering::Release),
+        }
+    }
+
+    pub(crate) fn operation(&self) -> Result<RwLockReadGuard<'_, ()>, ()> {
+        let guard = self.gate.read().map_err(|_| ())?;
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(());
+        }
+        Ok(guard)
+    }
+}
+
 impl Drop for SealingMaterial {
     fn drop(&mut self) {
         self.key.zeroize();
@@ -214,6 +250,8 @@ impl Drop for SealingMaterial {
 pub struct E2eeSession {
     state: Mutex<E2eeState>,
     sealing: Mutex<Option<SealingMaterial>>,
+    mls_root: Zeroizing<[u8; 32]>,
+    account_lifetime: Arc<AccountLifetime>,
 }
 
 #[uniffi::export]
@@ -486,6 +524,7 @@ impl E2eeSession {
     pub fn create(export_key: Vec<u8>) -> Result<Arc<Self>, AbyssalError> {
         let export_key = Zeroizing::new(export_key);
         validate_export_key(&export_key)?;
+        let mls_root = derive_mls_root(&export_key).map_err(AbyssalError::from)?;
         let mut account = Account::new();
         account.generate_fallback_key();
         account.generate_one_time_keys(PREKEY_POOL_SIZE_V9);
@@ -508,6 +547,8 @@ impl E2eeSession {
                 pending_outbound: None,
             }),
             sealing: Mutex::new(None),
+            mls_root,
+            account_lifetime: AccountLifetime::new(),
         }))
     }
 
@@ -520,6 +561,7 @@ impl E2eeSession {
     ) -> Result<Arc<Self>, AbyssalError> {
         let export_key = Zeroizing::new(export_key);
         validate_export_key(&export_key)?;
+        let mls_root = derive_mls_root(&export_key).map_err(AbyssalError::from)?;
         validate_context(&context)?;
         if envelope.len() <= 1 + NONCE_BYTES
             || envelope.len() > MAX_IDENTITY_STATE_BYTES
@@ -600,6 +642,8 @@ impl E2eeSession {
                 pending_outbound: None,
             }),
             sealing: Mutex::new(Some(SealingMaterial { key: *key, context })),
+            mls_root,
+            account_lifetime: AccountLifetime::new(),
         });
         let actual_public_key = session.public_key();
         validate_identity_public_bundle(&actual_public_key, Some(&session.prekey_id()))
@@ -608,6 +652,85 @@ impl E2eeSession {
             return Err("Identity unavailable".to_string().into());
         }
         Ok(session)
+    }
+
+    /// Create an account-scoped MLS room. MLS identity material is derived
+    /// and signed here so no root, stable private key, or detached credential
+    /// proof crosses the public API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mls_room(
+        &self,
+        room_id: String,
+        username: String,
+        node_context: Vec<u8>,
+        group_id: Vec<u8>,
+    ) -> Result<Arc<crate::mls_protocol::MlsRoom>, AbyssalError> {
+        let (stable, proof) = self.mls_material(&room_id, &username, &node_context, &group_id)?;
+        crate::mls_protocol::MlsRoom::create_from_account(
+            &self.mls_root,
+            self.account_lifetime.clone(),
+            room_id,
+            username,
+            node_context,
+            stable.to_vec(),
+            proof,
+            group_id,
+        )
+    }
+
+    /// Recover an account-scoped MLS room from its authenticated state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_mls_room(
+        &self,
+        room_id: String,
+        username: String,
+        node_context: Vec<u8>,
+        group_id: Vec<u8>,
+        envelope: Vec<u8>,
+        expected_active: bool,
+        expected_epoch: u64,
+        expected_revision: u64,
+        expected_members: Vec<crate::mls_protocol::MlsRosterMember>,
+        expected_digest: Vec<u8>,
+    ) -> Result<Arc<crate::mls_protocol::MlsRoom>, AbyssalError> {
+        let (stable, proof) = self.mls_material(&room_id, &username, &node_context, &group_id)?;
+        crate::mls_protocol::MlsRoom::recover_from_account(
+            &self.mls_root,
+            self.account_lifetime.clone(),
+            room_id,
+            username,
+            node_context,
+            stable.to_vec(),
+            proof,
+            group_id,
+            envelope,
+            expected_active,
+            expected_epoch,
+            expected_revision,
+            expected_members,
+            expected_digest,
+        )
+    }
+
+    /// Create a pending account-scoped MLS join room.
+    pub fn pending_mls_join(
+        &self,
+        room_id: String,
+        username: String,
+        node_context: Vec<u8>,
+        group_id: Vec<u8>,
+    ) -> Result<Arc<crate::mls_protocol::MlsRoom>, AbyssalError> {
+        let (stable, proof) = self.mls_material(&room_id, &username, &node_context, &group_id)?;
+        crate::mls_protocol::MlsRoom::pending_from_account(
+            &self.mls_root,
+            self.account_lifetime.clone(),
+            room_id,
+            username,
+            node_context,
+            stable.to_vec(),
+            proof,
+            group_id,
+        )
     }
 
     pub fn public_key(&self) -> Vec<u8> {
@@ -1552,12 +1675,68 @@ fn lock<'a, T>(mutex: &'a Mutex<T>, message: &str) -> Result<MutexGuard<'a, T>, 
         .map_err(|_| AbyssalError::from(message.to_string()))
 }
 
+impl Drop for E2eeSession {
+    fn drop(&mut self) {
+        self.account_lifetime.revoke();
+        self.mls_root.zeroize();
+    }
+}
+
+impl E2eeSession {
+    fn mls_material(
+        &self,
+        room_id: &str,
+        username: &str,
+        node_context: &[u8],
+        group_id: &[u8],
+    ) -> Result<([u8; 64], Vec<u8>), AbyssalError> {
+        let username = username.to_ascii_lowercase();
+        let group_id: [u8; 32] = group_id
+            .try_into()
+            .map_err(|_| AbyssalError::from("Identity unavailable".to_string()))?;
+        let stable_bundle = self.public_key();
+        let stable: [u8; 64] = stable_bundle
+            .get(..IDENTITY_FINGERPRINT_BYTES)
+            .ok_or_else(|| AbyssalError::from("Identity unavailable".to_string()))?
+            .try_into()
+            .map_err(|_| AbyssalError::from("Identity unavailable".to_string()))?;
+        let mls_public = crate::mls_protocol::mls_public_for_root(
+            &self.mls_root,
+            &username,
+            node_context,
+            room_id,
+            &group_id,
+        )
+        .map_err(AbyssalError::from)?;
+        let transcript = crate::mls_protocol::credential_transcript(
+            &username,
+            room_id,
+            node_context,
+            &group_id,
+            &stable,
+            &mls_public,
+        )
+        .map_err(AbyssalError::from)?;
+        let state = lock(&self.state, "Identity unavailable")?;
+        Ok((stable, state.account.sign(&transcript).to_bytes().to_vec()))
+    }
+}
+
 fn identity_wrap_key(export_key: &[u8], context: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
     Hkdf::<Sha256>::new(Some(context), export_key)
         .expand(b"ABYSSAL_IDENTITY_WRAP_V3", &mut key)
         .map_err(|_| "Identity unavailable".to_string())?;
     Ok(key)
+}
+
+pub(crate) fn derive_mls_root(export_key: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+    validate_export_key(export_key)?;
+    let mut root = Zeroizing::new([0_u8; 32]);
+    Hkdf::<Sha256>::new(Some(MLS_ROOT_DOMAIN), export_key)
+        .expand(MLS_ROOT_DOMAIN, root.as_mut())
+        .map_err(|_| "Identity unavailable".to_string())?;
+    Ok(root)
 }
 
 fn message_aad(chat_id: &str, message_id: &str, sender_username: &str) -> Vec<u8> {
@@ -2387,6 +2566,67 @@ impl WasmE2eeSession {
         })
     }
 
+    #[wasm_bindgen(js_name = mlsCreateRoom)]
+    pub fn wasm_mls_create_room(
+        &self,
+        room_id: String,
+        username: String,
+        node_context: Vec<u8>,
+        group_id: Vec<u8>,
+    ) -> Result<WasmMlsRoom, JsValue> {
+        self.inner
+            .create_mls_room(room_id, username, node_context, group_id)
+            .map(WasmMlsRoom::from_inner)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = mlsRecoverRoom)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn wasm_mls_recover_room(
+        &self,
+        room_id: String,
+        username: String,
+        node_context: Vec<u8>,
+        group_id: Vec<u8>,
+        envelope: Vec<u8>,
+        expected_active: bool,
+        expected_epoch: u64,
+        expected_revision: u64,
+        expected_members_json: String,
+        expected_digest: Vec<u8>,
+    ) -> Result<WasmMlsRoom, JsValue> {
+        let expected_members = crate::mls_protocol::parse_roster_json(&expected_members_json)?;
+        self.inner
+            .recover_mls_room(
+                room_id,
+                username,
+                node_context,
+                group_id,
+                envelope,
+                expected_active,
+                expected_epoch,
+                expected_revision,
+                expected_members,
+                expected_digest,
+            )
+            .map(WasmMlsRoom::from_inner)
+            .map_err(js_error)
+    }
+
+    #[wasm_bindgen(js_name = mlsPendingJoin)]
+    pub fn wasm_mls_pending_join(
+        &self,
+        room_id: String,
+        username: String,
+        node_context: Vec<u8>,
+        group_id: Vec<u8>,
+    ) -> Result<WasmMlsRoom, JsValue> {
+        self.inner
+            .pending_mls_join(room_id, username, node_context, group_id)
+            .map(WasmMlsRoom::from_inner)
+            .map_err(js_error)
+    }
+
     #[wasm_bindgen(js_name = publicKey)]
     pub fn wasm_public_key(&self) -> Vec<u8> {
         self.inner.public_key()
@@ -2421,6 +2661,7 @@ impl WasmE2eeSession {
     }
 
     #[wasm_bindgen(js_name = signRegistrationIdentityProof)]
+    #[allow(clippy::too_many_arguments)]
     pub fn wasm_sign_registration_identity_proof(
         &self,
         node_id: String,
@@ -2486,6 +2727,7 @@ impl WasmE2eeSession {
         serde_json::to_string(&result).map_err(|_| js_error("Payload unavailable".to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn decrypt(
         &self,
         chat_id: String,
@@ -2728,6 +2970,217 @@ mod tests {
             conversation_safety_number(alice.public_key(), eve.public_key())
                 .expect("different safety number")
         );
+    }
+
+    #[test]
+    fn mls_account_root_is_deterministic_and_domain_separated() {
+        let first = derive_mls_root(&[7_u8; 64]).expect("MLS root");
+        let repeat = derive_mls_root(&[7_u8; 64]).expect("same MLS root");
+        let second = derive_mls_root(&[8_u8; 64]).expect("different MLS root");
+        assert_eq!(first, repeat);
+        assert_ne!(first, second);
+        assert_ne!(first.as_slice(), &[7_u8; 64][..32]);
+    }
+
+    #[test]
+    fn recovered_account_can_recover_its_mls_room() {
+        let export_key = vec![73_u8; 64];
+        let context = b"node:MLS-RECOVERY".to_vec();
+        let session = E2eeSession::create(export_key.clone()).expect("account");
+        let identity_envelope = session
+            .seal_identity(export_key.clone(), context.clone())
+            .expect("identity envelope");
+        let room = session
+            .create_mls_room(
+                "recovered-room".to_string(),
+                "alice".to_string(),
+                b"node=local".to_vec(),
+                vec![19_u8; 32],
+            )
+            .expect("MLS room");
+        let info = room.room_info().expect("room info");
+        let envelope = room.seal_state().expect("room envelope");
+        let recovered =
+            E2eeSession::recover(export_key, context, identity_envelope, session.public_key())
+                .expect("recovered account");
+        let recovered_room = recovered
+            .recover_mls_room(
+                "recovered-room".to_string(),
+                "alice".to_string(),
+                b"node=local".to_vec(),
+                vec![19_u8; 32],
+                envelope,
+                true,
+                info.epoch,
+                info.revision,
+                vec![crate::mls_protocol::MlsRosterMember {
+                    username: "alice".to_string(),
+                    stable_identity: session.public_key()[..64].to_vec(),
+                }],
+                info.membership_digest.clone(),
+            )
+            .expect("recovered MLS room");
+        assert_eq!(recovered_room.room_info().expect("recovered info"), info);
+    }
+
+    #[test]
+    fn mls_recovery_is_bound_to_export_key_and_context() {
+        let export_key = vec![76_u8; 64];
+        let wrong_export_key = vec![77_u8; 64];
+        let context = b"node:MLS-BOUND".to_vec();
+        let identity = E2eeSession::create(export_key.clone()).expect("account");
+        let identity_envelope = identity
+            .seal_identity(export_key.clone(), context.clone())
+            .expect("identity envelope");
+        let expected_public_key = identity.public_key();
+
+        let wrong_key = match E2eeSession::recover(
+            wrong_export_key,
+            context.clone(),
+            identity_envelope.clone(),
+            expected_public_key.clone(),
+        ) {
+            Ok(_) => panic!("a different OPAQUE export key recovered the account"),
+            Err(error) => error,
+        };
+        assert_eq!(wrong_key.to_string(), "Identity unavailable");
+
+        let wrong_context = match E2eeSession::recover(
+            export_key.clone(),
+            b"node:MLS-OTHER".to_vec(),
+            identity_envelope.clone(),
+            expected_public_key.clone(),
+        ) {
+            Ok(_) => panic!("a different OPAQUE context recovered the account"),
+            Err(error) => error,
+        };
+        assert_eq!(wrong_context.to_string(), "Identity unavailable");
+
+        let mut wrong_public_key = expected_public_key.clone();
+        wrong_public_key[0] ^= 1;
+        let wrong_public =
+            match E2eeSession::recover(export_key, context, identity_envelope, wrong_public_key) {
+                Ok(_) => panic!("a detached public identity recovered the account"),
+                Err(error) => error,
+            };
+        assert_eq!(wrong_public.to_string(), "Identity unavailable");
+    }
+
+    #[test]
+    fn mls_room_is_revoked_when_account_session_drops() {
+        let room = {
+            let session = E2eeSession::create(vec![74_u8; 64]).expect("account");
+            session
+                .create_mls_room(
+                    "stale-room".to_string(),
+                    "alice".to_string(),
+                    b"node=local".to_vec(),
+                    vec![20_u8; 32],
+                )
+                .expect("MLS room")
+        };
+        assert!(room.room_info().is_err());
+        assert!(room.key_package().is_err());
+        assert!(room.seal_state().is_err());
+    }
+
+    #[test]
+    fn failed_mls_factory_returns_no_room_handle() {
+        let session = E2eeSession::create(vec![75_u8; 64]).expect("account");
+        let result = session.create_mls_room(
+            "invalid room".to_string(),
+            "alice".to_string(),
+            b"node=local".to_vec(),
+            vec![21_u8; 32],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_mls_factory_inputs_do_not_advance_account_or_leak_material() {
+        let session = E2eeSession::create(vec![78_u8; 64]).expect("account");
+        let before = session.public_key();
+
+        let invalid_room = session.create_mls_room(
+            "invalid room".to_string(),
+            "alice".to_string(),
+            b"node=local".to_vec(),
+            vec![79_u8; 32],
+        );
+        let invalid_room_error = match invalid_room {
+            Ok(_) => panic!("invalid room was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(invalid_room_error.to_string(), "Room unavailable");
+
+        let invalid_username = session.create_mls_room(
+            "valid-room".to_string(),
+            "alice/attacker".to_string(),
+            b"node=local".to_vec(),
+            vec![79_u8; 32],
+        );
+        let invalid_username_error = match invalid_username {
+            Ok(_) => panic!("invalid username was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(invalid_username_error.to_string(), "Identity unavailable");
+
+        let invalid_context = session.create_mls_room(
+            "valid-room".to_string(),
+            "alice".to_string(),
+            vec![0xff],
+            vec![79_u8; 32],
+        );
+        let invalid_context_error = match invalid_context {
+            Ok(_) => panic!("invalid context was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(invalid_context_error.to_string(), "Identity unavailable");
+
+        let invalid_group = session.create_mls_room(
+            "valid-room".to_string(),
+            "alice".to_string(),
+            b"node=local".to_vec(),
+            vec![79_u8; 31],
+        );
+        let invalid_group_error = match invalid_group {
+            Ok(_) => panic!("invalid group id was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(invalid_group_error.to_string(), "Identity unavailable");
+
+        assert_eq!(session.public_key(), before);
+        let room = session
+            .create_mls_room(
+                "valid-room".to_string(),
+                "alice".to_string(),
+                b"node=local".to_vec(),
+                vec![79_u8; 32],
+            )
+            .expect("a valid factory call remains usable");
+        assert_eq!(room.room_info().expect("room info").member_count, 1);
+    }
+
+    #[test]
+    fn poisoned_account_lifetime_fails_closed() {
+        let session = E2eeSession::create(vec![129_u8; 64]).expect("account");
+        let room = session
+            .create_mls_room(
+                "poisoned-lifetime-room".to_string(),
+                "alice".to_string(),
+                b"node=local".to_vec(),
+                vec![130_u8; 32],
+            )
+            .expect("room");
+        let lifetime = session.account_lifetime.clone();
+        let lifetime_thread = std::thread::spawn(move || {
+            let _guard = lifetime.gate.write().expect("lifetime write lock");
+            panic!("poison lifetime lock for fail-closed test");
+        });
+        assert!(lifetime_thread.join().is_err());
+        assert!(room.room_info().is_err());
+        assert!(room.key_package().is_err());
+        assert!(room.seal_state().is_err());
     }
 
     #[test]

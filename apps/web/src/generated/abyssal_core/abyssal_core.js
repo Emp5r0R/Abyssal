@@ -1,4 +1,6 @@
 /* @ts-self-types="./abyssal_core.d.ts" */
+import * as import1 from "./snippets/mls-rs-core-f99cdecbb456b09c/inline0.js"
+
 
 export class WasmE2eeSession {
     static __wrap(ptr) {
@@ -133,6 +135,84 @@ export class WasmE2eeSession {
         } finally {
             wasm.__wbindgen_free(deferred7_0, deferred7_1, 1);
         }
+    }
+    /**
+     * @param {string} room_id
+     * @param {string} username
+     * @param {Uint8Array} node_context
+     * @param {Uint8Array} group_id
+     * @returns {WasmMlsRoom}
+     */
+    mlsCreateRoom(room_id, username, node_context, group_id) {
+        const ptr0 = passStringToWasm0(room_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(node_context, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passArray8ToWasm0(group_id, wasm.__wbindgen_malloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.wasme2eesession_mlsCreateRoom(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsRoom.__wrap(ret[0]);
+    }
+    /**
+     * @param {string} room_id
+     * @param {string} username
+     * @param {Uint8Array} node_context
+     * @param {Uint8Array} group_id
+     * @returns {WasmMlsRoom}
+     */
+    mlsPendingJoin(room_id, username, node_context, group_id) {
+        const ptr0 = passStringToWasm0(room_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(node_context, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passArray8ToWasm0(group_id, wasm.__wbindgen_malloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.wasme2eesession_mlsPendingJoin(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsRoom.__wrap(ret[0]);
+    }
+    /**
+     * @param {string} room_id
+     * @param {string} username
+     * @param {Uint8Array} node_context
+     * @param {Uint8Array} group_id
+     * @param {Uint8Array} envelope
+     * @param {boolean} expected_active
+     * @param {bigint} expected_epoch
+     * @param {bigint} expected_revision
+     * @param {string} expected_members_json
+     * @param {Uint8Array} expected_digest
+     * @returns {WasmMlsRoom}
+     */
+    mlsRecoverRoom(room_id, username, node_context, group_id, envelope, expected_active, expected_epoch, expected_revision, expected_members_json, expected_digest) {
+        const ptr0 = passStringToWasm0(room_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(node_context, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passArray8ToWasm0(group_id, wasm.__wbindgen_malloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passArray8ToWasm0(envelope, wasm.__wbindgen_malloc);
+        const len4 = WASM_VECTOR_LEN;
+        const ptr5 = passStringToWasm0(expected_members_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len5 = WASM_VECTOR_LEN;
+        const ptr6 = passArray8ToWasm0(expected_digest, wasm.__wbindgen_malloc);
+        const len6 = WASM_VECTOR_LEN;
+        const ret = wasm.wasme2eesession_mlsRecoverRoom(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, expected_active, expected_epoch, expected_revision, ptr5, len5, ptr6, len6);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsRoom.__wrap(ret[0]);
     }
     /**
      * @returns {string}
@@ -282,6 +362,724 @@ export class WasmE2eeSession {
     }
 }
 if (Symbol.dispose) WasmE2eeSession.prototype[Symbol.dispose] = WasmE2eeSession.prototype.free;
+
+export class WasmMlsApplicationMessage {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmMlsApplicationMessage.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmMlsApplicationMessageFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmMlsApplicationMessageFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmmlsapplicationmessage_free(ptr, 0);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get authenticatedData() {
+        const ret = wasm.wasmmlsapplicationmessage_authenticatedData(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get epoch() {
+        const ret = wasm.wasmmlsapplicationmessage_epoch(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get groupId() {
+        const ret = wasm.wasmmlsapplicationmessage_groupId(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get membershipDigest() {
+        const ret = wasm.wasmmlsapplicationmessage_membershipDigest(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {string}
+     */
+    get messageId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmmlsapplicationmessage_messageId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get plaintext() {
+        const ret = wasm.wasmmlsapplicationmessage_plaintext(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get revision() {
+        const ret = wasm.wasmmlsapplicationmessage_revision(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {number}
+     */
+    get senderIndex() {
+        const ret = wasm.wasmmlsapplicationmessage_senderIndex(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get stateEnvelope() {
+        const ret = wasm.wasmmlsapplicationmessage_stateEnvelope(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) WasmMlsApplicationMessage.prototype[Symbol.dispose] = WasmMlsApplicationMessage.prototype.free;
+
+export class WasmMlsCommit {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmMlsCommit.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmMlsCommitFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmMlsCommitFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmmlscommit_free(ptr, 0);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get authenticatedData() {
+        const ret = wasm.wasmmlscommit_authenticatedData(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get commit() {
+        const ret = wasm.wasmmlscommit_commit(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get fromEpoch() {
+        const ret = wasm.wasmmlscommit_fromEpoch(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get fromMembershipDigest() {
+        const ret = wasm.wasmmlscommit_fromMembershipDigest(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get groupId() {
+        const ret = wasm.wasmmlscommit_groupId(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get membershipDigest() {
+        const ret = wasm.wasmmlscommit_membershipDigest(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {string}
+     */
+    get messageId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmmlscommit_messageId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {bigint}
+     */
+    get revision() {
+        const ret = wasm.wasmmlscommit_revision(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {string}
+     */
+    get rosterJson() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ret = wasm.wasmmlscommit_rosterJson(this.__wbg_ptr);
+            var ptr1 = ret[0];
+            var len1 = ret[1];
+            if (ret[3]) {
+                ptr1 = 0; len1 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get stateEnvelope() {
+        const ret = wasm.wasmmlscommit_stateEnvelope(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get toEpoch() {
+        const ret = wasm.wasmmlscommit_toEpoch(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get welcome() {
+        const ret = wasm.wasmmlscommit_welcome(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) WasmMlsCommit.prototype[Symbol.dispose] = WasmMlsCommit.prototype.free;
+
+export class WasmMlsEncryptedApplication {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmMlsEncryptedApplication.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmMlsEncryptedApplicationFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmMlsEncryptedApplicationFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmmlsencryptedapplication_free(ptr, 0);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get authenticatedData() {
+        const ret = wasm.wasmmlsencryptedapplication_authenticatedData(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get ciphertext() {
+        const ret = wasm.wasmmlsencryptedapplication_ciphertext(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get epoch() {
+        const ret = wasm.wasmmlsencryptedapplication_epoch(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get groupId() {
+        const ret = wasm.wasmmlsencryptedapplication_groupId(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get membershipDigest() {
+        const ret = wasm.wasmmlsencryptedapplication_membershipDigest(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {string}
+     */
+    get messageId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmmlsencryptedapplication_messageId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {bigint}
+     */
+    get revision() {
+        const ret = wasm.wasmmlsencryptedapplication_revision(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {number}
+     */
+    get senderIndex() {
+        const ret = wasm.wasmmlsencryptedapplication_senderIndex(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get stateEnvelope() {
+        const ret = wasm.wasmmlsencryptedapplication_stateEnvelope(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) WasmMlsEncryptedApplication.prototype[Symbol.dispose] = WasmMlsEncryptedApplication.prototype.free;
+
+export class WasmMlsProcessedControl {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmMlsProcessedControl.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmMlsProcessedControlFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmMlsProcessedControlFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmmlsprocessedcontrol_free(ptr, 0);
+    }
+    /**
+     * @returns {bigint}
+     */
+    get epoch() {
+        const ret = wasm.wasmmlsprocessedcontrol_epoch(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get groupId() {
+        const ret = wasm.wasmmlsprocessedcontrol_groupId(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {number}
+     */
+    get memberCount() {
+        const ret = wasm.wasmmlsprocessedcontrol_memberCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get membershipDigest() {
+        const ret = wasm.wasmmlsprocessedcontrol_membershipDigest(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {string}
+     */
+    get messageId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmmlsprocessedcontrol_messageId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {bigint}
+     */
+    get revision() {
+        const ret = wasm.wasmmlsprocessedcontrol_revision(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {string}
+     */
+    get roomId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmmlsprocessedcontrol_roomId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get stateEnvelope() {
+        const ret = wasm.wasmmlsprocessedcontrol_stateEnvelope(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) WasmMlsProcessedControl.prototype[Symbol.dispose] = WasmMlsProcessedControl.prototype.free;
+
+export class WasmMlsRoom {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmMlsRoom.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmMlsRoomFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmMlsRoomFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmmlsroom_free(ptr, 0);
+    }
+    /**
+     * @param {Uint8Array} key_package
+     * @param {string} expected_username
+     * @param {Uint8Array} expected_stable_identity
+     * @param {string} message_id
+     * @returns {WasmMlsCommit}
+     */
+    addMember(key_package, expected_username, expected_stable_identity, message_id) {
+        const ptr0 = passArray8ToWasm0(key_package, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(expected_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(expected_stable_identity, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_addMember(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsCommit.__wrap(ret[0]);
+    }
+    /**
+     * @param {string} message_id
+     * @param {bigint} revision
+     */
+    commitOutbound(message_id, revision) {
+        const ptr0 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_commitOutbound(this.__wbg_ptr, ptr0, len0, revision);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @param {Uint8Array} ciphertext
+     * @param {bigint} expected_epoch
+     * @param {string} message_id
+     * @param {Uint8Array} expected_authenticated_data
+     * @returns {WasmMlsApplicationMessage}
+     */
+    decryptApplication(ciphertext, expected_epoch, message_id, expected_authenticated_data) {
+        const ptr0 = passArray8ToWasm0(ciphertext, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(expected_authenticated_data, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_decryptApplication(this.__wbg_ptr, ptr0, len0, expected_epoch, ptr1, len1, ptr2, len2);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsApplicationMessage.__wrap(ret[0]);
+    }
+    /**
+     * @param {string} message_id
+     * @param {Uint8Array} plaintext
+     * @param {Uint8Array} authenticated_data
+     * @returns {WasmMlsEncryptedApplication}
+     */
+    encryptApplication(message_id, plaintext, authenticated_data) {
+        const ptr0 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(plaintext, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(authenticated_data, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_encryptApplication(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsEncryptedApplication.__wrap(ret[0]);
+    }
+    /**
+     * @param {Uint8Array} welcome
+     * @param {string} expected_members_json
+     * @param {Uint8Array} expected_digest
+     * @returns {WasmMlsRoomInfo}
+     */
+    joinWelcome(welcome, expected_members_json, expected_digest) {
+        const ptr0 = passArray8ToWasm0(welcome, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(expected_members_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(expected_digest, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_joinWelcome(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsRoomInfo.__wrap(ret[0]);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    keyPackage() {
+        const ret = wasm.wasmmlsroom_keyPackage(this.__wbg_ptr);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @param {Uint8Array} control
+     * @param {bigint} expected_from_epoch
+     * @param {bigint} expected_to_epoch
+     * @param {string} expected_members_json
+     * @param {Uint8Array} expected_digest
+     * @param {string} message_id
+     * @param {Uint8Array} expected_authenticated_data
+     * @returns {WasmMlsProcessedControl}
+     */
+    processControl(control, expected_from_epoch, expected_to_epoch, expected_members_json, expected_digest, message_id, expected_authenticated_data) {
+        const ptr0 = passArray8ToWasm0(control, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(expected_members_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passArray8ToWasm0(expected_digest, wasm.__wbindgen_malloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len3 = WASM_VECTOR_LEN;
+        const ptr4 = passArray8ToWasm0(expected_authenticated_data, wasm.__wbindgen_malloc);
+        const len4 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_processControl(this.__wbg_ptr, ptr0, len0, expected_from_epoch, expected_to_epoch, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsProcessedControl.__wrap(ret[0]);
+    }
+    /**
+     * @param {string} expected_username
+     * @param {Uint8Array} expected_stable_identity
+     * @param {string} message_id
+     * @returns {WasmMlsCommit}
+     */
+    removeMember(expected_username, expected_stable_identity, message_id) {
+        const ptr0 = passStringToWasm0(expected_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(expected_stable_identity, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_removeMember(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsCommit.__wrap(ret[0]);
+    }
+    /**
+     * @param {string} message_id
+     * @param {bigint} revision
+     */
+    rollbackOutbound(message_id, revision) {
+        const ptr0 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmmlsroom_rollbackOutbound(this.__wbg_ptr, ptr0, len0, revision);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @returns {WasmMlsRoomInfo}
+     */
+    roomInfo() {
+        const ret = wasm.wasmmlsroom_roomInfo(this.__wbg_ptr);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return WasmMlsRoomInfo.__wrap(ret[0]);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    sealState() {
+        const ret = wasm.wasmmlsroom_sealState(this.__wbg_ptr);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) WasmMlsRoom.prototype[Symbol.dispose] = WasmMlsRoom.prototype.free;
+
+export class WasmMlsRoomInfo {
+    static __wrap(ptr) {
+        const obj = Object.create(WasmMlsRoomInfo.prototype);
+        obj.__wbg_ptr = ptr;
+        WasmMlsRoomInfoFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmMlsRoomInfoFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmmlsroominfo_free(ptr, 0);
+    }
+    /**
+     * @returns {bigint}
+     */
+    get epoch() {
+        const ret = wasm.wasmmlsroominfo_epoch(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get groupId() {
+        const ret = wasm.wasmmlsroominfo_groupId(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {number}
+     */
+    get memberCount() {
+        const ret = wasm.wasmmlsroominfo_memberCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    get membershipDigest() {
+        const ret = wasm.wasmmlsroominfo_membershipDigest(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {bigint}
+     */
+    get revision() {
+        const ret = wasm.wasmmlsroominfo_revision(this.__wbg_ptr);
+        return BigInt.asUintN(64, ret);
+    }
+    /**
+     * @returns {string}
+     */
+    get roomId() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.wasmmlsroominfo_roomId(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+}
+if (Symbol.dispose) WasmMlsRoomInfo.prototype[Symbol.dispose] = WasmMlsRoomInfo.prototype.free;
 
 /**
  * @param {Uint8Array} first_public_key
@@ -576,12 +1374,31 @@ function __wbg_get_imports() {
     return {
         __proto__: null,
         "./abyssal_core_bg.js": import0,
+        "./snippets/mls-rs-core-f99cdecbb456b09c/inline0.js": import1,
     };
 }
 
 const WasmE2eeSessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasme2eesession_free(ptr, 1));
+const WasmMlsApplicationMessageFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmmlsapplicationmessage_free(ptr, 1));
+const WasmMlsCommitFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmmlscommit_free(ptr, 1));
+const WasmMlsEncryptedApplicationFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmmlsencryptedapplication_free(ptr, 1));
+const WasmMlsProcessedControlFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmmlsprocessedcontrol_free(ptr, 1));
+const WasmMlsRoomFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmmlsroom_free(ptr, 1));
+const WasmMlsRoomInfoFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmmlsroominfo_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();

@@ -7,6 +7,7 @@ import initWasm, {
   opaqueClientStart,
   WasmE2eeSession,
 } from "../generated/abyssal_core/abyssal_core";
+import { MlsRoomManager } from "./mls";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -323,6 +324,16 @@ export class InMemoryPayloadCipher {
     const prekeyId = this.#session.prekeyId();
     if (!PREKEY_ID_PATTERN.test(prekeyId)) throw new Error("Identity unavailable");
     return prekeyId;
+  }
+
+  createMlsManager(username: string, nodeId: string): MlsRoomManager {
+    const session = this.nativeSession();
+    const identity = this.publicKey();
+    try {
+      return new MlsRoomManager(session, username, nodeId, identity);
+    } finally {
+      identity.fill(0);
+    }
   }
 
   requiresPrekey(peer: string): boolean {

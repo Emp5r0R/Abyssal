@@ -52,10 +52,12 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod mls_wire;
+mod rooms;
 mod transport_padding;
 
 use transport_padding::{
@@ -73,8 +75,24 @@ const ATTACHMENT_WIRE_OVERHEAD_BYTES: usize = 41;
 const ATTACHMENT_BLOB_VERSION: u8 = 1;
 const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
-const WS_MAX_BYTES_PER_WINDOW: usize = 4 * 1024 * 1024;
+const WS_MAX_BYTES_PER_WINDOW: usize = 32 * 1024 * 1024;
 const WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
+// MLS state envelopes are bounded at 4 MiB before base64 transport encoding.
+// Keep the legacy 1 MiB frame ceiling for protocol-v9 and non-MLS traffic.
+const MLS_WS_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+// Oversized inbound JSON must identify itself before deserialization.  Keep
+// this prefix deliberately canonical: accepting arbitrary whitespace, property
+// order, or substring matches would let legacy/unknown frames reach the larger
+// serde allocation budget.  The full schema and field limits remain enforced
+// after this bounded admission check.
+const LARGE_MLS_INBOUND_PREFIXES: [&str; 5] = [
+    r#"{"type":"mls_create_room","protocol_version":10,"#,
+    r#"{"type":"mls_join_request","protocol_version":10,"#,
+    r#"{"type":"mls_membership_commit","protocol_version":10,"#,
+    r#"{"type":"mls_application","protocol_version":10,"#,
+    r#"{"type":"mls_state_snapshot","protocol_version":10,"#,
+];
+const MLS_CLIENT_OUTBOUND_BYTES: usize = MLS_WS_MAX_FRAME_BYTES;
 const STATE_REVISION_WINDOW_BITS: u32 = u128::BITS;
 const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
@@ -85,7 +103,7 @@ const HOURS_TO_MILLISECONDS: u64 = 60 * 60 * 1000;
 const CLIENT_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const CLIENT_CONTROL_QUEUE_CAPACITY: usize = 1;
 const CLIENT_RESULT_QUEUE_CAPACITY: usize = 2;
-const CLIENT_OUTBOUND_BYTES: usize = 4 * 1024 * 1024;
+const CLIENT_OUTBOUND_BYTES: usize = WS_MAX_FRAME_BYTES;
 const GLOBAL_OUTBOUND_BYTES: usize = 64 * 1024 * 1024;
 // A fanout is assembled before its per-recipient frames enter either the
 // live client queues or pending queues. Keep that temporary allocation
@@ -96,6 +114,7 @@ const CLIENT_WIPE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const CLIENT_RESULT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const PURGE_CLOSE_CODE: u16 = 4001;
 const PURGE_CLOSE_REASON: &str = "purge";
+#[allow(dead_code)]
 const MAX_ROOM_CATALOG_ENTRIES: usize = 1_024;
 const MAX_DIRECT_CATALOG_ENTRIES: usize = 8_192;
 const MAX_DIRECT_CATALOG_PER_USER: usize = 128;
@@ -211,6 +230,7 @@ struct AppState {
     login_limits: Arc<Mutex<HashMap<CodeId, RateState>>>,
     replay_ids: Arc<Mutex<HashMap<ReplayKey, u64>>>,
     prekey_leases: Arc<Mutex<HashMap<PrekeyLeaseKey, PrekeyLease>>>,
+    mls_rooms: Arc<Mutex<rooms::RoomAuthority>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
     room_catalog: Arc<Mutex<HashMap<String, RoomEntry>>>,
     direct_catalog: Arc<Mutex<HashMap<String, DirectEntry>>>,
@@ -480,6 +500,27 @@ struct AttachmentRecord {
     completed_recipient_code_ids: HashSet<CodeId>,
 }
 
+struct StagedAttachmentRollback {
+    attachment_id: Uuid,
+    owner_code_id: CodeId,
+    chat_id: String,
+    message_id: String,
+    eligible_recipient_code_ids: HashSet<CodeId>,
+    published: bool,
+    staged_expires_at_ms: Option<u64>,
+}
+
+impl Drop for StagedAttachmentRollback {
+    fn drop(&mut self) {
+        self.owner_code_id.zeroize();
+        self.chat_id.zeroize();
+        self.message_id.zeroize();
+        for mut code_id in self.eligible_recipient_code_ids.drain() {
+            code_id.zeroize();
+        }
+    }
+}
+
 struct AttachmentDownloadClaim {
     recipient_code_id: CodeId,
     created_at_ms: u64,
@@ -583,6 +624,7 @@ impl Drop for ClientHandle {
 
 #[derive(Clone)]
 enum ConversationAccess {
+    MlsRoom(rooms::RoomPolicy),
     Room(RoomRecord),
     Direct,
 }
@@ -703,6 +745,20 @@ struct HealthResponse {
     storage: &'static str,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MlsRosterWire {
+    username: String,
+    stable_identity_b64: String,
+}
+
+impl Drop for MlsRosterWire {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.stable_identity_b64.zeroize();
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(tag = "type")]
@@ -774,6 +830,106 @@ enum InboundFrame {
     DeleteRoom { chat_id: String },
     #[serde(rename = "open_direct")]
     OpenDirect { peer_username: String },
+    #[serde(rename = "mls_create_room")]
+    MlsCreateRoom {
+        protocol_version: u32,
+        room_id: String,
+        group_id_b64: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        membership_digest_b64: String,
+        stable_identity_b64: String,
+        state_envelope_b64: String,
+        #[serde(default)]
+        policy: rooms::RoomPolicy,
+    },
+    #[serde(rename = "mls_discover_room")]
+    MlsDiscoverRoom {
+        protocol_version: u32,
+        room_id: String,
+    },
+    #[serde(rename = "mls_join_request")]
+    MlsJoinRequest {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+        stable_identity_b64: String,
+        key_package_b64: String,
+        state_envelope_b64: String,
+    },
+    #[serde(rename = "mls_join_reject")]
+    MlsJoinReject {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+    },
+    #[serde(rename = "mls_leave_request")]
+    MlsLeaveRequest {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+    },
+    #[serde(rename = "mls_leave_reject")]
+    MlsLeaveReject {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+    },
+    #[serde(rename = "mls_membership_commit")]
+    MlsMembershipCommit {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        request_id: Option<String>,
+        #[serde(with = "mls_wire::decimal_u64")]
+        from_epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        to_epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        group_id_b64: String,
+        from_membership_digest_b64: String,
+        membership_digest_b64: String,
+        roster: Vec<MlsRosterWire>,
+        control_b64: String,
+        welcome_b64: String,
+        authenticated_data_b64: String,
+        state_envelope_b64: String,
+    },
+    #[serde(rename = "mls_application")]
+    MlsApplication {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        group_id_b64: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        membership_digest_b64: String,
+        ciphertext_b64: String,
+        authenticated_data_b64: String,
+        state_envelope_b64: String,
+    },
+    #[serde(rename = "mls_state_snapshot")]
+    MlsStateSnapshot {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        membership_digest_b64: String,
+        state_envelope_b64: String,
+    },
+    #[serde(rename = "mls_delete_room")]
+    MlsDeleteRoom {
+        protocol_version: u32,
+        room_id: String,
+    },
     #[serde(rename = "dummy")]
     Dummy {
         padding_b64: Option<String>,
@@ -800,6 +956,7 @@ impl Drop for InboundRecipientEnvelope {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Serialize)]
 #[serde(tag = "type")]
 enum OutboundFrame {
@@ -846,6 +1003,119 @@ enum OutboundFrame {
     Directs { directs: Vec<DirectRecord> },
     #[serde(rename = "direct_opened")]
     DirectOpened { direct: DirectRecord },
+    #[serde(rename = "mls_rooms")]
+    MlsRooms {
+        protocol_version: u32,
+        rooms: Vec<MlsRoomWire>,
+    },
+    #[serde(rename = "mls_room_discovered")]
+    MlsRoomDiscovered {
+        protocol_version: u32,
+        room_id: String,
+        group_id_b64: String,
+        owner_username: String,
+    },
+    #[serde(rename = "mls_room_created")]
+    MlsRoomCreated {
+        protocol_version: u32,
+        room: MlsRoomWire,
+    },
+    #[serde(rename = "mls_join_requested")]
+    MlsJoinRequested {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+        username: String,
+        stable_identity_b64: String,
+        key_package_b64: String,
+    },
+    #[serde(rename = "mls_join_rejected")]
+    MlsJoinRejected {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+    },
+    #[serde(rename = "mls_leave_requested")]
+    MlsLeaveRequested {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+        username: String,
+        stable_identity_b64: String,
+    },
+    #[serde(rename = "mls_leave_pending")]
+    MlsLeavePending {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+    },
+    #[serde(rename = "mls_leave_rejected")]
+    MlsLeaveRejected {
+        protocol_version: u32,
+        room_id: String,
+        request_id: String,
+    },
+    #[serde(rename = "mls_left")]
+    MlsLeft {
+        protocol_version: u32,
+        room_id: String,
+    },
+    #[serde(rename = "mls_membership")]
+    MlsMembership {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        from_epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        to_epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        from_membership_digest_b64: String,
+        group_id_b64: String,
+        membership_digest_b64: String,
+        roster: Vec<MlsRosterWire>,
+        control_b64: String,
+        welcome_b64: String,
+        authenticated_data_b64: String,
+    },
+    #[serde(rename = "mls_application")]
+    MlsApplication {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        sender_username: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        epoch: u64,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        membership_digest_b64: String,
+        ciphertext_b64: String,
+        authenticated_data_b64: String,
+    },
+    #[serde(rename = "mls_room_result")]
+    MlsRoomResult {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        accepted: bool,
+    },
+    #[serde(rename = "mls_room_deleted")]
+    MlsRoomDeleted {
+        protocol_version: u32,
+        room_id: String,
+    },
+    #[serde(rename = "mls_snapshot_result")]
+    MlsSnapshotResult {
+        protocol_version: u32,
+        room_id: String,
+        message_id: String,
+        #[serde(with = "mls_wire::decimal_u64")]
+        revision: u64,
+        accepted: bool,
+    },
     #[serde(rename = "message_result")]
     MessageResult { message_id: String, accepted: bool },
     #[serde(rename = "ack_result")]
@@ -876,6 +1146,26 @@ struct InboundMessageWire<'a> {
 }
 
 impl OutboundFrame {
+    fn is_mls(&self) -> bool {
+        matches!(
+            self,
+            Self::MlsRooms { .. }
+                | Self::MlsRoomDiscovered { .. }
+                | Self::MlsRoomCreated { .. }
+                | Self::MlsJoinRequested { .. }
+                | Self::MlsJoinRejected { .. }
+                | Self::MlsLeaveRequested { .. }
+                | Self::MlsLeavePending { .. }
+                | Self::MlsLeaveRejected { .. }
+                | Self::MlsLeft { .. }
+                | Self::MlsMembership { .. }
+                | Self::MlsApplication { .. }
+                | Self::MlsRoomResult { .. }
+                | Self::MlsRoomDeleted { .. }
+                | Self::MlsSnapshotResult { .. }
+        )
+    }
+
     fn zeroize_sensitive(&mut self) {
         if let Self::Message {
             chat_id,
@@ -924,6 +1214,155 @@ impl OutboundFrame {
         if let Self::MessageResult { message_id, .. } | Self::AckResult { message_id, .. } = self {
             message_id.zeroize();
         }
+        match self {
+            Self::MlsApplication {
+                room_id,
+                message_id,
+                sender_username,
+                membership_digest_b64,
+                ciphertext_b64,
+                authenticated_data_b64,
+                ..
+            } => {
+                room_id.zeroize();
+                message_id.zeroize();
+                sender_username.zeroize();
+                membership_digest_b64.zeroize();
+                ciphertext_b64.zeroize();
+                authenticated_data_b64.zeroize();
+            }
+            Self::MlsMembership {
+                room_id,
+                message_id,
+                group_id_b64,
+                from_membership_digest_b64,
+                membership_digest_b64,
+                control_b64,
+                welcome_b64,
+                authenticated_data_b64,
+                roster,
+                ..
+            } => {
+                room_id.zeroize();
+                message_id.zeroize();
+                group_id_b64.zeroize();
+                from_membership_digest_b64.zeroize();
+                membership_digest_b64.zeroize();
+                control_b64.zeroize();
+                welcome_b64.zeroize();
+                authenticated_data_b64.zeroize();
+                for member in roster {
+                    member.username.zeroize();
+                    member.stable_identity_b64.zeroize();
+                }
+            }
+            Self::MlsJoinRequested {
+                room_id,
+                request_id,
+                username,
+                stable_identity_b64,
+                key_package_b64,
+                ..
+            } => {
+                room_id.zeroize();
+                request_id.zeroize();
+                username.zeroize();
+                stable_identity_b64.zeroize();
+                key_package_b64.zeroize();
+            }
+            Self::MlsJoinRejected {
+                room_id,
+                request_id,
+                ..
+            } => {
+                room_id.zeroize();
+                request_id.zeroize();
+            }
+            Self::MlsLeaveRequested {
+                room_id,
+                request_id,
+                username,
+                stable_identity_b64,
+                ..
+            } => {
+                room_id.zeroize();
+                request_id.zeroize();
+                username.zeroize();
+                stable_identity_b64.zeroize();
+            }
+            Self::MlsLeavePending {
+                room_id,
+                request_id,
+                ..
+            }
+            | Self::MlsLeaveRejected {
+                room_id,
+                request_id,
+                ..
+            } => {
+                room_id.zeroize();
+                request_id.zeroize();
+            }
+            Self::MlsLeft { room_id, .. } => room_id.zeroize(),
+            Self::MlsRoomResult {
+                room_id,
+                message_id,
+                ..
+            } => {
+                room_id.zeroize();
+                message_id.zeroize();
+            }
+            Self::MlsRoomDeleted { room_id, .. } => room_id.zeroize(),
+            Self::MlsSnapshotResult {
+                room_id,
+                message_id,
+                ..
+            } => {
+                room_id.zeroize();
+                message_id.zeroize();
+            }
+            Self::MlsRoomCreated { room, .. } => {
+                room.room_id.zeroize();
+                room.owner_username.zeroize();
+                room.group_id_b64.zeroize();
+                room.membership_digest_b64.zeroize();
+                if let Some(snapshot) = &mut room.recovery_snapshot {
+                    snapshot.membership_digest_b64.zeroize();
+                    snapshot.state_envelope_b64.zeroize();
+                }
+                for member in &mut room.roster {
+                    member.username.zeroize();
+                    member.stable_identity_b64.zeroize();
+                }
+            }
+            Self::MlsRoomDiscovered {
+                room_id,
+                group_id_b64,
+                owner_username,
+                ..
+            } => {
+                room_id.zeroize();
+                group_id_b64.zeroize();
+                owner_username.zeroize();
+            }
+            Self::MlsRooms { rooms, .. } => {
+                for room in rooms {
+                    room.room_id.zeroize();
+                    room.owner_username.zeroize();
+                    room.group_id_b64.zeroize();
+                    room.membership_digest_b64.zeroize();
+                    if let Some(snapshot) = &mut room.recovery_snapshot {
+                        snapshot.membership_digest_b64.zeroize();
+                        snapshot.state_envelope_b64.zeroize();
+                    }
+                    for member in &mut room.roster {
+                        member.username.zeroize();
+                        member.stable_identity_b64.zeroize();
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -948,6 +1387,54 @@ struct PresenceUser {
 struct DirectRecord {
     id: String,
     peer_username: String,
+}
+
+#[derive(Clone, Serialize)]
+struct MlsRoomWire {
+    room_id: String,
+    owner_username: String,
+    group_id_b64: String,
+    active: bool,
+    synchronized: bool,
+    #[serde(with = "mls_wire::decimal_u64")]
+    epoch: u64,
+    #[serde(with = "mls_wire::decimal_u64")]
+    revision: u64,
+    membership_digest_b64: String,
+    roster: Vec<MlsRosterWire>,
+    recovery_snapshot: Option<MlsRecoverySnapshotWire>,
+    policy: rooms::RoomPolicy,
+}
+
+impl Drop for MlsRoomWire {
+    fn drop(&mut self) {
+        self.room_id.zeroize();
+        self.owner_username.zeroize();
+        self.group_id_b64.zeroize();
+        self.membership_digest_b64.zeroize();
+        self.recovery_snapshot = None;
+        self.roster.clear();
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct MlsRecoverySnapshotWire {
+    active: bool,
+    #[serde(with = "mls_wire::decimal_u64")]
+    epoch: u64,
+    #[serde(with = "mls_wire::decimal_u64")]
+    revision: u64,
+    membership_digest_b64: String,
+    state_envelope_b64: String,
+    roster: Vec<MlsRosterWire>,
+}
+
+impl Drop for MlsRecoverySnapshotWire {
+    fn drop(&mut self) {
+        self.membership_digest_b64.zeroize();
+        self.state_envelope_b64.zeroize();
+        self.roster.clear();
+    }
 }
 
 fn configured_bind_addr() -> SocketAddr {
@@ -1020,6 +1507,7 @@ async fn main() {
     let state = AppState::from_env();
     tokio::spawn(attachment_sweeper(state.clone()));
     tokio::spawn(session_sweeper(state.clone()));
+    tokio::spawn(mls_sweeper(state.clone()));
     if state.inactivity_limit_ms.is_some() {
         tokio::spawn(inactivity_watcher(state.clone()));
     }
@@ -1209,6 +1697,10 @@ impl AppState {
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
             prekey_leases: Arc::new(Mutex::new(HashMap::new())),
+            mls_rooms: Arc::new(Mutex::new(rooms::RoomAuthority::new_with_pending_ttl(
+                max_rooms_per_user,
+                pending_message_ttl_ms,
+            ))),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),
@@ -1780,6 +2272,24 @@ async fn remove_chat_attachments(state: &AppState, chat_id: &str) {
     });
 }
 
+async fn revoke_mls_attachment_access(state: &AppState, room_id: &str, removed_code_id: &CodeId) {
+    let mut attachments = state.attachments.lock().await;
+    for record in attachments
+        .values_mut()
+        .filter(|record| record.chat_id == room_id)
+    {
+        if let Some(mut code_id) = record.eligible_recipient_code_ids.take(removed_code_id) {
+            code_id.zeroize();
+        }
+        if let Some(mut code_id) = record.completed_recipient_code_ids.take(removed_code_id) {
+            code_id.zeroize();
+        }
+        record
+            .download_claims
+            .retain(|_, claim| claim.recipient_code_id != *removed_code_id);
+    }
+}
+
 async fn session_sweeper(state: AppState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1798,6 +2308,15 @@ async fn session_sweeper(state: AppState) {
         drop(sessions);
         prune_ws_tickets(&state, now).await;
         prune_pending_queues(&state, now).await;
+    }
+}
+
+async fn mls_sweeper(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        state.mls_rooms.lock().await.prune_at(now_ms());
     }
 }
 
@@ -2076,7 +2595,9 @@ async fn attachment_conversation_access(
     let Some(access) = conversation_access(state, username, chat_id).await else {
         return Err(StatusCode::FORBIDDEN);
     };
-    if matches!(&access, ConversationAccess::Room(room) if !room_allows_media(room, media_type)) {
+    if matches!(&access, ConversationAccess::MlsRoom(policy) if !policy_allows_media(policy, media_type))
+        || matches!(&access, ConversationAccess::Room(room) if !room_allows_media(room, media_type))
+    {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(access)
@@ -2097,6 +2618,23 @@ async fn conversation_access(
 ) -> Option<ConversationAccess> {
     if !valid_chat_id(chat_id) {
         return None;
+    }
+    let code_id = state
+        .accounts
+        .lock()
+        .await
+        .iter()
+        .find_map(|(code_id, account)| (account.username == username).then_some(*code_id));
+    if let Some(code_id) = code_id {
+        let mut mls_rooms = state.mls_rooms.lock().await;
+        if mls_rooms.is_member(chat_id, &code_id) {
+            if !mls_rooms.is_active_member(chat_id, &code_id) {
+                return None;
+            }
+            if let Ok(info) = mls_rooms.member_info(chat_id, &code_id) {
+                return Some(ConversationAccess::MlsRoom(info.policy));
+            }
+        }
     }
     if let Some(room) = state
         .room_catalog
@@ -2123,6 +2661,17 @@ async fn snapshot_attachment_recipients(
     owner_username: &str,
     owner_code_id: &CodeId,
 ) -> HashSet<CodeId> {
+    if let ConversationAccess::MlsRoom(_) = access {
+        return state
+            .mls_rooms
+            .lock()
+            .await
+            .active_member_code_ids(chat_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|code_id| code_id != owner_code_id)
+            .collect();
+    }
     let peer_username = if matches!(access, ConversationAccess::Direct) {
         state
             .direct_catalog
@@ -2141,6 +2690,7 @@ async fn snapshot_attachment_recipients(
         .filter(|(code_id, account)| {
             **code_id != *owner_code_id
                 && match (&access, &peer_username) {
+                    (ConversationAccess::MlsRoom(_), _) => false,
                     (ConversationAccess::Room(_), _) => true,
                     (ConversationAccess::Direct, Some(peer)) => account.username == *peer,
                     (ConversationAccess::Direct, None) => false,
@@ -2155,6 +2705,14 @@ fn room_allows_media(room: &RoomRecord, media_type: &str) -> bool {
         "IMAGE" => room.allow_images,
         "VIDEO" => room.allow_videos,
         _ => room.allow_files,
+    }
+}
+
+fn policy_allows_media(policy: &rooms::RoomPolicy, media_type: &str) -> bool {
+    match media_type {
+        "IMAGE" => policy.allow_images,
+        "VIDEO" => policy.allow_videos,
+        _ => policy.allow_files,
     }
 }
 
@@ -2176,6 +2734,24 @@ fn enforced_attachment_ttl_sec(room: &RoomRecord, media_type: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn enforced_attachment_ttl_sec_policy(policy: &rooms::RoomPolicy, media_type: &str) -> u64 {
+    let room_ttl = policy
+        .enforce_text_absolute_expiry
+        .then_some(policy.overall_expiry_sec)
+        .filter(|ttl| *ttl > 0);
+    let media_ttl = match media_type {
+        "IMAGE" if policy.enforce_image_absolute_expiry => policy.image_overall_expiry_sec,
+        "VIDEO" if policy.enforce_video_absolute_expiry => policy.video_overall_expiry_sec,
+        "FILE" if policy.enforce_file_absolute_expiry => policy.file_overall_expiry_sec,
+        _ => 0,
+    };
+    room_ttl
+        .into_iter()
+        .chain((media_ttl > 0).then_some(media_ttl))
+        .min()
+        .unwrap_or(0)
+}
+
 fn effective_attachment_ttl_sec(
     requested: Option<u64>,
     access: &ConversationAccess,
@@ -2183,15 +2759,24 @@ fn effective_attachment_ttl_sec(
     max_lifetime_sec: u64,
 ) -> u64 {
     let requested = requested.unwrap_or_default().min(86_400);
-    let effective = if let ConversationAccess::Room(room) = access {
-        let enforced = enforced_attachment_ttl_sec(room, media_type);
-        match (requested, enforced) {
-            (0, enforced) => enforced,
-            (requested, 0) => requested,
-            (requested, enforced) => requested.min(enforced),
+    let effective = match access {
+        ConversationAccess::MlsRoom(policy) => {
+            let enforced = enforced_attachment_ttl_sec_policy(policy, media_type);
+            match (requested, enforced) {
+                (0, enforced) => enforced,
+                (requested, 0) => requested,
+                (requested, enforced) => requested.min(enforced),
+            }
         }
-    } else {
-        requested
+        ConversationAccess::Room(room) => {
+            let enforced = enforced_attachment_ttl_sec(room, media_type);
+            match (requested, enforced) {
+                (0, enforced) => enforced,
+                (requested, 0) => requested,
+                (requested, enforced) => requested.min(enforced),
+            }
+        }
+        ConversationAccess::Direct => requested,
     };
     // Even an explicit zero/no-expiry request gets a finite relay-side
     // lifetime.  Room policy can still shorten this value, never extend it.
@@ -2302,21 +2887,21 @@ async fn staged_attachment_for_message(
     }
 }
 
-async fn publish_staged_attachment(
+async fn publish_staged_attachment_checked(
     state: &AppState,
     attachment_id: Uuid,
     owner_code_id: &CodeId,
     chat_id: &str,
     message_id: &str,
-) {
+) -> Result<(), String> {
     let key = AttachmentBindingKey::new(owner_code_id, chat_id, message_id);
     let mut bindings = state.attachment_bindings.lock().await;
     let Some(indexed_id) = bindings.get(&key).copied() else {
-        return;
+        return Err("staged attachment unavailable".to_string());
     };
     if indexed_id != attachment_id {
         bindings.remove(&key);
-        return;
+        return Err("staged attachment binding mismatch".to_string());
     }
     let mut attachments = state.attachments.lock().await;
     let now = now_ms();
@@ -2335,12 +2920,13 @@ async fn publish_staged_attachment(
         _ => 3,
     };
     match action {
-        0 => {}
+        0 => Ok(()),
         1 => {
             if let Some(record) = attachments.get_mut(&attachment_id) {
                 record.published = true;
                 record.staged_expires_at_ms = None;
             }
+            Ok(())
         }
         2 => {
             if let Some(record) = attachments.remove(&attachment_id) {
@@ -2352,6 +2938,7 @@ async fn publish_staged_attachment(
                     record.blob.bytes.len(),
                 );
             }
+            Err("staged attachment expired".to_string())
         }
         _ => {
             let orphaned_record = attachments.get(&attachment_id).is_some_and(|record| {
@@ -2371,7 +2958,77 @@ async fn publish_staged_attachment(
                     );
                 }
             }
+            Err("staged attachment unavailable".to_string())
         }
+    }
+}
+
+async fn publish_staged_attachment(
+    state: &AppState,
+    attachment_id: Uuid,
+    owner_code_id: &CodeId,
+    chat_id: &str,
+    message_id: &str,
+) {
+    let _ =
+        publish_staged_attachment_checked(state, attachment_id, owner_code_id, chat_id, message_id)
+            .await;
+}
+
+async fn rebind_staged_attachment_recipients(
+    state: &AppState,
+    attachment_id: Uuid,
+    recipients: &HashSet<CodeId>,
+) -> Result<StagedAttachmentRollback, String> {
+    let mut attachments = state.attachments.lock().await;
+    let record = attachments
+        .get_mut(&attachment_id)
+        .ok_or_else(|| "staged attachment unavailable".to_string())?;
+    if record.published {
+        return Err("staged attachment already published".to_string());
+    }
+    if (record.one_time || record.delete_after_download) && recipients.is_empty() {
+        return Err("attachment recipient roster rejected".to_string());
+    }
+    let rollback = StagedAttachmentRollback {
+        attachment_id,
+        owner_code_id: record.owner_code_id,
+        chat_id: record.chat_id.clone(),
+        message_id: record.message_id.clone(),
+        eligible_recipient_code_ids: record.eligible_recipient_code_ids.clone(),
+        published: record.published,
+        staged_expires_at_ms: record.staged_expires_at_ms,
+    };
+    if record.one_time || record.delete_after_download {
+        record.eligible_recipient_code_ids = recipients.clone();
+    }
+    Ok(rollback)
+}
+
+async fn rollback_staged_attachment(state: &AppState, mut rollback: StagedAttachmentRollback) {
+    let attachment_id = rollback.attachment_id;
+    let key = AttachmentBindingKey::new(
+        &rollback.owner_code_id,
+        &rollback.chat_id,
+        &rollback.message_id,
+    );
+    let mut bindings = state.attachment_bindings.lock().await;
+    let mut attachments = state.attachments.lock().await;
+    let restored = if let Some(record) = attachments.get_mut(&rollback.attachment_id) {
+        if key.matches_record(record) {
+            record.eligible_recipient_code_ids =
+                std::mem::take(&mut rollback.eligible_recipient_code_ids);
+            record.published = rollback.published;
+            record.staged_expires_at_ms = rollback.staged_expires_at_ms;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if restored {
+        bindings.insert(key, attachment_id);
     }
 }
 
@@ -3128,6 +3785,27 @@ fn decode_bounded(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn decode_bounded_allow_empty(value: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    decode_bounded(value, max_bytes)
+}
+
+fn valid_mls_correlator(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= rooms::MAX_ROOM_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn require_mls_protocol_version(version: u32) -> Result<(), String> {
+    (version == rooms::MLS_PROTOCOL_VERSION)
+        .then_some(())
+        .ok_or_else(|| "Wrong information".to_string())
+}
+
 fn decode_exact(value: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
     let bytes = decode_bounded(value, expected_bytes)?;
     (bytes.len() == expected_bytes)
@@ -3827,9 +4505,11 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     if !websocket_origin_allowed(&headers, &state.web_origins) {
+        debug!("websocket_upgrade_rejected reason=origin");
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(ticket) = websocket_ticket_header(&headers) else {
+        debug!("websocket_upgrade_rejected reason=protocol");
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let auth = consume_ws_ticket(&state, ticket.as_str()).await;
@@ -3840,14 +4520,16 @@ async fn ws_handler(
             let code_id = session.code_id;
             let mut active_connections = state.active_connections.lock().await;
             if !reserve_connection(&mut active_connections, code_id, client_id) {
+                debug!("websocket_upgrade_rejected reason=active_connection");
                 return StatusCode::CONFLICT.into_response();
             }
             drop(active_connections);
             let failed_state = state.clone();
-            ws.max_frame_size(WS_MAX_FRAME_BYTES)
-                .max_message_size(WS_MAX_FRAME_BYTES)
+            ws.max_frame_size(MLS_WS_MAX_FRAME_BYTES)
+                .max_message_size(MLS_WS_MAX_FRAME_BYTES)
                 .protocols([WEB_SOCKET_PROTOCOL])
                 .on_failed_upgrade(move |_| {
+                    debug!("websocket_upgrade_failed reason=transport");
                     tokio::spawn(async move {
                         release_connection_reservation(&failed_state, &code_id, client_id).await;
                     });
@@ -3855,7 +4537,10 @@ async fn ws_handler(
                 .on_upgrade(move |socket| socket_loop(state, token, session, client_id, socket))
                 .into_response()
         }
-        None => StatusCode::UNAUTHORIZED.into_response(),
+        None => {
+            debug!("websocket_upgrade_rejected reason=ticket_or_session");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
     }
 }
 
@@ -3949,7 +4634,10 @@ async fn socket_loop(
     }
     info!("client_connected id={client_id}");
     broadcast_presence(&state).await;
-    send_room_catalog(&state, client_id).await;
+    send_mls_catalog(&state, client_id, &auth.code_id).await;
+    send_mls_pending(&state, client_id, &auth.code_id).await;
+    send_mls_pending_joins(&state, client_id, &auth.code_id).await;
+    send_mls_pending_leaves(&state, client_id, &auth.code_id).await;
     send_direct_catalog(&state, client_id, &auth.username).await;
 
     let global_outbound_bytes = Arc::clone(&state.outbound_bytes);
@@ -4078,9 +4766,12 @@ async fn socket_loop(
                         if active_session(&state, session_token.as_str(), false).await.is_none() {
                             break;
                         }
-                        if let Err(err) = check_ws_frame_allowed(&state, client_id, text.len()).await {
-                            warn!("dropping limited frame from {client_id}: {err}");
-                            continue;
+                        if let Err(err) = validate_inbound_text_socket_admission(
+                            text.as_str(),
+                            check_ws_frame_allowed(&state, client_id, text.len()).await,
+                        ) {
+                            warn!("closing limited frame connection from {client_id}: {err}");
+                            break;
                         }
                         if let Err(err) = handle_frame(&state, client_id, text.as_str()).await {
                             warn!("dropping invalid frame from {client_id}: {err}");
@@ -4088,7 +4779,8 @@ async fn socket_loop(
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if let Err(err) = check_ws_frame_allowed(&state, client_id, bytes.len()).await {
-                            warn!("dropping limited binary frame from {client_id}: {err}");
+                            warn!("closing limited binary connection from {client_id}: {err}");
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -4114,10 +4806,10 @@ async fn check_ws_frame_allowed(
     client_id: Uuid,
     frame_bytes: usize,
 ) -> Result<(), String> {
-    if frame_bytes > WS_MAX_FRAME_BYTES {
+    if frame_bytes > MLS_WS_MAX_FRAME_BYTES {
         return Err(format!(
             "frame too large: bytes={} max={}",
-            frame_bytes, WS_MAX_FRAME_BYTES
+            frame_bytes, MLS_WS_MAX_FRAME_BYTES
         ));
     }
 
@@ -4147,7 +4839,45 @@ async fn check_ws_frame_allowed(
     Ok(())
 }
 
+fn validate_inbound_frame_size_before_parse(text: &str) -> Result<(), String> {
+    let frame_bytes = text.len();
+    if frame_bytes <= WS_MAX_FRAME_BYTES {
+        return Ok(());
+    }
+    if frame_bytes > MLS_WS_MAX_FRAME_BYTES {
+        return Err(format!(
+            "frame too large: bytes={} max={}",
+            frame_bytes, MLS_WS_MAX_FRAME_BYTES
+        ));
+    }
+    if LARGE_MLS_INBOUND_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "oversized inbound frame is not a canonical protocol-v10 MLS frame: bytes={} legacy_max={}",
+        frame_bytes, WS_MAX_FRAME_BYTES
+    ))
+}
+
+fn validate_inbound_text_socket_admission(
+    text: &str,
+    frame_limit: Result<(), String>,
+) -> Result<(), String> {
+    // Size classification is repeated here even though handle_frame keeps the
+    // same check as defense in depth for direct callers and tests.  Returning
+    // an error from this function is the socket-loop's terminal branch.
+    validate_inbound_frame_size_before_parse(text)?;
+    frame_limit
+}
+
 async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(), String> {
+    // Do this before serde_json sees attacker-controlled input.  The websocket
+    // layer permits the MLS ceiling so legitimate state envelopes can transit,
+    // but legacy and unknown frames retain the smaller parser allocation budget.
+    validate_inbound_frame_size_before_parse(text)?;
     let frame: InboundFrame = serde_json::from_str(text).map_err(|err| err.to_string())?;
     validate_inbound_message_padding(text, &frame)?;
     match frame {
@@ -4191,9 +4921,15 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             Ok(())
         }
         InboundFrame::Join { chat_id } => {
+            if state.room_catalog.lock().await.contains_key(&chat_id) {
+                return Err("protocol-v9 rooms are unavailable".to_string());
+            }
             touch_activity_on_success(state, join_room(state, sender_id, chat_id).await).await
         }
         InboundFrame::Leave { chat_id } => {
+            if state.room_catalog.lock().await.contains_key(&chat_id) {
+                return Err("protocol-v9 rooms are unavailable".to_string());
+            }
             touch_activity_on_success(state, leave_room(state, sender_id, &chat_id).await).await
         }
         InboundFrame::Message {
@@ -4304,13 +5040,245 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             touch_activity_on_success(state, broadcast_wipe(state, sender_id).await).await
         }
         InboundFrame::CreateRoom { room } => {
-            touch_activity_on_success(state, create_room(state, sender_id, room).await).await
+            let _ = room;
+            Err("protocol-v9 rooms are unavailable".to_string())
         }
         InboundFrame::DeleteRoom { chat_id } => {
-            touch_activity_on_success(state, delete_room(state, sender_id, &chat_id).await).await
+            let _ = chat_id;
+            Err("protocol-v9 rooms are unavailable".to_string())
         }
         InboundFrame::OpenDirect { peer_username } => {
             touch_activity_on_success(state, open_direct(state, sender_id, &peer_username).await)
+                .await
+        }
+        InboundFrame::MlsCreateRoom {
+            protocol_version,
+            room_id,
+            group_id_b64,
+            epoch,
+            revision,
+            membership_digest_b64,
+            stable_identity_b64,
+            state_envelope_b64,
+            policy,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(
+                state,
+                mls_create_room(
+                    state,
+                    sender_id,
+                    room_id,
+                    group_id_b64,
+                    epoch,
+                    revision,
+                    membership_digest_b64,
+                    stable_identity_b64,
+                    state_envelope_b64,
+                    policy,
+                )
+                .await,
+            )
+            .await
+        }
+        InboundFrame::MlsDiscoverRoom {
+            protocol_version,
+            room_id,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(state, mls_discover_room(state, sender_id, &room_id).await)
+                .await
+        }
+        InboundFrame::MlsJoinRequest {
+            protocol_version,
+            room_id,
+            request_id,
+            stable_identity_b64,
+            key_package_b64,
+            state_envelope_b64,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(
+                state,
+                mls_join_request(
+                    state,
+                    sender_id,
+                    room_id,
+                    request_id,
+                    stable_identity_b64,
+                    key_package_b64,
+                    state_envelope_b64,
+                )
+                .await,
+            )
+            .await
+        }
+        InboundFrame::MlsJoinReject {
+            protocol_version,
+            room_id,
+            request_id,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(
+                state,
+                mls_join_reject(state, sender_id, &room_id, &request_id).await,
+            )
+            .await
+        }
+        InboundFrame::MlsLeaveRequest {
+            protocol_version,
+            room_id,
+            request_id,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(
+                state,
+                mls_leave_request(state, sender_id, room_id, request_id).await,
+            )
+            .await
+        }
+        InboundFrame::MlsLeaveReject {
+            protocol_version,
+            room_id,
+            request_id,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(
+                state,
+                mls_leave_reject(state, sender_id, &room_id, &request_id).await,
+            )
+            .await
+        }
+        InboundFrame::MlsMembershipCommit {
+            protocol_version,
+            room_id,
+            message_id,
+            request_id,
+            from_epoch,
+            to_epoch,
+            revision,
+            group_id_b64,
+            from_membership_digest_b64,
+            membership_digest_b64,
+            roster,
+            control_b64,
+            welcome_b64,
+            authenticated_data_b64,
+            state_envelope_b64,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            let safe = valid_mls_correlator(&room_id) && valid_mls_correlator(&message_id);
+            let authenticated = safe && client_identity(state, sender_id).await.is_ok();
+            let result = mls_membership_commit(
+                state,
+                sender_id,
+                room_id.clone(),
+                message_id.clone(),
+                request_id,
+                from_epoch,
+                to_epoch,
+                revision,
+                group_id_b64,
+                from_membership_digest_b64,
+                membership_digest_b64,
+                roster,
+                control_b64,
+                welcome_b64,
+                authenticated_data_b64,
+                state_envelope_b64,
+            )
+            .await;
+            finish_mls_room_transaction(
+                state,
+                sender_id,
+                room_id,
+                message_id,
+                revision,
+                authenticated,
+                result,
+            )
+            .await
+        }
+        InboundFrame::MlsApplication {
+            protocol_version,
+            room_id,
+            message_id,
+            group_id_b64,
+            epoch,
+            revision,
+            membership_digest_b64,
+            ciphertext_b64,
+            authenticated_data_b64,
+            state_envelope_b64,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            let safe = valid_mls_correlator(&room_id) && valid_mls_correlator(&message_id);
+            let authenticated = safe && client_identity(state, sender_id).await.is_ok();
+            let result = mls_application(
+                state,
+                sender_id,
+                room_id.clone(),
+                message_id.clone(),
+                group_id_b64,
+                epoch,
+                revision,
+                membership_digest_b64,
+                ciphertext_b64,
+                authenticated_data_b64,
+                state_envelope_b64,
+            )
+            .await;
+            finish_mls_room_transaction(
+                state,
+                sender_id,
+                room_id,
+                message_id,
+                revision,
+                authenticated,
+                result,
+            )
+            .await
+        }
+        InboundFrame::MlsStateSnapshot {
+            protocol_version,
+            room_id,
+            message_id,
+            epoch,
+            revision,
+            membership_digest_b64,
+            state_envelope_b64,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            let safe = valid_mls_correlator(&room_id) && valid_mls_correlator(&message_id);
+            let authenticated = safe && client_identity(state, sender_id).await.is_ok();
+            let result = mls_state_snapshot(
+                state,
+                sender_id,
+                room_id.clone(),
+                message_id.clone(),
+                epoch,
+                revision,
+                membership_digest_b64,
+                state_envelope_b64,
+            )
+            .await;
+            finish_mls_snapshot_transaction(
+                state,
+                sender_id,
+                room_id,
+                message_id,
+                revision,
+                authenticated,
+                result,
+            )
+            .await
+        }
+        InboundFrame::MlsDeleteRoom {
+            protocol_version,
+            room_id,
+        } => {
+            require_mls_protocol_version(protocol_version)?;
+            touch_activity_on_success(state, mls_delete_room(state, sender_id, &room_id).await)
                 .await
         }
     }
@@ -4336,6 +5304,7 @@ async fn lease_prekey(
         .await
         .ok_or_else(|| "conversation unavailable".to_string())?;
     let authorized = match access {
+        ConversationAccess::MlsRoom(_) => false,
         ConversationAccess::Direct => state
             .direct_catalog
             .lock()
@@ -4672,6 +5641,9 @@ async fn route_encrypted_message_with_directory(
     let staged_attachment_id =
         staged_attachment_for_message(state, &sender_code_id, &chat_id, &message_id).await?;
     let expected_recipients = match access {
+        ConversationAccess::MlsRoom(_) => {
+            return Err("MLS application required".to_string());
+        }
         ConversationAccess::Room(_) => state
             .accounts
             .lock()
@@ -4954,6 +5926,7 @@ async fn admit_prekey_leases(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn release_prekey_lease(
     state: &AppState,
     chat_id: &str,
@@ -5549,6 +6522,7 @@ async fn acknowledge_message(
         .await
         .ok_or_else(|| "conversation unavailable".to_string())?;
     let valid_sender = match access {
+        ConversationAccess::MlsRoom(_) => false,
         ConversationAccess::Room(_) => state
             .accounts
             .lock()
@@ -5742,6 +6716,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     zeroize_code_id_map(&mut attachment_usage);
     drop(attachment_usage);
     state.room_catalog.lock().await.clear();
+    state.mls_rooms.lock().await.wipe();
     state.direct_catalog.lock().await.clear();
     state.rooms.lock().await.clear();
     let mut sessions = state.sessions.lock().await;
@@ -5775,6 +6750,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     zeroize_code_id_map(&mut active_connections);
 }
 
+#[allow(dead_code)]
 async fn create_room(
     state: &AppState,
     sender_id: Uuid,
@@ -5815,6 +6791,7 @@ async fn create_room(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result<(), String> {
     let _conversation_guard = state.conversation_ops.lock().await;
     let (owner_code_id, _) = client_identity(state, sender_id).await?;
@@ -5877,6 +6854,7 @@ async fn delete_room(state: &AppState, sender_id: Uuid, chat_id: &str) -> Result
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn send_room_catalog(state: &AppState, client_id: Uuid) {
     let rooms = state
         .room_catalog
@@ -5887,6 +6865,854 @@ async fn send_room_catalog(state: &AppState, client_id: Uuid) {
         .map(|entry| entry.room.clone())
         .collect::<Vec<_>>();
     send_to_client(state, client_id, &OutboundFrame::Rooms { rooms }).await;
+}
+
+fn mls_room_wire(info: rooms::RoomInfo) -> MlsRoomWire {
+    MlsRoomWire {
+        room_id: info.room_id,
+        owner_username: info.owner_username,
+        group_id_b64: URL_SAFE_NO_PAD.encode(info.group_id),
+        active: info.active,
+        synchronized: info.synchronized,
+        epoch: info.epoch,
+        revision: info.revision,
+        membership_digest_b64: URL_SAFE_NO_PAD.encode(info.membership_digest),
+        roster: info
+            .roster
+            .into_iter()
+            .map(|member| MlsRosterWire {
+                username: member.username.clone(),
+                stable_identity_b64: URL_SAFE_NO_PAD.encode(member.stable_identity.clone()),
+            })
+            .collect(),
+        recovery_snapshot: info
+            .recovery_snapshot
+            .map(|snapshot| MlsRecoverySnapshotWire {
+                active: snapshot.active,
+                epoch: snapshot.epoch,
+                revision: snapshot.revision,
+                membership_digest_b64: URL_SAFE_NO_PAD.encode(snapshot.membership_digest.clone()),
+                state_envelope_b64: URL_SAFE_NO_PAD.encode(snapshot.state_envelope.clone()),
+                roster: snapshot
+                    .roster
+                    .iter()
+                    .map(|member| MlsRosterWire {
+                        username: member.username.clone(),
+                        stable_identity_b64: URL_SAFE_NO_PAD.encode(&member.stable_identity),
+                    })
+                    .collect(),
+            }),
+        policy: info.policy,
+    }
+}
+
+fn mls_roster_from_wire(roster: Vec<MlsRosterWire>) -> Result<Vec<rooms::RosterMember>, String> {
+    roster
+        .into_iter()
+        .map(|member| {
+            Ok(rooms::RosterMember {
+                username: member.username.clone(),
+                stable_identity: decode_exact(
+                    &member.stable_identity_b64,
+                    rooms::STABLE_IDENTITY_BYTES,
+                )?,
+            })
+        })
+        .collect()
+}
+
+async fn send_mls_catalog(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    let mut authority = state.mls_rooms.lock().await;
+    let mut rooms = authority
+        .rooms_for_member(code_id)
+        .into_iter()
+        .map(mls_room_wire)
+        .collect::<Vec<_>>();
+    rooms.extend(
+        authority
+            .pending_rooms_for_member(code_id)
+            .into_iter()
+            .map(mls_room_wire),
+    );
+    drop(authority);
+    send_to_client(
+        state,
+        client_id,
+        &OutboundFrame::MlsRooms {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            rooms,
+        },
+    )
+    .await;
+}
+
+async fn mls_discover_room(state: &AppState, sender_id: Uuid, room_id: &str) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let _ = client_identity(state, sender_id).await?;
+    let info = state.mls_rooms.lock().await.discover(room_id)?;
+    send_to_client(
+        state,
+        sender_id,
+        &OutboundFrame::MlsRoomDiscovered {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: info.room_id,
+            group_id_b64: URL_SAFE_NO_PAD.encode(info.group_id),
+            owner_username: info.owner_username,
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn authenticated_mls_identity(
+    state: &AppState,
+    code_id: &CodeId,
+    encoded: &str,
+) -> Result<Vec<u8>, String> {
+    let supplied = decode_exact(encoded, rooms::STABLE_IDENTITY_BYTES)?;
+    let accounts = state.accounts.lock().await;
+    let account = accounts
+        .get(code_id)
+        .ok_or_else(|| "authenticated identity required".to_string())?;
+    if account.identity_public.len() < rooms::STABLE_IDENTITY_BYTES
+        || account.identity_public[..rooms::STABLE_IDENTITY_BYTES] != supplied
+    {
+        return Err("authenticated identity required".to_string());
+    }
+    Ok(supplied)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mls_create_room(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    group_id_b64: String,
+    epoch: u64,
+    revision: u64,
+    membership_digest_b64: String,
+    stable_identity_b64: String,
+    state_envelope_b64: String,
+    policy: rooms::RoomPolicy,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (owner_code_id, owner_username) = client_identity(state, sender_id).await?;
+    let group_id = decode_exact(&group_id_b64, rooms::GROUP_ID_BYTES)?;
+    let digest = decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?;
+    let stable = authenticated_mls_identity(state, &owner_code_id, &stable_identity_b64).await?;
+    let info = state.mls_rooms.lock().await.create_with_policy_and_state(
+        owner_code_id,
+        owner_username,
+        room_id,
+        group_id,
+        epoch,
+        revision,
+        digest,
+        stable,
+        policy,
+        decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
+    )?;
+    send_to_client(
+        state,
+        sender_id,
+        &OutboundFrame::MlsRoomCreated {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room: mls_room_wire(info),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn mls_join_request(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    request_id: String,
+    stable_identity_b64: String,
+    key_package_b64: String,
+    state_envelope_b64: String,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (code_id, username) = client_identity(state, sender_id).await?;
+    let stable = authenticated_mls_identity(state, &code_id, &stable_identity_b64).await?;
+    let key_package = decode_bounded(&key_package_b64, rooms::MAX_KEY_PACKAGE_BYTES)?;
+    let state_envelope = decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?;
+    let request = state.mls_rooms.lock().await.request_join(
+        code_id,
+        username.clone(),
+        &room_id,
+        request_id,
+        stable,
+        key_package,
+        state_envelope,
+    )?;
+    let owner_code_id = state.mls_rooms.lock().await.owner_code_id(&room_id)?;
+    let owner_ids = state
+        .clients
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(client_id, client)| (client.code_id == owner_code_id).then_some(*client_id))
+        .collect::<Vec<_>>();
+    let frame = OutboundFrame::MlsJoinRequested {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        room_id,
+        request_id: request.request_id.clone(),
+        username: request.username.clone(),
+        stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
+        key_package_b64: URL_SAFE_NO_PAD.encode(request.key_package.clone()),
+    };
+    for owner_id in owner_ids {
+        send_to_client(state, owner_id, &frame).await;
+    }
+    Ok(())
+}
+
+async fn mls_join_reject(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: &str,
+    request_id: &str,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (owner_code_id, _) = client_identity(state, sender_id).await?;
+    let request = state
+        .mls_rooms
+        .lock()
+        .await
+        .remove_join(owner_code_id, room_id, request_id)?;
+    let frame = OutboundFrame::MlsJoinRejected {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        room_id: room_id.to_string(),
+        request_id: request.request_id.clone(),
+    };
+    for client_id in active_client_ids_for_code(state, &request.code_id).await {
+        send_to_client(state, client_id, &frame).await;
+    }
+    Ok(())
+}
+
+async fn active_client_ids_for_code(state: &AppState, code_id: &CodeId) -> Vec<Uuid> {
+    state
+        .clients
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(client_id, client)| (client.code_id == *code_id).then_some(*client_id))
+        .collect()
+}
+
+async fn mls_leave_request(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    request_id: String,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (code_id, _) = client_identity(state, sender_id).await?;
+    let request = state
+        .mls_rooms
+        .lock()
+        .await
+        .request_leave(code_id, &room_id, request_id)?;
+    let owner_code_id = state.mls_rooms.lock().await.owner_code_id(&room_id)?;
+    let owner_frame = OutboundFrame::MlsLeaveRequested {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        room_id: room_id.clone(),
+        request_id: request.request_id.clone(),
+        username: request.username.clone(),
+        stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
+    };
+    for owner_id in active_client_ids_for_code(state, &owner_code_id).await {
+        send_to_client(state, owner_id, &owner_frame).await;
+    }
+    send_to_client(
+        state,
+        sender_id,
+        &OutboundFrame::MlsLeavePending {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id,
+            request_id: request.request_id.clone(),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn mls_leave_reject(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: &str,
+    request_id: &str,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (owner_code_id, _) = client_identity(state, sender_id).await?;
+    let request = state
+        .mls_rooms
+        .lock()
+        .await
+        .remove_leave(owner_code_id, room_id, request_id)?;
+    let frame = OutboundFrame::MlsLeaveRejected {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        room_id: room_id.to_string(),
+        request_id: request_id.to_string(),
+    };
+    for client_id in active_client_ids_for_code(state, &request.code_id).await {
+        send_to_client(state, client_id, &frame).await;
+    }
+    Ok(())
+}
+
+fn mls_delivery_frame(delivery: &rooms::PendingDelivery) -> OutboundFrame {
+    match &delivery.payload {
+        rooms::DeliveryPayload::Membership {
+            from_epoch,
+            from_membership_digest,
+            group_id,
+            roster,
+            control,
+            welcome,
+            authenticated_data,
+        } => OutboundFrame::MlsMembership {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: delivery.room_id.clone(),
+            message_id: delivery.message_id.clone(),
+            from_epoch: *from_epoch,
+            to_epoch: delivery.epoch,
+            revision: delivery.revision,
+            group_id_b64: URL_SAFE_NO_PAD.encode(group_id),
+            from_membership_digest_b64: URL_SAFE_NO_PAD.encode(from_membership_digest),
+            membership_digest_b64: URL_SAFE_NO_PAD.encode(&delivery.membership_digest),
+            roster: roster
+                .iter()
+                .map(|member| MlsRosterWire {
+                    username: member.username.clone(),
+                    stable_identity_b64: URL_SAFE_NO_PAD.encode(&member.stable_identity),
+                })
+                .collect(),
+            control_b64: URL_SAFE_NO_PAD.encode(control),
+            welcome_b64: URL_SAFE_NO_PAD.encode(welcome),
+            authenticated_data_b64: URL_SAFE_NO_PAD.encode(authenticated_data),
+        },
+        rooms::DeliveryPayload::Application {
+            sender_username,
+            ciphertext,
+            authenticated_data,
+            ..
+        } => OutboundFrame::MlsApplication {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: delivery.room_id.clone(),
+            message_id: delivery.message_id.clone(),
+            sender_username: sender_username.clone(),
+            epoch: delivery.epoch,
+            revision: delivery.revision,
+            membership_digest_b64: URL_SAFE_NO_PAD.encode(&delivery.membership_digest),
+            ciphertext_b64: URL_SAFE_NO_PAD.encode(ciphertext),
+            authenticated_data_b64: URL_SAFE_NO_PAD.encode(authenticated_data),
+        },
+    }
+}
+
+async fn send_mls_delivery(state: &AppState, delivery: &rooms::PendingDelivery) {
+    let active = state
+        .mls_rooms
+        .lock()
+        .await
+        .is_active_member(&delivery.room_id, &delivery.recipient_code_id);
+    let welcome_delivery = matches!(
+        &delivery.payload,
+        rooms::DeliveryPayload::Membership { welcome, .. } if !welcome.is_empty()
+    );
+    if !active && !welcome_delivery {
+        return;
+    }
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(client_id, client)| {
+            (client.code_id == delivery.recipient_code_id).then_some(*client_id)
+        })
+        .collect::<Vec<_>>();
+    let frame = mls_delivery_frame(delivery);
+    for client_id in clients {
+        send_to_client(state, client_id, &frame).await;
+    }
+}
+
+async fn send_mls_pending(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    let room_ids = state
+        .mls_rooms
+        .lock()
+        .await
+        .rooms_for_member(code_id)
+        .into_iter()
+        .map(|room| (room.room_id, room.active))
+        .collect::<Vec<_>>();
+    let mut deliveries = Vec::new();
+    {
+        let mut authority = state.mls_rooms.lock().await;
+        for (room_id, active) in room_ids {
+            if let Ok(room_deliveries) = authority.deliveries_for_member(&room_id, code_id) {
+                deliveries.extend(room_deliveries.into_iter().filter(|delivery| {
+                    active
+                        || matches!(
+                            &delivery.payload,
+                            rooms::DeliveryPayload::Membership { welcome, .. } if !welcome.is_empty()
+                        )
+                }));
+            }
+        }
+    }
+    for delivery in deliveries {
+        send_to_client(state, client_id, &mls_delivery_frame(&delivery)).await;
+    }
+}
+
+async fn send_mls_pending_joins(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    let joins = state
+        .mls_rooms
+        .lock()
+        .await
+        .pending_joins_for_owner(code_id);
+    for request in joins {
+        send_to_client(
+            state,
+            client_id,
+            &OutboundFrame::MlsJoinRequested {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: request.room_id.clone(),
+                request_id: request.request_id.clone(),
+                username: request.username.clone(),
+                stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
+                key_package_b64: URL_SAFE_NO_PAD.encode(request.key_package.clone()),
+            },
+        )
+        .await;
+    }
+}
+
+async fn send_mls_pending_leaves(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    let (owner_requests, member_requests) = {
+        let mut authority = state.mls_rooms.lock().await;
+        (
+            authority.pending_leaves_for_owner(code_id),
+            authority.pending_leaves_for_member(code_id),
+        )
+    };
+    for request in owner_requests {
+        send_to_client(
+            state,
+            client_id,
+            &OutboundFrame::MlsLeaveRequested {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: request.room_id.clone(),
+                request_id: request.request_id.clone(),
+                username: request.username.clone(),
+                stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
+            },
+        )
+        .await;
+    }
+    for request in member_requests {
+        send_to_client(
+            state,
+            client_id,
+            &OutboundFrame::MlsLeavePending {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: request.room_id.clone(),
+                request_id: request.request_id.clone(),
+            },
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mls_membership_commit(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    message_id: String,
+    request_id: Option<String>,
+    from_epoch: u64,
+    to_epoch: u64,
+    revision: u64,
+    group_id_b64: String,
+    from_membership_digest_b64: String,
+    membership_digest_b64: String,
+    roster: Vec<MlsRosterWire>,
+    control_b64: String,
+    welcome_b64: String,
+    authenticated_data_b64: String,
+    state_envelope_b64: String,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (owner_code_id, _) = client_identity(state, sender_id).await?;
+    let previous_member_code_ids = state
+        .mls_rooms
+        .lock()
+        .await
+        .member_code_ids(&room_id)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let transition = rooms::MembershipTransition {
+        room_id: room_id.clone(),
+        message_id: message_id.clone(),
+        request_id,
+        from_epoch,
+        to_epoch,
+        revision,
+        group_id: decode_exact(&group_id_b64, rooms::GROUP_ID_BYTES)?,
+        from_membership_digest: decode_exact(
+            &from_membership_digest_b64,
+            rooms::MEMBERSHIP_DIGEST_BYTES,
+        )?,
+        membership_digest: decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?,
+        roster: mls_roster_from_wire(roster)?,
+        control: decode_bounded(&control_b64, rooms::MAX_CONTROL_BYTES)?,
+        welcome: decode_bounded_allow_empty(&welcome_b64, rooms::MAX_CONTROL_BYTES)?,
+        authenticated_data: decode_bounded(
+            &authenticated_data_b64,
+            rooms::MAX_AUTHENTICATED_DATA_BYTES,
+        )?,
+        state_envelope: decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
+        created_at_ms: 0,
+        expires_at_ms: 0,
+    };
+    let staged = state
+        .mls_rooms
+        .lock()
+        .await
+        .begin_membership(owner_code_id, transition)?;
+    if let Err(error) = state.mls_rooms.lock().await.accept_membership(
+        owner_code_id,
+        &room_id,
+        &message_id,
+        revision,
+    ) {
+        let _ = state.mls_rooms.lock().await.rollback_membership(
+            owner_code_id,
+            &room_id,
+            &message_id,
+            revision,
+        );
+        return Err(error);
+    }
+    let recipient_code_ids = state
+        .mls_rooms
+        .lock()
+        .await
+        .member_code_ids(&room_id)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let removed_code_ids = previous_member_code_ids
+        .difference(&recipient_code_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    for recipient_code_id in &recipient_code_ids {
+        let deliveries = state
+            .mls_rooms
+            .lock()
+            .await
+            .deliveries_for_member(&room_id, recipient_code_id)
+            .unwrap_or_default();
+        for delivery in deliveries
+            .into_iter()
+            .filter(|delivery| delivery.message_id == staged.message_id)
+        {
+            send_mls_delivery(state, &delivery).await;
+        }
+    }
+    for removed_code_id in &removed_code_ids {
+        revoke_mls_attachment_access(state, &room_id, removed_code_id).await;
+        let frame = OutboundFrame::MlsLeft {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: room_id.clone(),
+        };
+        for client_id in active_client_ids_for_code(state, removed_code_id).await {
+            send_to_client(state, client_id, &frame).await;
+        }
+    }
+    send_to_client(
+        state,
+        sender_id,
+        &OutboundFrame::MlsRoomResult {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id,
+            message_id,
+            revision,
+            accepted: true,
+        },
+    )
+    .await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mls_application(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    message_id: String,
+    group_id_b64: String,
+    epoch: u64,
+    revision: u64,
+    membership_digest_b64: String,
+    ciphertext_b64: String,
+    authenticated_data_b64: String,
+    state_envelope_b64: String,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (sender_code_id, _) = client_identity(state, sender_id).await?;
+    let staged_attachment_id =
+        staged_attachment_for_message(state, &sender_code_id, &room_id, &message_id).await?;
+    let admission = state.mls_rooms.lock().await.admit_application(
+        sender_code_id,
+        &room_id,
+        message_id.clone(),
+        decode_exact(&group_id_b64, rooms::GROUP_ID_BYTES)?,
+        epoch,
+        revision,
+        decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?,
+        decode_bounded(&ciphertext_b64, rooms::MAX_APPLICATION_CIPHERTEXT_BYTES)?,
+        decode_bounded(&authenticated_data_b64, rooms::MAX_AUTHENTICATED_DATA_BYTES)?,
+        decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
+    )?;
+    let mut attachment_rollback = None;
+    if let Some(attachment_id) = staged_attachment_id {
+        let application_recipients = admission
+            .recipient_code_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let rollback = match rebind_staged_attachment_recipients(
+            state,
+            attachment_id,
+            &application_recipients,
+        )
+        .await
+        {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                let _ = state
+                    .mls_rooms
+                    .lock()
+                    .await
+                    .rollback_application(&room_id, &message_id);
+                return Err(error);
+            }
+        };
+        if let Err(error) = publish_staged_attachment_checked(
+            state,
+            attachment_id,
+            &sender_code_id,
+            &room_id,
+            &message_id,
+        )
+        .await
+        {
+            let _ = state
+                .mls_rooms
+                .lock()
+                .await
+                .rollback_application(&room_id, &message_id);
+            rollback_staged_attachment(state, rollback).await;
+            return Err(error);
+        }
+        attachment_rollback = Some(rollback);
+    }
+    if let Err(error) = state
+        .mls_rooms
+        .lock()
+        .await
+        .commit_application(&room_id, &message_id)
+    {
+        let _ = state
+            .mls_rooms
+            .lock()
+            .await
+            .rollback_application(&room_id, &message_id);
+        if let Some(rollback) = attachment_rollback {
+            rollback_staged_attachment(state, rollback).await;
+        }
+        return Err(error);
+    }
+    for recipient_code_id in &admission.recipient_code_ids {
+        let deliveries = state
+            .mls_rooms
+            .lock()
+            .await
+            .deliveries_for_member(&room_id, recipient_code_id)
+            .unwrap_or_default();
+        for delivery in deliveries
+            .into_iter()
+            .filter(|delivery| delivery.message_id == admission.message_id)
+        {
+            send_mls_delivery(state, &delivery).await;
+        }
+    }
+    send_to_client(
+        state,
+        sender_id,
+        &OutboundFrame::MlsRoomResult {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id,
+            message_id,
+            revision: admission.sender_revision,
+            accepted: true,
+        },
+    )
+    .await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mls_state_snapshot(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    message_id: String,
+    epoch: u64,
+    revision: u64,
+    membership_digest_b64: String,
+    state_envelope_b64: String,
+) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (code_id, _) = client_identity(state, sender_id).await?;
+    let (snapshot, was_active) = {
+        let mut authority = state.mls_rooms.lock().await;
+        let was_active = authority.member_info(&room_id, &code_id)?.active;
+        let snapshot = authority.store_snapshot(
+            code_id,
+            &room_id,
+            &message_id,
+            epoch,
+            revision,
+            decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?,
+            decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
+        )?;
+        (snapshot, was_active)
+    };
+    send_to_client(
+        state,
+        sender_id,
+        &OutboundFrame::MlsSnapshotResult {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id,
+            message_id,
+            revision: snapshot.revision,
+            accepted: true,
+        },
+    )
+    .await;
+    // Only Welcome acknowledgement changes the member's delivery capability.
+    // Normal ACKs must not replay the already-published active queue.
+    if !was_active {
+        send_mls_pending(state, sender_id, &code_id).await;
+    }
+    send_mls_catalog(state, sender_id, &code_id).await;
+    Ok(())
+}
+
+async fn finish_mls_room_transaction(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    message_id: String,
+    revision: u64,
+    authenticated: bool,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => {
+            touch_activity(state).await;
+            Ok(())
+        }
+        Err(_error) if authenticated => {
+            send_to_client(
+                state,
+                sender_id,
+                &OutboundFrame::MlsRoomResult {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room_id,
+                    message_id,
+                    revision,
+                    accepted: false,
+                },
+            )
+            .await;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn finish_mls_snapshot_transaction(
+    state: &AppState,
+    sender_id: Uuid,
+    room_id: String,
+    message_id: String,
+    revision: u64,
+    authenticated: bool,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => {
+            touch_activity(state).await;
+            Ok(())
+        }
+        Err(_) if authenticated => {
+            send_to_client(
+                state,
+                sender_id,
+                &OutboundFrame::MlsSnapshotResult {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room_id,
+                    message_id,
+                    revision,
+                    accepted: false,
+                },
+            )
+            .await;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn mls_delete_room(state: &AppState, sender_id: Uuid, room_id: &str) -> Result<(), String> {
+    let _conversation_guard = state.conversation_ops.lock().await;
+    let (owner_code_id, _) = client_identity(state, sender_id).await?;
+    let member_code_ids = state.mls_rooms.lock().await.member_code_ids(room_id)?;
+    state
+        .mls_rooms
+        .lock()
+        .await
+        .delete(owner_code_id, room_id)?;
+    remove_chat_attachments(state, room_id).await;
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(client_id, client)| {
+            member_code_ids
+                .contains(&client.code_id)
+                .then_some(*client_id)
+        })
+        .collect::<Vec<_>>();
+    let frame = OutboundFrame::MlsRoomDeleted {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        room_id: room_id.to_string(),
+    };
+    for client_id in clients {
+        send_to_client(state, client_id, &frame).await;
+    }
+    Ok(())
 }
 
 impl DirectEntry {
@@ -6008,6 +7834,7 @@ async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(CodeId, S
         .ok_or_else(|| "authenticated client required".to_string())
 }
 
+#[allow(dead_code)]
 fn owned_room_count(catalog: &HashMap<String, RoomEntry>, owner_code_id: &CodeId) -> usize {
     catalog
         .values()
@@ -6015,6 +7842,7 @@ fn owned_room_count(catalog: &HashMap<String, RoomEntry>, owner_code_id: &CodeId
         .count()
 }
 
+#[allow(dead_code)]
 fn has_room_capacity(
     catalog: &HashMap<String, RoomEntry>,
     owner_code_id: &CodeId,
@@ -6023,6 +7851,7 @@ fn has_room_capacity(
     owned_room_count(catalog, owner_code_id) < max_rooms_per_user
 }
 
+#[allow(dead_code)]
 fn normalize_room_record(room: &mut RoomRecord) -> Result<(), String> {
     room.id = room.id.trim().to_string();
     room.name = room
@@ -6144,6 +7973,7 @@ fn identity_directory_digest_v2(
     URL_SAFE_NO_PAD.encode(digest.finalize())
 }
 
+#[allow(dead_code)]
 async fn broadcast_to_all(state: &AppState, frame: &OutboundFrame) {
     let clients = state
         .clients
@@ -6425,7 +8255,12 @@ fn serialize_outbound_frame(frame: &OutboundFrame) -> Option<String> {
     if !outbound_message_padding_is_canonical(frame, serialized.len()) {
         return None;
     }
-    (serialized.len() <= WS_MAX_FRAME_BYTES).then_some(serialized)
+    let limit = if frame.is_mls() {
+        MLS_WS_MAX_FRAME_BYTES
+    } else {
+        WS_MAX_FRAME_BYTES
+    };
+    (serialized.len() <= limit).then_some(serialized)
 }
 
 fn outbound_queue_bytes(frame: &OutboundFrame) -> usize {
@@ -6434,17 +8269,28 @@ fn outbound_queue_bytes(frame: &OutboundFrame) -> usize {
     }
     serialize_outbound_frame(frame)
         .map(|serialized| serialized.len())
-        .unwrap_or(WS_MAX_FRAME_BYTES.saturating_add(1))
+        .unwrap_or_else(|| {
+            if frame.is_mls() {
+                MLS_WS_MAX_FRAME_BYTES.saturating_add(1)
+            } else {
+                WS_MAX_FRAME_BYTES.saturating_add(1)
+            }
+        })
 }
 
-fn reserve_outbound_bytes(global: &AtomicUsize, local: &AtomicUsize, bytes: usize) -> bool {
+fn reserve_outbound_bytes(
+    global: &AtomicUsize,
+    local: &AtomicUsize,
+    bytes: usize,
+    limit: usize,
+) -> bool {
     let bytes = bytes.max(1);
     let mut local_current = local.load(Ordering::Acquire);
     loop {
         let Some(local_next) = local_current.checked_add(bytes) else {
             return false;
         };
-        if local_next > CLIENT_OUTBOUND_BYTES {
+        if local_next > limit {
             return false;
         }
         match local.compare_exchange_weak(
@@ -6587,8 +8433,13 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
         return;
     };
     let bytes = outbound_queue_bytes(frame);
-    if bytes > WS_MAX_FRAME_BYTES
-        || !reserve_outbound_bytes(&state.outbound_bytes, &queued_bytes, bytes)
+    let (frame_limit, queue_limit) = if frame.is_mls() {
+        (MLS_WS_MAX_FRAME_BYTES, MLS_CLIENT_OUTBOUND_BYTES)
+    } else {
+        (WS_MAX_FRAME_BYTES, CLIENT_OUTBOUND_BYTES)
+    };
+    if bytes > frame_limit
+        || !reserve_outbound_bytes(&state.outbound_bytes, &queued_bytes, bytes, queue_limit)
     {
         warn!("closing slow or over-budget client {client_id}");
         send_control_to_client(state, client_id, ClientControl::Close).await;
@@ -7128,6 +8979,50 @@ mod tests {
         assert!(valid_encrypted_attachment_body(
             &[ATTACHMENT_BLOB_VERSION; ATTACHMENT_WIRE_OVERHEAD_BYTES]
         ));
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_rebind_rejects_empty_roster_without_mutation() {
+        let state = test_state();
+        let owner = test_code_id("rebind-empty-owner");
+        let recipient = test_code_id("rebind-empty-recipient");
+        let attachment_id = Uuid::new_v4();
+        {
+            let mut attachments = state.attachments.lock().await;
+            attachments.insert(
+                attachment_id,
+                AttachmentRecord {
+                    blob: test_attachment_blob(vec![1]),
+                    chat_id: "mls-rebind".to_string(),
+                    message_id: "application-1".to_string(),
+                    media_type: "FILE".to_string(),
+                    owner_code_id: owner,
+                    published: false,
+                    staged_expires_at_ms: Some(now_ms().saturating_add(60_000)),
+                    one_time: true,
+                    delete_after_download: false,
+                    expires_at_ms: None,
+                    eligible_recipient_code_ids: HashSet::from([recipient]),
+                    download_claims: HashMap::new(),
+                    completed_recipient_code_ids: HashSet::new(),
+                },
+            );
+        }
+        assert!(
+            rebind_staged_attachment_recipients(&state, attachment_id, &HashSet::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .attachments
+                .lock()
+                .await
+                .get(&attachment_id)
+                .expect("staged attachment")
+                .eligible_recipient_code_ids,
+            HashSet::from([recipient])
+        );
     }
 
     #[tokio::test]
@@ -8827,8 +10722,8 @@ mod tests {
             r#"{"type":"join","chat_id":"activity-room"}"#,
         )
         .await
-        .is_ok());
-        assert!(*state.last_activity_ms.lock().await > 123);
+        .is_err());
+        assert_eq!(*state.last_activity_ms.lock().await, 123);
 
         *state.last_activity_ms.lock().await = 123;
         assert!(handle_frame(&state, client_id, r#"{"type":"activity"}"#)
@@ -9294,6 +11189,8 @@ mod tests {
 
         let oversized = "A".repeat(2 * 4 + 1);
         assert!(decode_bounded(&oversized, 4).is_err());
+        assert_eq!(decode_bounded_allow_empty("", 4).unwrap(), Vec::<u8>::new());
+        assert!(decode_bounded_allow_empty("AQ==", 4).is_err());
     }
 
     #[test]
@@ -9689,6 +11586,55 @@ mod tests {
             padding: String::new(),
         };
         assert!(serialize_outbound_frame(&frame).is_none());
+    }
+
+    #[test]
+    fn outbound_queue_ceiling_is_selected_by_protocol() {
+        let mls_global = AtomicUsize::new(0);
+        let mls_local = AtomicUsize::new(0);
+        assert!(reserve_outbound_bytes(
+            &mls_global,
+            &mls_local,
+            WS_MAX_FRAME_BYTES + 1,
+            MLS_CLIENT_OUTBOUND_BYTES,
+        ));
+
+        let legacy_global = AtomicUsize::new(0);
+        let legacy_local = AtomicUsize::new(0);
+        assert!(reserve_outbound_bytes(
+            &legacy_global,
+            &legacy_local,
+            CLIENT_OUTBOUND_BYTES,
+            CLIENT_OUTBOUND_BYTES,
+        ));
+        assert!(!reserve_outbound_bytes(
+            &legacy_global,
+            &legacy_local,
+            1,
+            CLIENT_OUTBOUND_BYTES,
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_to_client_allows_mls_frames_above_legacy_one_megabyte_limit() {
+        let state = test_state();
+        let (client_id, mut rx) = add_test_client(&state, "code-a", "Alice").await;
+        let frame = OutboundFrame::MlsApplication {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: "room-1".to_string(),
+            message_id: "message-1".to_string(),
+            sender_username: "Bob".to_string(),
+            epoch: 1,
+            revision: 1,
+            membership_digest_b64: "digest".to_string(),
+            ciphertext_b64: "x".repeat(WS_MAX_FRAME_BYTES + 1024),
+            authenticated_data_b64: "aad".to_string(),
+        };
+        assert!(serialize_outbound_frame(&frame)
+            .as_ref()
+            .is_some_and(|serialized| serialized.len() > WS_MAX_FRAME_BYTES));
+        send_to_client(&state, client_id, &frame).await;
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]
@@ -11659,6 +13605,1293 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mls_attachment_policy_preserves_media_and_absolute_retention_rules() {
+        let access = ConversationAccess::MlsRoom(rooms::RoomPolicy {
+            allow_images: false,
+            enforce_text_absolute_expiry: true,
+            overall_expiry_sec: 60,
+            enforce_video_absolute_expiry: true,
+            video_overall_expiry_sec: 20,
+            ..rooms::RoomPolicy::default()
+        });
+        assert!(!matches!(
+            &access,
+            ConversationAccess::MlsRoom(policy) if policy_allows_media(policy, "IMAGE")
+        ));
+        assert!(matches!(
+            &access,
+            ConversationAccess::MlsRoom(policy) if policy_allows_media(policy, "VIDEO")
+        ));
+        assert_eq!(
+            effective_attachment_ttl_sec(Some(100), &access, "VIDEO", 604_800),
+            20
+        );
+    }
+
+    #[test]
+    fn mls_owner_join_notification_omits_private_recovery_envelope() {
+        let frame = OutboundFrame::MlsJoinRequested {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: "room-1".to_string(),
+            request_id: "request-1".to_string(),
+            username: "Bob".to_string(),
+            stable_identity_b64: "identity".to_string(),
+            key_package_b64: "key-package".to_string(),
+        };
+        let wire = serde_json::to_value(&frame).unwrap();
+        assert_eq!(wire["type"], "mls_join_requested");
+        assert!(wire.get("state_envelope_b64").is_none());
+        assert!(wire.get("recovery_snapshot").is_none());
+    }
+
+    #[tokio::test]
+    async fn every_inbound_mls_frame_rejects_wrong_or_missing_protocol_version_first() {
+        let frames = vec![
+            serde_json::json!({"type":"mls_create_room","protocol_version":9,"room_id":"r","group_id_b64":"x","epoch":"0","revision":"0","membership_digest_b64":"x","stable_identity_b64":"x","state_envelope_b64":"x"}),
+            serde_json::json!({"type":"mls_discover_room","protocol_version":9,"room_id":"r"}),
+            serde_json::json!({"type":"mls_join_request","protocol_version":9,"room_id":"r","request_id":"q","stable_identity_b64":"x","key_package_b64":"x","state_envelope_b64":"x"}),
+            serde_json::json!({"type":"mls_join_reject","protocol_version":9,"room_id":"r","request_id":"q"}),
+            serde_json::json!({"type":"mls_leave_request","protocol_version":9,"room_id":"r","request_id":"q"}),
+            serde_json::json!({"type":"mls_leave_reject","protocol_version":9,"room_id":"r","request_id":"q"}),
+            serde_json::json!({"type":"mls_membership_commit","protocol_version":9,"room_id":"r","message_id":"m","request_id":null,"from_epoch":"0","to_epoch":"1","revision":"1","group_id_b64":"x","from_membership_digest_b64":"x","membership_digest_b64":"x","roster":[],"control_b64":"x","welcome_b64":"x","authenticated_data_b64":"x","state_envelope_b64":"x"}),
+            serde_json::json!({"type":"mls_application","protocol_version":9,"room_id":"r","message_id":"m","group_id_b64":"x","epoch":"0","revision":"1","membership_digest_b64":"x","ciphertext_b64":"x","authenticated_data_b64":"x","state_envelope_b64":"x"}),
+            serde_json::json!({"type":"mls_state_snapshot","protocol_version":9,"room_id":"r","message_id":"m","epoch":"0","revision":"0","membership_digest_b64":"x","state_envelope_b64":"x"}),
+            serde_json::json!({"type":"mls_delete_room","protocol_version":9,"room_id":"r"}),
+        ];
+        let state = test_state();
+        for frame in frames {
+            let encoded = serde_json::to_string(&frame).unwrap();
+            assert_eq!(
+                handle_frame(&state, Uuid::new_v4(), &encoded)
+                    .await
+                    .unwrap_err(),
+                "Wrong information"
+            );
+            let mut unknown = frame.clone();
+            unknown
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!(true));
+            assert!(serde_json::from_value::<InboundFrame>(unknown).is_err());
+            let mut missing = frame;
+            missing.as_object_mut().unwrap().remove("protocol_version");
+            assert!(serde_json::from_value::<InboundFrame>(missing).is_err());
+        }
+    }
+
+    #[test]
+    fn protocol_v10_counters_and_policy_durations_are_decimal_strings() {
+        let max = u64::MAX;
+        let policy = rooms::RoomPolicy {
+            self_destruct_timer_sec: max,
+            overall_expiry_sec: max,
+            image_read_timer_sec: max,
+            image_overall_expiry_sec: max,
+            video_read_timer_sec: max,
+            video_overall_expiry_sec: max,
+            file_read_timer_sec: max,
+            file_overall_expiry_sec: max,
+            ..rooms::RoomPolicy::default()
+        };
+        let room = MlsRoomWire {
+            room_id: "room".to_string(),
+            owner_username: "owner".to_string(),
+            group_id_b64: "group".to_string(),
+            active: true,
+            synchronized: true,
+            epoch: max,
+            revision: max,
+            membership_digest_b64: "digest".to_string(),
+            roster: Vec::new(),
+            recovery_snapshot: Some(MlsRecoverySnapshotWire {
+                active: true,
+                epoch: max,
+                revision: max,
+                membership_digest_b64: "digest".to_string(),
+                state_envelope_b64: "state".to_string(),
+                roster: vec![MlsRosterWire {
+                    username: "alice".to_string(),
+                    stable_identity_b64: "identity".to_string(),
+                }],
+            }),
+            policy,
+        };
+        let wire = serde_json::to_value(OutboundFrame::MlsRoomCreated {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room: room.clone(),
+        })
+        .expect("MLS room JSON");
+        let max_string = max.to_string();
+        assert_eq!(wire["room"]["epoch"], max_string);
+        assert_eq!(wire["room"]["revision"], max_string);
+        assert_eq!(wire["room"]["recovery_snapshot"]["epoch"], max_string);
+        assert_eq!(wire["room"]["recovery_snapshot"]["revision"], max_string);
+        assert_eq!(wire["room"]["synchronized"], true);
+        assert_eq!(
+            wire["room"]["recovery_snapshot"]["roster"][0]["username"],
+            "alice"
+        );
+        for field in [
+            "self_destruct_timer_sec",
+            "overall_expiry_sec",
+            "image_read_timer_sec",
+            "image_overall_expiry_sec",
+            "video_read_timer_sec",
+            "video_overall_expiry_sec",
+            "file_read_timer_sec",
+            "file_overall_expiry_sec",
+        ] {
+            assert_eq!(wire["room"]["policy"][field], max_string);
+        }
+
+        let inbound = serde_json::json!({
+            "type": "mls_create_room",
+            "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+            "room_id": "room",
+            "group_id_b64": "group",
+            "epoch": max_string,
+            "revision": max_string,
+            "membership_digest_b64": "digest",
+            "stable_identity_b64": "identity",
+            "state_envelope_b64": "state",
+            "policy": wire["room"]["policy"].clone(),
+        });
+        assert!(serde_json::from_value::<InboundFrame>(inbound).is_ok());
+    }
+
+    #[test]
+    fn every_mls_counter_field_accepts_only_canonical_decimal_strings() {
+        let max = u64::MAX;
+        let max_string = max.to_string();
+        let policy = rooms::RoomPolicy {
+            self_destruct_timer_sec: max,
+            overall_expiry_sec: max,
+            image_read_timer_sec: max,
+            image_overall_expiry_sec: max,
+            video_read_timer_sec: max,
+            video_overall_expiry_sec: max,
+            file_read_timer_sec: max,
+            file_overall_expiry_sec: max,
+            ..rooms::RoomPolicy::default()
+        };
+        let policy_json = serde_json::to_value(policy).unwrap();
+        let room = || MlsRoomWire {
+            room_id: "room".to_string(),
+            owner_username: "owner".to_string(),
+            group_id_b64: "group".to_string(),
+            active: true,
+            synchronized: true,
+            epoch: max,
+            revision: max,
+            membership_digest_b64: "digest".to_string(),
+            roster: Vec::new(),
+            recovery_snapshot: Some(MlsRecoverySnapshotWire {
+                active: true,
+                epoch: max,
+                revision: max,
+                membership_digest_b64: "digest".to_string(),
+                state_envelope_b64: "state".to_string(),
+                roster: Vec::new(),
+            }),
+            policy,
+        };
+        let outbound = vec![
+            (
+                OutboundFrame::MlsRooms {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    rooms: vec![room()],
+                },
+                vec![
+                    "/rooms/0/epoch",
+                    "/rooms/0/revision",
+                    "/rooms/0/recovery_snapshot/epoch",
+                    "/rooms/0/recovery_snapshot/revision",
+                    "/rooms/0/policy/self_destruct_timer_sec",
+                    "/rooms/0/policy/overall_expiry_sec",
+                    "/rooms/0/policy/image_read_timer_sec",
+                    "/rooms/0/policy/image_overall_expiry_sec",
+                    "/rooms/0/policy/video_read_timer_sec",
+                    "/rooms/0/policy/video_overall_expiry_sec",
+                    "/rooms/0/policy/file_read_timer_sec",
+                    "/rooms/0/policy/file_overall_expiry_sec",
+                ],
+            ),
+            (
+                OutboundFrame::MlsRoomCreated {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room: room(),
+                },
+                vec![
+                    "/room/epoch",
+                    "/room/revision",
+                    "/room/recovery_snapshot/epoch",
+                    "/room/recovery_snapshot/revision",
+                    "/room/policy/self_destruct_timer_sec",
+                    "/room/policy/overall_expiry_sec",
+                    "/room/policy/image_read_timer_sec",
+                    "/room/policy/image_overall_expiry_sec",
+                    "/room/policy/video_read_timer_sec",
+                    "/room/policy/video_overall_expiry_sec",
+                    "/room/policy/file_read_timer_sec",
+                    "/room/policy/file_overall_expiry_sec",
+                ],
+            ),
+            (
+                OutboundFrame::MlsMembership {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room_id: "room".to_string(),
+                    message_id: "message".to_string(),
+                    from_epoch: max,
+                    to_epoch: max,
+                    revision: max,
+                    from_membership_digest_b64: "from".to_string(),
+                    group_id_b64: "group".to_string(),
+                    membership_digest_b64: "digest".to_string(),
+                    roster: Vec::new(),
+                    control_b64: "control".to_string(),
+                    welcome_b64: "welcome".to_string(),
+                    authenticated_data_b64: "aad".to_string(),
+                },
+                vec!["/from_epoch", "/to_epoch", "/revision"],
+            ),
+            (
+                OutboundFrame::MlsApplication {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room_id: "room".to_string(),
+                    message_id: "message".to_string(),
+                    sender_username: "sender".to_string(),
+                    epoch: max,
+                    revision: max,
+                    membership_digest_b64: "digest".to_string(),
+                    ciphertext_b64: "ciphertext".to_string(),
+                    authenticated_data_b64: "aad".to_string(),
+                },
+                vec!["/epoch", "/revision"],
+            ),
+            (
+                OutboundFrame::MlsRoomResult {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room_id: "room".to_string(),
+                    message_id: "message".to_string(),
+                    revision: max,
+                    accepted: true,
+                },
+                vec!["/revision"],
+            ),
+            (
+                OutboundFrame::MlsSnapshotResult {
+                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                    room_id: "room".to_string(),
+                    message_id: "message".to_string(),
+                    revision: max,
+                    accepted: true,
+                },
+                vec!["/revision"],
+            ),
+        ];
+        for (frame, fields) in outbound {
+            let wire = serde_json::to_value(frame).unwrap();
+            for field in fields {
+                assert_eq!(
+                    wire.pointer(field),
+                    Some(&serde_json::json!(max_string)),
+                    "{field}"
+                );
+            }
+        }
+
+        let inbound = vec![
+            (
+                serde_json::json!({
+                    "type": "mls_create_room",
+                    "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+                    "room_id": "room",
+                    "group_id_b64": "group",
+                    "epoch": max_string,
+                    "revision": max_string,
+                    "membership_digest_b64": "digest",
+                    "stable_identity_b64": "identity",
+                    "state_envelope_b64": "state",
+                    "policy": policy_json,
+                }),
+                vec![
+                    "epoch",
+                    "revision",
+                    "policy.self_destruct_timer_sec",
+                    "policy.overall_expiry_sec",
+                    "policy.image_read_timer_sec",
+                    "policy.image_overall_expiry_sec",
+                    "policy.video_read_timer_sec",
+                    "policy.video_overall_expiry_sec",
+                    "policy.file_read_timer_sec",
+                    "policy.file_overall_expiry_sec",
+                ],
+            ),
+            (
+                serde_json::json!({
+                    "type": "mls_membership_commit",
+                    "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+                    "room_id": "room",
+                    "message_id": "message",
+                    "request_id": null,
+                    "from_epoch": max_string,
+                    "to_epoch": max_string,
+                    "revision": max_string,
+                    "group_id_b64": "group",
+                    "from_membership_digest_b64": "from",
+                    "membership_digest_b64": "digest",
+                    "roster": [],
+                    "control_b64": "control",
+                    "welcome_b64": "welcome",
+                    "authenticated_data_b64": "aad",
+                    "state_envelope_b64": "state",
+                }),
+                vec!["from_epoch", "to_epoch", "revision"],
+            ),
+            (
+                serde_json::json!({
+                    "type": "mls_application",
+                    "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+                    "room_id": "room",
+                    "message_id": "message",
+                    "group_id_b64": "group",
+                    "epoch": max_string,
+                    "revision": max_string,
+                    "membership_digest_b64": "digest",
+                    "ciphertext_b64": "ciphertext",
+                    "authenticated_data_b64": "aad",
+                    "state_envelope_b64": "state",
+                }),
+                vec!["epoch", "revision"],
+            ),
+            (
+                serde_json::json!({
+                    "type": "mls_state_snapshot",
+                    "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+                    "room_id": "room",
+                    "message_id": "message",
+                    "epoch": max_string,
+                    "revision": max_string,
+                    "membership_digest_b64": "digest",
+                    "state_envelope_b64": "state",
+                }),
+                vec!["epoch", "revision"],
+            ),
+        ];
+        let invalid_values = [
+            serde_json::json!(1),
+            serde_json::json!("01"),
+            serde_json::json!("+1"),
+            serde_json::json!("-1"),
+            serde_json::json!(" 1"),
+            serde_json::json!("1 "),
+            serde_json::json!("not-a-number"),
+            serde_json::json!("18446744073709551616"),
+        ];
+        for (frame, fields) in inbound {
+            let parsed = serde_json::from_value::<InboundFrame>(frame.clone());
+            assert!(parsed.is_ok(), "{frame}: {:?}", parsed.err());
+            for field in fields {
+                for invalid in &invalid_values {
+                    let mut rejected = frame.clone();
+                    let mut cursor = &mut rejected;
+                    for segment in field.split('.') {
+                        cursor = cursor
+                            .get_mut(segment)
+                            .unwrap_or_else(|| panic!("missing JSON field {field}"));
+                    }
+                    *cursor = invalid.clone();
+                    assert!(
+                        serde_json::from_value::<InboundFrame>(rejected).is_err(),
+                        "accepted invalid {invalid} for {field}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_mls_counters_remain_json_numbers() {
+        let outbound = OutboundFrame::Message {
+            chat_id: "chat".to_string(),
+            version: 9,
+            message_id: "message".to_string(),
+            nonce_b64: "nonce".to_string(),
+            ciphertext_b64: "ciphertext".to_string(),
+            signature_b64: "signature".to_string(),
+            wrapped_key_b64: "wrapped".to_string(),
+            prekey_id: "prekey".to_string(),
+            is_prekey: false,
+            sender_username: "sender".to_string(),
+            sender_public_key_b64: "public".to_string(),
+            identity_public_b64: "identity".to_string(),
+            directory_node_id: "node".to_string(),
+            directory_revision: u64::MAX,
+            directory_digest: "digest".to_string(),
+            padding_bucket: 1,
+            padding: "padding".to_string(),
+        };
+        let wire = serde_json::to_value(outbound).unwrap();
+        assert!(wire["directory_revision"].is_u64());
+
+        let inbound = serde_json::json!({
+            "type": "message",
+            "chat_id": "chat",
+            "version": 9,
+            "message_id": "message",
+            "nonce_b64": "nonce",
+            "ciphertext_b64": "ciphertext",
+            "envelopes": [],
+            "state_revision": u64::MAX,
+            "identity_envelope_b64": "identity-envelope",
+            "identity_public_b64": "identity",
+            "prekey_id": "prekey",
+            "state_signature_b64": "state-signature",
+            "directory_node_id": "node",
+            "directory_revision": u64::MAX,
+            "directory_digest": "digest",
+            "padding_bucket": 1,
+            "padding": "padding",
+        });
+        assert!(serde_json::from_value::<InboundFrame>(inbound).is_ok());
+    }
+
+    #[test]
+    fn mls_create_room_omitted_policy_uses_default_policy() {
+        let frame = serde_json::json!({
+            "type": "mls_create_room",
+            "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+            "room_id": "room",
+            "group_id_b64": "group",
+            "epoch": "0",
+            "revision": "0",
+            "membership_digest_b64": "digest",
+            "stable_identity_b64": "identity",
+            "state_envelope_b64": "state",
+        });
+        let InboundFrame::MlsCreateRoom { policy, .. } =
+            serde_json::from_value(frame).expect("MLS create room")
+        else {
+            panic!("expected MLS create room frame");
+        };
+        assert_eq!(policy, rooms::RoomPolicy::default());
+    }
+
+    #[test]
+    fn mls_create_room_rejects_unknown_nested_policy_fields() {
+        let frame = serde_json::json!({
+            "type": "mls_create_room",
+            "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+            "room_id": "room-1",
+            "group_id_b64": "group",
+            "epoch": "0",
+            "revision": "0",
+            "membership_digest_b64": "digest",
+            "stable_identity_b64": "identity",
+            "state_envelope_b64": "state",
+            "policy": {"unexpected": true}
+        });
+
+        assert!(serde_json::from_value::<InboundFrame>(frame).is_err());
+    }
+
+    #[test]
+    fn every_outbound_mls_frame_carries_protocol_v10() {
+        let room = || MlsRoomWire {
+            room_id: "room-1".to_string(),
+            owner_username: "Alice".to_string(),
+            group_id_b64: "group".to_string(),
+            active: true,
+            synchronized: true,
+            epoch: 1,
+            revision: 1,
+            membership_digest_b64: "digest".to_string(),
+            roster: Vec::new(),
+            recovery_snapshot: None,
+            policy: rooms::RoomPolicy::default(),
+        };
+        let frames = vec![
+            OutboundFrame::MlsRooms {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                rooms: vec![room()],
+            },
+            OutboundFrame::MlsRoomDiscovered {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                group_id_b64: "g".to_string(),
+                owner_username: "u".to_string(),
+            },
+            OutboundFrame::MlsRoomCreated {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room: room(),
+            },
+            OutboundFrame::MlsJoinRequested {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                request_id: "q".to_string(),
+                username: "u".to_string(),
+                stable_identity_b64: "s".to_string(),
+                key_package_b64: "k".to_string(),
+            },
+            OutboundFrame::MlsJoinRejected {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                request_id: "q".to_string(),
+            },
+            OutboundFrame::MlsLeaveRequested {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                request_id: "q".to_string(),
+                username: "u".to_string(),
+                stable_identity_b64: "s".to_string(),
+            },
+            OutboundFrame::MlsLeavePending {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                request_id: "q".to_string(),
+            },
+            OutboundFrame::MlsLeaveRejected {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                request_id: "q".to_string(),
+            },
+            OutboundFrame::MlsLeft {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+            },
+            OutboundFrame::MlsMembership {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                message_id: "m".to_string(),
+                from_epoch: 0,
+                to_epoch: 1,
+                revision: 1,
+                group_id_b64: "g".to_string(),
+                from_membership_digest_b64: "f".to_string(),
+                membership_digest_b64: "d".to_string(),
+                roster: Vec::new(),
+                control_b64: "c".to_string(),
+                welcome_b64: "w".to_string(),
+                authenticated_data_b64: "a".to_string(),
+            },
+            OutboundFrame::MlsApplication {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                message_id: "m".to_string(),
+                sender_username: "u".to_string(),
+                epoch: 1,
+                revision: 1,
+                membership_digest_b64: "d".to_string(),
+                ciphertext_b64: "c".to_string(),
+                authenticated_data_b64: "a".to_string(),
+            },
+            OutboundFrame::MlsRoomResult {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                message_id: "m".to_string(),
+                revision: 1,
+                accepted: true,
+            },
+            OutboundFrame::MlsRoomDeleted {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+            },
+            OutboundFrame::MlsSnapshotResult {
+                protocol_version: rooms::MLS_PROTOCOL_VERSION,
+                room_id: "r".to_string(),
+                message_id: "m".to_string(),
+                revision: 1,
+                accepted: true,
+            },
+        ];
+        for frame in frames {
+            assert!(frame.is_mls());
+            let wire = serde_json::to_value(&frame).unwrap();
+            assert_eq!(wire["protocol_version"], rooms::MLS_PROTOCOL_VERSION);
+        }
+    }
+
+    #[test]
+    fn mls_delivery_preserves_authenticated_data_for_core_aad_verification() {
+        let authenticated_data = vec![0_u8, 1, 127, 255];
+        let delivery = rooms::PendingDelivery {
+            room_id: "room-1".to_string(),
+            message_id: "message-1".to_string(),
+            recipient_code_id: [2_u8; rooms::GROUP_ID_BYTES],
+            epoch: 3,
+            membership_digest: vec![8_u8; rooms::MEMBERSHIP_DIGEST_BYTES],
+            revision: 4,
+            payload: rooms::DeliveryPayload::Application {
+                sender_code_id: [1_u8; rooms::GROUP_ID_BYTES],
+                sender_username: "Alice".to_string(),
+                ciphertext: vec![9_u8],
+                authenticated_data: authenticated_data.clone(),
+            },
+            created_at_ms: 0,
+            expires_at_ms: 1,
+        };
+
+        let wire = serde_json::to_value(mls_delivery_frame(&delivery)).unwrap();
+        assert_eq!(
+            wire["authenticated_data_b64"],
+            URL_SAFE_NO_PAD.encode(authenticated_data)
+        );
+        assert_eq!(wire["protocol_version"], rooms::MLS_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn mls_membership_delivery_preserves_prior_membership_digest() {
+        let prior_digest = vec![1_u8; rooms::MEMBERSHIP_DIGEST_BYTES];
+        let post_digest = vec![2_u8; rooms::MEMBERSHIP_DIGEST_BYTES];
+        let delivery = rooms::PendingDelivery {
+            room_id: "room-1".to_string(),
+            message_id: "membership-1".to_string(),
+            recipient_code_id: [2_u8; rooms::GROUP_ID_BYTES],
+            epoch: 4,
+            membership_digest: post_digest.clone(),
+            revision: 5,
+            payload: rooms::DeliveryPayload::Membership {
+                from_epoch: 3,
+                from_membership_digest: prior_digest.clone(),
+                group_id: vec![3_u8; rooms::GROUP_ID_BYTES],
+                roster: Vec::new(),
+                control: vec![4],
+                welcome: Vec::new(),
+                authenticated_data: vec![5],
+            },
+            created_at_ms: 0,
+            expires_at_ms: 1,
+        };
+
+        let wire = serde_json::to_value(mls_delivery_frame(&delivery)).unwrap();
+        assert_eq!(
+            wire["from_membership_digest_b64"],
+            URL_SAFE_NO_PAD.encode(prior_digest)
+        );
+        assert_eq!(
+            wire["membership_digest_b64"],
+            URL_SAFE_NO_PAD.encode(post_digest)
+        );
+        assert_ne!(
+            wire["from_membership_digest_b64"],
+            wire["membership_digest_b64"]
+        );
+    }
+
+    #[test]
+    fn oversized_inbound_frames_allow_only_canonical_large_mls_families() {
+        let oversized = |prefix: &str| {
+            format!(
+                "{prefix}{}",
+                "x".repeat(WS_MAX_FRAME_BYTES + 1 - prefix.len())
+            )
+        };
+        for prefix in LARGE_MLS_INBOUND_PREFIXES {
+            let frame = oversized(prefix);
+            assert_eq!(frame.len(), WS_MAX_FRAME_BYTES + 1);
+            assert!(validate_inbound_frame_size_before_parse(&frame).is_ok());
+        }
+
+        for frame in [
+            oversized(r#"{"type":"mls_discover_room","protocol_version":10,"#),
+            oversized(r#"{"type":"mls_unknown","protocol_version":10,"#),
+            oversized(r#"{"type":"mls_application","protocol_version":9,"#),
+            oversized(r#" {"type":"mls_application","protocol_version":10,"#),
+            oversized(r#"{"protocol_version":10,"type":"mls_application","#),
+            oversized(r#"{"type":"message","protocol_version":10,"#),
+        ] {
+            assert!(validate_inbound_frame_size_before_parse(&frame).is_err());
+        }
+    }
+
+    #[test]
+    fn oversized_mls_prefix_does_not_bypass_full_json_schema_validation() {
+        let prefix = LARGE_MLS_INBOUND_PREFIXES[3];
+        let suffix = "\"type\":\"message\",\"ciphertext_b64\":\"";
+        let filler_len = WS_MAX_FRAME_BYTES + 1 - prefix.len() - suffix.len() - 2;
+        let frame = format!("{prefix}{suffix}{}\"}}", "x".repeat(filler_len));
+        assert!(frame.len() > WS_MAX_FRAME_BYTES);
+        assert!(validate_inbound_frame_size_before_parse(&frame).is_ok());
+        assert!(serde_json::from_str::<InboundFrame>(&frame).is_err());
+    }
+
+    #[test]
+    fn websocket_admission_errors_are_terminal_but_schema_errors_are_not() {
+        assert!(validate_inbound_text_socket_admission(r#"{"type":"activity"}"#, Ok(())).is_ok());
+        assert!(validate_inbound_text_socket_admission(
+            r#"{"type":"activity"}"#,
+            Err("rate limit exceeded".to_string()),
+        )
+        .is_err());
+
+        let oversized_legacy = format!(
+            "{{\"type\":\"dummy\",\"padding_b64\":\"{}\"}}",
+            "x".repeat(WS_MAX_FRAME_BYTES)
+        );
+        assert!(validate_inbound_text_socket_admission(&oversized_legacy, Ok(())).is_err());
+
+        // Ordinary malformed or unauthorized frames at the legacy ceiling
+        // remain non-terminal; handle_frame reports their schema error after
+        // this admission function returns success.
+        assert!(validate_inbound_text_socket_admission(r#"{"type":"unknown"}"#, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn exact_mls_frame_ceiling_is_admitted_but_one_byte_over_is_rejected() {
+        let prefix = LARGE_MLS_INBOUND_PREFIXES[4];
+        let exact = format!(
+            "{prefix}{}",
+            "x".repeat(MLS_WS_MAX_FRAME_BYTES - prefix.len())
+        );
+        assert_eq!(exact.len(), MLS_WS_MAX_FRAME_BYTES);
+        assert!(validate_inbound_frame_size_before_parse(&exact).is_ok());
+
+        let over = format!(
+            "{prefix}{}",
+            "x".repeat(MLS_WS_MAX_FRAME_BYTES + 1 - prefix.len())
+        );
+        assert_eq!(over.len(), MLS_WS_MAX_FRAME_BYTES + 1);
+        assert!(validate_inbound_frame_size_before_parse(&over).is_err());
+    }
+
+    #[tokio::test]
+    async fn mls_frame_ceiling_fits_bounded_records_but_legacy_frames_stay_small() {
+        fn base64_len(bytes: usize) -> usize {
+            bytes.checked_add(2).unwrap() / 3 * 4
+        }
+        let worst_membership = base64_len(rooms::MAX_CONTROL_BYTES)
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(base64_len(rooms::MAX_STATE_BYTES)))
+            .and_then(|bytes| bytes.checked_add(base64_len(rooms::MAX_AUTHENTICATED_DATA_BYTES)))
+            .and_then(|bytes| bytes.checked_add(256 * 1024))
+            .unwrap();
+        assert!(worst_membership < MLS_WS_MAX_FRAME_BYTES);
+
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        assert!(
+            check_ws_frame_allowed(&state, client_id, MLS_WS_MAX_FRAME_BYTES)
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_ws_frame_allowed(&test_state(), Uuid::new_v4(), MLS_WS_MAX_FRAME_BYTES + 1)
+                .await
+                .is_err()
+        );
+
+        let oversized_legacy = serde_json::json!({"type":"dummy","padding_b64":"x".repeat(WS_MAX_FRAME_BYTES),"bytes":1}).to_string();
+        assert!(
+            handle_frame(&test_state(), Uuid::new_v4(), &oversized_legacy)
+                .await
+                .is_err()
+        );
+        let large_mls = OutboundFrame::MlsApplication {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: "r".to_string(),
+            message_id: "m".to_string(),
+            sender_username: "u".to_string(),
+            epoch: 1,
+            revision: 1,
+            membership_digest_b64: "d".to_string(),
+            ciphertext_b64: "x".repeat(WS_MAX_FRAME_BYTES),
+            authenticated_data_b64: "a".to_string(),
+        };
+        assert!(serialize_outbound_frame(&large_mls).is_some());
+    }
+
+    #[tokio::test]
+    async fn websocket_byte_rate_budget_rejects_only_after_exact_boundary() {
+        let state = test_state();
+        let client_id = Uuid::new_v4();
+        assert!(
+            check_ws_frame_allowed(&state, client_id, MLS_WS_MAX_FRAME_BYTES)
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_ws_frame_allowed(&state, client_id, MLS_WS_MAX_FRAME_BYTES)
+                .await
+                .is_ok()
+        );
+        assert!(check_ws_frame_allowed(&state, client_id, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn removed_mls_member_loses_attachment_and_claim_access() {
+        let state = test_state();
+        let owner = test_code_id("mls-owner");
+        let removed = test_code_id("mls-removed");
+        let retained = test_code_id("mls-retained");
+        let attachment_id = Uuid::new_v4();
+        let removed_claim = Uuid::new_v4();
+        let retained_claim = Uuid::new_v4();
+        state.attachments.lock().await.insert(
+            attachment_id,
+            AttachmentRecord {
+                blob: test_attachment_blob(vec![1]),
+                chat_id: "mls-room".to_string(),
+                message_id: "message-1".to_string(),
+                media_type: "FILE".to_string(),
+                owner_code_id: owner,
+                published: true,
+                staged_expires_at_ms: None,
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: None,
+                eligible_recipient_code_ids: HashSet::from([removed, retained]),
+                download_claims: HashMap::from([
+                    (
+                        removed_claim,
+                        AttachmentDownloadClaim {
+                            recipient_code_id: removed,
+                            created_at_ms: now_ms(),
+                        },
+                    ),
+                    (
+                        retained_claim,
+                        AttachmentDownloadClaim {
+                            recipient_code_id: retained,
+                            created_at_ms: now_ms(),
+                        },
+                    ),
+                ]),
+                completed_recipient_code_ids: HashSet::from([removed, retained]),
+            },
+        );
+        revoke_mls_attachment_access(&state, "mls-room", &removed).await;
+        let attachments = state.attachments.lock().await;
+        let record = attachments.get(&attachment_id).unwrap();
+        assert!(!record.eligible_recipient_code_ids.contains(&removed));
+        assert!(record.eligible_recipient_code_ids.contains(&retained));
+        assert!(!record.completed_recipient_code_ids.contains(&removed));
+        assert!(record.completed_recipient_code_ids.contains(&retained));
+        assert!(!record.download_claims.contains_key(&removed_claim));
+        assert!(record.download_claims.contains_key(&retained_claim));
+    }
+
+    #[tokio::test]
+    async fn inactive_mls_joiner_has_no_message_or_attachment_access() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let owner = test_code_id("code-a");
+        let joiner = test_code_id("code-b");
+        let mut authority = state.mls_rooms.lock().await;
+        authority
+            .create(
+                owner,
+                "Alice".to_string(),
+                "room-inactive".to_string(),
+                vec![7; rooms::GROUP_ID_BYTES],
+                0,
+                0,
+                vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                vec![1; rooms::STABLE_IDENTITY_BYTES],
+            )
+            .unwrap();
+        let request = authority
+            .request_join(
+                joiner,
+                "Bob".to_string(),
+                "room-inactive",
+                "request-1".to_string(),
+                vec![2; rooms::STABLE_IDENTITY_BYTES],
+                vec![5],
+                vec![9],
+            )
+            .unwrap();
+        authority
+            .begin_membership(
+                owner,
+                rooms::MembershipTransition {
+                    room_id: "room-inactive".to_string(),
+                    message_id: "commit-1".to_string(),
+                    request_id: Some(request.request_id.clone()),
+                    from_epoch: 0,
+                    to_epoch: 1,
+                    revision: 1,
+                    group_id: vec![7; rooms::GROUP_ID_BYTES],
+                    from_membership_digest: vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                    membership_digest: vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                    roster: vec![
+                        rooms::RosterMember {
+                            username: "Alice".to_string(),
+                            stable_identity: vec![1; rooms::STABLE_IDENTITY_BYTES],
+                        },
+                        rooms::RosterMember {
+                            username: "Bob".to_string(),
+                            stable_identity: vec![2; rooms::STABLE_IDENTITY_BYTES],
+                        },
+                    ],
+                    control: vec![1],
+                    welcome: vec![2],
+                    authenticated_data: vec![3],
+                    state_envelope: vec![4],
+                    created_at_ms: 0,
+                    expires_at_ms: 0,
+                },
+            )
+            .unwrap();
+        authority
+            .accept_membership(owner, "room-inactive", "commit-1", 1)
+            .unwrap();
+        drop(authority);
+
+        assert!(conversation_access(&state, "Bob", "room-inactive")
+            .await
+            .is_none());
+        assert!(
+            attachment_conversation_access(&state, "Bob", "room-inactive", "FILE")
+                .await
+                .is_err()
+        );
+        let access = ConversationAccess::MlsRoom(rooms::RoomPolicy::default());
+        assert!(
+            snapshot_attachment_recipients(&state, &access, "room-inactive", "Alice", &owner,)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_mls_transaction_rejections_are_exactly_correlated() {
+        let group = URL_SAFE_NO_PAD.encode([7_u8; rooms::GROUP_ID_BYTES]);
+        let digest = URL_SAFE_NO_PAD.encode([8_u8; rooms::MEMBERSHIP_DIGEST_BYTES]);
+        let frames = [
+            serde_json::json!({
+                "type": "mls_membership_commit",
+                "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+                "room_id": "missing-room",
+                "message_id": "membership-reject",
+                "request_id": null,
+                "from_epoch": "0",
+                "to_epoch": "1",
+                "revision": "1",
+                "group_id_b64": group,
+                "from_membership_digest_b64": digest,
+                "membership_digest_b64": digest,
+                "roster": [],
+                "control_b64": "AQ",
+                "welcome_b64": "",
+                "authenticated_data_b64": "AQ",
+                "state_envelope_b64": "AQ"
+            }),
+            serde_json::json!({
+                "type": "mls_application",
+                "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+                "room_id": "missing-room",
+                "message_id": "application-reject",
+                "group_id_b64": group,
+                "epoch": "0",
+                "revision": "1",
+                "membership_digest_b64": digest,
+                "ciphertext_b64": "AQ",
+                "authenticated_data_b64": "AQ",
+                "state_envelope_b64": "AQ"
+            }),
+        ];
+        for (index, frame) in frames.into_iter().enumerate() {
+            let state = test_state();
+            let code = format!("mls-reject-{index}");
+            add_test_account(&state, &code, "Alice").await;
+            let (client_id, mut rx) = add_test_client(&state, &code, "Alice").await;
+            handle_frame(&state, client_id, &frame.to_string())
+                .await
+                .expect("safe authenticated rejection is acknowledged");
+            assert!(matches!(
+                rx.try_recv().expect("negative transaction result"),
+                OutboundFrame::MlsRoomResult {
+                    accepted: false,
+                    revision: 1,
+                    ..
+                }
+            ));
+            assert!(rx.try_recv().is_err());
+        }
+
+        let state = test_state();
+        add_test_account(&state, "snapshot-reject", "Alice").await;
+        let (client_id, mut rx) = add_test_client(&state, "snapshot-reject", "Alice").await;
+        let snapshot = serde_json::json!({
+            "type": "mls_state_snapshot",
+            "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+            "room_id": "missing-room",
+            "message_id": "snapshot-reject",
+            "epoch": "0",
+            "revision": "1",
+            "membership_digest_b64": digest,
+            "state_envelope_b64": "AQ"
+        });
+        handle_frame(&state, client_id, &snapshot.to_string())
+            .await
+            .expect("safe authenticated snapshot rejection is acknowledged");
+        assert!(matches!(
+            rx.try_recv().expect("negative snapshot result"),
+            OutboundFrame::MlsSnapshotResult {
+                ref message_id,
+                revision: 1,
+                accepted: false,
+                ..
+            } if message_id == "snapshot-reject"
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let state = test_state();
+        add_test_account(&state, "unsafe-reject", "Alice").await;
+        let (client_id, mut rx) = add_test_client(&state, "unsafe-reject", "Alice").await;
+        let unsafe_frame = serde_json::json!({
+            "type": "mls_application",
+            "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+            "room_id": "bad room",
+            "message_id": "unsafe-reject",
+            "group_id_b64": group,
+            "epoch": "0",
+            "revision": "1",
+            "membership_digest_b64": digest,
+            "ciphertext_b64": "AQ",
+            "authenticated_data_b64": "AQ",
+            "state_envelope_b64": "AQ"
+        });
+        assert!(handle_frame(&state, client_id, &unsafe_frame.to_string())
+            .await
+            .is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn mls_wire_activates_joiner_only_after_welcome_snapshot() {
+        let owner = [1_u8; 32];
+        let joiner = [2_u8; 32];
+        let mut authority = rooms::RoomAuthority::new(2);
+        authority
+            .create(
+                owner,
+                "Alice".to_string(),
+                "room-1".to_string(),
+                vec![7; rooms::GROUP_ID_BYTES],
+                0,
+                0,
+                vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                vec![1; rooms::STABLE_IDENTITY_BYTES],
+            )
+            .unwrap();
+        let request = authority
+            .request_join(
+                joiner,
+                "Bob".to_string(),
+                "room-1",
+                "request-1".to_string(),
+                vec![2; rooms::STABLE_IDENTITY_BYTES],
+                vec![5],
+                vec![9],
+            )
+            .unwrap();
+        authority
+            .begin_membership(
+                owner,
+                rooms::MembershipTransition {
+                    room_id: "room-1".to_string(),
+                    message_id: "commit-1".to_string(),
+                    request_id: Some(request.request_id.clone()),
+                    from_epoch: 0,
+                    to_epoch: 1,
+                    revision: 1,
+                    group_id: vec![7; rooms::GROUP_ID_BYTES],
+                    from_membership_digest: vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                    membership_digest: vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                    roster: vec![
+                        rooms::RosterMember {
+                            username: "Alice".to_string(),
+                            stable_identity: vec![1; rooms::STABLE_IDENTITY_BYTES],
+                        },
+                        rooms::RosterMember {
+                            username: "Bob".to_string(),
+                            stable_identity: vec![2; rooms::STABLE_IDENTITY_BYTES],
+                        },
+                    ],
+                    control: vec![1],
+                    welcome: vec![2],
+                    authenticated_data: vec![3],
+                    state_envelope: vec![4],
+                    created_at_ms: 0,
+                    expires_at_ms: 0,
+                },
+            )
+            .unwrap();
+        authority
+            .accept_membership(owner, "room-1", "commit-1", 1)
+            .unwrap();
+        let before = mls_room_wire(authority.member_info("room-1", &joiner).unwrap());
+        assert!(!before.active);
+        assert!(!before.recovery_snapshot.as_ref().unwrap().active);
+
+        let welcome = authority
+            .deliveries_for_member("room-1", &joiner)
+            .unwrap()
+            .pop()
+            .unwrap();
+        authority
+            .store_snapshot(
+                joiner,
+                "room-1",
+                &welcome.message_id,
+                welcome.epoch,
+                welcome.revision,
+                welcome.membership_digest.clone(),
+                vec![6],
+            )
+            .unwrap();
+        let after = mls_room_wire(authority.member_info("room-1", &joiner).unwrap());
+        assert!(after.active);
+        assert!(after.recovery_snapshot.as_ref().unwrap().active);
+    }
+
+    #[tokio::test]
+    async fn active_mls_snapshot_ack_emits_result_and_fresh_catalog_without_replaying_queue() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let owner = test_code_id("code-a");
+        let recipient = test_code_id("code-b");
+        {
+            let mut authority = state.mls_rooms.lock().await;
+            authority
+                .create(
+                    owner,
+                    "Alice".to_string(),
+                    "room-ack".to_string(),
+                    vec![7; rooms::GROUP_ID_BYTES],
+                    0,
+                    0,
+                    vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                    vec![1; rooms::STABLE_IDENTITY_BYTES],
+                )
+                .unwrap();
+            let join = authority
+                .request_join(
+                    recipient,
+                    "Bob".to_string(),
+                    "room-ack",
+                    "request-1".to_string(),
+                    vec![2; rooms::STABLE_IDENTITY_BYTES],
+                    vec![5],
+                    vec![9],
+                )
+                .unwrap();
+            authority
+                .begin_membership(
+                    owner,
+                    rooms::MembershipTransition {
+                        room_id: "room-ack".to_string(),
+                        message_id: "commit-1".to_string(),
+                        request_id: Some(join.request_id.clone()),
+                        from_epoch: 0,
+                        to_epoch: 1,
+                        revision: 1,
+                        group_id: vec![7; rooms::GROUP_ID_BYTES],
+                        from_membership_digest: vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                        membership_digest: vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                        roster: vec![
+                            rooms::RosterMember {
+                                username: "alice".to_string(),
+                                stable_identity: vec![1; rooms::STABLE_IDENTITY_BYTES],
+                            },
+                            rooms::RosterMember {
+                                username: "bob".to_string(),
+                                stable_identity: vec![2; rooms::STABLE_IDENTITY_BYTES],
+                            },
+                        ],
+                        control: vec![1],
+                        welcome: vec![2],
+                        authenticated_data: vec![3],
+                        state_envelope: vec![4],
+                        created_at_ms: 0,
+                        expires_at_ms: 0,
+                    },
+                )
+                .unwrap();
+            authority
+                .accept_membership(owner, "room-ack", "commit-1", 1)
+                .unwrap();
+            let welcome = authority
+                .deliveries_for_member("room-ack", &recipient)
+                .unwrap()
+                .pop()
+                .unwrap();
+            authority
+                .store_snapshot(
+                    recipient,
+                    "room-ack",
+                    &welcome.message_id,
+                    welcome.epoch,
+                    welcome.revision,
+                    welcome.membership_digest.clone(),
+                    vec![6],
+                )
+                .unwrap();
+            authority
+                .admit_application(
+                    owner,
+                    "room-ack",
+                    "application-1".to_string(),
+                    vec![7; rooms::GROUP_ID_BYTES],
+                    1,
+                    2,
+                    vec![8; rooms::MEMBERSHIP_DIGEST_BYTES],
+                    vec![10],
+                    vec![11],
+                    vec![12],
+                )
+                .unwrap();
+            authority
+                .commit_application("room-ack", "application-1")
+                .unwrap();
+        }
+        let client_id = Uuid::new_v4();
+        let (data_tx, mut data_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id: recipient,
+                username: "Bob".to_string(),
+                tx: data_tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+
+        mls_state_snapshot(
+            &state,
+            client_id,
+            "room-ack".to_string(),
+            "application-1".to_string(),
+            1,
+            1,
+            URL_SAFE_NO_PAD.encode([8_u8; rooms::MEMBERSHIP_DIGEST_BYTES]),
+            URL_SAFE_NO_PAD.encode([13_u8]),
+        )
+        .await
+        .unwrap();
+        let result = data_rx.recv().await.expect("snapshot result");
+        assert!(matches!(
+            result,
+            OutboundFrame::MlsSnapshotResult { accepted: true, .. }
+        ));
+        let catalog = data_rx.recv().await.expect("fresh MLS catalog");
+        assert!(matches!(
+            catalog,
+            OutboundFrame::MlsRooms { ref rooms, .. }
+                if rooms.len() == 1 && rooms[0].synchronized
+        ));
+        assert!(data_rx.try_recv().is_err());
+        assert!(result_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn direct_conversations_are_canonical_and_participant_restricted() {
         let state = test_state();
@@ -13434,6 +16667,7 @@ mod tests {
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
+            mls_rooms: Arc::new(Mutex::new(rooms::RoomAuthority::new(2))),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
             direct_catalog: Arc::new(Mutex::new(HashMap::new())),

@@ -16,6 +16,107 @@ const mocks = vi.hoisted(() => {
     wsBaseUrl: "wss://node.example.test",
     displayHost: "node.example.test",
   };
+  class FakeMlsManager {
+    static instances: FakeMlsManager[] = [];
+    closed = false;
+    finishOutcomes: string[] = [];
+    snapshotOutcomes: string[] = [];
+    receiveApplicationCount = 0;
+    pendingJoinItems: Array<{ roomId: string; requestId: string; username: string }> = [];
+    ownJoin: { roomId: string; requestId: string } | null = null;
+    pendingLeaveItems: Array<{ roomId: string; requestId: string; username: string }> = [];
+    constructor() { FakeMlsManager.instances.push(this); }
+    close() { this.closed = true; }
+    recoverCatalog(rooms: Array<{ room_id: string; owner_username: string; active: boolean }>) {
+      return rooms.map((room) => ({
+        id: room.room_id, name: "MLS room", owner_username: room.owner_username, conversation_type: "room" as const,
+        mlsActive: room.active, self_destruct_timer_sec: 0, overall_expiry_sec: 0, allow_images: true, allow_videos: true,
+        allow_files: true, enforce_text_absolute_expiry: false, image_read_timer_sec: 0, image_overall_expiry_sec: 0,
+        enforce_image_absolute_expiry: false, video_read_timer_sec: 0, video_overall_expiry_sec: 0,
+        enforce_video_absolute_expiry: false, file_read_timer_sec: 0, file_overall_expiry_sec: 0,
+        enforce_file_absolute_expiry: false,
+      }));
+    }
+    removeRoom(roomId?: string) {
+      if (!roomId) return;
+      this.pendingLeaveItems = this.pendingLeaveItems.filter((leave) => leave.roomId !== roomId);
+      this.pendingJoinItems = this.pendingJoinItems.filter((join) => join.roomId !== roomId);
+      if (this.ownJoin?.roomId === roomId) this.ownJoin = null;
+    }
+    beginJoin(frame: { room_id: string }) {
+      this.ownJoin = { roomId: frame.room_id, requestId: "own-join-request" };
+      return { type: "mls_join_request", protocol_version: 10, room_id: frame.room_id, request_id: "own-join-request" };
+    }
+    rejectOwnJoin(roomId: string, requestId: string) {
+      if (this.ownJoin?.roomId !== roomId || this.ownJoin.requestId !== requestId) throw new Error("Room unavailable");
+      this.ownJoin = null;
+    }
+    rememberJoin(frame: { room_id: string; request_id: string; username: string }) {
+      const existing = this.pendingJoinItems.find((join) => join.requestId === frame.request_id);
+      if (existing && (existing.roomId !== frame.room_id || existing.username !== frame.username)) throw new Error("Room unavailable");
+      if (!existing) this.pendingJoinItems.push({ roomId: frame.room_id, requestId: frame.request_id, username: frame.username });
+    }
+    pendingJoins() { return this.pendingJoinItems.map((join) => ({ ...join })); }
+    rejectJoin(requestId: string) {
+      const request = this.pendingJoinItems.find((join) => join.requestId === requestId);
+      if (!request) throw new Error("Room unavailable");
+      return { type: "mls_join_reject", protocol_version: 10, room_id: request.roomId, request_id: requestId };
+    }
+    forgetJoin(roomId: string, requestId: string) {
+      const request = this.pendingJoinItems.find((join) => join.requestId === requestId);
+      if (!request || request.roomId !== roomId) throw new Error("Room unavailable");
+      this.pendingJoinItems = this.pendingJoinItems.filter((join) => join.requestId !== requestId);
+    }
+    pendingLeaves() { return this.pendingLeaveItems.map((leave) => ({ ...leave })); }
+    rememberLeave(frame: { room_id: string; request_id: string; username: string }) {
+      const existing = this.pendingLeaveItems.find((leave) => leave.requestId === frame.request_id);
+      if (existing && (existing.roomId !== frame.room_id || existing.username !== frame.username)) throw new Error("Room unavailable");
+      if (!existing) this.pendingLeaveItems.push({ roomId: frame.room_id, requestId: frame.request_id, username: frame.username });
+    }
+    beginLeave(roomId: string) {
+      const frame = { type: "mls_leave_request", protocol_version: 10, room_id: roomId, request_id: "member-leave" };
+      this.pendingLeaveItems.push({ roomId, requestId: frame.request_id, username: "Alice" });
+      return frame;
+    }
+    acceptLeave(requestId: string) {
+      const request = this.pendingLeaveItems.find((leave) => leave.requestId === requestId);
+      if (!request) throw new Error("Room unavailable");
+      return {
+        roomId: request.roomId, messageId: "leave-membership", revision: 2n, requestId, requestType: "leave",
+        frame: { type: "mls_membership_commit", room_id: request.roomId, message_id: "leave-membership", revision: "2", request_id: requestId },
+      };
+    }
+    rejectLeave(requestId: string) {
+      const request = this.pendingLeaveItems.find((leave) => leave.requestId === requestId);
+      if (!request) throw new Error("Room unavailable");
+      return { type: "mls_leave_reject", protocol_version: 10, room_id: request.roomId, request_id: requestId };
+    }
+    forgetLeave(roomId: string, requestId: string) {
+      this.pendingLeaveItems = this.pendingLeaveItems.filter((leave) => leave.roomId !== roomId || leave.requestId !== requestId);
+    }
+    prepareApplication(roomId: string, messageId: string) {
+      return { roomId, messageId, revision: 2n, frame: { type: "mls_application", room_id: roomId, message_id: messageId, revision: "2" } };
+    }
+    finishTransaction(prepared: { requestType?: string; requestId?: string; roomId?: string }, outcome: string) {
+      this.finishOutcomes.push(outcome);
+      if (outcome === "ACCEPTED" && prepared.requestType === "leave" && prepared.requestId && prepared.roomId) {
+        this.forgetLeave(prepared.roomId, prepared.requestId);
+      }
+    }
+    receiveApplication(frame: { room_id: string; message_id: string }) {
+      this.receiveApplicationCount += 1;
+      return {
+        plaintext: new TextEncoder().encode(JSON.stringify({
+          kind: "text", id: frame.message_id, sender: "Bob", content: "incoming MLS", timestamp_ms: Date.now(),
+        })),
+        snapshot: {
+          roomId: frame.room_id, messageId: frame.message_id, revision: 3n, nativePending: true,
+          frame: { type: "mls_state_snapshot", protocol_version: 10, room_id: frame.room_id, message_id: frame.message_id, revision: "3" },
+        },
+      };
+    }
+    finishSnapshot(_prepared: unknown, outcome: string) { this.snapshotOutcomes.push(outcome); }
+  }
   class FakeCipher {
     static failAcknowledgement = false;
     static encryptError: Error | null = null;
@@ -130,6 +231,10 @@ const mocks = vi.hoisted(() => {
       return new Uint8Array([8, 9, 10]);
     }
 
+    createMlsManager() {
+      return new FakeMlsManager();
+    }
+
     clear(): void {
       this.publicKeyBytes?.fill(0);
       this.publicKeyBytes = null;
@@ -143,6 +248,7 @@ const mocks = vi.hoisted(() => {
     static leaseFailureAt: number | null = null;
     static leaseFailureCode: "NOT_SENT" | "AMBIGUOUS" | "CLOSED" = "NOT_SENT";
     static acknowledgeResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
+    static mlsControlResult = true;
     private readonly frameHandler: (frame: IncomingFrame) => void;
     readonly session: AccountSession;
     connected = false;
@@ -216,6 +322,13 @@ const mocks = vi.hoisted(() => {
     join(): boolean { return this.send({ type: "join" }); }
     openDirect(): boolean { return this.send({ type: "open_direct" }); }
     createRoom(): boolean { return this.send({ type: "create_room" }); }
+    sendMlsControl(frame: object): boolean { return FakeRelay.mlsControlResult && this.send(frame); }
+    sendMlsTransaction(_room: string, _message: string, _revision: bigint, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
+      this.send(frame); return Promise.resolve(FakeRelay.encryptedOutcome);
+    }
+    sendMlsSnapshot(_room: string, _message: string, _revision: bigint, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
+      this.send(frame); return Promise.resolve(FakeRelay.encryptedOutcome);
+    }
     deleteRoom(): boolean { return this.send({ type: "delete_room" }); }
     wipe(): boolean { return this.send({ type: "global_wipe" }); }
     activity(): boolean { return this.send({ type: "activity" }); }
@@ -246,6 +359,7 @@ const mocks = vi.hoisted(() => {
       identityPrekeyId: "prekey-one",
     } satisfies AccountSession,
     FakeCipher,
+    FakeMlsManager,
     FakeRelay,
     getLastRelay: () => FakeRelay.instances.at(-1) ?? null,
     reset: () => {
@@ -255,6 +369,8 @@ const mocks = vi.hoisted(() => {
       FakeRelay.leaseFailureAt = null;
       FakeRelay.leaseFailureCode = "NOT_SENT";
       FakeRelay.acknowledgeResult = null;
+      FakeRelay.mlsControlResult = true;
+      FakeMlsManager.instances.length = 0;
       FakeCipher.failAcknowledgement = false;
       FakeCipher.encryptError = null;
       FakeCipher.decryptError = null;
@@ -1964,6 +2080,152 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     mocks.FakeRelay.encryptedOutcome = "AMBIGUOUS";
     await act(async () => expect(await result.current.sendText("ambiguous")).toBe(false));
     expect(relay?.leasesReleased).toHaveLength(3);
+    unmount();
+  });
+
+  it("routes protocol-v10 room sends through MLS and fails closed on ambiguous admission", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
+    act(() => result.current.openRoom("forum_mls"));
+
+    await act(async () => expect(result.current.sendText("MLS accepted")).resolves.toBe(true));
+    expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_application", room_id: "forum_mls" });
+    expect(mocks.FakeMlsManager.instances[0]?.finishOutcomes).toEqual(["ACCEPTED"]);
+
+    mocks.FakeRelay.encryptedOutcome = "REJECTED";
+    await act(async () => expect(result.current.sendText("MLS rejected")).resolves.toBe(false));
+    expect(mocks.FakeMlsManager.instances[0]?.finishOutcomes).toEqual(["ACCEPTED", "REJECTED"]);
+
+    mocks.FakeRelay.encryptedOutcome = "AMBIGUOUS";
+    await act(async () => expect(result.current.sendText("MLS ambiguous")).resolves.toBe(false));
+    expect(result.current.session).toBeNull();
+    expect(mocks.FakeMlsManager.instances[0]?.closed).toBe(true);
+    unmount();
+  });
+
+  it("replays an accepted MLS snapshot transaction without decrypting or republishing the message", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0];
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    const incoming = {
+      type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "incoming-mls",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+    } as unknown as IncomingFrame;
+    await act(async () => relay?.emit(incoming));
+    await waitFor(() => expect(result.current.messages.forum_mls).toHaveLength(1));
+    expect(manager?.receiveApplicationCount).toBe(1);
+    await act(async () => relay?.emit(incoming));
+    await waitFor(() => expect(manager?.snapshotOutcomes).toEqual(["ACCEPTED", "ACCEPTED"]));
+    expect(manager?.receiveApplicationCount).toBe(1);
+    expect(result.current.messages.forum_mls).toHaveLength(1);
+    expect(relay?.sent.filter((frame) => (frame as { type?: string }).type === "mls_state_snapshot")).toHaveLength(2);
+    unmount();
+  });
+
+  it("accepts generic protocol-safe room ids and retains join rejection state when send fails", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    expect(result.current.joinRoom("general-room_1")).toBe(true);
+    expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_discover_room", room_id: "general-room_1" });
+    expect(result.current.joinRoom("bad room")).toBe(false);
+
+    await act(async () => relay?.emit({
+      type: "mls_join_requested", protocol_version: 10, room_id: "general-room_1", request_id: "join-request",
+      username: "Bob", stable_identity_b64: "AA", key_package_b64: "AA",
+    } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.pendingMlsJoins).toHaveLength(1));
+    mocks.FakeRelay.mlsControlResult = false;
+    expect(result.current.rejectRoomJoin("join-request")).toBe(false);
+    expect(result.current.pendingMlsJoins).toHaveLength(1);
+    mocks.FakeRelay.mlsControlResult = true;
+    expect(result.current.rejectRoomJoin("join-request")).toBe(true);
+    await waitFor(() => expect(result.current.pendingMlsJoins).toHaveLength(0));
+    unmount();
+  });
+
+  it("accepts only an exact rejection for this client's pending join", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({
+      type: "mls_room_discovered", protocol_version: 10, room_id: "general-room", group_id_b64: "AA", owner_username: "Bob",
+    } as unknown as IncomingFrame));
+    expect(mocks.FakeMlsManager.instances[0]?.ownJoin).toEqual({ roomId: "general-room", requestId: "own-join-request" });
+    await act(async () => relay?.emit({
+      type: "mls_join_rejected", protocol_version: 10, room_id: "general-room", request_id: "own-join-request",
+    } as unknown as IncomingFrame));
+    expect(result.current.session).not.toBeNull();
+    expect(mocks.FakeMlsManager.instances[0]?.ownJoin).toBeNull();
+    unmount();
+
+    const second = renderHook(() => useAbyssalSession());
+    await act(async () => { await second.result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const secondRelay = mocks.getLastRelay();
+    await act(async () => secondRelay?.emit({
+      type: "mls_room_discovered", protocol_version: 10, room_id: "other-room", group_id_b64: "AA", owner_username: "Bob",
+    } as unknown as IncomingFrame));
+    await act(async () => secondRelay?.emit({
+      type: "mls_join_rejected", protocol_version: 10, room_id: "other-room", request_id: "wrong-request",
+    } as unknown as IncomingFrame));
+    await waitFor(() => expect(second.result.current.session).toBeNull());
+    second.unmount();
+  });
+
+  it("routes owner leave approval and retains the request when rejection send fails", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    const request = { type: "mls_leave_requested", protocol_version: 10, room_id: "forum_mls", request_id: "leave-request", username: "Bob", stable_identity_b64: "AA" } as unknown as IncomingFrame;
+    await act(async () => relay?.emit(request));
+    await waitFor(() => expect(result.current.pendingMlsLeaves).toEqual([{ roomId: "forum_mls", requestId: "leave-request", username: "Bob" }]));
+
+    mocks.FakeRelay.mlsControlResult = false;
+    await act(async () => expect(result.current.rejectRoomLeave("leave-request")).toBe(false));
+    expect(result.current.pendingMlsLeaves).toHaveLength(1);
+    mocks.FakeRelay.mlsControlResult = true;
+    await act(async () => expect(result.current.rejectRoomLeave("leave-request")).toBe(true));
+    await waitFor(() => expect(result.current.pendingMlsLeaves).toHaveLength(0));
+
+    await act(async () => relay?.emit({ ...request, request_id: "leave-accept" } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.pendingMlsLeaves).toHaveLength(1));
+    await act(async () => expect(result.current.acceptRoomLeave("leave-accept")).resolves.toBe(true));
+    expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_membership_commit", request_id: "leave-accept" });
+    await waitFor(() => expect(result.current.pendingMlsLeaves).toHaveLength(0));
+    unmount();
+  });
+
+  it("fails closed when a member leave acknowledgement is not bound to its pending request", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    act(() => result.current.leaveRoom("forum_mls"));
+    await waitFor(() => expect(result.current.pendingMlsLeaves).toHaveLength(1));
+    await act(async () => relay?.emit({ type: "mls_leave_pending", protocol_version: 10, room_id: "forum_mls", request_id: "member-leave" } as unknown as IncomingFrame));
+    expect(result.current.session).not.toBeNull();
+    await act(async () => relay?.emit({ type: "mls_leave_pending", protocol_version: 10, room_id: "forum_mls", request_id: "wrong-request" } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    unmount();
+  });
+
+  it("removes MLS room state and plaintext messages after the relay confirms the member left", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    act(() => result.current.openRoom("forum_mls"));
+    await act(async () => expect(result.current.sendText("leave me")).resolves.toBe(true));
+    await waitFor(() => expect(result.current.messages.forum_mls).toHaveLength(1));
+    await act(async () => relay?.emit({ type: "mls_left", protocol_version: 10, room_id: "forum_mls" } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.rooms).toHaveLength(0));
+    expect(result.current.messages).not.toHaveProperty("forum_mls");
+    expect(result.current.activeRoomId).toBeNull();
     unmount();
   });
 });

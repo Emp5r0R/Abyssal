@@ -59,6 +59,8 @@ import androidx.compose.ui.unit.sp
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.PendingMlsJoinSummary
+import com.abyssal.chat.domain.model.PendingMlsLeaveSummary
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
@@ -85,6 +87,8 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val presence by viewModel.presence.collectAsState()
     val sessionSecurity by viewModel.sessionSecurity.collectAsState()
     val roomCreationLimit by viewModel.roomCreationLimit.collectAsState()
+    val pendingMlsJoins by viewModel.pendingMlsJoins.collectAsState()
+    val pendingMlsLeaves by viewModel.pendingMlsLeaves.collectAsState()
     val showCamouflagePinPrompt = viewModel.showCamouflagePinPrompt.value
 
     DashboardContent(
@@ -100,6 +104,14 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         onUpdateDisguise = viewModel::updateDisguiseSettings,
         onCreateForum = viewModel::createForum,
         onDeleteForum = viewModel::deleteForum,
+        onLeaveForum = viewModel::leaveRoom,
+        pendingMlsJoins = pendingMlsJoins,
+        pendingMlsLeaves = pendingMlsLeaves,
+        onJoinRoom = viewModel::requestJoinRoom,
+        onAcceptJoin = viewModel::acceptMlsJoin,
+        onRejectJoin = viewModel::rejectMlsJoin,
+        onAcceptLeave = viewModel::acceptMlsLeave,
+        onRejectLeave = viewModel::rejectMlsLeave,
         onWipe = viewModel::executeClearAll,
         onLock = viewModel::lockApp,
         onEndSession = viewModel::endSession
@@ -124,6 +136,14 @@ private fun DashboardContent(
     onUpdateDisguise: (Boolean, String, String) -> Unit,
     onCreateForum: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean) -> Unit,
     onDeleteForum: (String) -> Unit,
+    onLeaveForum: (String) -> Unit,
+    pendingMlsJoins: List<PendingMlsJoinSummary>,
+    pendingMlsLeaves: List<PendingMlsLeaveSummary>,
+    onJoinRoom: (String) -> Unit,
+    onAcceptJoin: (String) -> Unit,
+    onRejectJoin: (String) -> Unit,
+    onAcceptLeave: (String) -> Unit,
+    onRejectLeave: (String) -> Unit,
     onWipe: () -> Unit,
     onLock: () -> Unit,
     onEndSession: () -> Unit
@@ -132,6 +152,8 @@ private fun DashboardContent(
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showCreateForumDialog by remember { mutableStateOf(false) }
     var showWipeDialog by remember { mutableStateOf(false) }
+    var showJoinDialog by remember { mutableStateOf(false) }
+    var showPendingJoins by remember { mutableStateOf(false) }
 
     val filteredSessions = remember(sessions, selectedTab) {
         sessions.filter { it.isForum == (selectedTab == 0) }
@@ -249,15 +271,18 @@ private fun DashboardContent(
                         .fillMaxWidth()
                         .weight(1f)
                         .padding(horizontal = 16.dp, vertical = 12.dp),
-                    contentPadding = PaddingValues(bottom = 104.dp),
+                    contentPadding = PaddingValues(bottom = if (selectedTab == 0) 280.dp else 104.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(filteredSessions, key = { it.id }) { session ->
                         ChatSessionItem(
                             session = session,
-                            canDelete = session.isForum && session.ownerUsername == currentUser?.username,
+                            canDelete = session.isForum,
                             onClick = { onOpenChat(session.id) },
-                            onDelete = { onDeleteForum(session.id) }
+                            onDelete = {
+                                if (session.ownerUsername == currentUser?.username) onDeleteForum(session.id)
+                                else onLeaveForum(session.id)
+                            }
                         )
                     }
                 }
@@ -272,6 +297,22 @@ private fun DashboardContent(
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.End
         ) {
+            if (selectedTab == 0 && (pendingMlsJoins.isNotEmpty() || pendingMlsLeaves.isNotEmpty())) {
+                ExtendedFloatingActionButton(
+                    onClick = { showPendingJoins = true },
+                    containerColor = NeonGreen,
+                    contentColor = DeepBlack,
+                    shape = RoundedCornerShape(8.dp)
+                ) { Text("Requests ${pendingMlsJoins.size + pendingMlsLeaves.size}", fontWeight = FontWeight.Bold) }
+            }
+            if (selectedTab == 0) {
+                ExtendedFloatingActionButton(
+                    onClick = { showJoinDialog = true },
+                    containerColor = GlassBorder,
+                    contentColor = PureWhite,
+                    shape = RoundedCornerShape(8.dp)
+                ) { Text("Join room", fontWeight = FontWeight.Bold) }
+            }
             if (selectedTab == 0 && filteredSessions.isNotEmpty() && canCreateRoom) {
                 ExtendedFloatingActionButton(
                     onClick = { showCreateForumDialog = true },
@@ -310,6 +351,23 @@ private fun DashboardContent(
                     showSettingsDialog = false
                     onEndSession()
                 }
+            )
+        }
+        if (showJoinDialog) {
+            JoinRoomDialog(
+                onDismiss = { showJoinDialog = false },
+                onJoin = { onJoinRoom(it); showJoinDialog = false }
+            )
+        }
+        if (showPendingJoins) {
+            PendingJoinDialog(
+                joins = pendingMlsJoins,
+                leaves = pendingMlsLeaves,
+                onDismiss = { showPendingJoins = false },
+                onAccept = onAcceptJoin,
+                onReject = onRejectJoin,
+                onAcceptLeave = onAcceptLeave,
+                onRejectLeave = onRejectLeave
             )
         }
 
@@ -683,6 +741,51 @@ private fun CamouflagePinSetupDialog(
                 .fillMaxWidth()
                 .padding(top = 18.dp)
         )
+    }
+}
+
+@Composable
+private fun JoinRoomDialog(onDismiss: () -> Unit, onJoin: (String) -> Unit) {
+    var roomId by remember { mutableStateOf("") }
+    val valid = Regex("^[A-Za-z0-9_-]{1,128}$").matches(roomId)
+    MirageDialog(title = "Join encrypted room", onDismiss = onDismiss) {
+        OutlinedTextField(
+            value = roomId,
+            onValueChange = { roomId = it.trim().take(128) },
+            label = { Text("Room ID") },
+            colors = mirageTextFieldColors(),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        DialogButtons("Cancel", "Request access", onDismiss, { onJoin(roomId) }, valid)
+    }
+}
+
+@Composable
+private fun PendingJoinDialog(
+    joins: List<PendingMlsJoinSummary>,
+    leaves: List<PendingMlsLeaveSummary>,
+    onDismiss: () -> Unit,
+    onAccept: (String) -> Unit,
+    onReject: (String) -> Unit,
+    onAcceptLeave: (String) -> Unit,
+    onRejectLeave: (String) -> Unit
+) {
+    MirageDialog(title = "Room join requests", onDismiss = onDismiss) {
+        joins.forEach { join ->
+            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                Text(join.username, color = PureWhite, fontWeight = FontWeight.Bold)
+                Text(join.roomId, color = SteelMuted, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                DialogButtons("Reject", "Accept", { onReject(join.requestId) }, { onAccept(join.requestId) })
+            }
+        }
+        leaves.forEach { leave ->
+            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                Text("${leave.username} wants to leave", color = PureWhite, fontWeight = FontWeight.Bold)
+                Text(leave.roomId, color = SteelMuted, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                DialogButtons("Reject", "Approve", { onRejectLeave(leave.requestId) }, { onAcceptLeave(leave.requestId) })
+            }
+        }
     }
 }
 
@@ -1120,6 +1223,14 @@ private fun DashboardContentPreview() {
         onUpdateDisguise = { _, _, _ -> },
         onCreateForum = { _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ -> },
         onDeleteForum = {},
+        onLeaveForum = {},
+        pendingMlsJoins = emptyList(),
+        pendingMlsLeaves = emptyList(),
+        onJoinRoom = {},
+        onAcceptJoin = {},
+        onRejectJoin = {},
+        onAcceptLeave = {},
+        onRejectLeave = {},
         onWipe = {},
         onLock = {},
         onEndSession = {}

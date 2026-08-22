@@ -1,5 +1,44 @@
 # Project Progress
 
+## Active Deployment: Protocol-v10 MLS Rooms
+
+This breaking package replaces pairwise room fanout with RFC 9420 MLS while
+leaving direct-chat Olm sessions isolated behind their existing core boundary.
+Protocol-v9 room clients will fail closed rather than receive a compatibility
+fallback.
+
+### Bounded Plan
+
+1. Add a private Rust-core MLS adapter using exact `mls-rs 0.55.4` and
+   `mls-rs-crypto-rustcrypto 0.22.1`, with account-bound credentials, bounded
+   opaque FFI records, transactional state, sealed RAM-recovery snapshots, and
+   native/WASM/Android tests.
+2. Replace relay room access and all-account fanout with owner-approved,
+   epoch-bound MLS membership; bounded join requests, control messages,
+   encrypted per-member state snapshots, replay windows, and exact roster
+   attachment authorization.
+3. Add web and Android MLS room managers, strict protocol-v10 schemas,
+   lifecycle invalidation, UI join/approval/removal flows, and no pairwise room
+   fallback. Regenerate pinned reproducible WASM, UniFFI, and Android-native
+   artifacts only after the core API stabilizes.
+4. Cover create, join, Welcome, add, remove, leave, offline control, encrypted
+   text and attachments, rollback, tamper, replay, restart, delete, and global
+   wipe across focused and disposable-relay integration tests.
+5. Update verified architecture and security disclosures, then run the complete
+   non-packaging repository gate before commit or push. Do not build or release
+   an Android package during this deployment.
+
+### Provider Decision
+
+OpenMLS `0.8.1` was rejected because its locked dependency graph contains
+current high-severity RustSec findings. Exact `mls-rs 0.55.4` with RustCrypto
+`0.22.1` passed create/add/Welcome/remove/application/reload behavior, native
+Rust, `wasm32-unknown-unknown`, all four Android ABIs, RustSec, and license
+checks. The provider is Apache-2.0 OR MIT and compatible with MPL-2.0. Its
+RustCrypto backend is still marked experimental, and `mls-rs` has not received
+an independent third-party security audit; those facts remain explicit
+residual risks rather than being represented as solved.
+
 ## Completed Deployment: Canonical WebSocket Envelope Padding
 
 This package reduces exact encrypted-message length leakage on the TLS path by

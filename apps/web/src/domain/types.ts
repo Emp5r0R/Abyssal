@@ -83,6 +83,10 @@ export interface RoomRecord {
   enforce_file_absolute_expiry: boolean;
   conversation_type?: "room" | "direct";
   peer_username?: string;
+  mlsActive?: boolean;
+  mlsEpoch?: bigint;
+  mlsRevision?: bigint;
+  mlsMembers?: string[];
 }
 
 export interface DirectRecord {
@@ -154,7 +158,8 @@ export type IncomingFrame =
   | { type: "room_created"; room: RoomRecord }
   | { type: "room_deleted"; chat_id: string }
   | { type: "directs"; directs: DirectRecord[] }
-  | { type: "direct_opened"; direct: DirectRecord };
+  | { type: "direct_opened"; direct: DirectRecord }
+  | import("../transport/mlsWire").MlsIncomingFrame;
 
 export interface AttachmentOptions {
   oneTime: boolean;

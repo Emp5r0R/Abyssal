@@ -11,6 +11,8 @@ import com.abyssal.chat.data.network.decryptAndCompleteAttachment
 import com.abyssal.chat.data.network.FatalPayloadCipherException
 import com.abyssal.chat.data.network.normalizeAttachmentId
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
+import com.abyssal.chat.data.network.MlsRoomManager
+import com.abyssal.chat.data.network.MlsWireCodec
 import com.abyssal.chat.data.network.protocolAttachmentLimitBytes
 import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
@@ -29,6 +31,10 @@ import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MlsIncomingFrame
+import com.abyssal.chat.domain.model.PendingMlsJoinSummary
+import com.abyssal.chat.domain.model.PendingMlsLeaveSummary
+import com.abyssal.chat.domain.model.PreparedMlsSnapshot
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
@@ -43,6 +49,7 @@ import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.model.UpdatePromptPolicy
 import com.abyssal.chat.domain.repository.IAppUpdateService
 import com.abyssal.chat.domain.repository.IChatTransport
+import com.abyssal.chat.domain.repository.IMlsTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
 import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
 import com.abyssal.chat.domain.repository.IIdentityService
@@ -51,6 +58,7 @@ import com.abyssal.chat.domain.repository.IMessageSender
 import com.abyssal.chat.domain.repository.INodeConfigService
 import com.abyssal.chat.domain.repository.OutboundSendResult
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Base64
 import java.util.Collections
 import java.util.LinkedHashSet
@@ -366,7 +374,8 @@ class ChatViewModel(
     private val attachmentService: IEncryptedAttachmentService,
     private val disguiseManager: IDisguiseManager,
     private val appUpdateService: IAppUpdateService,
-    private val payloadCipher: InMemoryPayloadCipher = InMemoryPayloadCipher()
+    private val payloadCipher: InMemoryPayloadCipher = InMemoryPayloadCipher(),
+    private val mlsTransport: IMlsTransport? = chatTransport as? IMlsTransport
 ) : ViewModel() {
 
     private data class SessionStamp(
@@ -447,6 +456,14 @@ class ChatViewModel(
 
     private val _roomCreationLimit = MutableStateFlow(DEFAULT_MAX_ROOMS_PER_USER)
     val roomCreationLimit: StateFlow<Int> = _roomCreationLimit.asStateFlow()
+    private val _pendingMlsJoins = MutableStateFlow<List<PendingMlsJoinSummary>>(emptyList())
+    val pendingMlsJoins: StateFlow<List<PendingMlsJoinSummary>> = _pendingMlsJoins.asStateFlow()
+    private val _pendingMlsLeaves = MutableStateFlow<List<PendingMlsLeaveSummary>>(emptyList())
+    val pendingMlsLeaves: StateFlow<List<PendingMlsLeaveSummary>> = _pendingMlsLeaves.asStateFlow()
+    private var mlsManager: MlsRoomManager? = null
+    private val requestedMlsRooms = LinkedHashSet<String>()
+    private data class CachedMlsSnapshot(val evidence: ByteArray, val snapshot: PreparedMlsSnapshot)
+    private val mlsSnapshotCache = LinkedHashMap<String, CachedMlsSnapshot>()
 
     private var retainSessionInBackground = false
     private var sessionInactivityTimeoutSec = DEFAULT_SESSION_INACTIVITY_SEC
@@ -665,6 +682,152 @@ class ChatViewModel(
         }
     }
 
+    private suspend fun processIncomingMls(frame: MlsIncomingFrame, generation: Long) {
+        val transport = mlsTransport ?: return
+        cryptoGate.withLock {
+            val stamp = captureSessionStamp() ?: return@withLock
+            try {
+                if (generation != stamp.connectionGeneration) return@withLock
+                val manager = mlsManager ?: return@withLock
+                when (frame) {
+                    is MlsIncomingFrame.Rooms -> {
+                        val catalog = runCatching { manager.recoverCatalog(frame.rooms) }.getOrElse {
+                            failClosedAfterAmbiguous(); return@withLock
+                        }
+                        val incomingIds = catalog.mapTo(HashSet()) { it.id }
+                        sessions.value.filter { it.isForum && it.id !in incomingIds }.forEach {
+                            mutateRepositoryIfCurrent(stamp) { messageRepository.deleteChatSessionIfCurrent(stamp.repositoryEpoch, it.id) }
+                        }
+                        catalog.forEach { session ->
+                            mutateRepositoryIfCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, session) }
+                        }
+                    }
+                    is MlsIncomingFrame.RoomCreated -> {
+                        val session = MlsWireCodec.roomSession(frame.room)
+                        mutateRepositoryIfCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, session) }
+                    }
+                    is MlsIncomingFrame.RoomDiscovered -> if (requestedMlsRooms.remove(frame.roomId)) {
+                        val join = runCatching { manager.beginJoin(frame) }.getOrNull() ?: return@withLock
+                        try {
+                            if (!transport.sendMlsControl(join, generation)) manager.removeRoom(frame.roomId)
+                        } catch (error: CancellationException) {
+                            withContext(NonCancellable) { manager.removeRoom(frame.roomId) }
+                            throw error
+                        }
+                    }
+                    is MlsIncomingFrame.JoinRequested -> {
+                        runCatching { manager.rememberJoin(frame) }.onFailure { failClosedAfterAmbiguous() }
+                        _pendingMlsJoins.value = manager.pendingJoins()
+                    }
+                    is MlsIncomingFrame.JoinRejected -> {
+                        if (!manager.joinRejected(frame.roomId, frame.requestId)) failClosedAfterAmbiguous()
+                    }
+                    is MlsIncomingFrame.LeaveRequested -> {
+                        runCatching { manager.rememberLeave(frame) }.onFailure { failClosedAfterAmbiguous() }
+                        _pendingMlsLeaves.value = manager.pendingLeaves()
+                    }
+                    is MlsIncomingFrame.Membership -> {
+                        val prepared = runCatching { manager.receiveMembership(frame) }.getOrElse {
+                            failClosedAfterAmbiguous(); return@withLock
+                        }
+                        val outcome = try {
+                            transport.sendMlsSnapshot(frame.roomId, frame.messageId, frame.revision, prepared.frame, generation)
+                        } catch (error: CancellationException) {
+                            withContext(NonCancellable) {
+                                runCatching { manager.finishSnapshot(prepared, OutboundSendResult.AMBIGUOUS) }
+                            }
+                            throw error
+                        }
+                        runCatching { manager.finishSnapshot(prepared, outcome) }.onFailure { failClosedAfterAmbiguous() }
+                    }
+                    is MlsIncomingFrame.Application -> {
+                        val replayKey = "${frame.roomId}\u0000${frame.senderUsername}\u0000${frame.messageId}"
+                        val evidence = mlsApplicationEvidence(frame)
+                        val cached = mlsSnapshotCache[replayKey]
+                        if (cached != null) {
+                            try {
+                                if (!cached.evidence.contentEquals(evidence)) {
+                                    failClosedAfterAmbiguous(); return@withLock
+                                }
+                                val replayOutcome = transport.sendMlsSnapshot(
+                                    frame.roomId, frame.messageId, frame.revision, cached.snapshot.frame, generation
+                                )
+                                if (replayOutcome != OutboundSendResult.ACCEPTED) failClosedAfterAmbiguous()
+                                return@withLock
+                            } finally { evidence.fill(0) }
+                        }
+                        val decrypted = runCatching { manager.receiveApplication(frame) }.getOrElse { return@withLock }
+                        try {
+                            val outcome = try {
+                                transport.sendMlsSnapshot(frame.roomId, frame.messageId, frame.revision, decrypted.snapshot.frame, generation)
+                            } catch (error: CancellationException) {
+                                withContext(NonCancellable) {
+                                    runCatching { manager.finishSnapshot(decrypted.snapshot, OutboundSendResult.AMBIGUOUS) }
+                                }
+                                throw error
+                            }
+                            runCatching { manager.finishSnapshot(decrypted.snapshot, outcome) }.getOrElse { failClosedAfterAmbiguous(); return@withLock }
+                            if (outcome != OutboundSendResult.ACCEPTED || !isSessionStampValid(stamp)) return@withLock
+                            // Cache the exact accepted snapshot before parsing/publishing.
+                            // A replay is acknowledged from this cache and never decrypted or published twice.
+                            rememberMlsSnapshot(replayKey, evidence, decrypted.snapshot)
+                            val json = runCatching { JSONObject(String(decrypted.plaintext, StandardCharsets.UTF_8)) }.getOrNull() ?: return@withLock
+                            if (!matchesCurrentDirectoryStamp(json)) return@withLock
+                            if (json.optString("kind") == "read_receipt") {
+                                if (MessageReplyPolicy.sanitizeMessageId(json.optString("id")) != frame.messageId) return@withLock
+                                val target = MessageReplyPolicy.sanitizeMessageId(json.optString("message_id"))
+                                if (target != null && target in ownMessageIds) {
+                                    mutateRepositoryIfCurrent(stamp) { messageRepository.markAsReadIfCurrent(stamp.repositoryEpoch, frame.roomId, target) }
+                                }
+                                return@withLock
+                            }
+                            val senderKey = presence.value.firstOrNull { it.username == frame.senderUsername }?.publicKey ?: return@withLock
+                            val message = parseIncomingMessage(frame.roomId, frame.messageId, json.toString(), frame.senderUsername, senderKey) ?: return@withLock
+                            if (!mutateRepositoryIfCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) wipeMessageSecrets(message)
+                        } finally { decrypted.plaintext.fill(0); evidence.fill(0) }
+                    }
+                    is MlsIncomingFrame.RoomDeleted, is MlsIncomingFrame.Left -> {
+                        val roomId = if (frame is MlsIncomingFrame.RoomDeleted) frame.roomId else (frame as MlsIncomingFrame.Left).roomId
+                        manager.removeRoom(roomId)
+                        mutateRepositoryIfCurrent(stamp) { messageRepository.deleteChatSessionIfCurrent(stamp.repositoryEpoch, roomId) }
+                    }
+                    is MlsIncomingFrame.LeavePending -> {
+                        if (!manager.leavePending(frame.roomId, frame.requestId)) failClosedAfterAmbiguous()
+                    }
+                    is MlsIncomingFrame.LeaveRejected -> {
+                        runCatching { manager.forgetLeave(frame.roomId, frame.requestId) }
+                            .onFailure { failClosedAfterAmbiguous() }
+                        _pendingMlsLeaves.value = manager.pendingLeaves()
+                    }
+                    is MlsIncomingFrame.RoomResult -> Unit
+                }
+            } finally { stamp.wipe() }
+        }
+    }
+
+    private fun matchesCurrentDirectoryStamp(json: JSONObject): Boolean {
+        val current = chatTransport.currentDirectoryStamp() ?: return false
+        val revision = (json.opt("directory_revision") as? Number)?.toLong()?.takeIf { it > 0 }?.toULong() ?: return false
+        return json.opt("directory_node_id") == current.nodeId && revision == current.revision && json.opt("directory_digest") == current.digest
+    }
+
+    private fun mlsApplicationEvidence(frame: MlsIncomingFrame.Application): ByteArray {
+        val text = listOf(
+            frame.roomId, frame.messageId, frame.senderUsername, frame.epoch.toString(), frame.revision.toString(),
+            frame.membershipDigestB64, frame.ciphertextB64, frame.authenticatedDataB64
+        ).joinToString("\u0000").toByteArray(StandardCharsets.UTF_8)
+        return try { MessageDigest.getInstance("SHA-256").digest(text) } finally { text.fill(0) }
+    }
+
+    private fun rememberMlsSnapshot(key: String, evidence: ByteArray, snapshot: PreparedMlsSnapshot) {
+        mlsSnapshotCache.put(key, CachedMlsSnapshot(evidence.clone(), snapshot))?.evidence?.fill(0)
+        while (mlsSnapshotCache.size > 128) {
+            val iterator = mlsSnapshotCache.entries.iterator()
+            if (!iterator.hasNext()) break
+            iterator.next().value.evidence.fill(0); iterator.remove()
+        }
+    }
+
     init {
         _disguiseSettings.value = DisguiseSettings(
             isDisguised = disguiseManager.isDisguiseEnabled()
@@ -713,6 +876,16 @@ class ChatViewModel(
             }
         }
 
+        mlsTransport?.let { transport ->
+            viewModelScope.launch {
+                transport.getIncomingMlsFrames().collect { envelope ->
+                    if (envelope.generation == chatTransport.currentConnectionGeneration()) {
+                        processIncomingMls(envelope.frame, envelope.generation)
+                    }
+                }
+            }
+        }
+
         viewModelScope.launch {
             chatTransport.getRoomChanges().collect { change ->
                 processRoomChange(change)
@@ -733,8 +906,8 @@ class ChatViewModel(
             _activeChatId.value = screen.sessionId
             refreshDirectTrust()
             val connectionGeneration = chatTransport.currentConnectionGeneration()
-            viewModelScope.launch {
-                chatTransport.joinChat(screen.sessionId, connectionGeneration)
+            if (sessions.value.none { it.id == screen.sessionId && it.isForum }) {
+                viewModelScope.launch { chatTransport.joinChat(screen.sessionId, connectionGeneration) }
             }
         } else {
             _activeChatId.value = null
@@ -807,6 +980,10 @@ class ChatViewModel(
                 }
 
                 ensureActive()
+                // Every MlsRoom must be closed before NetworkIdentityService replaces
+                // the account E2eeSession owned by payloadCipher.
+                mlsManager?.close()
+                mlsManager = null
                 validation = identityService.enterAccount(code, password, endpoint)
                 // Do not install an identity returned by a request that was canceled while
                 // its response was being delivered.
@@ -832,6 +1009,8 @@ class ChatViewModel(
                         prekeyId = prekeyId
                     )
                     ensureActive()
+                    mlsManager?.close()
+                    mlsManager = MlsRoomManager(payloadCipher, identity.username, nodeId, publicKey)
                     identityService.setCurrentUser(identity)
                     nodeConfigService.setActiveSession(
                         NodeSession(endpoint, token, nodeId, result.maxRoomsPerUser)
@@ -917,9 +1096,10 @@ class ChatViewModel(
                     replyToMessageId = validReplyTarget(replyToMessageId)
                 )
                 if (!isSessionStampValid(capturedStamp)) return@sendMessageOperation
-                val remoteRecipients = recipientIdentities(chatId, includeSelf = false)
+                val isMlsRoom = mlsManager?.isActiveRoom(chatId) == true
+                val remoteRecipients = if (isMlsRoom) emptyList() else recipientIdentities(chatId, includeSelf = false)
                 if (!isSessionStampValid(capturedStamp)) return@sendMessageOperation
-                if (isLocalOnlyForum(chatId, remoteRecipients)) {
+                if (!isMlsRoom && isLocalOnlyForum(chatId, remoteRecipients)) {
                     if (!mutateRepositoryIfCurrent(capturedStamp) {
                             messageRepository.saveMessageIfCurrent(
                                 capturedStamp.repositoryEpoch,
@@ -987,8 +1167,9 @@ class ChatViewModel(
             bytes.fill(0)
             return
         }
-        val remoteRecipients = recipientIdentities(chatId, includeSelf = false)
-        if (isLocalOnlyForum(chatId, remoteRecipients)) {
+        val isMlsRoom = mlsManager?.isActiveRoom(chatId) == true
+        val remoteRecipients = if (isMlsRoom) emptyList() else recipientIdentities(chatId, includeSelf = false)
+        if (!isMlsRoom && isLocalOnlyForum(chatId, remoteRecipients)) {
             _attachmentError.value = "Wrong information."
             bytes.fill(0)
             return
@@ -1051,14 +1232,14 @@ class ChatViewModel(
                         totalBytes = bytes.size.toLong()
                     )
                 }
-                val metadataRecipients = recipientIdentities(chatId, includeSelf = false)
+                val metadataRecipients = if (isMlsRoom) emptyList() else recipientIdentities(chatId, includeSelf = false)
                 if (!isAttachmentSessionCurrent(
                         capturedSession,
                         sessionStamp,
                         operationActive
                     ) ||
                     metadataRecipients == null ||
-                    isLocalOnlyForum(chatId, metadataRecipients)
+                    (!isMlsRoom && isLocalOnlyForum(chatId, metadataRecipients))
                 ) {
                     if (isAttachmentProgressCurrent(
                             operationId,
@@ -1606,14 +1787,114 @@ class ChatViewModel(
                 enforceFileAbsoluteExpiry = enforceFileAbsoluteExpiry,
                 ownerUsername = currentUser.value?.username
             )
-            chatTransport.createForum(session, connectionGeneration)
+            val manager = mlsManager ?: return@launch
+            val transport = mlsTransport ?: return@launch
+            val frame = runCatching { manager.createRoom(session) }.getOrNull() ?: return@launch
+            try {
+                if (!transport.sendMlsControl(frame, connectionGeneration)) manager.removeRoom(session.id)
+            } catch (error: CancellationException) {
+                withContext(NonCancellable) { manager.removeRoom(session.id) }
+                throw error
+            }
         }
     }
 
     fun deleteForum(chatId: String) {
         val connectionGeneration = chatTransport.currentConnectionGeneration()
         viewModelScope.launch {
-            chatTransport.deleteForum(chatId, connectionGeneration)
+            val transport = mlsTransport ?: return@launch
+            val frame = JSONObject().put("type", "mls_delete_room").put("protocol_version", 10).put("room_id", chatId)
+            transport.sendMlsControl(frame, connectionGeneration)
+        }
+    }
+
+    fun requestJoinRoom(roomId: String) {
+        val normalized = roomId.trim()
+        if (!Regex("^[A-Za-z0-9_-]{1,128}$").matches(normalized) || requestedMlsRooms.size >= 32) return
+        val transport = mlsTransport ?: return
+        val generation = chatTransport.currentConnectionGeneration()
+        requestedMlsRooms += normalized
+        viewModelScope.launch {
+            val frame = JSONObject().put("type", "mls_discover_room").put("protocol_version", 10).put("room_id", normalized)
+            if (!transport.sendMlsControl(frame, generation)) requestedMlsRooms.remove(normalized)
+        }
+    }
+
+    fun acceptMlsJoin(requestId: String) {
+        val transport = mlsTransport ?: return
+        val manager = mlsManager ?: return
+        val generation = chatTransport.currentConnectionGeneration()
+        viewModelScope.launch {
+                cryptoGate.withLock {
+                    val prepared = runCatching { manager.acceptJoin(requestId) }.getOrNull() ?: return@withLock
+                val result = try {
+                    transport.sendMlsTransaction(prepared.roomId, prepared.messageId, prepared.revision, prepared.frame, generation)
+                } catch (error: CancellationException) {
+                    withContext(NonCancellable) { runCatching { manager.finishTransaction(prepared, OutboundSendResult.AMBIGUOUS) } }
+                    throw error
+                }
+                runCatching { manager.finishTransaction(prepared, result) }
+                _pendingMlsJoins.value = manager.pendingJoins()
+            }
+        }
+    }
+
+    fun rejectMlsJoin(requestId: String) {
+        val transport = mlsTransport ?: return
+        val manager = mlsManager ?: return
+        val generation = chatTransport.currentConnectionGeneration()
+        viewModelScope.launch {
+            val frame = runCatching { manager.rejectJoin(requestId) }.getOrNull() ?: return@launch
+            if (transport.sendMlsControl(frame, generation)) {
+                runCatching { manager.forgetJoin(requestId) }
+            }
+            _pendingMlsJoins.value = manager.pendingJoins()
+        }
+    }
+
+    fun leaveRoom(chatId: String) {
+        val transport = mlsTransport ?: return
+        val manager = mlsManager ?: return
+        val generation = chatTransport.currentConnectionGeneration()
+        viewModelScope.launch {
+            val frame = runCatching { manager.beginLeave(chatId) }.getOrNull() ?: return@launch
+            val sent = transport.sendMlsControl(frame, generation)
+            if (!sent) {
+                val roomId = frame.optString("room_id")
+                val requestId = frame.optString("request_id")
+                runCatching { manager.forgetLeave(roomId, requestId) }
+            }
+            _pendingMlsLeaves.value = manager.pendingLeaves()
+        }
+    }
+
+    fun acceptMlsLeave(requestId: String) {
+        val transport = mlsTransport ?: return
+        val manager = mlsManager ?: return
+        val generation = chatTransport.currentConnectionGeneration()
+        viewModelScope.launch { cryptoGate.withLock {
+            val prepared = runCatching { manager.acceptLeave(requestId) }.getOrNull() ?: return@withLock
+            val result = try {
+                transport.sendMlsTransaction(prepared.roomId, prepared.messageId, prepared.revision, prepared.frame, generation)
+            } catch (error: CancellationException) {
+                withContext(NonCancellable) { runCatching { manager.finishTransaction(prepared, OutboundSendResult.AMBIGUOUS) } }
+                throw error
+            }
+            runCatching { manager.finishTransaction(prepared, result) }
+            _pendingMlsLeaves.value = manager.pendingLeaves()
+        } }
+    }
+
+    fun rejectMlsLeave(requestId: String) {
+        val transport = mlsTransport ?: return
+        val manager = mlsManager ?: return
+        val generation = chatTransport.currentConnectionGeneration()
+        viewModelScope.launch {
+            val frame = runCatching { manager.rejectLeave(requestId) }.getOrNull() ?: return@launch
+            if (transport.sendMlsControl(frame, generation)) {
+                runCatching { manager.forgetLeave(frame.getString("room_id"), frame.getString("request_id")) }
+            }
+            _pendingMlsLeaves.value = manager.pendingLeaves()
         }
     }
 
@@ -1635,7 +1916,7 @@ class ChatViewModel(
 
     private suspend fun joinAvailableSessions(expectedConnectionGeneration: Long) {
         sessions.value.forEach { session ->
-            chatTransport.joinChat(session.id, expectedConnectionGeneration)
+            if (!session.isForum) chatTransport.joinChat(session.id, expectedConnectionGeneration)
         }
     }
 
@@ -1934,6 +2215,13 @@ class ChatViewModel(
             logout = identityService::logout,
             clearNodeSession = nodeConfigService::clear
         )
+        mlsManager?.close()
+        mlsManager = null
+        requestedMlsRooms.clear()
+        _pendingMlsJoins.value = emptyList()
+        _pendingMlsLeaves.value = emptyList()
+        mlsSnapshotCache.values.forEach { it.evidence.fill(0) }
+        mlsSnapshotCache.clear()
         payloadCipher.clear()
         _currentUser.value = null
         _currentScreen.value = Screen.Entrance
@@ -2186,6 +2474,36 @@ class ChatViewModel(
                 put("directory_digest", directoryStamp.digest)
             }.toString()
         }.getOrElse { return@withLock OutboundSendResult.NOT_SENT }
+        val mlsManagerForChat = mlsManager
+        if (mlsManagerForChat?.isActiveRoom(chatId) == true) {
+            val transport = mlsTransport ?: return@withLock OutboundSendResult.NOT_SENT
+            val manager = mlsManagerForChat
+            val sender = currentUser.value?.username ?: return@withLock OutboundSendResult.NOT_SENT
+            val plain = stampedMetadata.toByteArray(StandardCharsets.UTF_8)
+            val prepared = try {
+                manager.prepareApplication(chatId, messageId, sender, plain)
+            } catch (_: Exception) {
+                return@withLock OutboundSendResult.NOT_SENT
+            } finally { plain.fill(0) }
+            val result = try {
+                transport.sendMlsTransaction(chatId, messageId, prepared.revision, prepared.frame, connectionGeneration)
+            } catch (error: CancellationException) {
+                withContext(NonCancellable) {
+                    runCatching { manager.finishTransaction(prepared, OutboundSendResult.AMBIGUOUS) }
+                }
+                throw error
+            } catch (_: Exception) {
+                OutboundSendResult.AMBIGUOUS
+            }
+            return@withLock try {
+                manager.finishTransaction(prepared, result)
+                result
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                OutboundSendResult.AMBIGUOUS
+            }
+        }
         val prepared = try {
             encryptMetadata(
                 chatId = chatId,
@@ -2754,6 +3072,10 @@ class ChatViewModel(
         _currentUser.value = null
         accountEntryJob?.cancel()
         accountEntryJob = null
+        // MlsRoom owns the account's native MLS session. Close it before the
+        // shared payload cipher clears the underlying identity provider.
+        mlsManager?.close()
+        mlsManager = null
         payloadCipher.clear()
         chatTransport.disconnect()
         super.onCleared()

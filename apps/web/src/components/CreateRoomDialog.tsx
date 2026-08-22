@@ -5,7 +5,7 @@ import { Dialog, Field, Toggle } from "./Ui";
 
 function newRoom(): RoomRecord {
   return {
-    id: `forum_${crypto.randomUUID()}`,
+    id: "forum_pending",
     name: "",
     self_destruct_timer_sec: 10,
     overall_expiry_sec: 300,
@@ -32,6 +32,8 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const next = clampRoom(room);
+    const slug = next.name.toLowerCase().replace(/[^a-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 72) || "room";
+    next.id = `forum_${slug}_${crypto.randomUUID().slice(0, 8)}`;
     if (next.name && onCreate(next)) onCancel();
   };
 

@@ -23,6 +23,7 @@ import {
   padOutgoingMessageFrame,
   validateAndStripIncomingMessagePadding,
 } from "./messagePadding";
+import { MLS_MAX_FRAME_BYTES, parseMlsIncomingFrame, validMlsControlFrame } from "./mlsWire";
 
 const JSON_HEADERS = { "Content-Type": "application/json" } as const;
 const ATTACHMENT_CLAIM_HEADER = "X-Abyssal-Attachment-Claim";
@@ -45,6 +46,7 @@ const MESSAGE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/u;
 const MAX_PENDING_MESSAGE_RESULTS = 256;
 const MAX_PENDING_ACK_RESULTS = 256;
+const MAX_PENDING_MLS_RESULTS = 256;
 export const MAX_PENDING_PREKEY_LEASES = 256;
 const MESSAGE_RESULT_TIMEOUT_MS = 10_000;
 const ACK_RESULT_TIMEOUT_MS = 10_000;
@@ -90,6 +92,12 @@ interface PendingMessageResult {
   timer: number;
 }
 
+interface PendingMlsResult extends PendingMessageResult {
+  roomId: string;
+  revision: string;
+  resultType: "mls_room_result" | "mls_snapshot_result";
+}
+
 export interface PrekeyLease {
   chatId: string;
   messageId: string;
@@ -131,6 +139,15 @@ interface MessageResultFrame {
 interface AckResultFrame {
   type: "ack_result";
   message_id: string;
+  accepted: boolean;
+}
+
+interface MlsResultFrame {
+  type: "mls_room_result" | "mls_snapshot_result";
+  protocol_version: 10;
+  room_id: string;
+  message_id: string;
+  revision: string;
   accepted: boolean;
 }
 
@@ -279,6 +296,7 @@ export class RelaySocket {
   #purgeNotified = false;
   #pendingResults = new Map<string, PendingMessageResult>();
   #pendingAckResults = new Map<string, PendingMessageResult>();
+  #pendingMlsResults = new Map<string, PendingMlsResult>();
   #pendingPrekeyLeases = new Map<string, PendingPrekeyLease>();
   #directoryStamp: DirectoryStamp | null = null;
 
@@ -353,6 +371,63 @@ export class RelaySocket {
         resolve("NOT_SENT");
       }
     });
+  }
+
+  sendMlsTransaction(roomId: string, messageId: string, revision: bigint, frame: object): Promise<EncryptedSendOutcome> {
+    const revisionText = revision.toString(10);
+    if (!CHAT_ID_PATTERN.test(roomId) || !MESSAGE_ID_PATTERN.test(messageId) ||
+      !plainRecord(frame) || frame.room_id !== roomId || frame.message_id !== messageId ||
+      frame.revision !== revisionText ||
+      (frame.type !== "mls_application" && frame.type !== "mls_membership_commit") ||
+      this.#socket?.readyState !== WebSocket.OPEN || this.#pendingMlsResults.size >= MAX_PENDING_MLS_RESULTS ||
+      this.#pendingMlsResults.has(messageId)) return Promise.resolve("NOT_SENT");
+    const serialized = serializeRelayFrame(frame, MLS_MAX_FRAME_BYTES);
+    if (serialized === null) return Promise.resolve("NOT_SENT");
+    const socket = this.#socket;
+    const generation = this.#socketGeneration;
+    return new Promise<EncryptedSendOutcome>((resolve) => {
+      const timer = window.setTimeout(() => {
+        const pending = this.#pendingMlsResults.get(messageId);
+        if (!pending || pending.generation !== generation) return;
+        this.#pendingMlsResults.delete(messageId);
+        pending.resolve("AMBIGUOUS");
+        this.failClosed("MLS result timeout");
+      }, MESSAGE_RESULT_TIMEOUT_MS);
+      this.#pendingMlsResults.set(messageId, { generation, resolve, timer, roomId, revision: revisionText, resultType: "mls_room_result" });
+      try { socket.send(serialized); }
+      catch {
+        window.clearTimeout(timer);
+        this.#pendingMlsResults.delete(messageId);
+        resolve("NOT_SENT");
+      }
+    });
+  }
+
+  sendMlsSnapshot(roomId: string, messageId: string, revision: bigint, frame: object): Promise<EncryptedSendOutcome> {
+    const revisionText = revision.toString(10);
+    if (!CHAT_ID_PATTERN.test(roomId) || !MESSAGE_ID_PATTERN.test(messageId) || !plainRecord(frame) ||
+      frame.type !== "mls_state_snapshot" || frame.room_id !== roomId || frame.message_id !== messageId ||
+      frame.revision !== revisionText || this.#socket?.readyState !== WebSocket.OPEN ||
+      this.#pendingMlsResults.size >= MAX_PENDING_MLS_RESULTS || this.#pendingMlsResults.has(messageId)) return Promise.resolve("NOT_SENT");
+    const serialized = serializeRelayFrame(frame, MLS_MAX_FRAME_BYTES);
+    if (serialized === null) return Promise.resolve("NOT_SENT");
+    const socket = this.#socket; const generation = this.#socketGeneration;
+    return new Promise<EncryptedSendOutcome>((resolve) => {
+      const timer = window.setTimeout(() => {
+        const pending = this.#pendingMlsResults.get(messageId);
+        if (!pending || pending.generation !== generation) return;
+        this.#pendingMlsResults.delete(messageId); pending.resolve("AMBIGUOUS"); this.failClosed("MLS snapshot timeout");
+      }, MESSAGE_RESULT_TIMEOUT_MS);
+      this.#pendingMlsResults.set(messageId, { generation, resolve, timer, roomId, revision: revisionText, resultType: "mls_snapshot_result" });
+      try { socket.send(serialized); } catch { window.clearTimeout(timer); this.#pendingMlsResults.delete(messageId); resolve("NOT_SENT"); }
+    });
+  }
+
+  sendMlsControl(frame: object): boolean {
+    if (!plainRecord(frame) || !validMlsControlFrame(frame)) return false;
+    const serialized = serializeRelayFrame(frame, MLS_MAX_FRAME_BYTES);
+    if (serialized === null || this.#socket?.readyState !== WebSocket.OPEN) return false;
+    try { this.#socket.send(serialized); return true; } catch { return false; }
   }
 
   requestPrekeyLease(
@@ -528,6 +603,7 @@ export class RelaySocket {
     this.#reconnectTimer = undefined;
     this.settlePending("AMBIGUOUS");
     this.settleAckPending("AMBIGUOUS");
+    this.settleMlsPending("AMBIGUOUS");
     this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     this.#socket?.close(1000, "client disconnect");
     this.#socket = null;
@@ -568,7 +644,8 @@ export class RelaySocket {
       socket.onmessage = (event) => {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         if (typeof event.data !== "string") return;
-        if (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES)) {
+        if (!utf8LengthWithin(event.data, MLS_MAX_FRAME_BYTES) ||
+          (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES) && !looksLikeMlsFrame(event.data))) {
           this.#manualClose = true;
           socket.close(1009, "frame too large");
           return;
@@ -584,6 +661,10 @@ export class RelaySocket {
           } else {
             this.resolveAckResult(parsed.result);
           }
+          return;
+        }
+        if (parsed.kind === "mls-result") {
+          this.resolveMlsResult(parsed.result);
           return;
         }
         if (parsed.kind === "prekey-lease") {
@@ -603,6 +684,7 @@ export class RelaySocket {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         this.settlePending("AMBIGUOUS");
         this.settleAckPending("AMBIGUOUS");
+        this.settleMlsPending("AMBIGUOUS");
         this.settlePrekeyPending(new PrekeyLeaseError("AMBIGUOUS"));
         socket.close();
       };
@@ -614,6 +696,7 @@ export class RelaySocket {
         }
         this.settlePending("AMBIGUOUS");
         this.settleAckPending("AMBIGUOUS");
+        this.settleMlsPending("AMBIGUOUS");
         this.settlePrekeyPending(new PrekeyLeaseError("AMBIGUOUS"));
         this.#socket = null;
         this.#socketGeneration = 0;
@@ -654,6 +737,7 @@ export class RelaySocket {
     this.#reconnectTimer = undefined;
     this.settlePending("AMBIGUOUS");
     this.settleAckPending("AMBIGUOUS");
+    this.settleMlsPending("AMBIGUOUS");
     this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     this.#socket = null;
     this.#socketGeneration = 0;
@@ -687,6 +771,18 @@ export class RelaySocket {
     pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
   }
 
+  private resolveMlsResult(result: MlsResultFrame): void {
+    const pending = this.#pendingMlsResults.get(result.message_id);
+    if (!pending || pending.generation !== this.#socketGeneration || pending.resultType !== result.type ||
+      pending.roomId !== result.room_id || pending.revision !== result.revision) {
+      this.failClosed("unknown MLS result");
+      return;
+    }
+    this.#pendingMlsResults.delete(result.message_id);
+    window.clearTimeout(pending.timer);
+    pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
+  }
+
   private settlePending(outcome: RelayOperationOutcome): void {
     const pending = [...this.#pendingResults.values()];
     this.#pendingResults.clear();
@@ -703,6 +799,12 @@ export class RelaySocket {
       window.clearTimeout(entry.timer);
       entry.resolve(outcome);
     });
+  }
+
+  private settleMlsPending(outcome: RelayOperationOutcome): void {
+    const pending = [...this.#pendingMlsResults.values()];
+    this.#pendingMlsResults.clear();
+    pending.forEach((entry) => { window.clearTimeout(entry.timer); entry.resolve(outcome); });
   }
 
   private settlePrekeyPending(error: PrekeyLeaseError): void {
@@ -760,6 +862,7 @@ export class RelaySocket {
     this.#reconnectTimer = undefined;
     this.settlePending("AMBIGUOUS");
     this.settleAckPending("AMBIGUOUS");
+    this.settleMlsPending("AMBIGUOUS");
     this.settlePrekeyPending(new PrekeyLeaseError("CLOSED"));
     const socket = this.#socket;
     this.#socket = null;
@@ -1254,12 +1357,13 @@ function nullish(value: unknown): boolean {
 type ParsedRelayFrame =
   | { kind: "frame"; frame: IncomingFrame }
   | { kind: "result"; result: MessageResultFrame | AckResultFrame }
+  | { kind: "mls-result"; result: MlsResultFrame }
   | { kind: "prekey-lease"; lease: PrekeyLeaseFrame }
   | { kind: "invalid-result" }
   | { kind: "ignored" };
 
 function parseRelayFrame(text: string): ParsedRelayFrame {
-  if (!utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES)) return { kind: "ignored" };
+  if (!utf8LengthWithin(text, MLS_MAX_FRAME_BYTES)) return { kind: "ignored" };
   let value: unknown;
   try {
     value = JSON.parse(text) as unknown;
@@ -1268,6 +1372,14 @@ function parseRelayFrame(text: string): ParsedRelayFrame {
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "ignored" };
   const frame = value as Record<string, unknown>;
+  const mls = typeof frame.type === "string" && frame.type.startsWith("mls_");
+  if (!mls && !utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES)) return { kind: "invalid-result" };
+  if (mls) {
+    const parsed = parseMlsIncomingFrame(frame);
+    if (!parsed) return { kind: "invalid-result" };
+    if (parsed.type === "mls_room_result" || parsed.type === "mls_snapshot_result") return { kind: "mls-result", result: parsed };
+    return { kind: "frame", frame: parsed };
+  }
   if (frame.type === "prekey_lease") {
     if (!exactObjectKeys(frame, [
       "type", "chat_id", "message_id", "recipient_username", "recipient_public_key_b64",
@@ -1382,14 +1494,14 @@ function prekeyLeaseKey(chatId: string, messageId: string, recipientUsername: st
   return `${chatId}\u0000${messageId}\u0000${recipientUsername}`;
 }
 
-function serializeRelayFrame(frame: object): string | null {
+function serializeRelayFrame(frame: object, maxBytes = MAX_RELAY_TEXT_BYTES): string | null {
   let serialized: string;
   try {
     serialized = JSON.stringify(frame);
   } catch {
     return null;
   }
-  return typeof serialized === "string" && utf8LengthWithin(serialized, MAX_RELAY_TEXT_BYTES)
+  return typeof serialized === "string" && utf8LengthWithin(serialized, maxBytes)
     ? serialized
     : null;
 }
@@ -1426,6 +1538,10 @@ function utf8LengthWithin(value: string, maxBytes: number): boolean {
     if (bytes > maxBytes) return false;
   }
   return true;
+}
+
+function looksLikeMlsFrame(value: string): boolean {
+  return /^\s*\{\s*"type"\s*:\s*"mls_[a-z_]+"/u.test(value.slice(0, 160));
 }
 
 function attachmentClaimHeaders(session: AccountSession, claim: string): Record<string, string> {
