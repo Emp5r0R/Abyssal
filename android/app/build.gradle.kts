@@ -7,6 +7,23 @@ val releaseStorePath = providers.environmentVariable("ABYSSAL_KEYSTORE_PATH").or
 val releaseStorePassword = providers.environmentVariable("ABYSSAL_KEYSTORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("ABYSSAL_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("ABYSSAL_KEY_PASSWORD").orNull
+val releaseBuildId = providers.environmentVariable("ABYSSAL_BUILD_ID").orNull
+    ?: "android@0.0.0"
+val releaseBuildSignature = providers.environmentVariable("ABYSSAL_BUILD_SIGNATURE_B64").orNull
+    ?: ""
+val releaseSourceCommit = providers.environmentVariable("ABYSSAL_SOURCE_COMMIT").orNull
+    ?: "0000000000000000000000000000000000000000"
+val releaseBuildConfigured = releaseBuildSignature.isNotEmpty()
+
+require(Regex("^android@(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$").matches(releaseBuildId)) {
+    "ABYSSAL_BUILD_ID is invalid"
+}
+require(releaseBuildSignature.isEmpty() || Regex("^[A-Za-z0-9_-]{86}$").matches(releaseBuildSignature)) {
+    "ABYSSAL_BUILD_SIGNATURE_B64 is invalid"
+}
+require(Regex("^[0-9a-f]{40}$").matches(releaseSourceCommit)) {
+    "ABYSSAL_SOURCE_COMMIT is invalid"
+}
 val hasReleaseSigning = listOf(
     releaseStorePath,
     releaseStorePassword,
@@ -30,6 +47,10 @@ android {
             "UPDATE_API_URL",
             "\"https://api.github.com/repos/Emp5r0R/Abyssal/releases/latest\""
         )
+        buildConfigField("String", "RELEASE_BUILD_ID", "\"$releaseBuildId\"")
+        buildConfigField("String", "RELEASE_BUILD_SIGNATURE_B64", "\"$releaseBuildSignature\"")
+        buildConfigField("String", "RELEASE_SOURCE_COMMIT", "\"$releaseSourceCommit\"")
+        buildConfigField("boolean", "RELEASE_BUILD_CONFIGURED", releaseBuildConfigured.toString())
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {

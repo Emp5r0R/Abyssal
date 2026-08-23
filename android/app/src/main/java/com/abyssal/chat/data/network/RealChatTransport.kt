@@ -46,6 +46,7 @@ import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -228,10 +229,11 @@ internal fun websocketUpgradeRequest(endpoint: NodeEndpoint, ticket: String): Re
         .build()
 }
 
-class RealChatTransport(
+internal class RealChatTransport(
     private val nodeConfigService: INodeConfigService,
     private val client: OkHttpClient,
-    private val callFactory: Call.Factory = client
+    private val callFactory: Call.Factory = client,
+    private val buildAttestationProvider: BuildAttestationProvider = AndroidBuildAttestationProvider
 ) : IChatTransport, IMlsTransport {
     private data class PendingOperation(
         val generation: Long,
@@ -312,6 +314,11 @@ class RealChatTransport(
             _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
             return
         }
+        val buildAttestation = buildAttestationProvider.current()
+        if (buildAttestation == null) {
+            _serverStatus.value = ServerStatus("SECURITY_REJECTED", session.nodeId, 0)
+            return
+        }
 
         val generation: Long
         synchronized(connectionLock) {
@@ -329,7 +336,11 @@ class RealChatTransport(
             .header("Authorization", "Bearer ${session.token}")
             .header("Cache-Control", "no-store")
             .header("Pragma", "no-cache")
-            .post(ByteArray(0).toRequestBody(null))
+            .post(
+                buildAttestation.toJson().toRequestBody(
+                    "application/json; charset=utf-8".toMediaType()
+                )
+            )
             .build()
         val call = runCatching { callFactory.newCall(request) }.getOrElse {
             failTicketConnection(generation, session)
@@ -358,9 +369,14 @@ class RealChatTransport(
                         response.close()
                         return
                     }
+                    val buildRejected = response.code == 426
                     val ticket = response.use { parseWsTicket(it) }
                     if (ticket == null || !isCurrentTicket(call, generation, session)) {
-                        failTicketConnection(generation, session)
+                        failTicketConnection(
+                            generation,
+                            session,
+                            if (buildRejected) "SECURITY_REJECTED" else "DISCONNECTED"
+                        )
                         return
                     }
                     synchronized(connectionLock) {
@@ -512,12 +528,16 @@ class RealChatTransport(
         generation == connectionGeneration.get() &&
             isSameSession(nodeConfigService.getActiveSession(), expected)
 
-    private fun failTicketConnection(generation: Long, expected: NodeSession) {
+    private fun failTicketConnection(
+        generation: Long,
+        expected: NodeSession,
+        state: String = "DISCONNECTED"
+    ) {
         synchronized(connectionLock) {
             if (!isCurrentConnection(generation, expected)) return
             ticketCall = null
             connecting.set(false)
-            _serverStatus.value = ServerStatus("DISCONNECTED", expected.nodeId, 0)
+            _serverStatus.value = ServerStatus(state, expected.nodeId, 0)
         }
     }
 

@@ -1,0 +1,16 @@
+[package]
+name = "abyssal-release-tool"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+abyssal-core = { path = "../../rust-core" }
+base64 = "=0.23.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "rand_core", "zeroize"] }
+libc = "0.2"
+rand = "0.8"
+serde_json = "1"
+sha2 = "0.11"
+zeroize = "1.7"

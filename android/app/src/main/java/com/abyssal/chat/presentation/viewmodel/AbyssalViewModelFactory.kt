@@ -13,6 +13,7 @@ import com.abyssal.chat.data.network.RealChatTransport
 import com.abyssal.chat.data.repository.AndroidDisguiseManager
 import com.abyssal.chat.data.repository.InMemoryMessageRepository
 import java.util.concurrent.TimeUnit
+import java.net.Proxy
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 
@@ -61,6 +62,7 @@ class AbyssalViewModelFactory(
         val appUpdateService = GitHubReleaseUpdateService(
             client = OkHttpClient.Builder()
                 .dns(Dns.SYSTEM)
+                .proxy(Proxy.NO_PROXY)
                 .callTimeout(12, TimeUnit.SECONDS)
                 .connectTimeout(8, TimeUnit.SECONDS)
                 .readTimeout(10, TimeUnit.SECONDS)

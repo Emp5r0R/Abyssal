@@ -5,6 +5,26 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ABYSSAL_RELEASE_ENV:-$ROOT_DIR/deploy/release.env}"
 GRADLE_HOME="${ABYSSAL_GRADLE_HOME:-$ROOT_DIR/.gradle-local}"
 OUTPUT_DIR="${ABYSSAL_RELEASE_OUTPUT_DIR:-$ROOT_DIR/build-outputs}"
+RELEASE_PROVENANCE_KEY="${ABYSSAL_RELEASE_SIGNING_KEY_FILE:-}"
+RELEASE_TOOL="$ROOT_DIR/target/release/abyssal-release-tool"
+
+[[ -n "$RELEASE_PROVENANCE_KEY" ]] || {
+  printf 'ABYSSAL_RELEASE_SIGNING_KEY_FILE is required. Environment key material is not accepted.\n' >&2
+  exit 1
+}
+[[ -f "$RELEASE_PROVENANCE_KEY" && ! -L "$RELEASE_PROVENANCE_KEY" ]] || {
+  printf 'Release signing key must be a regular non-symlink file.\n' >&2
+  exit 1
+}
+git -C "$ROOT_DIR" diff --quiet --ignore-submodules -- && \
+  git -C "$ROOT_DIR" diff --cached --quiet --ignore-submodules -- || {
+  printf 'Release builds require a clean tracked worktree and index.\n' >&2
+  exit 1
+}
+
+cargo build --manifest-path "$ROOT_DIR/Cargo.toml" \
+  --package abyssal-release-tool --release --locked
+"$RELEASE_TOOL" check-root --private-key "$RELEASE_PROVENANCE_KEY"
 
 # Packaging is deliberately downstream of the complete non-packaging gate.
 # This keeps a release build from being used to bypass supply-chain, crypto,
@@ -45,6 +65,29 @@ unset RECORDED_CRYPTO_DIGEST CURRENT_CRYPTO_DIGEST
 
 VERSION="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' "$ROOT_DIR/android/app/build.gradle.kts" | head -1)"
 [[ -n "$VERSION" ]] || { printf 'Unable to read Android versionName.\n' >&2; exit 1; }
+SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse --verify HEAD)"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { printf 'Release source commit is invalid.\n' >&2; exit 1; }
+BUILD_ID="android@$VERSION"
+APK_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-universal-release.apk"
+AAB_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-release.aab"
+CHECKSUM_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-SHA256SUMS.txt"
+BUILD_RECORD="$OUTPUT_DIR/abyssal-android-$VERSION-build-record.json"
+for output in "$APK_OUTPUT" "$AAB_OUTPUT" "$CHECKSUM_OUTPUT" "$BUILD_RECORD"; do
+  [[ ! -e "$output" && ! -L "$output" ]] || {
+    printf 'Refusing to overwrite release output: %s\n' "$output" >&2
+    exit 1
+  }
+done
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/abyssal-android-release.XXXXXX")"
+trap 'rm -rf -- "$TEMP_DIR"' EXIT
+BUILD_SIGNATURE_FILE="$TEMP_DIR/android-build-signature.b64"
+"$RELEASE_TOOL" sign-build \
+  --private-key "$RELEASE_PROVENANCE_KEY" \
+  --build-id "$BUILD_ID" \
+  --source-commit "$SOURCE_COMMIT" \
+  --output "$BUILD_SIGNATURE_FILE"
+ABYSSAL_BUILD_SIGNATURE_B64="$(tr -d '\n' < "$BUILD_SIGNATURE_FILE")"
+export ABYSSAL_BUILD_ID="$BUILD_ID" ABYSSAL_BUILD_SIGNATURE_B64 ABYSSAL_SOURCE_COMMIT="$SOURCE_COMMIT"
 
 (
   cd "$ROOT_DIR/android"
@@ -98,16 +141,24 @@ fi
 unset AAB_VERIFY_OUTPUT
 
 mkdir -p "$OUTPUT_DIR"
-APK_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-universal-release.apk"
-AAB_OUTPUT="$OUTPUT_DIR/abyssal-android-$VERSION-release.aab"
 cp "$APK_SOURCE" "$APK_OUTPUT"
 cp "$AAB_SOURCE" "$AAB_OUTPUT"
 (
   cd "$OUTPUT_DIR"
   sha256sum "$(basename "$APK_OUTPUT")" "$(basename "$AAB_OUTPUT")" \
-    >"abyssal-android-$VERSION-SHA256SUMS.txt"
+    >"$(basename "$CHECKSUM_OUTPUT")"
 )
+"$RELEASE_TOOL" create-build-record \
+  --private-key "$RELEASE_PROVENANCE_KEY" \
+  --build-id "$BUILD_ID" \
+  --source-commit "$SOURCE_COMMIT" \
+  --expected-signature "$BUILD_SIGNATURE_FILE" \
+  --output "$BUILD_RECORD" \
+  --asset "$(basename "$APK_OUTPUT")" "$APK_OUTPUT" \
+  --asset "$(basename "$AAB_OUTPUT")" "$AAB_OUTPUT" \
+  --asset "$(basename "$CHECKSUM_OUTPUT")" "$CHECKSUM_OUTPUT"
 
 printf 'Release APK: %s\n' "$APK_OUTPUT"
 printf 'Release AAB: %s\n' "$AAB_OUTPUT"
-printf 'Checksums: %s\n' "$OUTPUT_DIR/abyssal-android-$VERSION-SHA256SUMS.txt"
+printf 'Checksums: %s\n' "$CHECKSUM_OUTPUT"
+printf 'Build record: %s\n' "$BUILD_RECORD"

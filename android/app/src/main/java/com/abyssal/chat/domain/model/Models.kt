@@ -93,7 +93,7 @@ data class ChatSession(
 )
 
 data class ServerStatus(
-    val state: String, // "CONNECTED", "RE-ROUTING", "DISCONNECTED", "WIPING"
+    val state: String, // "CONNECTED", "CONNECTING", "DISCONNECTED", "SECURITY_REJECTED"
     val nodeId: String,
     val latencyMs: Int
 )
@@ -140,7 +140,22 @@ data class IdentityValidationResult(
 data class AvailableAppUpdate(
     val versionName: String,
     val apkDownloadUrl: String,
-    val releasePageUrl: String
+    val releasePageUrl: String,
+    val apkSha256Hex: String,
+    val apkSizeBytes: Long,
+    val sourceCommit: String
+)
+
+enum class ReleaseVerificationStatus {
+    CHECKING,
+    VERIFIED,
+    UNAVAILABLE,
+    REJECTED
+}
+
+data class AppUpdateCheckResult(
+    val verificationStatus: ReleaseVerificationStatus,
+    val update: AvailableAppUpdate? = null
 )
 
 data class SessionSecurityState(

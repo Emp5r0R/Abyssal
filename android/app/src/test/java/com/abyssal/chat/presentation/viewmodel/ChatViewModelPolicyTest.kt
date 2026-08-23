@@ -1170,7 +1170,11 @@ class ChatViewModelPolicyTest {
                 else -> Unit
             }
         }
-        val updateService = proxy(IAppUpdateService::class.java) { Unit }
+        val updateService = proxy(IAppUpdateService::class.java) {
+            com.abyssal.chat.domain.model.AppUpdateCheckResult(
+                com.abyssal.chat.domain.model.ReleaseVerificationStatus.VERIFIED
+            )
+        }
         val viewModel = ChatViewModel(
             identityService = identityService,
             nodeConfigService = nodeConfig,

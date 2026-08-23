@@ -1,5 +1,5 @@
 [workspace]
-members = ["mirage-server", "rust-core"]
+members = ["mirage-server", "rust-core", "tools/release-tool"]
 resolver = "2"
 
 [profile.release]

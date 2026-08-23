@@ -27,6 +27,8 @@ import com.abyssal.chat.theme.SteelMuted
 fun UpdateAvailableDialog(
     update: AvailableAppUpdate,
     currentVersionName: String,
+    isPreparing: Boolean,
+    failureMessage: String?,
     onUpdate: () -> Unit,
     onRemindLater: () -> Unit,
     onCancel: () -> Unit
@@ -57,7 +59,7 @@ fun UpdateAvailableDialog(
         }
 
         Text(
-            text = "Android verifies the signing key before replacing this installation.",
+            text = "Abyssal verifies the complete package against the signed release digest before Android opens it.",
             color = SteelMuted,
             fontSize = 12.sp,
             lineHeight = 17.sp,
@@ -66,12 +68,23 @@ fun UpdateAvailableDialog(
         )
 
         MiragePrimaryButton(
-            text = "UPDATE",
+            text = if (isPreparing) "VERIFYING..." else "UPDATE",
             onClick = onUpdate,
+            enabled = !isPreparing,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 22.dp)
         )
+
+        if (failureMessage != null) {
+            Text(
+                text = failureMessage,
+                color = SteelMuted,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),

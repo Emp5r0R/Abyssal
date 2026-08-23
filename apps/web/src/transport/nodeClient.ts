@@ -10,6 +10,7 @@ import type {
   RoomRecord,
   UploadProgress,
 } from "../domain/types";
+import { currentBuildAttestation } from "../buildIdentity";
 import {
   base64ToBytes,
   bytesToBase64,
@@ -273,14 +274,26 @@ async function requestWebSocketTicket(
     cache: "no-store",
     credentials: "omit",
     referrerPolicy: "no-referrer",
-    headers: { Authorization: `Bearer ${session.token}` },
+    headers: { ...JSON_HEADERS, Authorization: `Bearer ${session.token}` },
+    body: JSON.stringify(currentBuildAttestation()),
     signal,
   });
+  if (response.status === 426) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new BuildAdmissionError();
+  }
   const payload = await readBoundedJson(response, MAX_WS_TICKET_JSON_BYTES, signal).catch(() => null);
   if (!response.ok || !validWebSocketTicketResponse(payload)) {
     throw new Error("Session unavailable");
   }
   return payload.ticket;
+}
+
+export class BuildAdmissionError extends Error {
+  constructor() {
+    super("Release verification rejected");
+    this.name = "BuildAdmissionError";
+  }
 }
 
 export class RelaySocket {
@@ -305,6 +318,7 @@ export class RelaySocket {
     private readonly onFrame: (frame: IncomingFrame) => void,
     private readonly onState: (state: "connecting" | "connected" | "disconnected") => void,
     private readonly onPurge?: () => void,
+    private readonly onBuildRejected?: () => void,
   ) {}
 
   connect(): void {
@@ -703,12 +717,17 @@ export class RelaySocket {
         this.onState("disconnected");
         if (!this.#manualClose) this.scheduleReconnect();
       };
-    } catch {
+    } catch (error) {
       if (this.isCurrentConnectionAttempt(generation, ticketAbort)) {
         this.#ticketAbort = null;
         this.#connecting = false;
         this.onState("disconnected");
-        this.scheduleReconnect();
+        if (error instanceof BuildAdmissionError) {
+          this.#manualClose = true;
+          this.onBuildRejected?.();
+        } else {
+          this.scheduleReconnect();
+        }
       }
     } finally {
       ticketHolder.value = "";

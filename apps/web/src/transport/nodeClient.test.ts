@@ -1083,11 +1083,18 @@ describe("RelaySocket", () => {
           cache: "no-store",
           credentials: "omit",
           referrerPolicy: "no-referrer",
-          headers: { Authorization: `Bearer ${SESSION_TOKEN}` },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${SESSION_TOKEN}`,
+          },
+          body: JSON.stringify({
+            platform: "web",
+            version: "0.0.0",
+            build_signature_b64: "",
+          }),
           signal: expect.any(AbortSignal),
         }),
       );
-      expect(fetchMock.mock.calls[0]?.[1]).not.toHaveProperty("body");
       const socket = sockets[0];
       expect(socket.url).toBe("wss://node.example/v1/ws");
       expect(socket.protocols).toEqual(["abyssal-v1", `ticket.${WS_TICKET}`]);
@@ -1160,6 +1167,31 @@ describe("RelaySocket", () => {
       parserRelay.close();
     } finally {
       globalThis.WebSocket = original;
+    }
+  });
+
+  it("treats release admission rejection as terminal and reports it once", async () => {
+    const rejected = vi.fn();
+    const states: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 426 }));
+    const timeoutSpy = vi.spyOn(window, "setTimeout");
+    const relay = new RelaySocket(
+      session,
+      () => undefined,
+      (state) => states.push(state),
+      undefined,
+      rejected,
+    );
+    try {
+      relay.connect();
+      await vi.waitFor(() => expect(rejected).toHaveBeenCalledTimes(1));
+      expect(rejected).toHaveBeenCalledTimes(1);
+      expect(states).toEqual(["connecting", "disconnected"]);
+      expect(timeoutSpy.mock.calls.some(([, delay]) =>
+        typeof delay === "number" && delay >= 750 && delay <= 15_499,
+      )).toBe(false);
+    } finally {
+      relay.close();
     }
   });
 

@@ -57,9 +57,13 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 mod mls_wire;
+mod release_admission;
 mod rooms;
 mod transport_padding;
 
+use release_admission::{
+    BuildAttestationRequest, InstallOutcome, ReleaseAdmissionStore, ReleaseManifestMirror,
+};
 use transport_padding::{
     json_array_len, json_bool_len, json_field_len, json_number_len, json_object_len,
     json_string_field_len, random_message_transport_padding, valid_message_transport_padding,
@@ -136,6 +140,9 @@ const WS_TICKET_BYTES: usize = 32;
 const WS_TICKET_B64_LEN: usize = 43;
 const WS_TICKET_TTL_MS: u64 = 30_000;
 const MAX_WS_TICKETS: usize = 1_024;
+const DEFAULT_RELEASE_MANIFEST_REFRESH_SECONDS: usize = 15 * 60;
+const MIN_RELEASE_MANIFEST_REFRESH_SECONDS: usize = 60;
+const MAX_RELEASE_MANIFEST_REFRESH_SECONDS: usize = 6 * 60 * 60;
 const OPAQUE_HANDSHAKE_TTL_MS: u64 = 60_000;
 const MAX_OPAQUE_HANDSHAKES: usize = 1_024;
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
@@ -197,6 +204,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone)]
 struct AppState {
     node_id: String,
+    release_admission: Arc<ReleaseAdmissionStore>,
     attachment_ram_limit_bytes: usize,
     attachment_account_limit_bytes: usize,
     attachment_record_limit: usize,
@@ -1490,9 +1498,34 @@ async fn healthcheck(bind_addr: SocketAddr) -> bool {
     matches!(result, Ok(Ok(true)))
 }
 
+async fn refresh_release_manifest(store: &ReleaseAdmissionStore, mirror: &ReleaseManifestMirror) {
+    match mirror.refresh(store, now_ms()).await {
+        Ok(InstallOutcome::Installed) => info!("release_manifest_refresh result=installed"),
+        Ok(InstallOutcome::Unchanged) => debug!("release_manifest_refresh result=unchanged"),
+        Err(error) => warn!("release_manifest_refresh result=rejected reason={error}"),
+    }
+}
+
+async fn release_manifest_watcher(
+    store: Arc<ReleaseAdmissionStore>,
+    mirror: ReleaseManifestMirror,
+    interval: Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        refresh_release_manifest(&store, &mirror).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let configured_bind_addr = configured_bind_addr();
+    #[cfg(feature = "integration-release-root")]
+    assert!(
+        configured_bind_addr.ip().is_loopback()
+            && env::var("ABYSSAL_INTEGRATION_TEST").as_deref() == Ok("1"),
+        "integration release root requires explicit loopback test mode"
+    );
     if env::args().nth(1).as_deref() == Some("--healthcheck") {
         let healthy = healthcheck(configured_bind_addr).await;
         std::process::exit(i32::from(!healthy));
@@ -1505,6 +1538,36 @@ async fn main() {
         .init();
 
     let state = AppState::from_env();
+    #[cfg(feature = "integration-release-root")]
+    let integration_manifest_installed = release_admission::install_integration_manifest_from_env(
+        &state.release_admission,
+        now_ms(),
+    )
+    .await
+    .expect("integration release manifest must verify");
+    #[cfg(not(feature = "integration-release-root"))]
+    let integration_manifest_installed = false;
+
+    if !integration_manifest_installed {
+        if let Ok(mirror) = ReleaseManifestMirror::new() {
+            refresh_release_manifest(&state.release_admission, &mirror).await;
+            let refresh_seconds = read_usize_env(
+                "ABYSSAL_RELEASE_MANIFEST_REFRESH_SECONDS",
+                DEFAULT_RELEASE_MANIFEST_REFRESH_SECONDS,
+            )
+            .clamp(
+                MIN_RELEASE_MANIFEST_REFRESH_SECONDS,
+                MAX_RELEASE_MANIFEST_REFRESH_SECONDS,
+            );
+            tokio::spawn(release_manifest_watcher(
+                state.release_admission.clone(),
+                mirror,
+                Duration::from_secs(refresh_seconds as u64),
+            ));
+        } else {
+            warn!("release_admission_unavailable reason=client_configuration");
+        }
+    }
     tokio::spawn(attachment_sweeper(state.clone()));
     tokio::spawn(session_sweeper(state.clone()));
     tokio::spawn(mls_sweeper(state.clone()));
@@ -1667,6 +1730,7 @@ impl AppState {
 
         Self {
             node_id,
+            release_admission: Arc::new(ReleaseAdmissionStore::new()),
             attachment_ram_limit_bytes,
             attachment_account_limit_bytes,
             attachment_record_limit,
@@ -3987,7 +4051,19 @@ async fn prune_ws_tickets(state: &AppState, now: u64) {
     prune_ws_tickets_locked(&mut tickets, now);
 }
 
-async fn issue_ws_ticket(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn issue_ws_ticket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(build_attestation): Json<BuildAttestationRequest>,
+) -> Response {
+    if state
+        .release_admission
+        .admit(&build_attestation, now_ms())
+        .await
+        .is_err()
+    {
+        return StatusCode::UPGRADE_REQUIRED.into_response();
+    }
     let Some(session_token) = bearer_token(&headers).map(Zeroizing::new) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -11360,8 +11436,21 @@ mod tests {
         headers
     }
 
+    fn ticket_build_attestation() -> BuildAttestationRequest {
+        BuildAttestationRequest {
+            platform: "web".to_string(),
+            version: "2.1.0".to_string(),
+            build_signature_b64: URL_SAFE_NO_PAD.encode([2_u8; 64]),
+        }
+    }
+
     async fn issue_test_ticket(state: &AppState, token: &str) -> (StatusCode, WsTicketResponse) {
-        let response = issue_ws_ticket(State(state.clone()), ticket_auth_headers(token)).await;
+        let response = issue_ws_ticket(
+            State(state.clone()),
+            ticket_auth_headers(token),
+            Json(ticket_build_attestation()),
+        )
+        .await;
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -11403,6 +11492,35 @@ mod tests {
         assert_eq!(token.as_str(), "ticket-session");
         assert_eq!(session.username, "Alice");
         assert!(consume_ws_ticket(&state, &response.ticket).await.is_none());
+        assert!(state.ws_tickets.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_admission_rejects_before_ticket_or_session_access() {
+        let mut state = test_state();
+        state.release_admission = Arc::new(ReleaseAdmissionStore::new());
+        add_test_session(&state, "attestation-session", "attestation-code", "Alice").await;
+
+        let response = issue_ws_ticket(
+            State(state.clone()),
+            ticket_auth_headers("attestation-session"),
+            Json(ticket_build_attestation()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert!(state.ws_tickets.lock().await.is_empty());
+
+        let response = issue_ws_ticket(
+            State(state.clone()),
+            ticket_auth_headers("missing-session"),
+            Json(BuildAttestationRequest {
+                platform: "web".to_string(),
+                version: "2.0.0".to_string(),
+                build_signature_b64: URL_SAFE_NO_PAD.encode([2_u8; 64]),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         assert!(state.ws_tickets.lock().await.is_empty());
     }
 
@@ -11457,8 +11575,12 @@ mod tests {
         }
         drop(tickets);
 
-        let response =
-            issue_ws_ticket(State(state.clone()), ticket_auth_headers("cap-session")).await;
+        let response = issue_ws_ticket(
+            State(state.clone()),
+            ticket_auth_headers("cap-session"),
+            Json(ticket_build_attestation()),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(state.ws_tickets.lock().await.len(), MAX_WS_TICKETS);
     }
@@ -16638,6 +16760,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             node_id: "test-node".to_string(),
+            release_admission: Arc::new(ReleaseAdmissionStore::ready_for_tests()),
             attachment_ram_limit_bytes: 8 * 1024 * 1024,
             attachment_account_limit_bytes: 4 * 1024 * 1024,
             attachment_record_limit: DEFAULT_ATTACHMENT_RECORD_LIMIT,

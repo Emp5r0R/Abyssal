@@ -115,6 +115,21 @@ run_rust() {
   cargo fmt --manifest-path "$ROOT_DIR/Cargo.toml" --all -- --check
   cargo test --manifest-path "$ROOT_DIR/Cargo.toml" --workspace --all-targets --locked
   cargo clippy --manifest-path "$ROOT_DIR/Cargo.toml" --workspace --all-targets --locked -- -D warnings
+  local forbidden_output
+  if forbidden_output="$(cargo check \
+      --manifest-path "$ROOT_DIR/Cargo.toml" \
+      --package mirage-server \
+      --release \
+      --features integration-release-root \
+      --locked 2>&1)"; then
+    echo "Integration release root unexpectedly compiled in release mode." >&2
+    exit 1
+  fi
+  if [[ "$forbidden_output" != *"the integration release root is forbidden in release builds"* ]]; then
+    printf 'Integration release-root guard failed for an unexpected reason:\n%s\n' \
+      "$forbidden_output" >&2
+    exit 1
+  fi
 }
 
 run_android() {

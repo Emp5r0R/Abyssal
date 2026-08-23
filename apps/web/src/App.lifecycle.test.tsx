@@ -87,6 +87,10 @@ vi.mock("./security/privacyPin", () => ({
   PrivacyPinGate: mocks.FakePinGate,
 }));
 
+vi.mock("./security/originAttestation", () => ({
+  verifyOriginAttestation: vi.fn().mockResolvedValue({ status: "OK" }),
+}));
+
 vi.mock("./components/Entrance", () => ({
   Entrance: () => <div data-testid="entrance" />,
 }));
@@ -133,7 +137,7 @@ function setVisibility(value: "visible" | "hidden"): void {
 }
 
 async function configureCover(): Promise<void> {
-  fireEvent.click(screen.getByRole("button", { name: "Configure cover" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Configure cover" }));
   await waitFor(() => expect(screen.queryByRole("button", { name: "Configure cover" })).not.toBeInTheDocument());
 }
 

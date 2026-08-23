@@ -1,7 +1,6 @@
 package com.abyssal.chat
 
 import android.content.Intent
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.view.MotionEvent
@@ -17,17 +16,24 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import com.abyssal.chat.presentation.screens.ChatScreen
 import com.abyssal.chat.presentation.screens.DashboardScreen
 import com.abyssal.chat.presentation.screens.EntranceScreen
 import com.abyssal.chat.presentation.screens.CalculatorScreen
 import com.abyssal.chat.presentation.screens.UpdateAvailableDialog
+import com.abyssal.chat.presentation.screens.SecurityVerificationDialog
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
+import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import com.abyssal.chat.theme.AbyssalTheme
 import com.abyssal.chat.theme.DeepBlack
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private lateinit var viewModel: ChatViewModel
@@ -48,6 +54,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val abyssalApplication = application as AbyssalApplication
+        val appUpdateInstaller = abyssalApplication.appUpdateInstaller
         viewModel = ViewModelProvider(
             abyssalApplication,
             abyssalApplication.viewModelFactory
@@ -62,6 +69,10 @@ class MainActivity : ComponentActivity() {
                     val currentScreen by viewModel.currentScreen.collectAsState()
                     val isLocked by viewModel.isLocked.collectAsState()
                     val availableUpdate by viewModel.availableUpdate.collectAsState()
+                    val serverStatus by viewModel.serverStatus.collectAsState()
+                    val releaseStatus by viewModel.releaseVerificationStatus.collectAsState()
+                    var updatePreparing by remember { mutableStateOf(false) }
+                    var updateFailure by remember { mutableStateOf<String?>(null) }
 
                     // If disguised, intercept routing to display Calculator Cover
                     if (isLocked) {
@@ -83,22 +94,70 @@ class MainActivity : ComponentActivity() {
                     }
 
                     if (!isLocked) {
-                        availableUpdate?.let { update ->
+                        if (releaseStatus != ReleaseVerificationStatus.VERIFIED) {
+                            val unavailable = releaseStatus == ReleaseVerificationStatus.UNAVAILABLE
+                            SecurityVerificationDialog(
+                                title = when (releaseStatus) {
+                                    ReleaseVerificationStatus.CHECKING -> "Verifying signed build"
+                                    ReleaseVerificationStatus.UNAVAILABLE -> "Verification unavailable"
+                                    else -> "Build verification failed"
+                                },
+                                message = if (unavailable) {
+                                    "The signed release record could not be verified."
+                                } else {
+                                    "The current build does not match the signed release record."
+                                },
+                                isChecking = releaseStatus == ReleaseVerificationStatus.CHECKING,
+                                onRetry = viewModel::retryReleaseVerification,
+                                onEndSession = viewModel::endSession
+                            )
+                        } else if (serverStatus.state == "SECURITY_REJECTED") {
+                            SecurityVerificationDialog(
+                                onRetry = viewModel::onHostResumed,
+                                onEndSession = viewModel::endSession
+                            )
+                        } else availableUpdate?.let { update ->
                             UpdateAvailableDialog(
                                 update = update,
                                 currentVersionName = BuildConfig.VERSION_NAME,
+                                isPreparing = updatePreparing,
+                                failureMessage = updateFailure,
                                 onUpdate = {
-                                    val intent = Intent(
-                                        Intent.ACTION_VIEW,
-                                        Uri.parse(update.apkDownloadUrl)
-                                    ).addCategory(Intent.CATEGORY_BROWSABLE)
-                                    runCatching {
-                                        startActivity(intent)
-                                        viewModel.acceptAvailableUpdate()
+                                    if (!updatePreparing) {
+                                        updatePreparing = true
+                                        updateFailure = null
+                                        lifecycleScope.launch {
+                                            val packageUri = appUpdateInstaller.prepare(update)
+                                            updatePreparing = false
+                                            if (packageUri == null) {
+                                                updateFailure = "Unable to continue."
+                                                return@launch
+                                            }
+                                            val intent = Intent(Intent.ACTION_VIEW)
+                                                .setDataAndType(
+                                                    packageUri,
+                                                    "application/vnd.android.package-archive"
+                                                )
+                                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            runCatching { startActivity(intent) }
+                                                .onSuccess { viewModel.acceptAvailableUpdate() }
+                                                .onFailure {
+                                                    appUpdateInstaller.discard()
+                                                    updateFailure = "Unable to continue."
+                                                }
+                                        }
                                     }
                                 },
-                                onRemindLater = viewModel::remindAvailableUpdateLater,
-                                onCancel = viewModel::cancelAvailableUpdate
+                                onRemindLater = {
+                                    appUpdateInstaller.discard()
+                                    updateFailure = null
+                                    viewModel.remindAvailableUpdateLater()
+                                },
+                                onCancel = {
+                                    appUpdateInstaller.discard()
+                                    updateFailure = null
+                                    viewModel.cancelAvailableUpdate()
+                                }
                             )
                         }
                     }

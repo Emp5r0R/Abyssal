@@ -675,6 +675,18 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_abyssal_core_checksum_func_inspect_release_manifest(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_parse_release_build_id(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_release_sha256(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_release_trust_anchor_configured(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_verify_release_build_signature(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_verify_release_manifest(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_conversation_safety_number(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_decrypt_attachment(
@@ -853,6 +865,18 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_sign_registration_identity_proof(`ptr`: Long,`nodeId`: RustBuffer.ByValue,`handshakeId`: RustBuffer.ByValue,`challenge`: RustBuffer.ByValue,`registrationUpload`: RustBuffer.ByValue,`identityPublic`: RustBuffer.ByValue,`prekeyId`: RustBuffer.ByValue,`identityEnvelope`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_inspect_release_manifest(`manifestJson`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_parse_release_build_id(`buildId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_release_sha256(`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_release_trust_anchor_configured(uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+    external fun uniffi_abyssal_core_fn_func_verify_release_build_signature(`buildId`: RustBuffer.ByValue,`sourceCommit`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_func_verify_release_manifest(`manifestJson`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_conversation_safety_number(`firstPublicKey`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_decrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`blob`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -984,6 +1008,24 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_abyssal_core_checksum_func_inspect_release_manifest() != 45504) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_parse_release_build_id() != 13244) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_release_sha256() != 52719) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_release_trust_anchor_configured() != 59595) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_verify_release_build_signature() != 2039) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_verify_release_manifest() != 45958) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_func_conversation_safety_number() != 24566) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3564,6 +3606,44 @@ public object FfiConverterTypeRecipientPublicKey: FfiConverterRustBuffer<Recipie
 
 
 
+data class ReleaseBuildId (
+    var `platform`: kotlin.String
+    ,
+    var `version`: kotlin.String
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeReleaseBuildId: FfiConverterRustBuffer<ReleaseBuildId> {
+    override fun read(buf: ByteBuffer): ReleaseBuildId {
+        return ReleaseBuildId(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ReleaseBuildId) = (
+            FfiConverterString.allocationSize(value.`platform`) +
+            FfiConverterString.allocationSize(value.`version`)
+    )
+
+    override fun write(value: ReleaseBuildId, buf: ByteBuffer) {
+            FfiConverterString.write(value.`platform`, buf)
+            FfiConverterString.write(value.`version`, buf)
+    }
+}
+
+
+
 
 
 sealed class AbyssalException: kotlin.Exception() {
@@ -3707,6 +3787,84 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
         }
     }
 }
+        /**
+         * Verifies signature, canonical encoding, build signatures, and manifest
+         * policy without accepting it for use at any wall-clock time. Callers must
+         * enforce `not_before_ms` and `expires_at_ms` from the returned document.
+         */
+    @Throws(AbyssalException::class) fun `inspectReleaseManifest`(`manifestJson`: kotlin.ByteArray, `signature`: kotlin.ByteArray): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_inspect_release_manifest(
+
+
+        FfiConverterByteArray.lower(`manifestJson`),
+        FfiConverterByteArray.lower(`signature`),_status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `parseReleaseBuildId`(`buildId`: kotlin.String): ReleaseBuildId {
+            return FfiConverterTypeReleaseBuildId.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_parse_release_build_id(
+
+
+        FfiConverterString.lower(`buildId`),_status)
+}
+    )
+    }
+
+ fun `releaseSha256`(`data`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_release_sha256(
+
+
+        FfiConverterByteArray.lower(`data`),_status)
+}
+    )
+    }
+
+ fun `releaseTrustAnchorConfigured`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_release_trust_anchor_configured(
+
+        _status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `verifyReleaseBuildSignature`(`buildId`: kotlin.String, `sourceCommit`: kotlin.String, `signature`: kotlin.ByteArray)
+        =
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_verify_release_build_signature(
+
+
+        FfiConverterString.lower(`buildId`),
+        FfiConverterString.lower(`sourceCommit`),
+        FfiConverterByteArray.lower(`signature`),_status)
+}
+
+
+
+    @Throws(AbyssalException::class) fun `verifyReleaseManifest`(`manifestJson`: kotlin.ByteArray, `signature`: kotlin.ByteArray, `nowMs`: kotlin.ULong): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_verify_release_manifest(
+
+
+        FfiConverterByteArray.lower(`manifestJson`),
+        FfiConverterByteArray.lower(`signature`),
+        FfiConverterULong.lower(`nowMs`),_status)
+}
+    )
+    }
+
+
     @Throws(AbyssalException::class) fun `conversationSafetyNumber`(`firstPublicKey`: kotlin.ByteArray, `secondPublicKey`: kotlin.ByteArray): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCallWithError(AbyssalException) { _status ->

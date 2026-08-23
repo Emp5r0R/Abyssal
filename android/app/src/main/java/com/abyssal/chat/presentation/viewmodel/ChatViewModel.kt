@@ -40,6 +40,7 @@ import com.abyssal.chat.domain.model.MessageReplyPolicy
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientIdentity
+import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.SenderClient
@@ -445,6 +446,9 @@ class ChatViewModel(
 
     private val _availableUpdate = MutableStateFlow<AvailableAppUpdate?>(null)
     val availableUpdate: StateFlow<AvailableAppUpdate?> = _availableUpdate.asStateFlow()
+    private val _releaseVerificationStatus = MutableStateFlow(ReleaseVerificationStatus.CHECKING)
+    val releaseVerificationStatus: StateFlow<ReleaseVerificationStatus> =
+        _releaseVerificationStatus.asStateFlow()
     private val updatePromptPolicy = UpdatePromptPolicy()
     private var updateCheckInFlight = false
 
@@ -916,31 +920,42 @@ class ChatViewModel(
         }
     }
 
-    fun checkForAppUpdate() {
+    fun checkForAppUpdate(force: Boolean = false) {
         val now = elapsedRealtimeMs()
         if (
             _isLocked.value ||
             _availableUpdate.value != null ||
             updateCheckInFlight ||
-            !updatePromptPolicy.shouldCheck(now)
+            (!force && !updatePromptPolicy.shouldCheck(now))
         ) {
             return
         }
         updateCheckInFlight = true
         viewModelScope.launch {
             try {
-                val result = runCatching { appUpdateService.findAvailableUpdate() }
+                val result = runCatching { appUpdateService.checkCurrentRelease() }
                 val completedAt = elapsedRealtimeMs()
-                result.onSuccess { update ->
-                    updatePromptPolicy.markChecked(completedAt)
-                    _availableUpdate.value = update
+                result.onSuccess { check ->
+                    _releaseVerificationStatus.value = check.verificationStatus
+                    if (check.verificationStatus == ReleaseVerificationStatus.VERIFIED) {
+                        updatePromptPolicy.markChecked(completedAt)
+                        _availableUpdate.value = check.update
+                    } else {
+                        updatePromptPolicy.markFailed(completedAt)
+                    }
                 }.onFailure {
+                    _releaseVerificationStatus.value = ReleaseVerificationStatus.UNAVAILABLE
                     updatePromptPolicy.markFailed(completedAt)
                 }
             } finally {
                 updateCheckInFlight = false
             }
         }
+    }
+
+    fun retryReleaseVerification() {
+        _releaseVerificationStatus.value = ReleaseVerificationStatus.CHECKING
+        checkForAppUpdate(force = true)
     }
 
     fun cancelAvailableUpdate() {

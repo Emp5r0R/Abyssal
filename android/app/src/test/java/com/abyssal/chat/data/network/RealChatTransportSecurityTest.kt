@@ -38,7 +38,10 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import okio.ByteString
+import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
@@ -53,6 +56,9 @@ class RealChatTransportSecurityTest {
     private companion object {
         const val ACK_CAPACITY = 64
         const val ACK_SIZE = 64
+        val TEST_BUILD_ATTESTATION = BuildAttestationProvider {
+            BuildAttestation("android", "2.1.0", "A".repeat(86), "1".repeat(40))
+        }
     }
 
     @Test
@@ -727,7 +733,12 @@ class RealChatTransportSecurityTest {
             setActiveSession(testSession())
         }
         val ticketFactory = TicketCancellationCallFactory()
-        val transport = RealChatTransport(nodeConfig, OkHttpClient(), ticketFactory)
+        val transport = RealChatTransport(
+            nodeConfig,
+            OkHttpClient(),
+            ticketFactory,
+            TEST_BUILD_ATTESTATION
+        )
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket, generation = 83L)
 
@@ -973,7 +984,7 @@ class RealChatTransportSecurityTest {
             displayHost = "127.0.0.1"
         )
         node.setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
-        val transport = RealChatTransport(node, OkHttpClient(), factory)
+        val transport = RealChatTransport(node, OkHttpClient(), factory, TEST_BUILD_ATTESTATION)
 
         transport.connect()
         assertTrue(factory.call.enqueued.await(2, java.util.concurrent.TimeUnit.SECONDS))
@@ -981,6 +992,63 @@ class RealChatTransportSecurityTest {
 
         assertTrue(factory.call.cancelled)
         assertEquals("DISCONNECTED", transport.getServerStatus().first().state)
+    }
+
+    @Test
+    fun unconfiguredBuildFailsBeforeTicketNetworkAccess() = runBlocking {
+        val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
+        val calls = AtomicBoolean(false)
+        val transport = RealChatTransport(
+            node,
+            OkHttpClient(),
+            Call.Factory {
+                calls.set(true)
+                error("ticket request must not be created")
+            },
+            BuildAttestationProvider { null }
+        )
+
+        transport.connect()
+
+        assertFalse(calls.get())
+        assertEquals("SECURITY_REJECTED", transport.getServerStatus().first().state)
+    }
+
+    @Test
+    fun relayBuildRejectionIsDistinctAndTicketBodyIsExact() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(426))
+        server.start()
+        try {
+            val base = server.url("/")
+            val endpoint = NodeEndpoint(
+                inputUrl = base.toString(),
+                apiBaseUrl = base.toString().removeSuffix("/"),
+                wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
+                displayHost = base.host
+            )
+            val node = InMemoryNodeConfigService().apply {
+                setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
+            }
+            val client = OkHttpClient.Builder().build()
+            val transport = RealChatTransport(node, client, client, TEST_BUILD_ATTESTATION)
+
+            transport.connect()
+
+            val status = withTimeout(2_000L) {
+                transport.getServerStatus().first { it.state == "SECURITY_REJECTED" }
+            }
+            assertEquals("node-1", status.nodeId)
+            val request = server.takeRequest(2, TimeUnit.SECONDS)
+            assertNotNull(request)
+            val payload = JSONObject(request!!.body.readUtf8())
+            assertEquals(
+                setOf("platform", "version", "build_signature_b64"),
+                payload.keys().asSequence().toSet()
+            )
+        } finally {
+            server.shutdown()
+        }
     }
 
     @Test
@@ -1591,7 +1659,17 @@ class RealChatTransportSecurityTest {
             assertEquals("POST", request.method)
             assertEquals("Bearer token-1", request.header("Authorization"))
             assertEquals("no-store", request.header("Cache-Control"))
-            assertEquals(0L, request.body?.contentLength())
+            assertEquals("application/json; charset=utf-8", request.body?.contentType().toString())
+            val body = Buffer()
+            request.body?.writeTo(body)
+            val payload = JSONObject(body.readUtf8())
+            assertEquals(
+                setOf("platform", "version", "build_signature_b64"),
+                payload.keys().asSequence().toSet()
+            )
+            assertEquals("android", payload.getString("platform"))
+            assertEquals("2.1.0", payload.getString("version"))
+            assertEquals("A".repeat(86), payload.getString("build_signature_b64"))
             assertTrue(request.url.encodedPath.endsWith("/v1/ws-ticket"))
             return call
         }

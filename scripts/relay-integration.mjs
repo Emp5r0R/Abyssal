@@ -20,9 +20,11 @@ initSync({
 const baseUrl = process.env.ABYSSAL_TEST_BASE_URL;
 const aliceCode = process.env.ABYSSAL_TEST_CODE_A;
 const bobCode = process.env.ABYSSAL_TEST_CODE_B;
+const buildSignatureB64 = process.env.ABYSSAL_TEST_BUILD_SIGNATURE_B64;
 assert.ok(baseUrl, "ABYSSAL_TEST_BASE_URL is required");
 assert.ok(aliceCode, "ABYSSAL_TEST_CODE_A is required");
 assert.ok(bobCode, "ABYSSAL_TEST_CODE_B is required");
+assert.match(buildSignatureB64 ?? "", /^[A-Za-z0-9_-]{86}$/);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const RESULT_TIMEOUT_MS = 5_000;
@@ -706,7 +708,15 @@ async function requestWsTicket(account) {
     cache: "no-store",
     credentials: "omit",
     referrerPolicy: "no-referrer",
-    headers: { authorization: `Bearer ${account.token}` },
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      platform: "web",
+      version: "2.1.0",
+      build_signature_b64: buildSignatureB64,
+    }),
   });
   assert.equal(response.status, 200);
   assert.match(response.headers.get("cache-control") ?? "", /no-store/);
@@ -716,6 +726,26 @@ async function requestWsTicket(account) {
   assert.ok(Number.isInteger(payload.expires_in_sec));
   assert.ok(payload.expires_in_sec >= 1 && payload.expires_in_sec <= 30);
   return payload.ticket;
+}
+
+async function expectBuildAdmissionRejected(account) {
+  const response = await fetch(`${baseUrl}/v1/ws-ticket`, {
+    method: "POST",
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+    headers: {
+      authorization: `Bearer ${account.token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      platform: "web",
+      version: "2.0.0",
+      build_signature_b64: buildSignatureB64,
+    }),
+  });
+  assert.equal(response.status, 426);
+  assert.equal(await response.text(), "");
 }
 
 function connectWithTicket(ticket, expectedNodeId) {
@@ -1913,6 +1943,7 @@ const bob = await register(bobCode, "bob-password");
 assert.equal(await opaqueStartStatus(aliceCode, "alice-password"), 409);
 assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
 
+await expectBuildAdmissionRejected(alice);
 const aliceTicket = await requestWsTicket(alice);
 await expectWebSocketRejected(["abyssal-v1", `bearer.${alice.token}`]);
 let aliceSocket = await connectWithTicket(aliceTicket, alice.node_id);

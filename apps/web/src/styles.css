@@ -2682,3 +2682,21 @@ button:disabled {
     display: none !important;
   }
 }
+
+.verification-root {
+  min-height: 100dvh;
+  background: #05080d;
+}
+
+.security-verification-dialog {
+  max-width: 460px;
+}
+
+.security-verification-mark {
+  width: 54px;
+  height: 54px;
+  margin: 4px auto;
+  border: 1px solid #16d8e5;
+  transform: rotate(45deg);
+  box-shadow: inset 0 0 0 12px #091118;
+}

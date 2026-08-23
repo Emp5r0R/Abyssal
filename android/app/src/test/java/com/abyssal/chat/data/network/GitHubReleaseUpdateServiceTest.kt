@@ -1,6 +1,7 @@
 package com.abyssal.chat.data.network
 
 import kotlinx.coroutines.runBlocking
+import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -24,18 +25,38 @@ class GitHubReleaseUpdateServiceTest {
                 currentVersionName = "1.8.0",
                 apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
                 expectedApiHost = server.hostName,
-                allowInsecureApiForTests = true
+                allowInsecureApiForTests = true,
+                assetLoader = ReleaseAssetLoader { url, maximum ->
+                    when (url.encodedPath.substringAfterLast('/')) {
+                        "release-manifest-v1.json" -> "manifest".toByteArray()
+                        "release-manifest-v1.sig" -> ByteArray(64)
+                        else -> error("unexpected asset")
+                    }.also { require(it.size.toLong() <= maximum) }
+                },
+                manifestInspector = ReleaseManifestInspector { _, _, _, expectation ->
+                    assertEquals("1.8.1", expectation.version)
+                    assertEquals(
+                        "abyssal-android-1.8.1-universal-release.apk",
+                        expectation.apkName
+                    )
+                    VerifiedAndroidRelease("a".repeat(64), 16L * 1024L * 1024L, "1".repeat(40))
+                }
             )
 
-            val update = service.findAvailableUpdate()
+            val result = service.checkCurrentRelease()
+            val update = result.update
             val request = server.takeRequest()
 
+            assertEquals(ReleaseVerificationStatus.VERIFIED, result.verificationStatus)
             assertEquals("1.8.1", update?.versionName)
             assertEquals(
                 "https://github.com/Emp5r0R/Abyssal/releases/download/v1.8.1/" +
                     "abyssal-android-1.8.1-universal-release.apk",
                 update?.apkDownloadUrl
             )
+            assertEquals("a".repeat(64), update?.apkSha256Hex)
+            assertEquals(16L * 1024L * 1024L, update?.apkSizeBytes)
+            assertEquals("1".repeat(40), update?.sourceCommit)
             assertEquals("no-cache", request.getHeader("Cache-Control"))
             assertEquals("application/vnd.github+json", request.getHeader("Accept"))
             assertTrue(request.getHeader("User-Agent")?.startsWith("Abyssal-Android/") == true)
@@ -48,11 +69,11 @@ class GitHubReleaseUpdateServiceTest {
     fun ignoresCurrentOlderDraftPrereleaseAndNonStableVersions() {
         val service = parserService("1.8.0")
 
-        assertNull(service.parseRelease(releaseJson("v1.8.0")))
-        assertNull(service.parseRelease(releaseJson("v1.7.9")))
-        assertNull(service.parseRelease(releaseJson("v1.8.1").put("draft", true)))
-        assertNull(service.parseRelease(releaseJson("v1.8.1").put("prerelease", true)))
-        assertNull(service.parseRelease(releaseJson("v1.8.1-beta.1")))
+        assertNull(service.parseReleaseCandidate(releaseJson("v1.8.0")))
+        assertNull(service.parseReleaseCandidate(releaseJson("v1.7.9")))
+        assertNull(service.parseReleaseCandidate(releaseJson("v1.8.1").put("draft", true)))
+        assertNull(service.parseReleaseCandidate(releaseJson("v1.8.1").put("prerelease", true)))
+        assertNull(service.parseReleaseCandidate(releaseJson("v1.8.1-beta.1")))
     }
 
     @Test
@@ -78,10 +99,10 @@ class GitHubReleaseUpdateServiceTest {
             release.getJSONArray("assets").getJSONObject(0).put("size", 300L * 1024L * 1024L)
         }
 
-        assertNull(service.parseRelease(wrongHost))
-        assertNull(service.parseRelease(insecure))
-        assertNull(service.parseRelease(wrongName))
-        assertNull(service.parseRelease(oversized))
+        assertNull(service.parseReleaseCandidate(wrongHost))
+        assertNull(service.parseReleaseCandidate(insecure))
+        assertNull(service.parseReleaseCandidate(wrongName))
+        assertNull(service.parseReleaseCandidate(oversized))
     }
 
     @Test
@@ -111,7 +132,70 @@ class GitHubReleaseUpdateServiceTest {
                 allowInsecureApiForTests = true
             )
 
-            assertTrue(runCatching { service.findAvailableUpdate() }.isFailure)
+            assertTrue(runCatching { service.checkCurrentRelease() }.isFailure)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun rejectsReleaseWhenSignedManifestDoesNotAuthorizeApk() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody(releaseJson("v1.8.1").toString()))
+        server.start()
+        try {
+            val service = GitHubReleaseUpdateService(
+                client = OkHttpClient(),
+                currentVersionName = "1.8.0",
+                apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
+                expectedApiHost = server.hostName,
+                allowInsecureApiForTests = true,
+                assetLoader = ReleaseAssetLoader { url, _ ->
+                    if (url.encodedPath.endsWith(".sig")) ByteArray(64) else byteArrayOf(1)
+                },
+                manifestInspector = ReleaseManifestInspector { _, _, _, _ -> null }
+            )
+
+            val result = service.checkCurrentRelease()
+            assertEquals(ReleaseVerificationStatus.REJECTED, result.verificationStatus)
+            assertNull(result.update)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun verifiesTheBakedCurrentBuildIdentityWithoutOfferingAnUpdate() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody(releaseJson("v1.8.0").toString()))
+        server.start()
+        try {
+            val service = GitHubReleaseUpdateService(
+                client = OkHttpClient.Builder().followRedirects(false).build(),
+                currentVersionName = "1.8.0",
+                apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
+                expectedApiHost = server.hostName,
+                allowInsecureApiForTests = true,
+                assetLoader = ReleaseAssetLoader { url, _ ->
+                    if (url.encodedPath.endsWith(".sig")) ByteArray(64) else byteArrayOf(1)
+                },
+                manifestInspector = ReleaseManifestInspector { _, _, _, expectation ->
+                    assertEquals("A".repeat(86), expectation.buildSignatureBase64Url)
+                    assertEquals("1".repeat(40), expectation.sourceCommit)
+                    VerifiedAndroidRelease("a".repeat(64), 16L * 1024L * 1024L, "1".repeat(40))
+                },
+                currentBuildAttestation = BuildAttestation(
+                    "android",
+                    "1.8.0",
+                    "A".repeat(86),
+                    "1".repeat(40)
+                )
+            )
+
+            val result = service.checkCurrentRelease()
+
+            assertEquals(ReleaseVerificationStatus.VERIFIED, result.verificationStatus)
+            assertNull(result.update)
         } finally {
             server.shutdown()
         }
@@ -135,16 +219,22 @@ class GitHubReleaseUpdateServiceTest {
             .put("html_url", "https://github.com/Emp5r0R/Abyssal/releases/tag/$tag")
             .put(
                 "assets",
-                JSONArray().put(
-                    JSONObject()
-                        .put("name", fileName)
-                        .put("size", 16L * 1024L * 1024L)
-                        .put("content_type", "application/vnd.android.package-archive")
-                        .put(
-                            "browser_download_url",
-                            "https://github.com/Emp5r0R/Abyssal/releases/download/$tag/$fileName"
-                        )
-                )
+                JSONArray()
+                    .put(releaseAsset(tag, fileName, 16L * 1024L * 1024L).put(
+                        "content_type",
+                        "application/vnd.android.package-archive"
+                    ))
+                    .put(releaseAsset(tag, "release-manifest-v1.json", 4096L))
+                    .put(releaseAsset(tag, "release-manifest-v1.sig", 64L))
             )
     }
+
+    private fun releaseAsset(tag: String, name: String, size: Long): JSONObject =
+        JSONObject()
+            .put("name", name)
+            .put("size", size)
+            .put(
+                "browser_download_url",
+                "https://github.com/Emp5r0R/Abyssal/releases/download/$tag/$name"
+            )
 }

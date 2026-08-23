@@ -9,6 +9,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
 bindgen-cli = ["uniffi/cli"]
+integration-release-root = []
 
 [[bin]]
 name = "uniffi-bindgen"

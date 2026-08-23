@@ -5,6 +5,7 @@ import com.abyssal.chat.domain.model.DirectoryStamp
 import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
 import com.abyssal.chat.domain.model.AttachmentUploadResult
 import com.abyssal.chat.domain.model.AvailableAppUpdate
+import com.abyssal.chat.domain.model.AppUpdateCheckResult
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
@@ -264,5 +265,11 @@ interface IDisguiseManager {
 }
 
 interface IAppUpdateService {
-    suspend fun findAvailableUpdate(): AvailableAppUpdate?
+    suspend fun checkCurrentRelease(): AppUpdateCheckResult
+}
+
+interface IAppUpdateInstaller {
+    /** Downloads only after explicit consent and returns a verified, read-only package URI. */
+    suspend fun prepare(update: AvailableAppUpdate): android.net.Uri?
+    fun discard()
 }

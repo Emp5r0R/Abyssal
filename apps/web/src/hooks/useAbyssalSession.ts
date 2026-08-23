@@ -173,6 +173,7 @@ export function useAbyssalSession() {
   const [upload, setUpload] = useState<UploadState>(EMPTY_UPLOAD);
   const [media, setMedia] = useState<DecryptedMedia | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [securityWarning, setSecurityWarning] = useState<"ATTESTATION_REJECTED" | null>(null);
   const [pendingMlsJoins, setPendingMlsJoins] = useState<PendingMlsJoinSummary[]>([]);
   const [pendingMlsLeaves, setPendingMlsLeaves] = useState<PendingMlsLeaveSummary[]>([]);
   const [directTrust, setDirectTrust] = useState<DirectTrustStatus>({
@@ -397,6 +398,7 @@ export function useAbyssalSession() {
     setRemainingSessionSec(0);
     setUpload(EMPTY_UPLOAD);
     setNotice(null);
+    setSecurityWarning(null);
     setPendingMlsJoins([]);
     setPendingMlsLeaves([]);
     ownMessageIdsRef.current.clear();
@@ -987,6 +989,7 @@ export function useAbyssalSession() {
     };
     let nextSession: AccountSession | null = null;
     setNotice(null);
+    setSecurityWarning(null);
     try {
       const endpoint = normalizeNodeUrl(input.nodeUrl);
       const opaque = await startOpaque(input.password);
@@ -1141,6 +1144,11 @@ export function useAbyssalSession() {
         () => {
           if (sessionGenerationRef.current === relayGeneration && sessionRef.current?.token === candidate.token) {
             failClosed(candidate);
+          }
+        },
+        () => {
+          if (sessionGenerationRef.current === relayGeneration && sessionRef.current?.token === candidate.token) {
+            setSecurityWarning("ATTESTATION_REJECTED");
           }
         },
       );
@@ -2044,6 +2052,7 @@ export function useAbyssalSession() {
     upload,
     media,
     notice,
+    securityWarning,
     pendingMlsJoins,
     pendingMlsLeaves,
     retainWhenHiddenRef,
