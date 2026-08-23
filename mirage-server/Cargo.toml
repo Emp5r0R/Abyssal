@@ -8,7 +8,7 @@ license = "MPL-2.0"
 integration-release-root = ["abyssal-core/integration-release-root"]
 
 [dependencies]
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 futures-util = "=0.3.34"
 hmac = "0.13"
 rand = "0.8"
