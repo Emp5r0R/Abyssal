@@ -545,7 +545,7 @@ class ChatViewModel(
             }
         )
         return if (result == OutboundSendResult.ACCEPTED &&
-            !isSessionStampValid(stamp)
+            !isAccountSessionStampValid(stamp)
         ) {
             OutboundSendResult.AMBIGUOUS
         } else {
@@ -627,7 +627,7 @@ class ChatViewModel(
                         failClosedForIncomingAckFailure(stamp)
                         return@withLock
                     }
-                    if (!isSessionStampValid(stamp)) {
+                    if (!isAccountSessionStampValid(stamp)) {
                         return@withLock
                     }
                     val control = runCatching { JSONObject(decryptedContent) }.getOrNull()
@@ -635,10 +635,10 @@ class ChatViewModel(
                         if (!matchesAuthoritativeMessageId(control, incoming.messageId)) return@withLock
                         val targetId = MessageReplyPolicy.sanitizeMessageId(control.optString("message_id"))
                         if (targetId != null && targetId in ownMessageIds) {
-                            if (!isSessionStampValid(stamp)) {
+                            if (!isAccountSessionStampValid(stamp)) {
                                 return@withLock
                             }
-                            if (!mutateRepositoryIfCurrent(stamp) {
+                            if (!mutateRepositoryIfAccountCurrent(stamp) {
                                     messageRepository.markAsReadIfCurrent(
                                         stamp.repositoryEpoch,
                                         incoming.chatId,
@@ -649,7 +649,7 @@ class ChatViewModel(
                                 return@withLock
                             }
                         }
-                        if (!isSessionStampValid(stamp)) {
+                        if (!isAccountSessionStampValid(stamp)) {
                             return@withLock
                         }
                         rememberReceivedFrame(replayKey, directoryEvidenceKey)
@@ -662,11 +662,11 @@ class ChatViewModel(
                         incoming.senderUsername,
                         incoming.senderPublicKey
                     ) ?: return@withLock
-                    if (!isSessionStampValid(stamp)) {
+                    if (!isAccountSessionStampValid(stamp)) {
                         wipeMessageSecrets(message)
                         return@withLock
                     }
-                    if (!mutateRepositoryIfCurrent(stamp) {
+                    if (!mutateRepositoryIfAccountCurrent(stamp) {
                             messageRepository.saveMessageIfCurrent(
                                 stamp.repositoryEpoch,
                                 incoming.chatId,
@@ -772,7 +772,7 @@ class ChatViewModel(
                                 throw error
                             }
                             runCatching { manager.finishSnapshot(decrypted.snapshot, outcome) }.getOrElse { failClosedAfterAmbiguous(); return@withLock }
-                            if (outcome != OutboundSendResult.ACCEPTED || !isSessionStampValid(stamp)) return@withLock
+                            if (outcome != OutboundSendResult.ACCEPTED || !isAccountSessionStampValid(stamp)) return@withLock
                             // Cache the exact accepted snapshot before parsing/publishing.
                             // A replay is acknowledged from this cache and never decrypted or published twice.
                             rememberMlsSnapshot(replayKey, evidence, decrypted.snapshot)
@@ -782,13 +782,13 @@ class ChatViewModel(
                                 if (MessageReplyPolicy.sanitizeMessageId(json.optString("id")) != frame.messageId) return@withLock
                                 val target = MessageReplyPolicy.sanitizeMessageId(json.optString("message_id"))
                                 if (target != null && target in ownMessageIds) {
-                                    mutateRepositoryIfCurrent(stamp) { messageRepository.markAsReadIfCurrent(stamp.repositoryEpoch, frame.roomId, target) }
+                                    mutateRepositoryIfAccountCurrent(stamp) { messageRepository.markAsReadIfCurrent(stamp.repositoryEpoch, frame.roomId, target) }
                                 }
                                 return@withLock
                             }
                             val senderKey = presence.value.firstOrNull { it.username == frame.senderUsername }?.publicKey ?: return@withLock
                             val message = parseIncomingMessage(frame.roomId, frame.messageId, json.toString(), frame.senderUsername, senderKey) ?: return@withLock
-                            if (!mutateRepositoryIfCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) wipeMessageSecrets(message)
+                            if (!mutateRepositoryIfAccountCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) wipeMessageSecrets(message)
                         } finally { decrypted.plaintext.fill(0); evidence.fill(0) }
                     }
                     is MlsIncomingFrame.RoomDeleted, is MlsIncomingFrame.Left -> {
@@ -1138,8 +1138,8 @@ class ChatViewModel(
                     recipientsOverride = remoteRecipients,
                     sessionStamp = capturedStamp
                 )
-                if (result == OutboundSendResult.ACCEPTED && isSessionStampValid(capturedStamp)) {
-                    if (!mutateRepositoryIfCurrent(capturedStamp) {
+                if (result == OutboundSendResult.ACCEPTED && isAccountSessionStampValid(capturedStamp)) {
+                    if (!mutateRepositoryIfAccountCurrent(capturedStamp) {
                             messageRepository.saveMessageIfCurrent(
                                 capturedStamp.repositoryEpoch,
                                 chatId,
@@ -1401,7 +1401,7 @@ class ChatViewModel(
                                     )
                                 },
                                 save = {
-                                    mutateRepositoryIfCurrent(sessionStamp) {
+                                    mutateRepositoryIfAccountCurrent(sessionStamp) {
                                         messageRepository.saveMessageIfCurrent(
                                             sessionStamp.repositoryEpoch,
                                             chatId,
@@ -1460,7 +1460,7 @@ class ChatViewModel(
         operationActive: AtomicBoolean
     ): Boolean = operationActive.get() &&
         serverStatus.value.state == "CONNECTED" &&
-        isSessionStampValid(stamp) &&
+        isAccountSessionStampValid(stamp) &&
         nodeConfigService.getActiveSession() == session
 
     private fun isAttachmentProgressCurrent(
@@ -2395,6 +2395,18 @@ class ChatViewModel(
         }
     }
 
+    /** Publishes a proven transaction result on the current transport epoch. */
+    private fun mutateRepositoryIfAccountCurrent(
+        stamp: SessionStamp,
+        mutation: () -> Boolean
+    ): Boolean {
+        if (!isAccountSessionStampValid(stamp)) return false
+        val currentConnectionGeneration = chatTransport.currentConnectionGeneration()
+        return chatTransport.runIfConnectionCurrent(currentConnectionGeneration) {
+            isAccountSessionStampValid(stamp) && mutation()
+        }
+    }
+
     private fun isRoomChangeCurrent(change: RoomChange, stamp: SessionStamp): Boolean =
         isSessionStampValid(stamp) &&
             change.connectionGeneration == chatTransport.currentConnectionGeneration()
@@ -2557,13 +2569,6 @@ class ChatViewModel(
             if (sessionGenerationSnapshot != sessionGeneration.get() ||
                 (sessionStamp != null && !isAccountSessionStampValid(sessionStamp))
             ) return@withLock OutboundSendResult.AMBIGUOUS
-            if (connectionGeneration != chatTransport.currentConnectionGeneration()) {
-                // The relay may have accepted the staged frame before the
-                // connection result was lost. Do not leave staged ratchet state
-                // installed or reuse it on a replacement connection.
-                failClosedAfterAmbiguous()
-                return@withLock OutboundSendResult.AMBIGUOUS
-            }
             when (result) {
                 OutboundSendResult.ACCEPTED -> {
                     try {
@@ -2577,7 +2582,10 @@ class ChatViewModel(
                 OutboundSendResult.NOT_SENT -> {
                     try {
                         payloadCipher.rollbackOutbound(encrypted.messageId, encrypted.stateRevision)
-                        releasePrekeyLeases(prepared.leases, connectionGeneration)
+                        releasePrekeyLeases(
+                            prepared.leases,
+                            chatTransport.currentConnectionGeneration()
+                        )
                     } catch (_: Exception) {
                         failClosedAfterAmbiguous()
                         return@withLock OutboundSendResult.AMBIGUOUS

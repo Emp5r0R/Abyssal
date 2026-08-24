@@ -36,6 +36,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -84,7 +85,8 @@ internal const val PURGE_CLOSE_CODE = 4001
 internal const val PURGE_CLOSE_REASON = "purge"
 private const val WS_TICKET_B64_LENGTH = 43
 private val WS_TICKET_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
-private const val OUTBOUND_RESULT_TIMEOUT_MS = 15_000L
+private const val TRANSACTION_RETRY_INTERVAL_MS = 3_000L
+private const val TRANSACTION_RECOVERY_TIMEOUT_MS = 30_000L
 internal const val PREKEY_LEASE_REQUEST_TIMEOUT_MS = 5_000L
 internal const val IDENTITY_PUBLIC_KEY_BYTES_V9 = 608
 internal val PREKEY_ID_REGEX_V9 = Regex("^[A-Za-z0-9_-]{1,32}$")
@@ -235,16 +237,25 @@ internal class RealChatTransport(
     private val callFactory: Call.Factory = client,
     private val buildAttestationProvider: BuildAttestationProvider = AndroidBuildAttestationProvider
 ) : IChatTransport, IMlsTransport {
-    private data class PendingOperation(
-        val generation: Long,
+    private interface RecoverableOperation {
+        var generation: Long
+        var exactFrame: String
+        val expiresAtMonotonicMs: Long
         val result: CompletableDeferred<OutboundSendResult>
-    )
+    }
+
+    private data class PendingOperation(
+        override var generation: Long,
+        override var exactFrame: String,
+        override val expiresAtMonotonicMs: Long,
+        override val result: CompletableDeferred<OutboundSendResult>
+    ) : RecoverableOperation
 
     private data class DrainedPendingOperations(
-        val outbound: List<CompletableDeferred<OutboundSendResult>>,
-        val acknowledgements: List<CompletableDeferred<OutboundSendResult>>,
+        val outbound: List<PendingOperation>,
+        val acknowledgements: List<PendingOperation>,
         val prekeyLeases: List<CompletableDeferred<PrekeyLease?>>,
-        val mls: List<CompletableDeferred<OutboundSendResult>>
+        val mls: List<PendingMlsOperation>
     )
 
     private data class PendingPrekeyLease(
@@ -253,12 +264,14 @@ internal class RealChatTransport(
     )
 
     private data class PendingMlsOperation(
-        val generation: Long,
+        override var generation: Long,
         val roomId: String,
         val revision: ULong,
         val snapshot: Boolean,
-        val result: CompletableDeferred<OutboundSendResult>
-    )
+        override var exactFrame: String,
+        override val expiresAtMonotonicMs: Long,
+        override val result: CompletableDeferred<OutboundSendResult>
+    ) : RecoverableOperation
 
     private data class SocketSnapshot(
         val socket: WebSocket,
@@ -545,7 +558,9 @@ internal class RealChatTransport(
         generation == connectionGeneration.get() && webSocket === socket
 
     /** Must be called under [connectionLock]. Registration also takes this lock. */
-    private fun advanceConnectionEpochAndDrainRoomChangesLocked(): DrainedPendingOperations {
+    private fun advanceConnectionEpochAndDrainRoomChangesLocked(
+        preserveRecoverableTransactions: Boolean = false
+    ): DrainedPendingOperations {
         connectionGeneration.incrementAndGet()
         val currentGeneration = connectionGeneration.get()
         while (_roomChanges.tryReceive().isSuccess) {
@@ -563,10 +578,10 @@ internal class RealChatTransport(
         // holding the same lock used by send registration. A reconnect may
         // register new entries immediately after this method returns; those
         // entries must never be included in the old invalidation result.
-        val outbound = synchronized(pendingOutbound) {
+        val outbound = if (preserveRecoverableTransactions) emptyList() else synchronized(pendingOutbound) {
             drainPendingResultsLocked(pendingOutbound, currentGeneration)
         }
-        val acknowledgements = synchronized(pendingAcknowledgements) {
+        val acknowledgements = if (preserveRecoverableTransactions) emptyList() else synchronized(pendingAcknowledgements) {
             drainPendingResultsLocked(pendingAcknowledgements, currentGeneration)
         }
         val prekeyLeases = synchronized(pendingPrekeyLeases) {
@@ -581,13 +596,13 @@ internal class RealChatTransport(
             }
             drained
         }
-        val mls = synchronized(pendingMls) {
-            val drained = ArrayList<CompletableDeferred<OutboundSendResult>>(pendingMls.size)
+        val mls = if (preserveRecoverableTransactions) emptyList() else synchronized(pendingMls) {
+            val drained = ArrayList<PendingMlsOperation>(pendingMls.size)
             val iterator = pendingMls.entries.iterator()
             while (iterator.hasNext()) {
                 val entry = iterator.next()
                 if (entry.value.generation != currentGeneration) {
-                    drained += entry.value.result
+                    drained += entry.value
                     iterator.remove()
                 }
             }
@@ -607,13 +622,13 @@ internal class RealChatTransport(
     private fun drainPendingResultsLocked(
         pending: LinkedHashMap<String, PendingOperation>,
         currentGeneration: Long
-    ): List<CompletableDeferred<OutboundSendResult>> {
-        val drained = ArrayList<CompletableDeferred<OutboundSendResult>>(pending.size)
+    ): List<PendingOperation> {
+        val drained = ArrayList<PendingOperation>(pending.size)
         val iterator = pending.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
             if (entry.value.generation != currentGeneration) {
-                drained += entry.value.result
+                drained += entry.value
                 iterator.remove()
             }
         }
@@ -665,7 +680,7 @@ internal class RealChatTransport(
         generation: Long,
         messageId: String,
         pending: LinkedHashMap<String, PendingOperation>
-    ): CompletableDeferred<OutboundSendResult>? = synchronized(connectionLock) {
+    ): PendingOperation? = synchronized(connectionLock) {
         if (!isCurrentSocket(socket, generation)) {
             null
         } else {
@@ -675,10 +690,73 @@ internal class RealChatTransport(
                     null
                 } else {
                     pending.remove(messageId)
-                    operation.result
+                    operation
                 }
             }
         }
+    }
+
+    private fun monotonicTimeMs(): Long = System.nanoTime() / 1_000_000L
+
+    private fun <T : RecoverableOperation> resendRecoverableOperation(
+        pending: LinkedHashMap<String, T>,
+        messageId: String,
+        operation: T
+    ): Boolean = synchronized(connectionLock) connection@{
+        val socket = webSocket ?: return@connection false
+        val generation = connectionGeneration.get()
+        synchronized(pending) pendingLock@{
+            if (pending[messageId] !== operation) return@pendingLock false
+            operation.generation = generation
+            runCatching { socket.send(operation.exactFrame) }.getOrDefault(false)
+        }
+    }
+
+    private suspend fun <T : RecoverableOperation> awaitRecoverableOperation(
+        pending: LinkedHashMap<String, T>,
+        messageId: String,
+        operation: T,
+        timeoutReason: String
+    ): OutboundSendResult {
+        while (true) {
+            val remaining = operation.expiresAtMonotonicMs - monotonicTimeMs()
+            if (remaining <= 0L) break
+            val result = withTimeoutOrNull(minOf(TRANSACTION_RETRY_INTERVAL_MS, remaining)) {
+                operation.result.await()
+            }
+            if (result != null) {
+                operation.exactFrame = ""
+                return result
+            }
+            if (!resendRecoverableOperation(pending, messageId, operation)) connect()
+        }
+
+        synchronized(pending) {
+            if (pending[messageId] === operation) pending.remove(messageId)
+        }
+        operation.exactFrame = ""
+        val snapshot = synchronized(connectionLock) {
+            webSocket?.let { SocketSnapshot(it, connectionGeneration.get()) }
+        }
+        if (snapshot != null && isCurrentSocket(snapshot.socket, snapshot.generation)) {
+            closeCurrentSocket(snapshot.socket, _serverStatus.value.nodeId, timeoutReason, closeCode = 1001)
+        }
+        return OutboundSendResult.AMBIGUOUS
+    }
+
+    private fun resendPendingTransactionsForSocket(socket: WebSocket, generation: Long) {
+        fun <T : RecoverableOperation> replay(pending: LinkedHashMap<String, T>) {
+            synchronized(pending) {
+                pending.values.forEach { operation ->
+                    if (!isCurrentSocket(socket, generation)) return
+                    operation.generation = generation
+                    runCatching { socket.send(operation.exactFrame) }
+                }
+            }
+        }
+        replay(pendingOutbound)
+        replay(pendingAcknowledgements)
+        replay(pendingMls)
     }
 
     private fun parseWsTicket(response: Response): WsTicket? {
@@ -769,6 +847,7 @@ internal class RealChatTransport(
         val text = frame.toString()
         if (exceedsUtf8ByteLimit(text, MlsWireCodec.MAX_FRAME_BYTES)) return OutboundSendResult.NOT_SENT
         val result = CompletableDeferred<OutboundSendResult>()
+        lateinit var operation: PendingMlsOperation
         val socket: WebSocket
         val generation: Long
         synchronized(connectionLock) {
@@ -777,20 +856,34 @@ internal class RealChatTransport(
             if (generation != expectedGeneration) return OutboundSendResult.NOT_SENT
             synchronized(pendingMls) {
                 if (pendingMls.size >= MAX_PENDING_MLS || pendingMls.containsKey(messageId)) return OutboundSendResult.NOT_SENT
-                pendingMls[messageId] = PendingMlsOperation(generation, roomId, revision, snapshot, result)
+                operation = PendingMlsOperation(
+                    generation = generation,
+                    roomId = roomId,
+                    revision = revision,
+                    snapshot = snapshot,
+                    exactFrame = text,
+                    expiresAtMonotonicMs = monotonicTimeMs() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+                    result = result
+                )
+                pendingMls[messageId] = operation
             }
         }
         val sent = synchronized(connectionLock) { isCurrentSocket(socket, generation) && runCatching { socket.send(text) }.getOrDefault(false) }
         if (!sent) {
-            synchronized(pendingMls) { pendingMls.remove(messageId) }
+            synchronized(pendingMls) {
+                if (pendingMls[messageId] === operation) pendingMls.remove(messageId)
+            }
+            operation.exactFrame = ""
             return OutboundSendResult.NOT_SENT
         }
         return try {
-            withTimeout(OUTBOUND_RESULT_TIMEOUT_MS) { result.await() }
-        } catch (_: Exception) {
-            synchronized(pendingMls) { pendingMls.remove(messageId) }
-            if (isCurrentSocket(socket, generation)) closeCurrentSocket(socket, _serverStatus.value.nodeId, "MLS result unavailable", 1001)
-            OutboundSendResult.AMBIGUOUS
+            awaitRecoverableOperation(pendingMls, messageId, operation, "MLS result unavailable")
+        } catch (error: CancellationException) {
+            synchronized(pendingMls) {
+                if (pendingMls[messageId] === operation) pendingMls.remove(messageId)
+            }
+            operation.exactFrame = ""
+            throw error
         }
     }
 
@@ -860,6 +953,7 @@ internal class RealChatTransport(
         expectedGeneration: Long?
     ): OutboundSendResult {
         var registered = false
+        var operationResult: CompletableDeferred<OutboundSendResult>? = null
         lateinit var socket: WebSocket
         var generation = 0L
         return try {
@@ -931,6 +1025,8 @@ internal class RealChatTransport(
                 return OutboundSendResult.NOT_SENT
             }
             val result = CompletableDeferred<OutboundSendResult>()
+            operationResult = result
+            lateinit var operation: PendingOperation
             synchronized(connectionLock) {
                 socket = webSocket ?: return OutboundSendResult.NOT_SENT
                 generation = connectionGeneration.get()
@@ -944,7 +1040,13 @@ internal class RealChatTransport(
                     if (pendingOutbound.containsKey(payload.messageId)) {
                         return OutboundSendResult.NOT_SENT
                     }
-                    pendingOutbound[payload.messageId] = PendingOperation(generation, result)
+                    operation = PendingOperation(
+                        generation = generation,
+                        exactFrame = frame,
+                        expiresAtMonotonicMs = monotonicTimeMs() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+                        result = result
+                    )
+                    pendingOutbound[payload.messageId] = operation
                     registered = true
                 }
             }
@@ -963,6 +1065,7 @@ internal class RealChatTransport(
                     val pending = pendingOutbound[payload.messageId]
                     if (pending?.generation == generation && pending.result === result) {
                         pendingOutbound.remove(payload.messageId)
+                        pending.exactFrame = ""
                     }
                 }
                 if (isCurrentSocket(socket, generation)) {
@@ -971,21 +1074,35 @@ internal class RealChatTransport(
                 return OutboundSendResult.NOT_SENT
             }
             try {
-                withTimeout(OUTBOUND_RESULT_TIMEOUT_MS) { result.await() }
-            } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
-                abortPendingOutbound(socket, generation, payload.messageId, result, "message result timeout")
-                OutboundSendResult.AMBIGUOUS
+                awaitRecoverableOperation(
+                    pendingOutbound,
+                    payload.messageId,
+                    operation,
+                    "message recovery expired"
+                )
             } catch (_: CancellationException) {
                 abortPendingOutbound(socket, generation, payload.messageId, result, "message send cancelled")
                 OutboundSendResult.AMBIGUOUS
             }
         } catch (error: CancellationException) {
             if (!registered) throw error
-            abortPendingOutbound(socket, generation, payload.messageId, null, "message send cancelled")
+            abortPendingOutbound(
+                socket,
+                generation,
+                payload.messageId,
+                operationResult,
+                "message send cancelled"
+            )
             OutboundSendResult.AMBIGUOUS
         } catch (_: Exception) {
             if (registered) {
-                abortPendingOutbound(socket, generation, payload.messageId, null, "message send failed")
+                abortPendingOutbound(
+                    socket,
+                    generation,
+                    payload.messageId,
+                    operationResult,
+                    "message send failed"
+                )
                 OutboundSendResult.AMBIGUOUS
             } else {
                 OutboundSendResult.NOT_SENT
@@ -1205,6 +1322,7 @@ internal class RealChatTransport(
         }
         if (frame.length > MAX_WEBSOCKET_FRAME_BYTES) return OutboundSendResult.NOT_SENT
         val result = CompletableDeferred<OutboundSendResult>()
+        lateinit var operation: PendingOperation
         lateinit var socket: WebSocket
         val generation: Long
         synchronized(connectionLock) {
@@ -1217,7 +1335,13 @@ internal class RealChatTransport(
                 if (pendingAcknowledgements.size >= MAX_PENDING_ACKNOWLEDGEMENTS ||
                     pendingAcknowledgements.containsKey(messageId)
                 ) return OutboundSendResult.NOT_SENT
-                pendingAcknowledgements[messageId] = PendingOperation(generation, result)
+                operation = PendingOperation(
+                    generation = generation,
+                    exactFrame = frame,
+                    expiresAtMonotonicMs = monotonicTimeMs() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+                    result = result
+                )
+                pendingAcknowledgements[messageId] = operation
             }
         }
         val sent = synchronized(connectionLock) {
@@ -1238,6 +1362,7 @@ internal class RealChatTransport(
                 val pending = pendingAcknowledgements[messageId]
                 if (pending?.generation == generation && pending.result === result) {
                     pendingAcknowledgements.remove(messageId)
+                    pending.exactFrame = ""
                 }
             }
             if (isCurrentSocket(socket, generation)) {
@@ -1246,10 +1371,12 @@ internal class RealChatTransport(
             return OutboundSendResult.NOT_SENT
         }
         return try {
-            withTimeout(OUTBOUND_RESULT_TIMEOUT_MS) { result.await() }
-        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
-            abortPendingAcknowledgement(socket, generation, messageId, result, "ack result timeout")
-            OutboundSendResult.AMBIGUOUS
+            awaitRecoverableOperation(
+                pendingAcknowledgements,
+                messageId,
+                operation,
+                "ack recovery expired"
+            )
         } catch (_: CancellationException) {
             abortPendingAcknowledgement(socket, generation, messageId, result, "ack send cancelled")
             OutboundSendResult.AMBIGUOUS
@@ -1337,6 +1464,7 @@ internal class RealChatTransport(
                 chatsToJoin.forEach { chatId ->
                     sendJoinFrameForSocket(webSocket, generation, chatId)
                 }
+                resendPendingTransactionsForSocket(webSocket, generation)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -1366,7 +1494,11 @@ internal class RealChatTransport(
                                 closeCurrentSocket(webSocket, nodeId, "unexpected MLS result")
                                 return
                             }
-                            pending.result.complete(if (frame.accepted) OutboundSendResult.ACCEPTED else OutboundSendResult.REJECTED)
+                            pending.exactFrame = ""
+                            pending.result.complete(
+                                if (frame.accepted) OutboundSendResult.ACCEPTED
+                                else OutboundSendResult.REJECTED
+                            )
                         }
                         "mls_rooms", "mls_room_created", "mls_room_discovered", "mls_join_requested",
                         "mls_join_rejected", "mls_leave_requested", "mls_leave_pending", "mls_leave_rejected",
@@ -1380,7 +1512,11 @@ internal class RealChatTransport(
                             }
                             Unit
                         }
-                        "GLOBAL_WIPE", "global_wipe" -> signalPurgeForSocket(webSocket, generation)
+                        "GLOBAL_WIPE", "global_wipe" -> signalPurgeForSocket(
+                            webSocket,
+                            generation,
+                            nodeId
+                        )
                         "prekey_lease" -> {
                             val lease = json.toPrekeyLease() ?: run {
                                 closeCurrentSocket(webSocket, nodeId, "invalid prekey lease")
@@ -1454,7 +1590,8 @@ internal class RealChatTransport(
                                 closeCurrentSocket(webSocket, nodeId, "unexpected message result")
                                 return
                             }
-                            pending.complete(
+                            pending.exactFrame = ""
+                            pending.result.complete(
                                 if (accepted) OutboundSendResult.ACCEPTED
                                 else OutboundSendResult.REJECTED
                             )
@@ -1476,7 +1613,8 @@ internal class RealChatTransport(
                                 closeCurrentSocket(webSocket, nodeId, "unexpected ack result")
                                 return
                             }
-                            pending.complete(
+                            pending.exactFrame = ""
+                            pending.result.complete(
                                 if (accepted) OutboundSendResult.ACCEPTED
                                 else OutboundSendResult.REJECTED
                             )
@@ -1537,22 +1675,27 @@ internal class RealChatTransport(
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                invalidateCurrentSocket(
+                val purge = isPurgeClose(code, reason)
+                val recover = invalidateCurrentSocket(
                     socket = webSocket,
                     nodeId = nodeId,
                     closeCode = null,
                     reason = reason,
-                    signalPurge = isPurgeClose(code, reason)
+                    signalPurge = purge,
+                    preserveRecoverableTransactions = !purge
                 )
+                if (recover && !purge) connect()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                invalidateCurrentSocket(
+                val recover = invalidateCurrentSocket(
                     socket = webSocket,
                     nodeId = nodeId,
                     closeCode = null,
-                    reason = "socket failure"
+                    reason = "socket failure",
+                    preserveRecoverableTransactions = true
                 )
+                if (recover) connect()
             }
         }
     }
@@ -1565,16 +1708,16 @@ internal class RealChatTransport(
         drained.forEach { it.complete(null) }
     }
 
-    private fun signalPurgeForSocket(socket: WebSocket, generation: Long) {
-        val drained = synchronized(connectionLock) {
-            if (isCurrentSocket(socket, generation)) {
-                signalPurgeLocked(generation, force = false)
-                drainPendingPrekeyLeasesLocked(generation)
-            } else {
-                emptyList()
-            }
-        }
-        drained.forEach { it.complete(null) }
+    private fun signalPurgeForSocket(socket: WebSocket, generation: Long, nodeId: String) {
+        if (!isCurrentSocket(socket, generation)) return
+        invalidateCurrentSocket(
+            socket = socket,
+            nodeId = nodeId,
+            closeCode = PURGE_CLOSE_CODE,
+            reason = PURGE_CLOSE_REASON,
+            signalPurge = true,
+            preserveRecoverableTransactions = false
+        )
     }
 
     /** Must be called under [connectionLock]. */
@@ -1607,10 +1750,19 @@ internal class RealChatTransport(
         drained: DrainedPendingOperations,
         result: OutboundSendResult
     ) {
-        drained.outbound.forEach { it.complete(result) }
-        drained.acknowledgements.forEach { it.complete(result) }
+        drained.outbound.forEach { operation ->
+            operation.exactFrame = ""
+            operation.result.complete(result)
+        }
+        drained.acknowledgements.forEach { operation ->
+            operation.exactFrame = ""
+            operation.result.complete(result)
+        }
         drained.prekeyLeases.forEach { it.complete(null) }
-        drained.mls.forEach { it.complete(result) }
+        drained.mls.forEach { operation ->
+            operation.exactFrame = ""
+            operation.result.complete(result)
+        }
     }
 
     private fun abortPendingOutbound(
@@ -1622,10 +1774,12 @@ internal class RealChatTransport(
     ) {
         synchronized(pendingOutbound) {
             val actual = pendingOutbound[messageId]
-            if (actual?.generation == generation &&
-                (expected == null || actual.result === expected)
+            if (actual != null &&
+                ((expected != null && actual.result === expected) ||
+                    (expected == null && actual.generation == generation))
             ) {
                 pendingOutbound.remove(messageId)
+                actual.exactFrame = ""
             }
         }
         if (isCurrentSocket(socket, generation)) {
@@ -1642,10 +1796,11 @@ internal class RealChatTransport(
     ) {
         val removed = synchronized(pendingAcknowledgements) {
             val actual = pendingAcknowledgements[messageId]
-            if (actual?.generation != generation || actual.result !== expected) {
+            if (actual == null || actual.result !== expected) {
                 false
             } else {
                 pendingAcknowledgements.remove(messageId)
+                actual.exactFrame = ""
                 true
             }
         }
@@ -1679,16 +1834,21 @@ internal class RealChatTransport(
         nodeId: String,
         closeCode: Int?,
         reason: String,
-        signalPurge: Boolean = false
-    ) {
+        signalPurge: Boolean = false,
+        preserveRecoverableTransactions: Boolean = false
+    ): Boolean {
         val drainedPending: DrainedPendingOperations
+        val shouldReconnect: Boolean
         synchronized(connectionLock) {
-            if (webSocket !== socket) return
+            if (webSocket !== socket) return false
             // A GLOBAL_WIPE frame can be queued immediately before the socket
             // fails. Carry that command into the post-invalidation generation
             // instead of draining and silently losing it.
             val carryPurge = signalPurge || purgeSignaled.get()
-            drainedPending = advanceConnectionEpochAndDrainRoomChangesLocked()
+            shouldReconnect = preserveRecoverableTransactions && !carryPurge
+            drainedPending = advanceConnectionEpochAndDrainRoomChangesLocked(
+                preserveRecoverableTransactions = shouldReconnect
+            )
             if (carryPurge) {
                 signalPurgeLocked(connectionGeneration.get(), force = true)
             }
@@ -1703,6 +1863,7 @@ internal class RealChatTransport(
         }
         completeDrainedPendingOperations(drainedPending, OutboundSendResult.AMBIGUOUS)
         if (closeCode != null && !socket.close(closeCode, reason)) socket.cancel()
+        return shouldReconnect
     }
 
     /**

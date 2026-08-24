@@ -51,8 +51,8 @@ const MAX_PENDING_MESSAGE_RESULTS = 256;
 const MAX_PENDING_ACK_RESULTS = 256;
 const MAX_PENDING_MLS_RESULTS = 256;
 export const MAX_PENDING_PREKEY_LEASES = 256;
-const MESSAGE_RESULT_TIMEOUT_MS = 10_000;
-const ACK_RESULT_TIMEOUT_MS = 10_000;
+const TRANSACTION_RETRY_INTERVAL_MS = 3_000;
+const TRANSACTION_RECOVERY_TIMEOUT_MS = 30_000;
 export const PREKEY_LEASE_TIMEOUT_MS = 10_000;
 const MAX_WS_TICKET_JSON_BYTES = 4 * 1024;
 const MAX_ATTACHMENT_UPLOAD_JSON_BYTES = 4 * 1024;
@@ -90,6 +90,8 @@ interface PendingMessageResult {
   generation: number;
   resolve: (outcome: EncryptedSendOutcome) => void;
   timer: number;
+  serialized: string;
+  expiresAtMs: number;
 }
 
 interface PendingMlsResult extends PendingMessageResult {
@@ -368,19 +370,21 @@ export class RelaySocket {
     const socket = this.#socket;
     const generation = this.#socketGeneration;
     return new Promise<EncryptedSendOutcome>((resolve) => {
-      const timer = window.setTimeout(() => {
-        const pending = this.#pendingResults.get(messageId);
-        if (!pending || pending.generation !== generation) return;
-        this.#pendingResults.delete(messageId);
-        pending.resolve("AMBIGUOUS");
-        this.failClosed("message result timeout");
-      }, MESSAGE_RESULT_TIMEOUT_MS);
-      this.#pendingResults.set(messageId, { generation, resolve, timer });
+      const pending: PendingMessageResult = {
+        generation,
+        resolve,
+        timer: 0,
+        serialized,
+        expiresAtMs: Date.now() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+      };
+      this.#pendingResults.set(messageId, pending);
       try {
         socket.send(serialized);
+        this.armRecoverableTimer(this.#pendingResults, messageId, pending, "message recovery expired");
       } catch {
-        window.clearTimeout(timer);
+        window.clearTimeout(pending.timer);
         this.#pendingResults.delete(messageId);
+        pending.serialized = "";
         resolve("NOT_SENT");
       }
     });
@@ -399,18 +403,20 @@ export class RelaySocket {
     const socket = this.#socket;
     const generation = this.#socketGeneration;
     return new Promise<EncryptedSendOutcome>((resolve) => {
-      const timer = window.setTimeout(() => {
-        const pending = this.#pendingMlsResults.get(messageId);
-        if (!pending || pending.generation !== generation) return;
-        this.#pendingMlsResults.delete(messageId);
-        pending.resolve("AMBIGUOUS");
-        this.failClosed("MLS result timeout");
-      }, MESSAGE_RESULT_TIMEOUT_MS);
-      this.#pendingMlsResults.set(messageId, { generation, resolve, timer, roomId, revision: revisionText, resultType: "mls_room_result" });
-      try { socket.send(serialized); }
+      const pending: PendingMlsResult = {
+        generation, resolve, timer: 0, serialized,
+        expiresAtMs: Date.now() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+        roomId, revision: revisionText, resultType: "mls_room_result",
+      };
+      this.#pendingMlsResults.set(messageId, pending);
+      try {
+        socket.send(serialized);
+        this.armRecoverableTimer(this.#pendingMlsResults, messageId, pending, "MLS recovery expired");
+      }
       catch {
-        window.clearTimeout(timer);
+        window.clearTimeout(pending.timer);
         this.#pendingMlsResults.delete(messageId);
+        pending.serialized = "";
         resolve("NOT_SENT");
       }
     });
@@ -426,13 +432,21 @@ export class RelaySocket {
     if (serialized === null) return Promise.resolve("NOT_SENT");
     const socket = this.#socket; const generation = this.#socketGeneration;
     return new Promise<EncryptedSendOutcome>((resolve) => {
-      const timer = window.setTimeout(() => {
-        const pending = this.#pendingMlsResults.get(messageId);
-        if (!pending || pending.generation !== generation) return;
-        this.#pendingMlsResults.delete(messageId); pending.resolve("AMBIGUOUS"); this.failClosed("MLS snapshot timeout");
-      }, MESSAGE_RESULT_TIMEOUT_MS);
-      this.#pendingMlsResults.set(messageId, { generation, resolve, timer, roomId, revision: revisionText, resultType: "mls_snapshot_result" });
-      try { socket.send(serialized); } catch { window.clearTimeout(timer); this.#pendingMlsResults.delete(messageId); resolve("NOT_SENT"); }
+      const pending: PendingMlsResult = {
+        generation, resolve, timer: 0, serialized,
+        expiresAtMs: Date.now() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+        roomId, revision: revisionText, resultType: "mls_snapshot_result",
+      };
+      this.#pendingMlsResults.set(messageId, pending);
+      try {
+        socket.send(serialized);
+        this.armRecoverableTimer(this.#pendingMlsResults, messageId, pending, "MLS snapshot recovery expired");
+      } catch {
+        window.clearTimeout(pending.timer);
+        this.#pendingMlsResults.delete(messageId);
+        pending.serialized = "";
+        resolve("NOT_SENT");
+      }
     });
   }
 
@@ -574,19 +588,21 @@ export class RelaySocket {
     const socket = this.#socket;
     const generation = this.#socketGeneration;
     return new Promise<RelayOperationOutcome>((resolve) => {
-      const timer = window.setTimeout(() => {
-        const pending = this.#pendingAckResults.get(messageId);
-        if (!pending || pending.generation !== generation) return;
-        this.#pendingAckResults.delete(messageId);
-        pending.resolve("AMBIGUOUS");
-        this.failClosed("ack result timeout");
-      }, ACK_RESULT_TIMEOUT_MS);
-      this.#pendingAckResults.set(messageId, { generation, resolve, timer });
+      const pending: PendingMessageResult = {
+        generation,
+        resolve,
+        timer: 0,
+        serialized,
+        expiresAtMs: Date.now() + TRANSACTION_RECOVERY_TIMEOUT_MS,
+      };
+      this.#pendingAckResults.set(messageId, pending);
       try {
         socket.send(serialized);
+        this.armRecoverableTimer(this.#pendingAckResults, messageId, pending, "ack recovery expired");
       } catch {
-        window.clearTimeout(timer);
+        window.clearTimeout(pending.timer);
         this.#pendingAckResults.delete(messageId);
+        pending.serialized = "";
         resolve("NOT_SENT");
       }
     });
@@ -653,6 +669,7 @@ export class RelaySocket {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         this.#attempt = 0;
         this.onState("connected");
+        this.resendPendingTransactions(socket, generation);
       };
       socket.onmessage = (event) => {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
@@ -695,9 +712,6 @@ export class RelaySocket {
       };
       socket.onerror = () => {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
-        this.settlePending("AMBIGUOUS");
-        this.settleAckPending("AMBIGUOUS");
-        this.settleMlsPending("AMBIGUOUS");
         this.settlePrekeyPending(new PrekeyLeaseError("AMBIGUOUS"));
         socket.close();
       };
@@ -707,9 +721,6 @@ export class RelaySocket {
           this.terminateForPurge();
           return;
         }
-        this.settlePending("AMBIGUOUS");
-        this.settleAckPending("AMBIGUOUS");
-        this.settleMlsPending("AMBIGUOUS");
         this.settlePrekeyPending(new PrekeyLeaseError("AMBIGUOUS"));
         this.#socket = null;
         this.#socketGeneration = 0;
@@ -775,6 +786,7 @@ export class RelaySocket {
     }
     this.#pendingResults.delete(result.message_id);
     window.clearTimeout(pending.timer);
+    pending.serialized = "";
     pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
   }
 
@@ -786,6 +798,7 @@ export class RelaySocket {
     }
     this.#pendingAckResults.delete(result.message_id);
     window.clearTimeout(pending.timer);
+    pending.serialized = "";
     pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
   }
 
@@ -798,7 +811,72 @@ export class RelaySocket {
     }
     this.#pendingMlsResults.delete(result.message_id);
     window.clearTimeout(pending.timer);
+    pending.serialized = "";
     pending.resolve(result.accepted ? "ACCEPTED" : "REJECTED");
+  }
+
+  private armRecoverableTimer<T extends PendingMessageResult>(
+    pendingMap: Map<string, T>,
+    messageId: string,
+    pending: T,
+    expiryReason: string,
+  ): void {
+    window.clearTimeout(pending.timer);
+    const remaining = pending.expiresAtMs - Date.now();
+    if (remaining <= 0) {
+      if (pendingMap.get(messageId) !== pending) return;
+      pendingMap.delete(messageId);
+      pending.serialized = "";
+      pending.resolve("AMBIGUOUS");
+      this.failClosed(expiryReason);
+      return;
+    }
+    pending.timer = window.setTimeout(() => {
+      if (pendingMap.get(messageId) !== pending) return;
+      const socket = this.#socket;
+      if (socket?.readyState === WebSocket.OPEN) {
+        this.resendPendingTransaction(pendingMap, messageId, pending, socket, this.#socketGeneration, expiryReason);
+      } else {
+        this.armRecoverableTimer(pendingMap, messageId, pending, expiryReason);
+      }
+    }, Math.min(TRANSACTION_RETRY_INTERVAL_MS, remaining));
+  }
+
+  private resendPendingTransaction<T extends PendingMessageResult>(
+    pendingMap: Map<string, T>,
+    messageId: string,
+    pending: T,
+    socket: WebSocket,
+    generation: number,
+    expiryReason: string,
+  ): void {
+    if (pendingMap.get(messageId) !== pending) return;
+    if (pending.expiresAtMs <= Date.now()) {
+      this.armRecoverableTimer(pendingMap, messageId, pending, expiryReason);
+      return;
+    }
+    pending.generation = generation;
+    try {
+      socket.send(pending.serialized);
+    } catch {
+      try { socket.close(); } catch { /* recovery timer remains authoritative */ }
+    }
+    this.armRecoverableTimer(pendingMap, messageId, pending, expiryReason);
+  }
+
+  private resendPendingTransactions(socket: WebSocket, generation: number): void {
+    const replay = <T extends PendingMessageResult>(
+      pendingMap: Map<string, T>,
+      expiryReason: string,
+    ) => {
+      [...pendingMap.entries()].forEach(([messageId, pending]) => {
+        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
+        this.resendPendingTransaction(pendingMap, messageId, pending, socket, generation, expiryReason);
+      });
+    };
+    replay(this.#pendingResults, "message recovery expired");
+    replay(this.#pendingAckResults, "ack recovery expired");
+    replay(this.#pendingMlsResults, "MLS recovery expired");
   }
 
   private settlePending(outcome: RelayOperationOutcome): void {
@@ -806,6 +884,7 @@ export class RelaySocket {
     this.#pendingResults.clear();
     pending.forEach((entry) => {
       window.clearTimeout(entry.timer);
+      entry.serialized = "";
       entry.resolve(outcome);
     });
   }
@@ -815,6 +894,7 @@ export class RelaySocket {
     this.#pendingAckResults.clear();
     pending.forEach((entry) => {
       window.clearTimeout(entry.timer);
+      entry.serialized = "";
       entry.resolve(outcome);
     });
   }
@@ -822,7 +902,11 @@ export class RelaySocket {
   private settleMlsPending(outcome: RelayOperationOutcome): void {
     const pending = [...this.#pendingMlsResults.values()];
     this.#pendingMlsResults.clear();
-    pending.forEach((entry) => { window.clearTimeout(entry.timer); entry.resolve(outcome); });
+    pending.forEach((entry) => {
+      window.clearTimeout(entry.timer);
+      entry.serialized = "";
+      entry.resolve(outcome);
+    });
   }
 
   private settlePrekeyPending(error: PrekeyLeaseError): void {

@@ -61,10 +61,15 @@ use zeroize::{Zeroize, Zeroizing};
 mod mls_wire;
 mod release_admission;
 mod rooms;
+mod transaction_receipts;
 mod transport_padding;
 
 use release_admission::{
     BuildAttestationRequest, InstallOutcome, ReleaseAdmissionStore, ReleaseManifestMirror,
+};
+use transaction_receipts::{
+    BeginOutcome as TransactionBeginOutcome, ReceiptError as TransactionReceiptError,
+    TransactionKey, TransactionKind, TransactionReceiptStore, TransactionTicket,
 };
 use transport_padding::{
     json_array_len, json_bool_len, json_field_len, json_number_len, json_object_len,
@@ -235,6 +240,7 @@ struct AppState {
     frame_limits: Arc<Mutex<HashMap<Uuid, RateState>>>,
     login_limits: Arc<Mutex<HashMap<CodeId, RateState>>>,
     replay_ids: Arc<Mutex<HashMap<ReplayKey, u64>>>,
+    transaction_receipts: Arc<Mutex<TransactionReceiptStore>>,
     prekey_leases: Arc<Mutex<HashMap<PrekeyLeaseKey, PrekeyLease>>>,
     mls_rooms: Arc<Mutex<rooms::RoomAuthority>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
@@ -1758,6 +1764,9 @@ impl AppState {
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
+            transaction_receipts: Arc::new(Mutex::new(TransactionReceiptStore::new(
+                pending_message_ttl_ms,
+            ))),
             prekey_leases: Arc::new(Mutex::new(HashMap::new())),
             mls_rooms: Arc::new(Mutex::new(rooms::RoomAuthority::new_with_pending_ttl(
                 max_rooms_per_user,
@@ -4950,6 +4959,65 @@ fn validate_inbound_text_socket_admission(
     frame_limit
 }
 
+enum RecoverableTransaction {
+    Execute(TransactionTicket),
+    Replay(bool),
+    RejectForCapacity,
+}
+
+async fn begin_recoverable_transaction(
+    state: &AppState,
+    sender_id: Uuid,
+    kind: TransactionKind,
+    conversation_id: &str,
+    message_id: &str,
+    exact_frame: &str,
+) -> Result<RecoverableTransaction, String> {
+    let (account_id, _) = client_identity(state, sender_id).await?;
+    let key = TransactionKey::new(account_id, kind, conversation_id, message_id);
+    let outcome = state
+        .transaction_receipts
+        .lock()
+        .await
+        .begin(key, exact_frame, now_ms());
+    match outcome {
+        Ok(TransactionBeginOutcome::Execute(ticket)) => Ok(RecoverableTransaction::Execute(ticket)),
+        Ok(TransactionBeginOutcome::Replay(accepted)) => {
+            Ok(RecoverableTransaction::Replay(accepted))
+        }
+        Ok(TransactionBeginOutcome::CapacityExceeded) => {
+            Ok(RecoverableTransaction::RejectForCapacity)
+        }
+        Ok(TransactionBeginOutcome::InProgress) => Err("transaction still in progress".to_string()),
+        Err(TransactionReceiptError::ConflictingFrame) => {
+            invalidate_client_connection(state, sender_id).await;
+            Err("conflicting transaction frame".to_string())
+        }
+        Err(TransactionReceiptError::MissingReservation) => {
+            Err("transaction receipt unavailable".to_string())
+        }
+    }
+}
+
+async fn finish_recoverable_transaction(
+    state: &AppState,
+    sender_id: Uuid,
+    ticket: TransactionTicket,
+    accepted: bool,
+) -> Result<(), String> {
+    if state
+        .transaction_receipts
+        .lock()
+        .await
+        .finish(ticket, accepted, now_ms())
+        .is_err()
+    {
+        invalidate_client_connection(state, sender_id).await;
+        return Err("transaction receipt unavailable".to_string());
+    }
+    Ok(())
+}
+
 async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(), String> {
     // Do this before serde_json sees attacker-controlled input.  The websocket
     // layer permits the MLS ceiling so legitimate state envelopes can transit,
@@ -5028,6 +5096,36 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             padding: _,
         } => {
             let message_id_is_safe = valid_chat_id(&message_id);
+            let transaction = if message_id_is_safe && valid_chat_id(&chat_id) {
+                Some(
+                    begin_recoverable_transaction(
+                        state,
+                        sender_id,
+                        TransactionKind::Message,
+                        &chat_id,
+                        &message_id,
+                        text,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            match &transaction {
+                Some(RecoverableTransaction::Replay(accepted)) => {
+                    send_message_result(state, sender_id, &message_id, *accepted).await?;
+                    return if *accepted {
+                        Ok(())
+                    } else {
+                        Err("message rejected".to_string())
+                    };
+                }
+                Some(RecoverableTransaction::RejectForCapacity) => {
+                    send_message_result(state, sender_id, &message_id, false).await?;
+                    return Err("transaction receipt capacity exceeded".to_string());
+                }
+                _ => {}
+            }
             let route_result = route_encrypted_message_with_directory(
                 state,
                 sender_id,
@@ -5045,6 +5143,10 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 directory_evidence(directory_node_id, directory_revision, directory_digest),
             )
             .await;
+            if let Some(RecoverableTransaction::Execute(ticket)) = transaction {
+                finish_recoverable_transaction(state, sender_id, ticket, route_result.is_ok())
+                    .await?;
+            }
             if message_id_is_safe {
                 let accepted = route_result.is_ok();
                 send_message_result(state, sender_id, &message_id, accepted).await?;
@@ -5067,6 +5169,36 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             used_prekey_id,
         } => {
             let message_id_is_safe = valid_chat_id(&message_id);
+            let transaction = if message_id_is_safe && valid_chat_id(&chat_id) {
+                Some(
+                    begin_recoverable_transaction(
+                        state,
+                        sender_id,
+                        TransactionKind::Acknowledgement,
+                        &chat_id,
+                        &message_id,
+                        text,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            match &transaction {
+                Some(RecoverableTransaction::Replay(accepted)) => {
+                    send_ack_result(state, sender_id, &message_id, *accepted).await?;
+                    return if *accepted {
+                        Ok(())
+                    } else {
+                        Err("acknowledgement rejected".to_string())
+                    };
+                }
+                Some(RecoverableTransaction::RejectForCapacity) => {
+                    send_ack_result(state, sender_id, &message_id, false).await?;
+                    return Err("transaction receipt capacity exceeded".to_string());
+                }
+                _ => {}
+            }
             let acknowledgement_result = acknowledge_message(
                 state,
                 sender_id,
@@ -5082,6 +5214,15 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                 &used_prekey_id,
             )
             .await;
+            if let Some(RecoverableTransaction::Execute(ticket)) = transaction {
+                finish_recoverable_transaction(
+                    state,
+                    sender_id,
+                    ticket,
+                    acknowledgement_result.is_ok(),
+                )
+                .await?;
+            }
             if message_id_is_safe {
                 let accepted = acknowledgement_result.is_ok();
                 send_ack_result(state, sender_id, &message_id, accepted).await?;
@@ -5245,36 +5386,62 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
         } => {
             require_mls_protocol_version(protocol_version)?;
             let safe = valid_mls_correlator(&room_id) && valid_mls_correlator(&message_id);
-            let authenticated = safe && client_identity(state, sender_id).await.is_ok();
-            let result = mls_membership_commit(
+            if !safe {
+                return Err("invalid MLS transaction identity".to_string());
+            }
+            let transaction = begin_recoverable_transaction(
                 state,
                 sender_id,
-                room_id.clone(),
-                message_id.clone(),
-                request_id,
-                from_epoch,
-                to_epoch,
-                revision,
-                group_id_b64,
-                from_membership_digest_b64,
-                membership_digest_b64,
-                roster,
-                control_b64,
-                welcome_b64,
-                authenticated_data_b64,
-                state_envelope_b64,
+                TransactionKind::MlsRoom,
+                &room_id,
+                &message_id,
+                text,
             )
-            .await;
-            finish_mls_room_transaction(
-                state,
-                sender_id,
-                room_id,
-                message_id,
-                revision,
-                authenticated,
-                result,
-            )
-            .await
+            .await?;
+            match transaction {
+                RecoverableTransaction::Replay(accepted) => {
+                    send_mls_room_result(
+                        state,
+                        sender_id,
+                        &room_id,
+                        &message_id,
+                        revision,
+                        accepted,
+                    )
+                    .await?;
+                    Ok(())
+                }
+                RecoverableTransaction::RejectForCapacity => {
+                    send_mls_room_result(state, sender_id, &room_id, &message_id, revision, false)
+                        .await?;
+                    Ok(())
+                }
+                RecoverableTransaction::Execute(ticket) => {
+                    let result = mls_membership_commit(
+                        state,
+                        sender_id,
+                        room_id.clone(),
+                        message_id.clone(),
+                        request_id,
+                        from_epoch,
+                        to_epoch,
+                        revision,
+                        group_id_b64,
+                        from_membership_digest_b64,
+                        membership_digest_b64,
+                        roster,
+                        control_b64,
+                        welcome_b64,
+                        authenticated_data_b64,
+                        state_envelope_b64,
+                    )
+                    .await;
+                    finish_mls_room_transaction(
+                        state, sender_id, room_id, message_id, revision, ticket, result,
+                    )
+                    .await
+                }
+            }
         }
         InboundFrame::MlsApplication {
             protocol_version,
@@ -5290,31 +5457,57 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
         } => {
             require_mls_protocol_version(protocol_version)?;
             let safe = valid_mls_correlator(&room_id) && valid_mls_correlator(&message_id);
-            let authenticated = safe && client_identity(state, sender_id).await.is_ok();
-            let result = mls_application(
+            if !safe {
+                return Err("invalid MLS transaction identity".to_string());
+            }
+            let transaction = begin_recoverable_transaction(
                 state,
                 sender_id,
-                room_id.clone(),
-                message_id.clone(),
-                group_id_b64,
-                epoch,
-                revision,
-                membership_digest_b64,
-                ciphertext_b64,
-                authenticated_data_b64,
-                state_envelope_b64,
+                TransactionKind::MlsRoom,
+                &room_id,
+                &message_id,
+                text,
             )
-            .await;
-            finish_mls_room_transaction(
-                state,
-                sender_id,
-                room_id,
-                message_id,
-                revision,
-                authenticated,
-                result,
-            )
-            .await
+            .await?;
+            match transaction {
+                RecoverableTransaction::Replay(accepted) => {
+                    send_mls_room_result(
+                        state,
+                        sender_id,
+                        &room_id,
+                        &message_id,
+                        revision,
+                        accepted,
+                    )
+                    .await?;
+                    Ok(())
+                }
+                RecoverableTransaction::RejectForCapacity => {
+                    send_mls_room_result(state, sender_id, &room_id, &message_id, revision, false)
+                        .await?;
+                    Ok(())
+                }
+                RecoverableTransaction::Execute(ticket) => {
+                    let result = mls_application(
+                        state,
+                        sender_id,
+                        room_id.clone(),
+                        message_id.clone(),
+                        group_id_b64,
+                        epoch,
+                        revision,
+                        membership_digest_b64,
+                        ciphertext_b64,
+                        authenticated_data_b64,
+                        state_envelope_b64,
+                    )
+                    .await;
+                    finish_mls_room_transaction(
+                        state, sender_id, room_id, message_id, revision, ticket, result,
+                    )
+                    .await
+                }
+            }
         }
         InboundFrame::MlsStateSnapshot {
             protocol_version,
@@ -5327,28 +5520,61 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
         } => {
             require_mls_protocol_version(protocol_version)?;
             let safe = valid_mls_correlator(&room_id) && valid_mls_correlator(&message_id);
-            let authenticated = safe && client_identity(state, sender_id).await.is_ok();
-            let result = mls_state_snapshot(
+            if !safe {
+                return Err("invalid MLS transaction identity".to_string());
+            }
+            let transaction = begin_recoverable_transaction(
                 state,
                 sender_id,
-                room_id.clone(),
-                message_id.clone(),
-                epoch,
-                revision,
-                membership_digest_b64,
-                state_envelope_b64,
+                TransactionKind::MlsSnapshot,
+                &room_id,
+                &message_id,
+                text,
             )
-            .await;
-            finish_mls_snapshot_transaction(
-                state,
-                sender_id,
-                room_id,
-                message_id,
-                revision,
-                authenticated,
-                result,
-            )
-            .await
+            .await?;
+            match transaction {
+                RecoverableTransaction::Replay(accepted) => {
+                    send_mls_snapshot_result(
+                        state,
+                        sender_id,
+                        &room_id,
+                        &message_id,
+                        revision,
+                        accepted,
+                    )
+                    .await?;
+                    Ok(())
+                }
+                RecoverableTransaction::RejectForCapacity => {
+                    send_mls_snapshot_result(
+                        state,
+                        sender_id,
+                        &room_id,
+                        &message_id,
+                        revision,
+                        false,
+                    )
+                    .await?;
+                    Ok(())
+                }
+                RecoverableTransaction::Execute(ticket) => {
+                    let result = mls_state_snapshot(
+                        state,
+                        sender_id,
+                        room_id.clone(),
+                        message_id.clone(),
+                        epoch,
+                        revision,
+                        membership_digest_b64,
+                        state_envelope_b64,
+                    )
+                    .await;
+                    finish_mls_snapshot_transaction(
+                        state, sender_id, room_id, message_id, revision, ticket, result,
+                    )
+                    .await
+                }
+            }
         }
         InboundFrame::MlsDeleteRoom {
             protocol_version,
@@ -6817,6 +7043,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     }
     state.frame_limits.lock().await.clear();
     state.replay_ids.lock().await.clear();
+    state.transaction_receipts.lock().await.clear();
     state.prekey_leases.lock().await.clear();
     state.opaque_handshakes.lock().await.clear();
     let mut login_limits = state.login_limits.lock().await;
@@ -7514,18 +7741,6 @@ async fn mls_membership_commit(
             send_to_client(state, client_id, &frame).await;
         }
     }
-    send_to_client(
-        state,
-        sender_id,
-        &OutboundFrame::MlsRoomResult {
-            protocol_version: rooms::MLS_PROTOCOL_VERSION,
-            room_id,
-            message_id,
-            revision,
-            accepted: true,
-        },
-    )
-    .await;
     Ok(())
 }
 
@@ -7632,18 +7847,6 @@ async fn mls_application(
             send_mls_delivery(state, &delivery).await;
         }
     }
-    send_to_client(
-        state,
-        sender_id,
-        &OutboundFrame::MlsRoomResult {
-            protocol_version: rooms::MLS_PROTOCOL_VERSION,
-            room_id,
-            message_id,
-            revision: admission.sender_revision,
-            accepted: true,
-        },
-    )
-    .await;
     Ok(())
 }
 
@@ -7660,7 +7863,7 @@ async fn mls_state_snapshot(
 ) -> Result<(), String> {
     let _conversation_guard = state.conversation_ops.lock().await;
     let (code_id, _) = client_identity(state, sender_id).await?;
-    let (snapshot, was_active) = {
+    let (_snapshot, was_active) = {
         let mut authority = state.mls_rooms.lock().await;
         let was_active = authority.member_info(&room_id, &code_id)?.active;
         let snapshot = authority.store_snapshot(
@@ -7674,18 +7877,6 @@ async fn mls_state_snapshot(
         )?;
         (snapshot, was_active)
     };
-    send_to_client(
-        state,
-        sender_id,
-        &OutboundFrame::MlsSnapshotResult {
-            protocol_version: rooms::MLS_PROTOCOL_VERSION,
-            room_id,
-            message_id,
-            revision: snapshot.revision,
-            accepted: true,
-        },
-    )
-    .await;
     // Only Welcome acknowledgement changes the member's delivery capability.
     // Normal ACKs must not replay the already-published active queue.
     if !was_active {
@@ -7701,31 +7892,16 @@ async fn finish_mls_room_transaction(
     room_id: String,
     message_id: String,
     revision: u64,
-    authenticated: bool,
+    ticket: TransactionTicket,
     result: Result<(), String>,
 ) -> Result<(), String> {
-    match result {
-        Ok(()) => {
-            touch_activity(state).await;
-            Ok(())
-        }
-        Err(_error) if authenticated => {
-            send_to_client(
-                state,
-                sender_id,
-                &OutboundFrame::MlsRoomResult {
-                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
-                    room_id,
-                    message_id,
-                    revision,
-                    accepted: false,
-                },
-            )
-            .await;
-            Ok(())
-        }
-        Err(error) => Err(error),
+    let accepted = result.is_ok();
+    finish_recoverable_transaction(state, sender_id, ticket, accepted).await?;
+    send_mls_room_result(state, sender_id, &room_id, &message_id, revision, accepted).await?;
+    if accepted {
+        touch_activity(state).await;
     }
+    Ok(())
 }
 
 async fn finish_mls_snapshot_transaction(
@@ -7734,31 +7910,16 @@ async fn finish_mls_snapshot_transaction(
     room_id: String,
     message_id: String,
     revision: u64,
-    authenticated: bool,
+    ticket: TransactionTicket,
     result: Result<(), String>,
 ) -> Result<(), String> {
-    match result {
-        Ok(()) => {
-            touch_activity(state).await;
-            Ok(())
-        }
-        Err(_) if authenticated => {
-            send_to_client(
-                state,
-                sender_id,
-                &OutboundFrame::MlsSnapshotResult {
-                    protocol_version: rooms::MLS_PROTOCOL_VERSION,
-                    room_id,
-                    message_id,
-                    revision,
-                    accepted: false,
-                },
-            )
-            .await;
-            Ok(())
-        }
-        Err(error) => Err(error),
+    let accepted = result.is_ok();
+    finish_recoverable_transaction(state, sender_id, ticket, accepted).await?;
+    send_mls_snapshot_result(state, sender_id, &room_id, &message_id, revision, accepted).await?;
+    if accepted {
+        touch_activity(state).await;
     }
+    Ok(())
 }
 
 async fn mls_delete_room(state: &AppState, sender_id: Uuid, room_id: &str) -> Result<(), String> {
@@ -8427,6 +8588,18 @@ async fn invalidate_client_connection(state: &AppState, client_id: Uuid) {
     replace_connected_clients_for_code(state, &code_id).await;
 }
 
+async fn close_client_transport(state: &AppState, client_id: Uuid) {
+    let control_tx = state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| client.control_tx.clone());
+    if let Some(control_tx) = control_tx {
+        let _ = control_tx.try_send(ClientControl::Close);
+    }
+}
+
 async fn send_message_result(
     state: &AppState,
     client_id: Uuid,
@@ -8461,6 +8634,50 @@ async fn send_ack_result(
     .await
 }
 
+async fn send_mls_room_result(
+    state: &AppState,
+    client_id: Uuid,
+    room_id: &str,
+    message_id: &str,
+    revision: u64,
+    accepted: bool,
+) -> Result<(), String> {
+    send_client_result(
+        state,
+        client_id,
+        OutboundFrame::MlsRoomResult {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: room_id.to_string(),
+            message_id: message_id.to_string(),
+            revision,
+            accepted,
+        },
+    )
+    .await
+}
+
+async fn send_mls_snapshot_result(
+    state: &AppState,
+    client_id: Uuid,
+    room_id: &str,
+    message_id: &str,
+    revision: u64,
+    accepted: bool,
+) -> Result<(), String> {
+    send_client_result(
+        state,
+        client_id,
+        OutboundFrame::MlsSnapshotResult {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: room_id.to_string(),
+            message_id: message_id.to_string(),
+            revision,
+            accepted,
+        },
+    )
+    .await
+}
+
 async fn send_client_result(
     state: &AppState,
     client_id: Uuid,
@@ -8473,7 +8690,6 @@ async fn send_client_result(
         .get(&client_id)
         .map(|client| client.result_tx.clone())
     else {
-        invalidate_client_connection(state, client_id).await;
         return Err("client connection unavailable".to_string());
     };
     let (completion, delivered) = oneshot::channel();
@@ -8484,7 +8700,7 @@ async fn send_client_result(
         })
         .is_err()
     {
-        invalidate_client_connection(state, client_id).await;
+        close_client_transport(state, client_id).await;
         return Err("client result channel unavailable".to_string());
     }
     let delivered = tokio::time::timeout(CLIENT_RESULT_SEND_TIMEOUT, delivered)
@@ -8493,7 +8709,7 @@ async fn send_client_result(
         .and_then(Result::ok)
         .unwrap_or(false);
     if !delivered {
-        invalidate_client_connection(state, client_id).await;
+        close_client_transport(state, client_id).await;
         return Err("client result delivery failed".to_string());
     }
     Ok(())
@@ -12754,7 +12970,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_result_sink_failure_invalidates_the_authenticated_connection() {
+    async fn ack_result_sink_failure_closes_transport_but_preserves_session() {
         let state = test_state();
         let client_id = Uuid::new_v4();
         let code_id = test_code_id("ack-sink-failure");
@@ -12788,7 +13004,7 @@ mod tests {
         let result = result_rx.recv().await.expect("dedicated ack result");
         assert!(result.delivered.send(false).is_ok());
         assert!(result_task.await.expect("ack result task").is_err());
-        assert!(state.sessions.lock().await.is_empty());
+        assert_eq!(state.sessions.lock().await.len(), 1);
         assert!(matches!(control_rx.try_recv(), Ok(ClientControl::Close)));
     }
 
@@ -12954,9 +13170,11 @@ mod tests {
             ),
             "used_prekey_id": "",
         });
+        let exact_frame = frame.to_string();
         let handle_task = tokio::spawn({
             let state = state.clone();
-            async move { handle_frame(&state, bob_id, &frame.to_string()).await }
+            let exact_frame = exact_frame.clone();
+            async move { handle_frame(&state, bob_id, &exact_frame).await }
         });
         let result = result_rx.recv().await.expect("ack result");
         assert_eq!(
@@ -12984,10 +13202,37 @@ mod tests {
         assert!(result.delivered.send(true).is_ok());
         assert!(handle_task.await.expect("ACK handler").is_ok());
         assert!(*state.last_activity_ms.lock().await > 123);
+
+        let replay_task = tokio::spawn({
+            let state = state.clone();
+            let exact_frame = exact_frame.clone();
+            async move { handle_frame(&state, bob_id, &exact_frame).await }
+        });
+        let replay = result_rx.recv().await.expect("replayed ack result");
+        assert!(matches!(
+            replay.frame,
+            OutboundFrame::AckResult {
+                ref message_id,
+                accepted: true
+            } if message_id == "ack-atomic-message"
+        ));
+        assert!(state.pending.lock().await.is_empty());
+        assert_eq!(
+            state
+                .accounts
+                .lock()
+                .await
+                .get(&test_code_id("ack-atomic-recipient"))
+                .expect("Bob account")
+                .state_revision,
+            1
+        );
+        assert!(replay.delivered.send(true).is_ok());
+        assert!(replay_task.await.expect("replayed ACK handler").is_ok());
     }
 
     #[tokio::test]
-    async fn ack_result_queue_overflow_invalidates_the_authenticated_connection() {
+    async fn ack_result_queue_overflow_closes_transport_but_preserves_session() {
         let state = test_state();
         let client_id = Uuid::new_v4();
         let code_id = test_code_id("ack-queue-overflow");
@@ -13031,7 +13276,7 @@ mod tests {
             .expect_err("full result queue must fail closed");
         assert_eq!(error, "client result channel unavailable");
         assert_eq!(result_rx.len(), CLIENT_RESULT_QUEUE_CAPACITY);
-        assert!(state.sessions.lock().await.is_empty());
+        assert_eq!(state.sessions.lock().await.len(), 1);
         assert!(matches!(control_rx.try_recv(), Ok(ClientControl::Close)));
     }
 
@@ -14734,24 +14979,34 @@ mod tests {
             let state = test_state();
             let code = format!("mls-reject-{index}");
             add_test_account(&state, &code, "Alice").await;
-            let (client_id, mut rx) = add_test_client(&state, &code, "Alice").await;
-            handle_frame(&state, client_id, &frame.to_string())
-                .await
-                .expect("safe authenticated rejection is acknowledged");
+            let (client_id, mut rx, mut result_rx) =
+                add_test_client_with_result(&state, &code, "Alice").await;
+            let frame_text = frame.to_string();
+            let handle_task = tokio::spawn({
+                let state = state.clone();
+                async move { handle_frame(&state, client_id, &frame_text).await }
+            });
+            let result = result_rx.recv().await.expect("negative transaction result");
             assert!(matches!(
-                rx.try_recv().expect("negative transaction result"),
+                result.frame,
                 OutboundFrame::MlsRoomResult {
                     accepted: false,
                     revision: 1,
                     ..
                 }
             ));
+            assert!(result.delivered.send(true).is_ok());
+            handle_task
+                .await
+                .expect("MLS rejection task")
+                .expect("safe authenticated rejection is acknowledged");
             assert!(rx.try_recv().is_err());
         }
 
         let state = test_state();
         add_test_account(&state, "snapshot-reject", "Alice").await;
-        let (client_id, mut rx) = add_test_client(&state, "snapshot-reject", "Alice").await;
+        let (client_id, mut rx, mut result_rx) =
+            add_test_client_with_result(&state, "snapshot-reject", "Alice").await;
         let snapshot = serde_json::json!({
             "type": "mls_state_snapshot",
             "protocol_version": rooms::MLS_PROTOCOL_VERSION,
@@ -14762,11 +15017,14 @@ mod tests {
             "membership_digest_b64": digest,
             "state_envelope_b64": "AQ"
         });
-        handle_frame(&state, client_id, &snapshot.to_string())
-            .await
-            .expect("safe authenticated snapshot rejection is acknowledged");
+        let snapshot_text = snapshot.to_string();
+        let handle_task = tokio::spawn({
+            let state = state.clone();
+            async move { handle_frame(&state, client_id, &snapshot_text).await }
+        });
+        let result = result_rx.recv().await.expect("negative snapshot result");
         assert!(matches!(
-            rx.try_recv().expect("negative snapshot result"),
+            result.frame,
             OutboundFrame::MlsSnapshotResult {
                 ref message_id,
                 revision: 1,
@@ -14774,6 +15032,11 @@ mod tests {
                 ..
             } if message_id == "snapshot-reject"
         ));
+        assert!(result.delivered.send(true).is_ok());
+        handle_task
+            .await
+            .expect("snapshot rejection task")
+            .expect("safe authenticated snapshot rejection is acknowledged");
         assert!(rx.try_recv().is_err());
 
         let state = test_state();
@@ -14887,7 +15150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_mls_snapshot_ack_emits_result_and_fresh_catalog_without_replaying_queue() {
+    async fn active_mls_snapshot_ack_refreshes_catalog_without_domain_result_or_queue_replay() {
         let state = test_state();
         add_test_account(&state, "code-a", "Alice").await;
         add_test_account(&state, "code-b", "Bob").await;
@@ -15015,11 +15278,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let result = data_rx.recv().await.expect("snapshot result");
-        assert!(matches!(
-            result,
-            OutboundFrame::MlsSnapshotResult { accepted: true, .. }
-        ));
         let catalog = data_rx.recv().await.expect("fresh MLS catalog");
         assert!(matches!(
             catalog,
@@ -16806,6 +17064,9 @@ mod tests {
             frame_limits: Arc::new(Mutex::new(HashMap::new())),
             login_limits: Arc::new(Mutex::new(HashMap::new())),
             replay_ids: Arc::new(Mutex::new(HashMap::new())),
+            transaction_receipts: Arc::new(Mutex::new(TransactionReceiptStore::new(
+                pending_message_ttl_ms_from_value(None),
+            ))),
             mls_rooms: Arc::new(Mutex::new(rooms::RoomAuthority::new(2))),
             rooms: Arc::new(Mutex::new(HashMap::new())),
             room_catalog: Arc::new(Mutex::new(HashMap::new())),
@@ -17069,6 +17330,33 @@ mod tests {
             },
         );
         (client_id, rx)
+    }
+
+    async fn add_test_client_with_result(
+        state: &AppState,
+        code: &str,
+        username: &str,
+    ) -> (
+        Uuid,
+        mpsc::Receiver<OutboundFrame>,
+        mpsc::Receiver<ClientResult>,
+    ) {
+        let client_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+        state.clients.lock().await.insert(
+            client_id,
+            ClientHandle {
+                code_id: test_code_id(code),
+                username: username.to_string(),
+                tx,
+                control_tx,
+                result_tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        (client_id, rx, result_rx)
     }
 
     fn test_code_id(code: &str) -> CodeId {

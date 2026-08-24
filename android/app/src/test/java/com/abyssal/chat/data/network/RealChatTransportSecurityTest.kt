@@ -326,7 +326,7 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun acknowledgementWaitersFailClosedOnCancellationDisconnectCloseAndFailure() = runBlocking {
+    fun acknowledgementWaitersRecoverExactFramesAcrossNetworkLoss() = runBlocking {
         suspend fun pendingCall(transport: RealChatTransport, id: String) =
             transport.acknowledgeMessage(
                 chatId = "forum_alpha",
@@ -365,8 +365,19 @@ class RealChatTransportSecurityTest {
             pendingCall(closedTransport, "message-closed")
         }
         awaitSent(closedSocket, 1)
+        val closedExactFrame = closedSocket.sentTexts.single()
         closedListener.onClosed(closedSocket, 1000, "bye")
-        assertEquals(OutboundSendResult.AMBIGUOUS, closed.await())
+        assertFalse(closed.isCompleted)
+        val recoveredClosedSocket = RecordingWebSocket()
+        val recoveredClosedListener = installSocket(closedTransport, recoveredClosedSocket, generation = 2L)
+        recoveredClosedListener.onOpen(recoveredClosedSocket, openResponse(recoveredClosedSocket))
+        awaitSent(recoveredClosedSocket, 1)
+        assertEquals(closedExactFrame, recoveredClosedSocket.sentTexts.single())
+        recoveredClosedListener.onMessage(
+            recoveredClosedSocket,
+            ackResult("message-closed", accepted = true)
+        )
+        assertEquals(OutboundSendResult.ACCEPTED, closed.await())
 
         val failedTransport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val failedSocket = RecordingWebSocket()
@@ -375,8 +386,19 @@ class RealChatTransportSecurityTest {
             pendingCall(failedTransport, "message-failed")
         }
         awaitSent(failedSocket, 1)
+        val failedExactFrame = failedSocket.sentTexts.single()
         failedListener.onFailure(failedSocket, IllegalStateException("socket"), null)
-        assertEquals(OutboundSendResult.AMBIGUOUS, failed.await())
+        assertFalse(failed.isCompleted)
+        val recoveredFailedSocket = RecordingWebSocket()
+        val recoveredFailedListener = installSocket(failedTransport, recoveredFailedSocket, generation = 2L)
+        recoveredFailedListener.onOpen(recoveredFailedSocket, openResponse(recoveredFailedSocket))
+        awaitSent(recoveredFailedSocket, 1)
+        assertEquals(failedExactFrame, recoveredFailedSocket.sentTexts.single())
+        recoveredFailedListener.onMessage(
+            recoveredFailedSocket,
+            ackResult("message-failed", accepted = false)
+        )
+        assertEquals(OutboundSendResult.REJECTED, failed.await())
     }
 
     @Test
@@ -718,10 +740,24 @@ class RealChatTransportSecurityTest {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket, generation = 82L)
+        val pending = async(start = CoroutineStart.UNDISPATCHED) {
+            transport.acknowledgeMessage(
+                chatId = "forum_alpha",
+                messageId = "message-wipe-command",
+                senderUsername = "Alice",
+                state = validAckState(),
+                usedPrekeyId = "",
+                ackSignature = ByteArray(ACK_SIZE) { 7 }
+            )
+        }
+        awaitSent(socket, 1)
 
         listener.onMessage(socket, JSONObject().put("type", "GLOBAL_WIPE").toString())
         listener.onFailure(socket, IllegalStateException("failure after wipe"), null)
 
+        assertEquals(OutboundSendResult.AMBIGUOUS, pending.await())
+        assertEquals(PURGE_CLOSE_CODE, socket.closeCode)
+        assertEquals(PURGE_CLOSE_REASON, socket.closeReason)
         assertEquals(83L, transport.currentConnectionGeneration())
         assertEquals(83L, transport.getIncomingWipeCommands().first())
         assertNull(withTimeoutOrNull(100L) { transport.getIncomingWipeCommands().first() })

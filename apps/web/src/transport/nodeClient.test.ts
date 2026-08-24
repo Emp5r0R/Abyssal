@@ -1574,7 +1574,7 @@ describe("RelaySocket", () => {
     }
   });
 
-  it("marks a sent message ambiguous when the authenticated socket closes", async () => {
+  it("replays the exact encrypted frame after a same-session reconnect", async () => {
     const original = globalThis.WebSocket;
     const sockets: FakeWebSocket[] = [];
     class TestWebSocket extends FakeWebSocket {
@@ -1596,8 +1596,19 @@ describe("RelaySocket", () => {
       socket.onopen?.(new Event("open"));
       relay.setDirectoryStamp(DIRECTORY_STAMP);
       const pending = relay.sendEncryptedPayload("message-3", encryptedFrame("message-3"));
+      const exactFrame = socket.sent.at(-1);
       socket.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
-      await expect(pending).resolves.toBe("AMBIGUOUS");
+      await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 3_000 });
+      const recovered = sockets[1];
+      recovered.readyState = 1;
+      recovered.onopen?.(new Event("open"));
+      expect(recovered.sent).toEqual([exactFrame]);
+      recovered.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "message_result",
+        message_id: "message-3",
+        accepted: true,
+      }) }));
+      await expect(pending).resolves.toBe("ACCEPTED");
       relay.close();
     } finally {
       globalThis.WebSocket = original;
@@ -1839,7 +1850,7 @@ describe("RelaySocket", () => {
     }
   });
 
-  it("marks an ACK ambiguous on timeout", async () => {
+  it("retries an ACK byte-for-byte and fails closed only after the recovery deadline", async () => {
     const context = await connectRelay();
     const { relay, socket, originalWebSocket } = context;
     vi.useFakeTimers();
@@ -1852,8 +1863,12 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
-      await vi.advanceTimersByTimeAsync(10_000);
+      const exactFrame = socket.sent.at(-1);
+      await vi.advanceTimersByTimeAsync(30_000);
       await expect(pending).resolves.toBe("AMBIGUOUS");
+      const ackFrames = socket.sent.filter((value) => JSON.parse(value).type === "message_ack");
+      expect(ackFrames.length).toBeGreaterThan(1);
+      expect(new Set(ackFrames)).toEqual(new Set([exactFrame]));
       expect(socket.readyState).toBe(3);
     } finally {
       vi.useRealTimers();
@@ -1865,10 +1880,10 @@ describe("RelaySocket", () => {
   it.each([
     ["socket close", (socket: FakeWebSocket) => socket.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent)],
     ["socket error", (socket: FakeWebSocket) => socket.onerror?.(new Event("error"))],
-    ["manual close", (socket: FakeWebSocket, relay: RelaySocket) => relay.close()],
-  ])("settles both message and ACK operations on %s", async (_label, trigger) => {
+  ])("retains message and ACK operations through %s until recovery expires", async (_label, trigger) => {
     const context = await connectRelay();
     const { relay, socket, originalWebSocket } = context;
+    vi.useFakeTimers();
     try {
       const message = relay.sendEncryptedPayload("message-close", encryptedFrame("message-close"));
       const ack = relay.acknowledge(
@@ -1880,6 +1895,25 @@ describe("RelaySocket", () => {
         "used-prekey",
       );
       trigger(socket, relay);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(message).resolves.toBe("AMBIGUOUS");
+      await expect(ack).resolves.toBe("AMBIGUOUS");
+    } finally {
+      vi.useRealTimers();
+      relay.close();
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it("settles recoverable operations immediately on explicit client close", async () => {
+    const context = await connectRelay();
+    const { relay, originalWebSocket } = context;
+    try {
+      const message = relay.sendEncryptedPayload("message-close", encryptedFrame("message-close"));
+      const ack = relay.acknowledge(
+        "dm_123", "ack-close", "Bob", ackState(), ACK_SIGNATURE, "used-prekey",
+      );
+      relay.close();
       await expect(message).resolves.toBe("AMBIGUOUS");
       await expect(ack).resolves.toBe("AMBIGUOUS");
     } finally {
@@ -1972,14 +2006,16 @@ describe("RelaySocket", () => {
         "used-prekey",
       );
       const lease = relay.requestPrekeyLease("dm_123", "lease-stale", "Bob");
+      const leaseAssertion = expect(lease).rejects.toMatchObject({ code: "AMBIGUOUS" });
+      const exactAck = first.sent.find((value) => JSON.parse(value).type === "message_ack");
       first.onclose?.({ code: 1006, reason: "network", wasClean: false } as CloseEvent);
-      await expect(pending).resolves.toBe("AMBIGUOUS");
-      await expect(lease).rejects.toMatchObject({ code: "AMBIGUOUS" });
+      await leaseAssertion;
       await vi.waitFor(() => expect(sockets).toHaveLength(2), { timeout: 3_000 });
       const second = sockets[1];
       second.readyState = 1;
       second.onopen?.(new Event("open"));
       relay.setDirectoryStamp(DIRECTORY_STAMP);
+      expect(second.sent).toContain(exactAck);
       first.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
         type: "ack_result",
         message_id: "ack-stale",
@@ -1995,6 +2031,12 @@ describe("RelaySocket", () => {
         expires_at_ms: Date.now() + 60_000,
       }) }));
       expect(frames).toEqual([]);
+      second.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+        type: "ack_result",
+        message_id: "ack-stale",
+        accepted: true,
+      }) }));
+      await expect(pending).resolves.toBe("ACCEPTED");
       relay.close();
     } finally {
       globalThis.WebSocket = originalWebSocket;

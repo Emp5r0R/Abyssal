@@ -1398,11 +1398,13 @@ export function useAbyssalSession() {
     const directoryStamp = directoryStampRef.current ? { ...directoryStampRef.current } : null;
     if (!directoryStamp) return "NOT_SENT";
     let leasesReleaseAttempted = false;
-    const active = () => generation === sessionGenerationRef.current &&
-      connectionGeneration === connectionGenerationRef.current &&
+    const accountActive = () => generation === sessionGenerationRef.current &&
       sessionRef.current?.token === currentSession.token;
+    const connectionActive = () => accountActive() &&
+      connectionGeneration === connectionGenerationRef.current &&
+      socketRef.current !== null;
     const releaseAcquiredLeases = () => {
-      if (leasesReleaseAttempted || !active()) return;
+      if (leasesReleaseAttempted || !accountActive()) return;
       leasesReleaseAttempted = true;
       acquiredLeases.forEach((lease) => {
         try {
@@ -1414,7 +1416,7 @@ export function useAbyssalSession() {
     };
     try {
       const outcome = await cryptoGateRef.current.run(async () => {
-        if (!active()) return "NOT_SENT" as const;
+        if (!connectionActive()) return "NOT_SENT" as const;
         try {
           for (const recipient of recipients) {
             if (!cipherRef.current.requiresPrekey(recipient.username)) continue;
@@ -1432,7 +1434,7 @@ export function useAbyssalSession() {
               releaseAcquiredLeases();
               throw error;
             }
-            if (!active()) {
+            if (!connectionActive()) {
               wipeBytes(lease.recipientPublicKey);
               return "NOT_SENT" as const;
             }
@@ -1441,7 +1443,7 @@ export function useAbyssalSession() {
             recipient.publicKey = lease.recipientPublicKey.slice();
             recipient.prekeyId = lease.prekeyId;
           }
-          if (!active()) return "NOT_SENT" as const;
+          if (!connectionActive()) return "NOT_SENT" as const;
           encrypted = createPayload(directoryStamp);
           staged = true;
           const stagedPayload = encrypted;
@@ -1456,7 +1458,7 @@ export function useAbyssalSession() {
               ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
             },
           ) ?? Promise.resolve("NOT_SENT" as const));
-          if (!active()) {
+          if (!accountActive()) {
             if (sent === "ACCEPTED") failClosed(currentSession);
             return sent === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
           }
@@ -1489,14 +1491,14 @@ export function useAbyssalSession() {
             // release them while the authenticated relay is still active,
             // then discard the now-invalid native identity.
             if (!admissionAttempted) releaseAcquiredLeases();
-            if (active()) failClosed(currentSession);
+            if (accountActive()) failClosed(currentSession);
             return "AMBIGUOUS" as const;
           }
           if (admissionAttempted) {
-            if (active()) failClosed(currentSession);
+            if (accountActive()) failClosed(currentSession);
             return "AMBIGUOUS" as const;
           }
-          if (staged && active() && encrypted) {
+          if (staged && accountActive() && encrypted) {
             try {
               cipherRef.current.rollbackOutbound(messageId, encrypted.stateRevision);
             } catch {
@@ -1523,20 +1525,22 @@ export function useAbyssalSession() {
     connectionGeneration: number,
     prepared: PreparedMlsApplication,
   ): Promise<EncryptedSendOutcome> => {
-    const active = () => generation === sessionGenerationRef.current &&
+    const accountActive = () => generation === sessionGenerationRef.current &&
+      sessionRef.current?.token === currentSession.token;
+    const connectionActive = () => accountActive() &&
       connectionGeneration === connectionGenerationRef.current && sessionRef.current?.token === currentSession.token;
     let outcome: EncryptedSendOutcome = "NOT_SENT";
     try {
-      if (!active()) return outcome;
+      if (!connectionActive()) return outcome;
       outcome = await (socketRef.current?.sendMlsTransaction(
         prepared.roomId, prepared.messageId, prepared.revision, prepared.frame,
       ) ?? Promise.resolve("NOT_SENT"));
-      if (!active()) outcome = outcome === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
+      if (!accountActive()) outcome = outcome === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
       mlsRef.current?.finishTransaction(prepared, outcome);
       if (outcome === "AMBIGUOUS") failClosed(currentSession);
       return outcome;
     } catch {
-      if (active()) failClosed(currentSession);
+      if (accountActive()) failClosed(currentSession);
       return "AMBIGUOUS";
     }
   }, [failClosed]);
@@ -1545,15 +1549,16 @@ export function useAbyssalSession() {
     const current = sessionRef.current; const generation = sessionGenerationRef.current;
     const connectionGeneration = connectionGenerationRef.current;
     if (!current || connection !== "connected") return "NOT_SENT";
-    const active = () => generation === sessionGenerationRef.current && connectionGeneration === connectionGenerationRef.current &&
-      sessionRef.current?.token === current.token;
+    const accountActive = () => generation === sessionGenerationRef.current && sessionRef.current?.token === current.token;
+    const connectionActive = () => accountActive() && connectionGeneration === connectionGenerationRef.current;
     try {
+      if (!connectionActive()) return "NOT_SENT";
       const raw = await (socketRef.current?.sendMlsSnapshot(prepared.roomId, prepared.messageId, prepared.revision, prepared.frame) ?? Promise.resolve("NOT_SENT"));
-      const outcome: EncryptedSendOutcome = active() ? raw : raw === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
+      const outcome: EncryptedSendOutcome = accountActive() ? raw : raw === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
       mlsRef.current?.finishSnapshot(prepared, outcome);
       if (outcome === "AMBIGUOUS") failClosed(current);
       return outcome;
-    } catch { if (active()) failClosed(current); return "AMBIGUOUS"; }
+    } catch { if (accountActive()) failClosed(current); return "AMBIGUOUS"; }
   }, [connection, failClosed]);
 
   useEffect(() => { sendMlsSnapshotRef.current = runMlsSnapshotTransaction; }, [runMlsSnapshotTransaction]);

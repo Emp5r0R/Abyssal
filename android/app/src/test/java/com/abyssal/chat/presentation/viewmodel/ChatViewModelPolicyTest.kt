@@ -199,7 +199,7 @@ class ChatViewModelPolicyTest {
     }
 
     @Test
-    fun connectionGenerationInvalidationFailsClosedAfterAcceptedTransportResult() = runBlocking {
+    fun sameAccountRecoveryCommitsAcceptedTransportResultAcrossReconnect() = runBlocking {
         val sender = nativeIdentity(15)
         val bob = nativeIdentity(16)
         establishReciprocalSession(sender, bob)
@@ -218,7 +218,7 @@ class ChatViewModelPolicyTest {
 
         try {
             assertEquals(
-                OutboundSendResult.AMBIGUOUS,
+                OutboundSendResult.ACCEPTED,
                 invokeSendEncryptedMetadata(
                     viewModel,
                     stamp,
@@ -229,9 +229,13 @@ class ChatViewModelPolicyTest {
                 )
             )
             assertEquals(2L, connectionGeneration.get())
-            assertEquals(listOf("send:encrypted", "disconnect"), probe.events)
-            assertNull(viewModel.currentUser.value)
-            assertNull(sender.stateSnapshot())
+            assertEquals(listOf("send:encrypted"), probe.events)
+            assertNotNull(viewModel.currentUser.value)
+            sender.stateSnapshot()?.let { snapshot ->
+                snapshot.envelope.fill(0)
+                snapshot.identityPublicKey.fill(0)
+                snapshot.stateSignature.fill(0)
+            } ?: error("accepted transaction must commit ratchet state")
         } finally {
             wipeSessionStamp(stamp)
             viewModel.clear()

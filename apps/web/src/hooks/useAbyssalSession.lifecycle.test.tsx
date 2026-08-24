@@ -2158,7 +2158,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
-  it("does not publish a verified operation after its connection generation is invalidated", async () => {
+  it("publishes an admitted operation recovered within the same account session", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
@@ -2182,14 +2182,14 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     let resolveSend!: (result: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
     mocks.FakeRelay.encryptedResult = new Promise((resolve) => { resolveSend = resolve; });
     let pending: Promise<boolean> | undefined;
-    act(() => { pending = result.current.sendText("must not cross reconnect"); });
+    act(() => { pending = result.current.sendText("recover exact transaction"); });
     await waitFor(() => expect(relay?.sent.some((item) => (item as { type?: string }).type === "message")).toBe(true));
 
     act(() => relay?.close());
     await waitFor(() => expect(result.current.directTrust.verified).toBe(false));
     act(() => resolveSend("ACCEPTED"));
-    await act(async () => expect(pending).resolves.toBe(false));
-    expect(result.current.messages.dm_bob).toBeUndefined();
+    await act(async () => expect(pending).resolves.toBe(true));
+    expect(result.current.messages.dm_bob).toHaveLength(1);
     unmount();
   });
 
