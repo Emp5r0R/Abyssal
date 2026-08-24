@@ -116,7 +116,7 @@ const DOWNLOAD_URL_CLEANUP_DELAY_MS = 60_000;
 interface LoginInput {
   nodeUrl: string;
   code: string;
-  password: string;
+  password: Uint8Array;
   retainWhenHidden: boolean;
 }
 
@@ -974,7 +974,10 @@ export function useAbyssalSession() {
   }, [clearMemory, failClosed, knownDirectoryEvidence, rememberDirectoryStamp, updateMessages]);
 
   const login = useCallback(async (input: LoginInput): Promise<AccountSession> => {
-    if (sessionRef.current || loginAbortRef.current) throw new Error("Action unavailable");
+    if (sessionRef.current || loginAbortRef.current) {
+      wipeBytes(input.password);
+      throw new Error("Action unavailable");
+    }
     const loginAbort = new AbortController();
     loginAbortRef.current = loginAbort;
     const ensureLoginActive = () => {
@@ -1088,6 +1091,7 @@ export function useAbyssalSession() {
       cipherRef.current.clear();
       await revokeDiscardedSession(nextSession);
       if (loginAbortRef.current === loginAbort) loginAbortRef.current = null;
+      wipeBytes(input.password);
       throw error;
     }
     let candidateRelay: RelaySocket | null = null;
@@ -1184,6 +1188,7 @@ export function useAbyssalSession() {
       await revokeDiscardedSession(candidate);
       throw error;
     } finally {
+      wipeBytes(input.password);
       if (loginAbortRef.current === loginAbort) loginAbortRef.current = null;
     }
   }, [applyFrame, cancelAttachmentOperations, clearDirectTrust, clearExportUrls, clearMedia, failClosed]);

@@ -24,9 +24,10 @@ import com.abyssal.chat.domain.model.UserPresence
 import kotlinx.coroutines.flow.Flow
 
 interface IIdentityService {
-    suspend fun enterAccount(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
-    suspend fun createAccount(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
-    suspend fun login(code: String, password: String, endpoint: NodeEndpoint): IdentityValidationResult
+    /** Consumes and zeroes [password] before returning or throwing. */
+    suspend fun enterAccount(code: String, password: ByteArray, endpoint: NodeEndpoint): IdentityValidationResult
+    suspend fun createAccount(code: String, password: ByteArray, endpoint: NodeEndpoint): IdentityValidationResult
+    suspend fun login(code: String, password: ByteArray, endpoint: NodeEndpoint): IdentityValidationResult
     fun setCurrentUser(user: User)
     fun getCurrentUser(): User?
     suspend fun revokeSession(session: NodeSession): Boolean

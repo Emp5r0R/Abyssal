@@ -162,60 +162,51 @@ export async function initializeCrypto(): Promise<void> {
   await wasmReady;
 }
 
-export async function startOpaque(password: string): Promise<OpaqueStartState> {
+export async function startOpaque(password: Uint8Array): Promise<OpaqueStartState> {
   await initializeCrypto();
-  const passwordBytes = ENCODER.encode(password);
-  try {
-    const result = parseJson<RustOpaqueStart>(opaqueClientStart(passwordBytes));
-    return {
-      registrationState: bytes(result.registration_state),
-      registrationRequest: bytes(result.registration_request),
-      loginState: bytes(result.login_state),
-      credentialRequest: bytes(result.credential_request),
-    };
-  } finally {
-    passwordBytes.fill(0);
-  }
+  const result = parseJson<RustOpaqueStart>(opaqueClientStart(password));
+  return {
+    registrationState: bytes(result.registration_state),
+    registrationRequest: bytes(result.registration_request),
+    loginState: bytes(result.login_state),
+    credentialRequest: bytes(result.credential_request),
+  };
 }
 
 export async function finishOpaqueRegistration(
-  password: string,
+  password: Uint8Array,
   state: OpaqueStartState,
   response: Uint8Array,
 ): Promise<OpaqueRegistrationResult> {
   await initializeCrypto();
-  const passwordBytes = ENCODER.encode(password);
   try {
     const result = parseJson<RustRegistrationFinish>(
-      opaqueClientFinishRegistration(passwordBytes, state.registrationState, response),
+      opaqueClientFinishRegistration(password, state.registrationState, response),
     );
     return {
       registrationUpload: bytes(result.registration_upload),
       exportKey: bytes(result.export_key),
     };
   } finally {
-    passwordBytes.fill(0);
     wipeOpaqueStart(state);
   }
 }
 
 export async function finishOpaqueLogin(
-  password: string,
+  password: Uint8Array,
   state: OpaqueStartState,
   response: Uint8Array,
 ): Promise<OpaqueLoginResult> {
   await initializeCrypto();
-  const passwordBytes = ENCODER.encode(password);
   try {
     const result = parseJson<RustLoginFinish>(
-      opaqueClientFinishLogin(passwordBytes, state.loginState, response),
+      opaqueClientFinishLogin(password, state.loginState, response),
     );
     return {
       credentialFinalization: bytes(result.credential_finalization),
       exportKey: bytes(result.export_key),
     };
   } finally {
-    passwordBytes.fill(0);
     wipeOpaqueStart(state);
   }
 }

@@ -96,9 +96,10 @@ class NetworkIdentityServiceTest {
             val baseUrl = server.url("/").toString().removeSuffix("/")
             val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
 
+            val password = "correct horse battery staple".toByteArray()
             val result = service.enterAccount(
                 code = "ABYS-INVITE-1234",
-                password = "correct horse battery staple",
+                password = password,
                 endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
             )
 
@@ -110,6 +111,7 @@ class NetworkIdentityServiceTest {
             assertTrue(body.contains("credential_request_b64"))
             assertFalse(body.contains("correct horse battery staple"))
             assertFalse(body.contains("password"))
+            assertTrue(password.all { it == 0.toByte() })
         } finally {
             server.shutdown()
         }
@@ -126,13 +128,15 @@ class NetworkIdentityServiceTest {
             val baseUrl = server.url("/").toString().removeSuffix("/")
             val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
 
+            val password = "correct horse battery staple".toByteArray()
             val result = service.enterAccount(
                 code = "ABYS-INVITE-1234",
-                password = "correct horse battery staple",
+                password = password,
                 endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
             )
 
             assertFalse(result.accepted)
+            assertTrue(password.all { it == 0.toByte() })
         } finally {
             server.shutdown()
         }
@@ -153,7 +157,7 @@ class NetworkIdentityServiceTest {
             displayHost = "test"
         )
         val job = launch(Dispatchers.Default) {
-            service.enterAccount("ABYS-INVITE-1234", "correct horse battery staple", endpoint)
+            service.enterAccount("ABYS-INVITE-1234", "correct horse battery staple".toByteArray(), endpoint)
         }
 
         assertTrue(factory.call.enqueued.await(2, TimeUnit.SECONDS))

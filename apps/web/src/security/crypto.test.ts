@@ -36,7 +36,7 @@ function commit(cipher: InMemoryPayloadCipher, payload: { messageId: string; sta
 
 describe("OPAQUE client bindings", () => {
   it("creates independent registration and login requests without exposing password bytes", async () => {
-    const state = await startOpaque("correct horse battery staple");
+    const state = await startOpaque(new TextEncoder().encode("correct horse battery staple"));
     expect(state.registrationRequest.byteLength).toBeGreaterThan(16);
     expect(state.credentialRequest.byteLength).toBeGreaterThan(16);
     expect(state.registrationRequest).not.toEqual(state.credentialRequest);
@@ -48,14 +48,14 @@ describe("OPAQUE client bindings", () => {
   });
 
   it("rejects malformed server responses", async () => {
-    const registration = await startOpaque("password-one");
+    const registration = await startOpaque(new TextEncoder().encode("password-one"));
     await expect(
-      finishOpaqueRegistration("password-one", registration, new Uint8Array([1, 2, 3])),
+      finishOpaqueRegistration(new TextEncoder().encode("password-one"), registration, new Uint8Array([1, 2, 3])),
     ).rejects.toThrow();
 
-    const login = await startOpaque("password-one");
+    const login = await startOpaque(new TextEncoder().encode("password-one"));
     await expect(
-      finishOpaqueLogin("password-one", login, new Uint8Array([1, 2, 3])),
+      finishOpaqueLogin(new TextEncoder().encode("password-one"), login, new Uint8Array([1, 2, 3])),
     ).rejects.toThrow();
   });
 });

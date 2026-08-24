@@ -143,19 +143,18 @@ class NetworkIdentityService(
 
     override suspend fun enterAccount(
         code: String,
-        password: String,
+        password: ByteArray,
         endpoint: NodeEndpoint
     ): IdentityValidationResult = withContext(Dispatchers.IO) {
-        if (
-            code.trim().length !in 1..MAX_CODE_CHARS ||
-            password.length !in MIN_PASSWORD_CHARS..MAX_PASSWORD_CHARS
-        ) return@withContext rejected()
-        val passwordBytes = password.toByteArray(StandardCharsets.UTF_8)
         var opaque: OpaqueClientStart? = null
         var responseBytes: ByteArray? = null
         var context: ByteArray? = null
         try {
-            opaque = opaqueClientStart(passwordBytes)
+            if (
+                code.trim().length !in 1..MAX_CODE_CHARS ||
+                password.size !in MIN_PASSWORD_CHARS..MAX_PASSWORD_CHARS
+            ) return@withContext rejected()
+            opaque = opaqueClientStart(password)
             val start = postJson(
                 endpoint,
                 "/v2/account/start",
@@ -175,7 +174,7 @@ class NetworkIdentityService(
             when (mode) {
                 "registration" -> {
                     val result = opaqueClientFinishRegistration(
-                        passwordBytes,
+                        password,
                         opaque.registrationState,
                         responseBytes
                     )
@@ -228,7 +227,7 @@ class NetworkIdentityService(
                         )
                         identityEnvelope = identityEnvelopeBytes
                         val result = opaqueClientFinishLogin(
-                            passwordBytes,
+                            password,
                             opaque.loginState,
                             responseBytes
                         )
@@ -287,7 +286,7 @@ class NetworkIdentityService(
         } catch (_: Exception) {
             rejectedAndClear()
         } finally {
-            passwordBytes.fill(0)
+            password.fill(0)
             responseBytes?.fill(0)
             context?.fill(0)
             opaque?.registrationState?.fill(0)
@@ -299,13 +298,13 @@ class NetworkIdentityService(
 
     override suspend fun createAccount(
         code: String,
-        password: String,
+        password: ByteArray,
         endpoint: NodeEndpoint
     ): IdentityValidationResult = enterAccount(code, password, endpoint)
 
     override suspend fun login(
         code: String,
-        password: String,
+        password: ByteArray,
         endpoint: NodeEndpoint
     ): IdentityValidationResult = enterAccount(code, password, endpoint)
 

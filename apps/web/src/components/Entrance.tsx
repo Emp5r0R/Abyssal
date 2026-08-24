@@ -6,7 +6,7 @@ import { Brand, Field, IconButton, Toggle } from "./Ui";
 export function Entrance({
   onLogin,
 }: {
-  onLogin: (input: { nodeUrl: string; code: string; password: string; retainWhenHidden: boolean }) => Promise<AccountSession>;
+  onLogin: (input: { nodeUrl: string; code: string; password: Uint8Array; retainWhenHidden: boolean }) => Promise<AccountSession>;
 }) {
   const [nodeUrl, setNodeUrl] = useState(() => (window.location.port === "4020" ? window.location.origin : ""));
   const [code, setCode] = useState("");
@@ -21,13 +21,16 @@ export function Entrance({
     if (busy) return;
     setBusy(true);
     setError(false);
+    const passwordBytes = new TextEncoder().encode(password);
+    setPassword("");
+    setShowPassword(false);
     try {
-      await onLogin({ nodeUrl, code, password, retainWhenHidden });
+      await onLogin({ nodeUrl, code, password: passwordBytes, retainWhenHidden });
       setCode("");
-      setPassword("");
     } catch {
       setError(true);
     } finally {
+      passwordBytes.fill(0);
       setBusy(false);
     }
   };
@@ -110,4 +113,3 @@ export function Entrance({
     </main>
   );
 }
-

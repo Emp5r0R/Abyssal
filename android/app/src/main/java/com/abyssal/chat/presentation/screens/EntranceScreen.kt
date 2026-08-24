@@ -54,6 +54,7 @@ import com.abyssal.chat.theme.NeonGreen
 import com.abyssal.chat.theme.PureWhite
 import com.abyssal.chat.theme.SelfDestructAmber
 import com.abyssal.chat.theme.SteelMuted
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 
 @Composable
@@ -71,7 +72,7 @@ private fun EntranceContent(
     isVerifying: Boolean,
     error: String?,
     onInputChanged: () -> Unit,
-    onSubmit: (String, String, String, Boolean) -> Unit
+    onSubmit: (String, String, ByteArray, Boolean) -> Unit
 ) {
     var nodeUrl by remember { mutableStateOf("") }
     var inviteCode by remember { mutableStateOf("") }
@@ -89,7 +90,10 @@ private fun EntranceContent(
     fun submit() {
         if (!canSubmit) return
         focusManager.clearFocus()
-        onSubmit(inviteCode, nodeUrl, password, rememberSession)
+        val passwordBytes = password.toByteArray(StandardCharsets.UTF_8)
+        password = ""
+        passwordVisible = false
+        onSubmit(inviteCode, nodeUrl, passwordBytes, rememberSession)
     }
 
     MirageBackground {

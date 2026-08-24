@@ -572,7 +572,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -625,7 +625,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -649,7 +649,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -671,7 +671,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -689,7 +689,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -732,7 +732,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -782,7 +782,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         await result.current.login({
           nodeUrl: "https://node.example.test",
           code: "ABCD-1234",
-          password: "password",
+          password: new TextEncoder().encode("password"),
           retainWhenHidden: true,
         });
       });
@@ -796,7 +796,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         await result.current.login({
           nodeUrl: "https://node.example.test",
           code: "ABCD-1234",
-          password: "password",
+          password: new TextEncoder().encode("password"),
           retainWhenHidden: true,
         });
       });
@@ -819,7 +819,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -868,7 +868,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -913,7 +913,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -979,7 +979,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1024,7 +1024,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1093,7 +1093,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1151,7 +1151,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1210,7 +1210,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1269,7 +1269,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1316,7 +1316,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1354,7 +1354,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1400,7 +1400,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1455,7 +1455,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1520,7 +1520,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1550,7 +1550,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1626,7 +1626,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1684,7 +1684,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1725,7 +1725,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1752,7 +1752,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1786,7 +1786,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1849,7 +1849,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1884,7 +1884,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await expect(result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       })).rejects.toThrow("Wrong information");
     });
@@ -1907,7 +1907,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await expect(result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       })).rejects.toThrow("Wrong information");
     });
@@ -1924,7 +1924,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1964,7 +1964,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -1992,7 +1992,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -2084,7 +2084,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -2122,7 +2122,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -2157,7 +2157,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
         code: "ABCD-1234",
-        password: "password",
+        password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
     });
@@ -2200,7 +2200,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("routes protocol-v10 room sends through MLS and fails closed on ambiguous admission", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
@@ -2223,7 +2223,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("replays an accepted MLS snapshot transaction without decrypting or republishing the message", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0];
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     const incoming = {
@@ -2243,7 +2243,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("accepts generic protocol-safe room ids and retains join rejection state when send fails", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     expect(result.current.joinRoom("general-room_1")).toBe(true);
     expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_discover_room", room_id: "general-room_1" });
@@ -2265,7 +2265,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("accepts only an exact rejection for this client's pending join", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({
       type: "mls_room_discovered", protocol_version: 10, room_id: "general-room", group_id_b64: "AA", owner_username: "Bob",
@@ -2279,7 +2279,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
 
     const second = renderHook(() => useAbyssalSession());
-    await act(async () => { await second.result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await second.result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const secondRelay = mocks.getLastRelay();
     await act(async () => secondRelay?.emit({
       type: "mls_room_discovered", protocol_version: 10, room_id: "other-room", group_id_b64: "AA", owner_username: "Bob",
@@ -2293,7 +2293,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("routes owner leave approval and retains the request when rejection send fails", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     const request = { type: "mls_leave_requested", protocol_version: 10, room_id: "forum_mls", request_id: "leave-request", username: "Bob", stable_identity_b64: "AA" } as unknown as IncomingFrame;
@@ -2317,7 +2317,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("fails closed when a member leave acknowledgement is not bound to its pending request", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     act(() => result.current.leaveRoom("forum_mls"));
@@ -2331,7 +2331,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("removes MLS room state and plaintext messages after the relay confirms the member left", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: "password", retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     act(() => result.current.openRoom("forum_mls"));

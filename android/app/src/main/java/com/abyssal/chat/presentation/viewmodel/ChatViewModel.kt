@@ -980,10 +980,13 @@ class ChatViewModel(
     fun submitAccount(
         code: String,
         nodeUrl: String,
-        password: String,
+        password: ByteArray,
         rememberSession: Boolean
     ) {
-        if (!canStartAccountEntry(accountEntryJob)) return
+        if (!canStartAccountEntry(accountEntryJob)) {
+            password.fill(0)
+            return
+        }
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             var validation: IdentityValidationResult? = null
             var installedSession = false
@@ -1081,6 +1084,7 @@ class ChatViewModel(
                 }
                 _inviteCodeError.value = "Wrong information."
             } finally {
+                password.fill(0)
                 if (!installedSession) validation?.publicKey?.fill(0)
                 _isVerifyingCode.value = false
                 if (accountEntryJob === currentCoroutineContext()[Job]) {
