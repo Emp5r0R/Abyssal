@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountSession, IncomingFrame, NodeEndpoint } from "../domain/types";
-import { bytesToBase64, IDENTITY_PUBLIC_KEY_BYTES } from "../security/crypto";
+import {
+  bytesToBase64,
+  ATTACHMENT_CHUNK_RECORD_BYTES,
+  IDENTITY_PUBLIC_KEY_BYTES,
+} from "../security/crypto";
 import {
   finishOpaqueAccount,
   RelaySocket,
   revokeSession,
   startOpaqueAccount,
-  downloadEncryptedAttachment,
+  streamEncryptedAttachmentRecords,
   completeAttachmentDownload,
   decryptAndCompleteAttachment,
   deleteUploadedAttachment,
@@ -15,6 +19,7 @@ import {
   PREKEY_LEASE_TIMEOUT_MS,
   PrekeyLeaseError,
   uploadEncryptedAttachment,
+  type AttachmentDownloadPolicy,
 } from "./nodeClient";
 
 const endpoint: NodeEndpoint = {
@@ -35,6 +40,29 @@ const session: AccountSession = {
   identityPublicKey: new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES),
   identityPrekeyId: "test-prekey",
 };
+
+async function downloadEncryptedAttachment(
+  account: AccountSession,
+  attachmentId: string,
+  policy: AttachmentDownloadPolicy,
+): Promise<{ bytes: Uint8Array; claim?: string }> {
+  const records: Uint8Array[] = [];
+  try {
+    const streamed = await streamEncryptedAttachmentRecords(
+      account,
+      attachmentId,
+      policy,
+      (record) => {
+        records.push(record.slice());
+      },
+    );
+    const bytes = new Uint8Array(records.length * ATTACHMENT_CHUNK_RECORD_BYTES);
+    records.forEach((record, index) => bytes.set(record, index * ATTACHMENT_CHUNK_RECORD_BYTES));
+    return streamed.claim ? { bytes, claim: streamed.claim } : { bytes };
+  } finally {
+    records.forEach((record) => record.fill(0));
+  }
+}
 const WS_TICKET = bytesToBase64(new Uint8Array(32).fill(7));
 const ACK_SIGNATURE = new Uint8Array(64).fill(9);
 const DIRECTORY_STAMP = {
@@ -114,6 +142,7 @@ const ATTACHMENT_TERTIARY = "123e4567-e89b-42d3-a456-426614174002";
 const ATTACHMENT_EMPTY = "123e4567-e89b-42d3-a456-426614174003";
 const ATTACHMENT_EXACT = "123e4567-e89b-42d3-a456-426614174004";
 const FILE_THREE_BYTE_POLICY = { mediaType: "FILE" as const, expectedPlaintextBytes: 3 };
+const exactEncryptedRecord = (fill: number) => new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES).fill(fill);
 const OPAQUE_CHALLENGE_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 afterEach(() => {
@@ -433,10 +462,10 @@ describe("account transport", () => {
   });
 
   it("streams bounded attachment bodies and rejects an oversized declaration", async () => {
-    const encrypted = new Uint8Array(44).fill(7);
+    const encrypted = exactEncryptedRecord(7);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
       encrypted.slice(),
-      { status: 200, headers: { "content-length": "44" } },
+      { status: 200, headers: { "content-length": String(encrypted.byteLength) } },
     ));
     await expect(downloadEncryptedAttachment(
       session,
@@ -464,7 +493,7 @@ describe("account transport", () => {
   });
 
   it("accepts an exact chunked body without Content-Length and rejects FILE-sized IMAGE metadata before fetch", async () => {
-    const exact = new Uint8Array(44).fill(6);
+    const exact = exactEncryptedRecord(6);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(exact.slice(0, 13));
@@ -486,6 +515,73 @@ describe("account transport", () => {
       { mediaType: "IMAGE", expectedPlaintextBytes: 200 * 1024 * 1024 },
     )).rejects.toThrow("Attachment unavailable");
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("frames arbitrary network chunks into fixed records and wipes callback buffers", async () => {
+    const encrypted = new Uint8Array(2 * ATTACHMENT_CHUNK_RECORD_BYTES);
+    encrypted.fill(0x11, 0, ATTACHMENT_CHUNK_RECORD_BYTES);
+    encrypted.fill(0x22, ATTACHMENT_CHUNK_RECORD_BYTES);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encrypted.slice(0, 17));
+        controller.enqueue(encrypted.slice(17, ATTACHMENT_CHUNK_RECORD_BYTES + 29));
+        controller.enqueue(encrypted.slice(ATTACHMENT_CHUNK_RECORD_BYTES + 29));
+        controller.close();
+      },
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream, {
+      status: 200,
+      headers: { "content-length": String(encrypted.byteLength) },
+    }));
+    const callbackViews: Uint8Array[] = [];
+    const observed: number[] = [];
+
+    await expect(streamEncryptedAttachmentRecords(
+      session,
+      ATTACHMENT_PRIMARY,
+      {
+        mediaType: "FILE",
+        expectedPlaintextBytes: 256 * 1024 + 1,
+      },
+      (record, index) => {
+        callbackViews.push(record);
+        observed.push(index, record[0]);
+      },
+    )).resolves.toEqual({});
+
+    expect(observed).toEqual([0, 0x11, 1, 0x22]);
+    for (const view of callbackViews) expect(view.every((value) => value === 0)).toBe(true);
+  });
+
+  it("releases a destructive claim when record processing fails", async () => {
+    const encrypted = exactEncryptedRecord(9);
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(encrypted, {
+        status: 200,
+        headers: {
+          "content-length": String(encrypted.byteLength),
+          "X-Abyssal-Attachment-Claim": CLAIM_DECRYPT,
+        },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    let callbackView: Uint8Array | undefined;
+
+    await expect(streamEncryptedAttachmentRecords(
+      session,
+      ATTACHMENT_PRIMARY,
+      FILE_THREE_BYTE_POLICY,
+      (record) => {
+        callbackView = record;
+        throw new Error("decrypt failed");
+      },
+    )).rejects.toThrow("decrypt failed");
+
+    expect(callbackView?.every((value) => value === 0)).toBe(true);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}/claim`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
   });
 
   it("rejects truncated bodies and mismatched encrypted Content-Length values", async () => {
@@ -576,13 +672,13 @@ describe("account transport", () => {
   });
 
   it("returns an optional claim without changing exact encrypted bytes", async () => {
-    const encrypted = new Uint8Array(44).fill(5);
+    const encrypted = exactEncryptedRecord(5);
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
       encrypted.slice(),
       {
         status: 200,
         headers: {
-          "content-length": "44",
+          "content-length": String(encrypted.byteLength),
           "X-Abyssal-Attachment-Claim": CLAIM_PRIMARY,
         },
       },
@@ -635,7 +731,7 @@ describe("account transport", () => {
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_PRIMARY,
-      { bytes: new Uint8Array([1]), claim: CLAIM_FAILED },
+      CLAIM_FAILED,
       () => plaintext,
     )).rejects.toThrow("Attachment unavailable");
     expect(plaintext).toEqual(new Uint8Array(3));
@@ -652,7 +748,7 @@ describe("account transport", () => {
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_PRIMARY,
-      { bytes: new Uint8Array([1]), claim: CLAIM_DECRYPT },
+      CLAIM_DECRYPT,
       () => { throw new Error("bad ciphertext"); },
     )).rejects.toThrow("bad ciphertext");
     expect(fetchMock).toHaveBeenCalledWith(
@@ -668,7 +764,7 @@ describe("account transport", () => {
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_EMPTY,
-      { bytes: new Uint8Array([1]), claim: CLAIM_FAILED },
+      CLAIM_FAILED,
       () => plaintext,
       { expectedBytes: 1, maxBytes: 20 },
     )).rejects.toThrow("Attachment unavailable");
@@ -686,14 +782,14 @@ describe("account transport", () => {
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_SECONDARY,
-      { bytes: new Uint8Array([1]), claim: CLAIM_FAILED },
+      CLAIM_FAILED,
       () => plaintext,
       { expectedBytes: 3, maxBytes: 4 },
     )).rejects.toThrow("Attachment unavailable");
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_TERTIARY,
-      { bytes: new Uint8Array([1]), claim: CLAIM_DECRYPT },
+      CLAIM_DECRYPT,
       () => plaintext,
       { expectedBytes: 4, maxBytes: 3 },
     )).rejects.toThrow("Attachment unavailable");
@@ -710,7 +806,7 @@ describe("account transport", () => {
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_EXACT,
-      { bytes: new Uint8Array([1]), claim: CLAIM_PRIMARY },
+      CLAIM_PRIMARY,
       () => plaintext,
       { expectedBytes: 3, maxBytes: 3 },
     )).resolves.toBe(plaintext);
@@ -727,7 +823,7 @@ describe("account transport", () => {
     await expect(decryptAndCompleteAttachment(
       session,
       ATTACHMENT_PRIMARY,
-      { bytes: new Uint8Array([1]) },
+      undefined,
       () => plaintext,
     )).resolves.toBe(plaintext);
     expect(fetchMock).not.toHaveBeenCalled();
@@ -760,7 +856,7 @@ describe("account transport", () => {
       }
     }
     globalThis.XMLHttpRequest = TestXmlHttpRequest as unknown as typeof XMLHttpRequest;
-    const encrypted = new Uint8Array([1, 2, 3]);
+    const encrypted = exactEncryptedRecord(3);
     try {
       await expect(uploadEncryptedAttachment(
         session,
@@ -793,7 +889,7 @@ describe("account transport", () => {
         "dm_Alice_Bob",
         "not-a-uuid",
         "FILE",
-        new Uint8Array([1, 2, 3]),
+        exactEncryptedRecord(3),
         { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
         () => undefined,
       )).rejects.toThrow("Upload rejected");
@@ -836,7 +932,7 @@ describe("account transport", () => {
         "dm_Alice_Bob",
         ATTACHMENT_PRIMARY,
         "FILE",
-        new Uint8Array([1, 2, 3]),
+        exactEncryptedRecord(3),
         { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
         () => undefined,
         controller.signal,
@@ -892,7 +988,7 @@ describe("account transport", () => {
       "dm_Alice_Bob",
       ATTACHMENT_PRIMARY,
       "FILE",
-      new Uint8Array([1, 2, 3]),
+      exactEncryptedRecord(3),
       { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
       () => undefined,
     );

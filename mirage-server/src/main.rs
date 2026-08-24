@@ -14,14 +14,16 @@ use std::{
 };
 
 use abyssal_core::secure_protocol::{
-    opaque_server_finish_login, opaque_server_finish_registration,
-    opaque_server_registration_response, opaque_server_setup, opaque_server_start_login,
-    prekey_ids_from_identity_public_v9,
+    attachment_encrypted_size, attachment_plaintext_size_from_blob, opaque_server_finish_login,
+    opaque_server_finish_registration, opaque_server_registration_response, opaque_server_setup,
+    opaque_server_start_login, prekey_ids_from_identity_public_v9,
     validate_identity_public_bundle as validate_core_identity_public_bundle,
     verify_ack_signature_v9, verify_identity_state_signature_v9, verify_message_signature_v9,
     verify_registration_identity_proof_v9, IDENTITY_PUBLIC_BYTES_V9, PREKEY_POOL_SIZE_V9,
     REGISTRATION_CHALLENGE_BYTES_V9,
 };
+#[cfg(test)]
+use abyssal_core::secure_protocol::{ATTACHMENT_BLOB_VERSION, ATTACHMENT_CHUNK_RECORD_BYTES};
 use axum::{
     body::{Body, Bytes},
     extract::Request,
@@ -73,10 +75,6 @@ use transport_padding::{
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 const FILE_ATTACHMENT_LIMIT_BYTES: usize = 200 * 1024 * 1024;
-// Stateless attachment blobs contain a version byte, XChaCha nonce, and
-// authentication tag in addition to the encrypted plaintext.
-const ATTACHMENT_WIRE_OVERHEAD_BYTES: usize = 41;
-const ATTACHMENT_BLOB_VERSION: u8 = 1;
 const WS_RATE_WINDOW_MS: u64 = 10_000;
 const WS_MAX_FRAMES_PER_WINDOW: usize = 30;
 const WS_MAX_BYTES_PER_WINDOW: usize = 32 * 1024 * 1024;
@@ -2540,15 +2538,18 @@ fn max_serialized_attachment_bytes(media_type: &str) -> usize {
         "VIDEO" => VIDEO_ATTACHMENT_LIMIT_BYTES,
         _ => FILE_ATTACHMENT_LIMIT_BYTES,
     };
-    plain_limit.saturating_add(ATTACHMENT_WIRE_OVERHEAD_BYTES)
+    attachment_encrypted_size(media_type.to_string(), plain_limit as u64)
+        .ok()
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(0)
 }
 
 fn encrypted_attachment_limit_bytes(media_type: &str) -> usize {
     max_serialized_attachment_bytes(media_type)
 }
 
-fn valid_encrypted_attachment_body(body: &[u8]) -> bool {
-    body.len() >= ATTACHMENT_WIRE_OVERHEAD_BYTES && body.first() == Some(&ATTACHMENT_BLOB_VERSION)
+fn valid_encrypted_attachment_body(media_type: &str, body: &[u8]) -> bool {
+    attachment_plaintext_size_from_blob(media_type, body).is_ok()
 }
 
 fn declared_attachment_length(headers: &HeaderMap, max_bytes: usize) -> Result<usize, StatusCode> {
@@ -4228,7 +4229,7 @@ async fn upload_attachment(
         Ok(auth) if auth.code_id == initial_auth.code_id => auth,
         Ok(_) | Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    if !valid_encrypted_attachment_body(&encrypted_body) {
+    if !valid_encrypted_attachment_body(&media_type, &encrypted_body) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let access =
@@ -8621,23 +8622,26 @@ mod tests {
     }
 
     #[test]
-    fn attachment_limits_budget_stateless_wire_overhead() {
+    fn attachment_limits_budget_fixed_authenticated_chunks() {
         let image_limit = max_serialized_attachment_bytes("IMAGE");
         let video_limit = max_serialized_attachment_bytes("VIDEO");
         let file_limit = max_serialized_attachment_bytes("FILE");
         assert_eq!(
             image_limit,
-            IMAGE_ATTACHMENT_LIMIT_BYTES + ATTACHMENT_WIRE_OVERHEAD_BYTES
+            attachment_encrypted_size("IMAGE".to_string(), IMAGE_ATTACHMENT_LIMIT_BYTES as u64)
+                .expect("image wire limit") as usize
         );
         assert_eq!(
             video_limit,
-            VIDEO_ATTACHMENT_LIMIT_BYTES + ATTACHMENT_WIRE_OVERHEAD_BYTES
+            attachment_encrypted_size("VIDEO".to_string(), VIDEO_ATTACHMENT_LIMIT_BYTES as u64)
+                .expect("video wire limit") as usize
         );
         assert_eq!(
             file_limit,
-            FILE_ATTACHMENT_LIMIT_BYTES + ATTACHMENT_WIRE_OVERHEAD_BYTES
+            attachment_encrypted_size("FILE".to_string(), FILE_ATTACHMENT_LIMIT_BYTES as u64)
+                .expect("file wire limit") as usize
         );
-        assert!(file_limit <= DEFAULT_ATTACHMENT_ACCOUNT_LIMIT_MB * 1024 * 1024);
+        assert!(file_limit > FILE_ATTACHMENT_LIMIT_BYTES);
     }
 
     #[test]
@@ -9044,17 +9048,21 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_attachment_body_requires_version_and_authentication_overhead() {
-        assert!(!valid_encrypted_attachment_body(&[]));
+    fn encrypted_attachment_body_requires_complete_ordered_v2_records() {
+        assert!(!valid_encrypted_attachment_body("FILE", &[]));
         assert!(!valid_encrypted_attachment_body(
-            &[ATTACHMENT_BLOB_VERSION; ATTACHMENT_WIRE_OVERHEAD_BYTES - 1]
+            "FILE",
+            &[ATTACHMENT_BLOB_VERSION; ATTACHMENT_CHUNK_RECORD_BYTES - 1]
         ));
         assert!(!valid_encrypted_attachment_body(
-            &[0; ATTACHMENT_WIRE_OVERHEAD_BYTES]
+            "FILE",
+            &[0; ATTACHMENT_CHUNK_RECORD_BYTES]
         ));
-        assert!(valid_encrypted_attachment_body(
-            &[ATTACHMENT_BLOB_VERSION; ATTACHMENT_WIRE_OVERHEAD_BYTES]
-        ));
+        let valid = test_valid_encrypted_attachment_body(1);
+        assert!(valid_encrypted_attachment_body("FILE", &valid));
+        let mut bad_index = valid.clone();
+        bad_index[4] = 1;
+        assert!(!valid_encrypted_attachment_body("FILE", &bad_index));
     }
 
     #[tokio::test]
@@ -9345,12 +9353,16 @@ mod tests {
         );
 
         let upload = |message_id: &'static str| {
+            let body = test_valid_encrypted_attachment_body(1);
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::AUTHORIZATION,
                 HeaderValue::from_static("Bearer staged-upload-token"),
             );
-            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string()).expect("content length"),
+            );
             upload_attachment(
                 State(state.clone()),
                 Query(AttachmentQuery {
@@ -9362,10 +9374,7 @@ mod tests {
                     ttl_sec: Some(1),
                 }),
                 headers,
-                Body::from(vec![
-                    ATTACHMENT_BLOB_VERSION;
-                    ATTACHMENT_WIRE_OVERHEAD_BYTES
-                ]),
+                Body::from(body),
             )
         };
 
@@ -9450,10 +9459,7 @@ mod tests {
         state.attachments.lock().await.insert(
             attachment_id,
             AttachmentRecord {
-                blob: test_attachment_blob(vec![
-                    ATTACHMENT_BLOB_VERSION;
-                    ATTACHMENT_WIRE_OVERHEAD_BYTES
-                ]),
+                blob: test_attachment_blob(test_valid_encrypted_attachment_body(1)),
                 chat_id: room_id.to_string(),
                 message_id: "staged-download-message".to_string(),
                 media_type: "FILE".to_string(),
@@ -10011,7 +10017,7 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer wipe-upload-token"),
         );
-        let body_bytes = vec![ATTACHMENT_BLOB_VERSION; ATTACHMENT_WIRE_OVERHEAD_BYTES];
+        let body_bytes = test_valid_encrypted_attachment_body(1);
         headers.insert(
             header::CONTENT_LENGTH,
             HeaderValue::from_str(&body_bytes.len().to_string()).expect("content length"),
@@ -10878,10 +10884,7 @@ mod tests {
         state.attachments.lock().await.insert(
             Uuid::new_v4(),
             AttachmentRecord {
-                blob: test_attachment_blob(vec![
-                    ATTACHMENT_BLOB_VERSION;
-                    ATTACHMENT_WIRE_OVERHEAD_BYTES
-                ]),
+                blob: test_attachment_blob(test_valid_encrypted_attachment_body(1)),
                 chat_id: "record_limit_room".to_string(),
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
@@ -10901,7 +10904,11 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer record-limit-token"),
         );
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&ATTACHMENT_CHUNK_RECORD_BYTES.to_string())
+                .expect("content length"),
+        );
         let body = Body::from_stream(futures_util::stream::once(async {
             panic!("a saturated attachment record limit must reject before reading the body");
             #[allow(unreachable_code)]
@@ -10962,6 +10969,7 @@ mod tests {
         let make_request = move |token: &'static str, gate: Arc<tokio::sync::Barrier>| {
             let state = request_state.clone();
             async move {
+                let body = test_valid_encrypted_attachment_body(1);
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     header::AUTHORIZATION,
@@ -10970,7 +10978,10 @@ mod tests {
                         _ => "Bearer record-race-token-b",
                     }),
                 );
-                headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+                headers.insert(
+                    header::CONTENT_LENGTH,
+                    HeaderValue::from_str(&body.len().to_string()).expect("content length"),
+                );
                 let body_gate = gate;
                 upload_attachment(
                     State(state.clone()),
@@ -10985,10 +10996,7 @@ mod tests {
                     headers,
                     Body::from_stream(futures_util::stream::once(async move {
                         body_gate.wait().await;
-                        Ok::<Bytes, Infallible>(Bytes::from(vec![
-                            ATTACHMENT_BLOB_VERSION;
-                            ATTACHMENT_WIRE_OVERHEAD_BYTES
-                        ]))
+                        Ok::<Bytes, Infallible>(Bytes::from(body))
                     })),
                 )
                 .await
@@ -11011,12 +11019,12 @@ mod tests {
         assert_eq!(state.attachments.lock().await.len(), 1);
         assert_eq!(
             state.attachment_memory.available_permits(),
-            8 * 1024 * 1024 - ATTACHMENT_WIRE_OVERHEAD_BYTES
+            8 * 1024 * 1024 - ATTACHMENT_CHUNK_RECORD_BYTES
         );
         let usage = state.attachment_bytes_by_code.lock().await;
         assert_eq!(
             usage.values().copied().sum::<usize>(),
-            ATTACHMENT_WIRE_OVERHEAD_BYTES
+            ATTACHMENT_CHUNK_RECORD_BYTES
         );
         assert_eq!(usage.len(), 1);
     }
@@ -11051,12 +11059,16 @@ mod tests {
         }
 
         let upload = |token: &'static str| {
+            let body = test_valid_encrypted_attachment_body(1);
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {token}")).expect("test bearer token"),
             );
-            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string()).expect("content length"),
+            );
             upload_attachment(
                 State(state.clone()),
                 Query(AttachmentQuery {
@@ -11068,10 +11080,7 @@ mod tests {
                     ttl_sec: None,
                 }),
                 headers,
-                Body::from(vec![
-                    ATTACHMENT_BLOB_VERSION;
-                    ATTACHMENT_WIRE_OVERHEAD_BYTES
-                ]),
+                Body::from(body),
             )
         };
 
@@ -11109,11 +11118,17 @@ mod tests {
         assert_eq!(state.attachments.lock().await.len(), 2);
         assert_eq!(
             state.attachment_memory.available_permits(),
-            8 * 1024 * 1024 - 2 * ATTACHMENT_WIRE_OVERHEAD_BYTES
+            8 * 1024 * 1024 - 2 * ATTACHMENT_CHUNK_RECORD_BYTES
         );
         let usage = state.attachment_bytes_by_code.lock().await;
-        assert_eq!(usage.get(&test_code_id("record-boundary-a")), Some(&41));
-        assert_eq!(usage.get(&test_code_id("record-boundary-b")), Some(&41));
+        assert_eq!(
+            usage.get(&test_code_id("record-boundary-a")),
+            Some(&ATTACHMENT_CHUNK_RECORD_BYTES)
+        );
+        assert_eq!(
+            usage.get(&test_code_id("record-boundary-b")),
+            Some(&ATTACHMENT_CHUNK_RECORD_BYTES)
+        );
         drop(usage);
 
         remove_chat_attachments(&state, room_id).await;
@@ -11154,12 +11169,16 @@ mod tests {
             },
         );
         let upload = |state: AppState| async move {
+            let body = test_valid_encrypted_attachment_body(1);
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::AUTHORIZATION,
                 HeaderValue::from_static("Bearer record-wipe-token"),
             );
-            headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("41"));
+            headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string()).expect("content length"),
+            );
             upload_attachment(
                 State(state),
                 Query(AttachmentQuery {
@@ -11171,10 +11190,7 @@ mod tests {
                     ttl_sec: None,
                 }),
                 headers,
-                Body::from(vec![
-                    ATTACHMENT_BLOB_VERSION;
-                    ATTACHMENT_WIRE_OVERHEAD_BYTES
-                ]),
+                Body::from(body),
             )
             .await
             .into_response()
@@ -17064,6 +17080,18 @@ mod tests {
             bytes: Zeroizing::new(bytes),
             _memory_permit: None,
         })
+    }
+
+    fn test_valid_encrypted_attachment_body(plaintext_bytes: usize) -> Vec<u8> {
+        abyssal_core::secure_protocol::encrypt_attachment(
+            "test_room".to_string(),
+            "test-message".to_string(),
+            "Alice".to_string(),
+            "FILE".to_string(),
+            vec![0x5a; plaintext_bytes],
+        )
+        .expect("test attachment encryption")
+        .blob
     }
 
     fn test_identity_public_b64(fill: u8) -> String {

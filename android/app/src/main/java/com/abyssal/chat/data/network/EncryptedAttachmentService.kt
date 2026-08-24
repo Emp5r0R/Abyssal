@@ -3,10 +3,13 @@ package com.abyssal.chat.data.network
 import android.content.Context
 import android.net.Uri
 import com.abyssal.chat.domain.model.AttachmentUploadResult
+import com.abyssal.chat.domain.model.AttachmentProtocol
 import com.abyssal.chat.domain.model.DecryptedAttachment
-import com.abyssal.chat.domain.model.EncryptedAttachmentDownload
+import com.abyssal.chat.domain.model.DecryptedAttachmentDownload
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.repository.IAttachmentPlaintextSource
 import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
+import java.io.EOFException
 import java.io.IOException
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -30,21 +33,25 @@ import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
 import org.json.JSONObject
+import uniffi.abyssal_core.decryptAttachmentChunk
+import uniffi.abyssal_core.encryptAttachmentChunk
+import uniffi.abyssal_core.generateAttachmentKey
 
-internal const val ATTACHMENT_WIRE_OVERHEAD_BYTES = 41L
+internal const val ATTACHMENT_CHUNK_PLAINTEXT_BYTES = 256L * 1024L
+internal const val ATTACHMENT_CHUNK_RECORD_BYTES = 1L + 4L + 4L + 8L + 24L +
+    ATTACHMENT_CHUNK_PLAINTEXT_BYTES + 16L
 internal const val ATTACHMENT_CLAIM_HEADER = "X-Abyssal-Attachment-Claim"
 
 internal fun maxSerializedAttachmentBytes(mediaType: String): Long =
-    protocolAttachmentLimitBytes(mediaType) + ATTACHMENT_WIRE_OVERHEAD_BYTES
+    expectedEncryptedAttachmentBytes(protocolAttachmentLimitBytes(mediaType)) ?: 0L
 
 internal fun expectedEncryptedAttachmentBytes(plaintextBytes: Long): Long? =
-    if (plaintextBytes <= 0L || plaintextBytes > Long.MAX_VALUE - ATTACHMENT_WIRE_OVERHEAD_BYTES) {
-        null
-    } else {
-        plaintextBytes + ATTACHMENT_WIRE_OVERHEAD_BYTES
+    if (plaintextBytes <= 0L) null else run {
+        val chunkCount = ((plaintextBytes - 1L) / ATTACHMENT_CHUNK_PLAINTEXT_BYTES) + 1L
+        if (chunkCount > Long.MAX_VALUE / ATTACHMENT_CHUNK_RECORD_BYTES) null
+        else chunkCount * ATTACHMENT_CHUNK_RECORD_BYTES
     }
 
-internal val MAX_ENCRYPTED_ATTACHMENT_BYTES: Long = maxSerializedAttachmentBytes("FILE")
 internal const val MAX_ATTACHMENT_UPLOAD_RESPONSE_BYTES = 64L * 1024L
 private val ATTACHMENT_ID_REGEX = Regex(
     "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
@@ -54,30 +61,86 @@ private val ATTACHMENT_CLAIM_REGEX = Regex(
 )
 private val SUPPORTED_ATTACHMENT_MEDIA_TYPES = setOf("IMAGE", "VIDEO", "FILE")
 
-internal fun readBoundedAttachmentBody(
+internal fun readAndDecryptAttachmentBody(
     body: okhttp3.ResponseBody,
-    maxBytes: Long = MAX_ENCRYPTED_ATTACHMENT_BYTES,
-    expectedPlaintextBytes: Long? = null
+    chatId: String,
+    messageId: String,
+    senderUsername: String,
+    mediaType: String,
+    key: ByteArray,
+    expectedPlaintextBytes: Long,
+    expectedWireBytes: Long
 ): ByteArray? {
-    val expectedBytes = expectedPlaintextBytes?.let(::expectedEncryptedAttachmentBytes)
-    if (expectedPlaintextBytes != null && expectedBytes == null) return null
-    val contentLength = body.contentLength()
-    if (expectedBytes != null) {
-        if (expectedBytes > maxBytes ||
-            expectedBytes > Int.MAX_VALUE.toLong() ||
-            (contentLength > 0L && contentLength != expectedBytes)
-        ) return null
-    } else if (
-        contentLength <= 0L ||
-        contentLength > maxBytes ||
-        contentLength > Int.MAX_VALUE.toLong()
+    if (key.size != AttachmentProtocol.KEY_BYTES ||
+        expectedPlaintextBytes !in 1L..Int.MAX_VALUE.toLong() ||
+        expectedWireBytes <= 0L ||
+        expectedWireBytes % ATTACHMENT_CHUNK_RECORD_BYTES != 0L ||
+        (body.contentLength() >= 0L && body.contentLength() != expectedWireBytes)
     ) return null
-    val bytesToRead = expectedBytes ?: contentLength
-    return BoundedInputReader.readExact(
-        input = body.byteStream(),
-        expectedBytes = bytesToRead,
-        maxBytes = maxBytes
-    )
+    val plaintext = ByteArray(expectedPlaintextBytes.toInt())
+    val record = ByteArray(ATTACHMENT_CHUNK_RECORD_BYTES.toInt())
+    var plaintextOffset = 0
+    var complete = false
+    return try {
+        val input = body.byteStream()
+        val recordCount = expectedWireBytes / ATTACHMENT_CHUNK_RECORD_BYTES
+        for (chunkIndex in 0L until recordCount) {
+            readFully(input, record)
+            val chunk = decryptAttachmentChunk(
+                chatId = chatId,
+                messageId = messageId,
+                senderUsername = senderUsername,
+                mediaType = mediaType,
+                key = key,
+                expectedTotalPlaintextBytes = expectedPlaintextBytes.toULong(),
+                expectedChunkIndex = chunkIndex.toUInt(),
+                record = record
+            )
+            try {
+                val expectedChunkBytes = minOf(
+                    ATTACHMENT_CHUNK_PLAINTEXT_BYTES.toInt(),
+                    plaintext.size - plaintextOffset
+                )
+                if (chunk.size != expectedChunkBytes) return null
+                chunk.copyInto(plaintext, plaintextOffset)
+                plaintextOffset += chunk.size
+            } finally {
+                chunk.fill(0)
+                record.fill(0)
+            }
+        }
+        if (plaintextOffset != plaintext.size || input.read() >= 0) return null
+        complete = true
+        plaintext
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        null
+    } finally {
+        record.fill(0)
+        if (!complete) plaintext.fill(0)
+    }
+}
+
+private fun readFully(
+    input: java.io.InputStream,
+    destination: ByteArray,
+    bytesToRead: Int = destination.size
+) {
+    if (bytesToRead !in 1..destination.size) throw EOFException("Attachment unavailable")
+    var offset = 0
+    while (offset < bytesToRead) {
+        val count = input.read(destination, offset, bytesToRead - offset)
+        when {
+            count < 0 -> throw EOFException("Attachment unavailable")
+            count == 0 -> {
+                val next = input.read()
+                if (next < 0) throw EOFException("Attachment unavailable")
+                destination[offset++] = next.toByte()
+            }
+            else -> offset += count
+        }
+    }
 }
 
 internal fun readBoundedAttachmentResponse(body: okhttp3.ResponseBody): JSONObject? {
@@ -107,7 +170,7 @@ internal fun normalizeAttachmentClaim(value: String): String? {
 
 /** Plaintext is returned only after the relay acknowledges a valid destructive claim. */
 internal suspend fun decryptAndCompleteAttachment(
-    downloaded: EncryptedAttachmentDownload,
+    downloaded: DecryptedAttachmentDownload,
     decrypt: suspend () -> ByteArray?,
     complete: suspend (claim: String) -> Boolean,
     release: suspend (claim: String) -> Boolean
@@ -154,62 +217,89 @@ class EncryptedAttachmentService(
         session: NodeSession,
         chatId: String,
         messageId: String,
+        senderUsername: String,
         mediaType: String,
-        encryptedBytes: ByteArray,
+        source: IAttachmentPlaintextSource,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
         ttlSec: Int,
         onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult = withContext(Dispatchers.IO) {
-        if (
-            !messageId.matches(ATTACHMENT_ID_REGEX) ||
-            encryptedBytes.isEmpty() ||
-            encryptedBytes.size.toLong() > attachmentWireSelectionLimitBytes(mediaType)
-        ) {
-            return@withContext AttachmentUploadResult(false)
-        }
-        val query = listOf(
-            "chat_id" to chatId,
-            "message_id" to messageId,
-            "media_type" to mediaType.uppercase(),
-            "one_time" to oneTimeView.toString(),
-            "delete_after_download" to deleteAfterDownload.toString(),
-            "ttl_sec" to ttlSec.coerceAtLeast(0).toString()
-        ).joinToString("&") { (key, value) ->
-            "${key}=${URLEncoder.encode(value, StandardCharsets.UTF_8.name())}"
-        }
-        val body = ProgressRequestBody(
-            bytes = encryptedBytes,
-            mediaType = "application/octet-stream".toMediaType(),
-            onProgress = onProgress
-        )
-        val request = Request.Builder()
-            .url("${session.endpoint.apiBaseUrl}/v1/attachment?$query")
-            .header("Authorization", "Bearer ${session.token}")
-            .post(body)
-            .build()
-
+        val normalizedMediaType = mediaType.uppercase(Locale.ROOT)
+        var key: ByteArray? = null
+        var keyTransferred = false
         try {
-            awaitHttpResponse(callFactory.newCall(request)) { response ->
+            val expectedWireBytes = expectedEncryptedAttachmentBytes(source.sizeBytes)
+            if (!messageId.matches(ATTACHMENT_ID_REGEX) ||
+                normalizedMediaType !in SUPPORTED_ATTACHMENT_MEDIA_TYPES ||
+                source.sizeBytes !in 1L..protocolAttachmentLimitBytes(normalizedMediaType) ||
+                expectedWireBytes == null ||
+                expectedWireBytes > maxSerializedAttachmentBytes(normalizedMediaType)
+            ) return@withContext AttachmentUploadResult(false)
+            key = generateAttachmentKey()
+            if (key.size != AttachmentProtocol.KEY_BYTES) {
+                return@withContext AttachmentUploadResult(false)
+            }
+            val query = listOf(
+                "chat_id" to chatId,
+                "message_id" to messageId,
+                "media_type" to normalizedMediaType,
+                "one_time" to oneTimeView.toString(),
+                "delete_after_download" to deleteAfterDownload.toString(),
+                "ttl_sec" to ttlSec.coerceAtLeast(0).toString()
+            ).joinToString("&") { (queryKey, value) ->
+                "${queryKey}=${URLEncoder.encode(value, StandardCharsets.UTF_8.name())}"
+            }
+            val body = EncryptedChunkRequestBody(
+                source = source,
+                chatId = chatId,
+                messageId = messageId,
+                senderUsername = senderUsername,
+                mediaTypeName = normalizedMediaType,
+                key = key,
+                onProgress = onProgress
+            )
+            val request = Request.Builder()
+                .url("${session.endpoint.apiBaseUrl}/v1/attachment?$query")
+                .header("Authorization", "Bearer ${session.token}")
+                .post(body)
+                .build()
+            val result = awaitHttpResponse(callFactory.newCall(request)) { response ->
                 val json = response.body?.let(::readBoundedAttachmentResponse)
                 AttachmentUploadResult(
                     accepted = response.isSuccessful && json?.optBoolean("accepted", false) == true,
                     attachmentId = json?.optString("attachment_id")?.takeIf { it.isNotBlank() }
                 )
             }
+            if (result.accepted && result.attachmentId != null) {
+                keyTransferred = true
+                result.copy(
+                    cipherVersion = AttachmentProtocol.CIPHER_VERSION,
+                    encryptionKey = key
+                )
+            } else {
+                result
+            }
         } catch (error: CancellationException) {
             throw error
         } catch (_: Exception) {
             AttachmentUploadResult(false)
+        } finally {
+            source.destroy()
+            if (!keyTransferred) key?.fill(0)
         }
     }
 
-    override suspend fun downloadEncryptedAttachment(
+    override suspend fun downloadDecryptedAttachment(
         session: NodeSession,
         attachmentId: String,
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
         mediaType: String,
+        encryptionKey: ByteArray,
         expectedPlaintextBytes: Long
-    ): EncryptedAttachmentDownload? = withContext(Dispatchers.IO) {
+    ): DecryptedAttachmentDownload? = withContext(Dispatchers.IO) {
         val normalizedAttachmentId = normalizeAttachmentId(attachmentId) ?: return@withContext null
         val normalizedMediaType = mediaType.uppercase(Locale.ROOT)
             .takeIf { it in SUPPORTED_ATTACHMENT_MEDIA_TYPES }
@@ -217,6 +307,7 @@ class EncryptedAttachmentService(
         val maxWireBytes = attachmentWireSelectionLimitBytes(normalizedMediaType)
         val expectedWireBytes = expectedEncryptedAttachmentBytes(expectedPlaintextBytes)
         if (expectedWireBytes == null ||
+            encryptionKey.size != AttachmentProtocol.KEY_BYTES ||
             expectedPlaintextBytes > attachmentSelectionLimitBytes(normalizedMediaType) ||
             expectedWireBytes > maxWireBytes
         ) return@withContext null
@@ -261,16 +352,21 @@ class EncryptedAttachmentService(
                 } else {
                     val body = response.body
                     val bytes = body?.let {
-                        readBoundedAttachmentBody(
+                        readAndDecryptAttachmentBody(
                             body = it,
-                            maxBytes = maxWireBytes,
-                            expectedPlaintextBytes = expectedPlaintextBytes
+                            chatId = chatId,
+                            messageId = messageId,
+                            senderUsername = senderUsername,
+                            mediaType = normalizedMediaType,
+                            key = encryptionKey,
+                            expectedPlaintextBytes = expectedPlaintextBytes,
+                            expectedWireBytes = expectedWireBytes
                         )
                     }
                     if (bytes == null || bytes.isEmpty()) {
                         null
                     } else {
-                        EncryptedAttachmentDownload(bytes = bytes, claim = claimRef.get())
+                        DecryptedAttachmentDownload(bytes = bytes, claim = claimRef.get())
                     }
                 }
             }
@@ -416,31 +512,75 @@ class EncryptedAttachmentService(
         }
     }
 
-    private class ProgressRequestBody(
-        private val bytes: ByteArray,
-        private val mediaType: MediaType,
+    private class EncryptedChunkRequestBody(
+        private val source: IAttachmentPlaintextSource,
+        private val chatId: String,
+        private val messageId: String,
+        private val senderUsername: String,
+        private val mediaTypeName: String,
+        private val key: ByteArray,
         private val onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ) : RequestBody() {
-        override fun contentType(): MediaType = mediaType
+        private val wireBytes = expectedEncryptedAttachmentBytes(source.sizeBytes)
+            ?: throw IllegalArgumentException("Attachment unavailable")
 
-        override fun contentLength(): Long = bytes.size.toLong()
+        override fun contentType(): MediaType = "application/octet-stream".toMediaType()
+
+        override fun contentLength(): Long = wireBytes
+
+        override fun isOneShot(): Boolean = true
 
         override fun writeTo(sink: BufferedSink) {
-            val total = bytes.size.toLong()
-            var sent = 0L
-            var offset = 0
-            onProgress(0L, total)
-            while (offset < bytes.size) {
-                val count = minOf(CHUNK_BYTES, bytes.size - offset)
-                sink.write(bytes, offset, count)
-                offset += count
-                sent += count
-                onProgress(sent, total)
+            val plaintextBuffer = ByteArray(ATTACHMENT_CHUNK_PLAINTEXT_BYTES.toInt())
+            var plaintextRead = 0L
+            var chunkIndex = 0L
+            onProgress(0L, source.sizeBytes)
+            try {
+                source.openStream().use { input ->
+                    while (plaintextRead < source.sizeBytes) {
+                        val chunkBytes = minOf(
+                            plaintextBuffer.size.toLong(),
+                            source.sizeBytes - plaintextRead
+                        ).toInt()
+                        readFully(input, plaintextBuffer, chunkBytes)
+                        val plaintext = if (chunkBytes == plaintextBuffer.size) {
+                            plaintextBuffer
+                        } else {
+                            plaintextBuffer.copyOf(chunkBytes)
+                        }
+                        val record = try {
+                            encryptAttachmentChunk(
+                                chatId = chatId,
+                                messageId = messageId,
+                                senderUsername = senderUsername,
+                                mediaType = mediaTypeName,
+                                key = key,
+                                totalPlaintextBytes = source.sizeBytes.toULong(),
+                                chunkIndex = chunkIndex.toUInt(),
+                                plaintext = plaintext
+                            )
+                        } finally {
+                            plaintext.fill(0)
+                        }
+                        try {
+                            if (record.size.toLong() != ATTACHMENT_CHUNK_RECORD_BYTES ||
+                                record.firstOrNull()?.toInt() != AttachmentProtocol.CIPHER_VERSION
+                            ) throw IOException("Attachment unavailable")
+                            sink.write(record)
+                        } finally {
+                            record.fill(0)
+                        }
+                        plaintextRead += chunkBytes
+                        chunkIndex += 1L
+                        onProgress(plaintextRead, source.sizeBytes)
+                    }
+                    if (input.read() >= 0 ||
+                        chunkIndex * ATTACHMENT_CHUNK_RECORD_BYTES != wireBytes
+                    ) throw IOException("Attachment unavailable")
+                }
+            } finally {
+                plaintextBuffer.fill(0)
             }
-        }
-
-        private companion object {
-            const val CHUNK_BYTES = 64 * 1024
         }
     }
 

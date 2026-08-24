@@ -56,4 +56,8 @@ for artifact in \
     printf 'Generated crypto artifact does not contain MLS protocol v10: %s\n' "$artifact" >&2
     exit 1
   }
+  grep -aFq "ABYSSAL_ATTACHMENT_CHUNK_AEAD_V2" "$artifact" || {
+    printf 'Generated crypto artifact does not contain attachment cipher v2: %s\n' "$artifact" >&2
+    exit 1
+  }
 done

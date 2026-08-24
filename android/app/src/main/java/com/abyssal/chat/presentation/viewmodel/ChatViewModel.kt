@@ -5,7 +5,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.abyssal.chat.data.network.ATTACHMENT_WIRE_OVERHEAD_BYTES
+import com.abyssal.chat.data.network.ByteArrayAttachmentSource
 import com.abyssal.chat.data.network.attachmentSelectionLimitBytes
 import com.abyssal.chat.data.network.decryptAndCompleteAttachment
 import com.abyssal.chat.data.network.FatalPayloadCipherException
@@ -16,6 +16,7 @@ import com.abyssal.chat.data.network.MlsWireCodec
 import com.abyssal.chat.data.network.protocolAttachmentLimitBytes
 import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
+import com.abyssal.chat.domain.model.AttachmentProtocol
 import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.ChatSession
@@ -50,6 +51,7 @@ import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.domain.model.UpdatePromptPolicy
 import com.abyssal.chat.domain.repository.IAppUpdateService
+import com.abyssal.chat.domain.repository.IAttachmentPlaintextSource
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.IMlsTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
@@ -95,8 +97,6 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import uniffi.abyssal_core.conversationSafetyNumber
 import uniffi.abyssal_core.conversationVerificationToken
-import uniffi.abyssal_core.decryptAttachment as decryptAttachmentBlob
-import uniffi.abyssal_core.encryptAttachment as encryptAttachmentBlob
 
 sealed class Screen {
     object Entrance : Screen()
@@ -334,8 +334,6 @@ internal fun isDecryptedAttachmentSizeValid(
     maxBytes: Long
 ): Boolean = actualBytes > 0L && expectedBytes > 0L && actualBytes == expectedBytes && actualBytes <= maxBytes
 
-internal const val ATTACHMENT_CIPHER_VERSION = 1
-internal const val ATTACHMENT_KEY_BYTES = 32
 private val ATTACHMENT_KEY_B64_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
 
 internal fun attachmentMetadataJson(message: Message, senderUsername: String): JSONObject =
@@ -1164,59 +1162,82 @@ class ChatViewModel(
         deleteAfterDownload: Boolean,
         replyToMessageId: String? = null,
         reactionShortcode: String? = null
+    ) = sendAttachmentSource(
+        mediaType = mediaType,
+        fileName = fileName,
+        mimeType = mimeType,
+        source = ByteArrayAttachmentSource(bytes),
+        selfDestructSec = selfDestructSec,
+        oneTimeView = oneTimeView,
+        deleteAfterDownload = deleteAfterDownload,
+        replyToMessageId = replyToMessageId,
+        reactionShortcode = reactionShortcode
+    )
+
+    fun sendAttachmentSource(
+        mediaType: String,
+        fileName: String,
+        mimeType: String,
+        source: IAttachmentPlaintextSource,
+        selfDestructSec: Int,
+        oneTimeView: Boolean,
+        deleteAfterDownload: Boolean,
+        replyToMessageId: String? = null,
+        reactionShortcode: String? = null
     ) {
+        val sourceSizeBytes = source.sizeBytes
         val chatId = _activeChatId.value ?: run {
-            bytes.fill(0)
+            source.destroy()
             return
         }
         if (serverStatus.value.state != "CONNECTED") {
             _attachmentError.value = "Wrong information."
-            bytes.fill(0)
+            source.destroy()
             return
         }
         if (!isDirectChatTrusted(chatId)) {
             _attachmentError.value = "Verify this direct chat's safety number before sending."
-            bytes.fill(0)
+            source.destroy()
             return
         }
         val effectiveTimerSec = effectiveRetentionSec(chatId, selfDestructSec, mediaType)
         val absoluteExpirySec = effectiveAbsoluteExpirySec(chatId, mediaType)
-        if (bytes.isEmpty() ||
-            bytes.size.toLong() > attachmentSelectionLimitBytes(mediaType) ||
+        if (sourceSizeBytes <= 0L ||
+            sourceSizeBytes > protocolAttachmentLimitBytes(mediaType) ||
             !isMediaAllowed(chatId, mediaType)
         ) {
             _attachmentError.value = "Wrong information."
-            bytes.fill(0)
+            source.destroy()
             return
         }
         val isMlsRoom = mlsManager?.isActiveRoom(chatId) == true
         val remoteRecipients = if (isMlsRoom) emptyList() else recipientIdentities(chatId, includeSelf = false)
         if (!isMlsRoom && isLocalOnlyForum(chatId, remoteRecipients)) {
             _attachmentError.value = "Wrong information."
-            bytes.fill(0)
+            source.destroy()
             return
         }
         val safeReactionShortcode = reactionShortcode?.let {
             MessageAttentionPolicy.validatedReactionShortcode(it, fileName, mimeType)
                 ?: run {
                     _attachmentError.value = "Wrong information."
-                    bytes.fill(0)
+                    source.destroy()
                     return
                 }
         }
         val capturedSession = nodeConfigService.getActiveSession() ?: run {
-            bytes.fill(0)
+            source.destroy()
             return
         }
         val sessionStamp = captureSessionStamp() ?: run {
-            bytes.fill(0)
+            source.destroy()
             return
         }
         val operationId = attachmentOperations.beginOperation()
         val operationActive = AtomicBoolean(true)
         val wipeUploadState = {
             operationActive.set(false)
-            bytes.fill(0)
+            source.destroy()
             sessionStamp.wipe()
             if (attachmentOperations.ownsProgress(operationId)) {
                 _attachmentUploadProgress.value = AttachmentUploadProgress()
@@ -1227,7 +1248,6 @@ class ChatViewModel(
             onCancelledBeforeStart = wipeUploadState,
             block = uploadAttachmentOperation@{
             var attachmentKey: ByteArray? = null
-            var encryptedBlob: ByteArray? = null
             var messageToWipe: Message? = null
             var uploadedAttachmentId: String? = null
             var metadataAccepted = false
@@ -1251,7 +1271,7 @@ class ChatViewModel(
                         active = true,
                         fileName = fileName.ifBlank { "attachment" },
                         mediaType = mediaType,
-                        totalBytes = bytes.size.toLong()
+                        totalBytes = sourceSizeBytes
                     )
                 }
                 val metadataRecipients = if (isMlsRoom) emptyList() else recipientIdentities(chatId, includeSelf = false)
@@ -1280,59 +1300,13 @@ class ChatViewModel(
                         operationActive
                     )
                 ) return@uploadAttachmentOperation
-                val attachmentPayload = try {
-                    encryptAttachmentBlob(
+                val upload = attachmentService.uploadEncryptedAttachment(
+                        session = capturedSession,
                         chatId = chatId,
                         messageId = messageId,
                         senderUsername = sessionStamp.username,
                         mediaType = normalizedMediaType,
-                        plaintext = bytes
-                    )
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (_: Exception) {
-                    if (isAttachmentProgressCurrent(
-                            operationId,
-                            capturedSession,
-                            sessionStamp,
-                            operationActive
-                        )
-                    ) _attachmentError.value = "Wrong information."
-                    return@uploadAttachmentOperation
-                }
-                val key = attachmentPayload.key
-                val blob = attachmentPayload.blob
-                attachmentKey = key
-                encryptedBlob = blob
-                if (!isValidAttachmentCiphertext(
-                        version = attachmentPayload.version.toInt(),
-                        key = key,
-                        blob = blob,
-                        mediaType = normalizedMediaType
-                    )
-                ) {
-                    if (isAttachmentProgressCurrent(
-                            operationId,
-                            capturedSession,
-                            sessionStamp,
-                            operationActive
-                        )
-                    ) _attachmentError.value = "Wrong information."
-                    return@uploadAttachmentOperation
-                }
-                if (!isAttachmentSessionCurrent(
-                        capturedSession,
-                        sessionStamp,
-                        operationActive
-                    )
-                ) return@uploadAttachmentOperation
-                try {
-                    val upload = attachmentService.uploadEncryptedAttachment(
-                        session = capturedSession,
-                        chatId = chatId,
-                        messageId = messageId,
-                        mediaType = normalizedMediaType,
-                        encryptedBytes = blob,
+                        source = source,
                         oneTimeView = oneTimeView,
                         deleteAfterDownload = deleteAfterDownload,
                         ttlSec = absoluteExpirySec,
@@ -1354,9 +1328,15 @@ class ChatViewModel(
                             }
                         }
                     )
-                    val attachmentId = upload.attachmentId?.let(::normalizeAttachmentId)
+                val key = upload.encryptionKey
+                attachmentKey = key
+                val attachmentId = upload.attachmentId?.let(::normalizeAttachmentId)
                     uploadedAttachmentId = attachmentId
-                    if (!upload.accepted || attachmentId == null) {
+                    if (!upload.accepted ||
+                        attachmentId == null ||
+                        upload.cipherVersion != AttachmentProtocol.CIPHER_VERSION ||
+                        key?.size != AttachmentProtocol.KEY_BYTES
+                    ) {
                         if (isAttachmentProgressCurrent(
                                 operationId,
                                 capturedSession,
@@ -1378,12 +1358,12 @@ class ChatViewModel(
                         sender = "You",
                         receiver = if (chatId.startsWith("dm_")) chatId.removePrefix("dm_") else null,
                         attachmentId = attachmentId,
-                        attachmentCipherVersion = attachmentPayload.version.toInt(),
+                        attachmentCipherVersion = upload.cipherVersion,
                         attachmentKey = key,
                         mediaType = normalizedMediaType,
                         fileName = fileName,
                         mimeType = mimeType,
-                        sizeBytes = bytes.size.toLong(),
+                        sizeBytes = sourceSizeBytes,
                         selfDestructSec = effectiveTimerSec,
                         absoluteExpirySec = absoluteExpirySec,
                         oneTimeView = oneTimeView,
@@ -1452,9 +1432,6 @@ class ChatViewModel(
                             )
                         ) _attachmentError.value = "Wrong information."
                     }
-                } finally {
-                    encryptedBlob.fill(0)
-                }
             } finally {
                 // Stop late OkHttp progress callbacks before any non-cancellable
                 // remote cleanup begins.
@@ -1470,7 +1447,6 @@ class ChatViewModel(
                 )
                 messageToWipe?.let(::wipeMessageSecrets)
                 attachmentKey?.fill(0)
-                encryptedBlob?.fill(0)
                 wipeUploadState()
             }
             }
@@ -1561,18 +1537,22 @@ class ChatViewModel(
                     return@viewAttachmentOperation
                 }
                 _attachmentError.value = null
-                val downloaded = attachmentService.downloadEncryptedAttachment(
-                    session = capturedSession,
-                    attachmentId = attachmentId,
-                    mediaType = message.mediaType ?: "FILE",
-                    expectedPlaintextBytes = message.attachmentSizeBytes
-                )
-                plaintext = downloaded?.let { encrypted ->
+                val downloaded = downloadDecryptedAttachment(capturedSession, chatId, message)
+                plaintext = downloaded?.let { decrypted ->
                     decryptAndCompleteAttachment(
-                        downloaded = encrypted,
+                        downloaded = decrypted,
                         decrypt = {
-                            if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) null
-                            else decryptAttachment(chatId, message, encrypted.bytes)
+                            if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) {
+                                null
+                            } else {
+                                decrypted.bytes.takeIf {
+                                    isDecryptedAttachmentSizeValid(
+                                        actualBytes = it.size.toLong(),
+                                        expectedBytes = message.attachmentSizeBytes,
+                                        maxBytes = attachmentSelectionLimitBytes(message.mediaType ?: "FILE")
+                                    )
+                                }
+                            }
                         },
                         complete = { claim ->
                             if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) false
@@ -1649,18 +1629,22 @@ class ChatViewModel(
                 }
                 val cachedAttachment = _attachmentPreview.value?.takeIf { it.messageId == message.id }
                 val attachment = cachedAttachment ?: run {
-                    val downloaded = attachmentService.downloadEncryptedAttachment(
-                        session = capturedSession,
-                        attachmentId = attachmentId,
-                        mediaType = message.mediaType ?: "FILE",
-                        expectedPlaintextBytes = message.attachmentSizeBytes
-                    )
-                    val bytes = downloaded?.let { encrypted ->
+                    val downloaded = downloadDecryptedAttachment(capturedSession, chatId, message)
+                    val bytes = downloaded?.let { decrypted ->
                         decryptAndCompleteAttachment(
-                            downloaded = encrypted,
+                            downloaded = decrypted,
                             decrypt = {
-                                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) null
-                                else decryptAttachment(chatId, message, encrypted.bytes)
+                                if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) {
+                                    null
+                                } else {
+                                    decrypted.bytes.takeIf {
+                                        isDecryptedAttachmentSizeValid(
+                                            actualBytes = it.size.toLong(),
+                                            expectedBytes = message.attachmentSizeBytes,
+                                            maxBytes = attachmentSelectionLimitBytes(message.mediaType ?: "FILE")
+                                        )
+                                    }
+                                }
                             },
                             complete = { claim ->
                                 if (!isAttachmentGenerationCurrent(capturedSession, generation, connectionGeneration)) false
@@ -2770,7 +2754,11 @@ class ChatViewModel(
         return recipients
     }
 
-    private suspend fun decryptAttachment(chatId: String, message: Message, encrypted: ByteArray): ByteArray? {
+    private suspend fun downloadDecryptedAttachment(
+        session: NodeSession,
+        chatId: String,
+        message: Message
+    ): com.abyssal.chat.domain.model.DecryptedAttachmentDownload? {
         var key: ByteArray? = null
         return try {
             val self = currentUser.value ?: return null
@@ -2781,36 +2769,21 @@ class ChatViewModel(
                 ?: return null
             val attachmentKey = message.attachmentKey?.copyOf() ?: return null
             key = attachmentKey
-            if (!isValidAttachmentCiphertext(
-                    version = message.attachmentCipherVersion,
-                    key = key,
-                    blob = encrypted,
-                    mediaType = mediaType
-                )
+            if (message.attachmentCipherVersion != AttachmentProtocol.CIPHER_VERSION ||
+                key.size != AttachmentProtocol.KEY_BYTES
             ) return null
-            val plain = runCatching {
-                decryptAttachmentBlob(
-                    chatId = chatId,
-                    messageId = message.id,
-                    senderUsername = senderUsername,
-                    mediaType = mediaType,
-                    key = attachmentKey,
-                    blob = encrypted
-                )
-            }.getOrNull() ?: return null
-            if (!isDecryptedAttachmentSizeValid(
-                    actualBytes = plain.size.toLong(),
-                    expectedBytes = message.attachmentSizeBytes,
-                    maxBytes = attachmentSelectionLimitBytes(mediaType)
-                )
-            ) {
-                plain.fill(0)
-                return null
-            }
-            plain
+            attachmentService.downloadDecryptedAttachment(
+                session = session,
+                attachmentId = message.attachmentId ?: return null,
+                chatId = chatId,
+                messageId = message.id,
+                senderUsername = senderUsername,
+                mediaType = mediaType,
+                encryptionKey = attachmentKey,
+                expectedPlaintextBytes = message.attachmentSizeBytes
+            )
         } finally {
             key?.fill(0)
-            encrypted.fill(0)
         }
     }
 
@@ -2849,7 +2822,7 @@ class ChatViewModel(
                 ?: return null
             val attachmentId = normalizeAttachmentId(json.optString("attachment_id")) ?: return null
             val attachmentCipherVersion = json.optInt("attachment_cipher_version", -1)
-            if (attachmentCipherVersion != ATTACHMENT_CIPHER_VERSION) return null
+            if (attachmentCipherVersion != AttachmentProtocol.CIPHER_VERSION) return null
             val sizeBytes = json.optLong("size_bytes", -1L)
             if (sizeBytes !in 1L..attachmentSelectionLimitBytes(mediaType)) return null
             val attachmentKey = decodeAttachmentKey(json.optString("attachment_key_b64")) ?: return null
@@ -3055,25 +3028,10 @@ class ChatViewModel(
         } ?: "application/octet-stream"
     }
 
-    private fun isValidAttachmentCiphertext(
-        version: Int,
-        key: ByteArray,
-        blob: ByteArray,
-        mediaType: String
-    ): Boolean {
-        val blobSize = blob.size.toLong()
-        return version == ATTACHMENT_CIPHER_VERSION &&
-            key.size == ATTACHMENT_KEY_BYTES &&
-            blobSize in ATTACHMENT_WIRE_OVERHEAD_BYTES..(
-                protocolAttachmentLimitBytes(mediaType) + ATTACHMENT_WIRE_OVERHEAD_BYTES
-            ) &&
-            blob.firstOrNull()?.toInt() == ATTACHMENT_CIPHER_VERSION
-    }
-
     private fun decodeAttachmentKey(value: String): ByteArray? {
         if (!ATTACHMENT_KEY_B64_REGEX.matches(value)) return null
         val decoded = runCatching { Base64.getUrlDecoder().decode(value) }.getOrNull() ?: return null
-        if (decoded.size != ATTACHMENT_KEY_BYTES) {
+        if (decoded.size != AttachmentProtocol.KEY_BYTES) {
             decoded.fill(0)
             return null
         }

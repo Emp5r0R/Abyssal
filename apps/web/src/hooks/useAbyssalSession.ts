@@ -35,7 +35,9 @@ import {
   bytesToBase64,
   conversationSafetyNumber,
   conversationVerificationToken,
+  ATTACHMENT_CHUNK_PLAINTEXT_BYTES,
   ATTACHMENT_CIPHER_VERSION,
+  ATTACHMENT_KEY_BYTES,
   finishOpaqueLogin,
   finishOpaqueRegistration,
   FatalCipherError,
@@ -46,11 +48,14 @@ import {
   PROTOCOL_VERSION,
   startOpaque,
   type EncryptedPayload,
-  type EncryptedAttachment,
   wipeBytes,
   wipeOpaqueStart,
 } from "../security/crypto";
 import { attachmentDownloadBlob, attachmentDownloadName } from "../security/attachmentExport";
+import {
+  encryptAttachmentFile,
+  type EncryptedAttachmentUpload,
+} from "../security/attachmentStreaming";
 import {
   MlsRoomManager,
   type PendingMlsJoinSummary,
@@ -66,17 +71,16 @@ import {
 import { normalizeNodeUrl } from "../security/nodeUrl";
 import {
   decryptAndCompleteAttachment,
-  downloadEncryptedAttachment,
   deleteUploadedAttachment,
   finishOpaqueAccount,
   RelaySocket,
   releaseAttachmentDownloadClaim,
   revokeSession,
   startOpaqueAccount,
+  streamEncryptedAttachmentRecords,
   uploadEncryptedAttachment,
   type EncryptedSendOutcome,
   type AttachmentPlaintextPolicy,
-  type DownloadedEncryptedAttachment,
   type PrekeyLease,
   PrekeyLeaseError,
 } from "../transport/nodeClient";
@@ -160,6 +164,64 @@ function attachmentPlaintextPolicy(
     expectedBytes: attachment.sizeBytes,
     maxBytes: MEDIA_LIMIT_BYTES[attachment.mediaType],
   };
+}
+
+async function downloadAndDecryptAttachmentRecords(
+  session: AccountSession,
+  message: ChatMessage,
+  attachment: NonNullable<ChatMessage["attachment"]>,
+  key: Uint8Array,
+  cipher: InMemoryPayloadCipher,
+  signal?: AbortSignal,
+): Promise<{ plaintext: Uint8Array; claim?: string }> {
+  if (!Number.isSafeInteger(attachment.sizeBytes) || attachment.sizeBytes <= 0 ||
+    attachment.sizeBytes > MEDIA_LIMIT_BYTES[attachment.mediaType]) {
+    throw new Error("Attachment unavailable");
+  }
+  const plaintext = new Uint8Array(attachment.sizeBytes);
+  let plaintextOffset = 0;
+  let claim: string | undefined;
+  try {
+    const streamed = await streamEncryptedAttachmentRecords(
+      session,
+      attachment.id,
+      { mediaType: attachment.mediaType, expectedPlaintextBytes: attachment.sizeBytes },
+      (record, chunkIndex) => {
+        signal?.throwIfAborted();
+        const chunk = cipher.decryptAttachmentChunk(
+          message.chatId,
+          message.id,
+          message.sender,
+          attachment.mediaType,
+          key,
+          attachment.sizeBytes,
+          chunkIndex,
+          record,
+        );
+        try {
+          const expected = Math.min(
+            ATTACHMENT_CHUNK_PLAINTEXT_BYTES,
+            attachment.sizeBytes - plaintextOffset,
+          );
+          if (chunk.byteLength !== expected) throw new Error("Attachment unavailable");
+          plaintext.set(chunk, plaintextOffset);
+          plaintextOffset += chunk.byteLength;
+        } finally {
+          wipeBytes(chunk);
+        }
+      },
+      signal,
+    );
+    claim = streamed.claim;
+    if (plaintextOffset !== attachment.sizeBytes) throw new Error("Attachment unavailable");
+    return claim ? { plaintext, claim } : { plaintext };
+  } catch (error) {
+    wipeBytes(plaintext);
+    if (claim) {
+      await releaseAttachmentDownloadClaim(session, attachment.id, claim).catch(() => undefined);
+    }
+    throw error;
+  }
 }
 
 export function useAbyssalSession() {
@@ -1634,34 +1696,30 @@ export function useAbyssalSession() {
       return false;
     }
 
-    let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-    let encrypted: EncryptedAttachment | null = null;
+    let encrypted: EncryptedAttachmentUpload | null = null;
     let message: ChatMessage | null = null;
     let retainedMessage: ChatMessage | null = null;
     let uploadedAttachmentId: string | null = null;
     let metadataAmbiguous = false;
     const operation = startAttachmentOperation(() => {
-      wipeBytes(plain);
-      if (encrypted) {
-        wipeBytes(encrypted.key);
-        wipeBytes(encrypted.blob);
-      }
+      if (encrypted) wipeBytes(encrypted.key);
       if (!retainedMessage?.attachment && message?.attachment) {
         wipeBytes(message.attachment.encryptionKey);
       }
     });
     try {
       setUpload({ active: true, name: file.name || "attachment", loaded: 0, total: file.size });
-      const fileBuffer = await file.arrayBuffer();
-      plain = new Uint8Array(fileBuffer);
-      if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const messageId = crypto.randomUUID();
-      encrypted = cipherRef.current.encryptAttachment(
-        chatId,
-        messageId,
-        currentSession.username,
-        mediaType,
-        plain,
+      encrypted = await encryptAttachmentFile(
+        file,
+        { chatId, messageId, senderUsername: currentSession.username, mediaType },
+        cipherRef.current,
+        (loaded) => {
+          if (attachmentOperationActive(operation, currentSession.token)) {
+            setUpload({ active: true, name: file.name || "attachment", loaded, total: file.size });
+          }
+        },
+        operation.controller.signal,
       );
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const ttlSec = absoluteRetention(room, mediaType);
@@ -1670,11 +1728,14 @@ export function useAbyssalSession() {
         chatId,
         messageId,
         mediaType,
-        encrypted.blob,
+        encrypted.body,
         { ...options, ttlSec },
         (progress) => {
           if (attachmentOperationActive(operation, currentSession.token)) {
-            setUpload({ active: true, name: file.name || "attachment", ...progress });
+            const loaded = progress.total > 0
+              ? Math.min(file.size, Math.floor((progress.loaded / progress.total) * file.size))
+              : 0;
+            setUpload({ active: true, name: file.name || "attachment", loaded, total: file.size });
           }
         },
         operation.controller.signal,
@@ -1775,55 +1836,49 @@ export function useAbyssalSession() {
       return;
     }
     clearMedia();
-    let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-    let downloaded: DownloadedEncryptedAttachment | null = null;
+    let claim: string | undefined;
     let claimHandled = false;
     let objectUrl: string | null = null;
     const operation = startAttachmentOperation(() => {
       wipeBytes(key);
-      wipeBytes(encrypted);
       wipeBytes(plain);
     });
     try {
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       if (
         attachment.encryptionVersion !== ATTACHMENT_CIPHER_VERSION ||
-        attachment.encryptionKey.byteLength !== 32
+        attachment.encryptionKey.byteLength !== ATTACHMENT_KEY_BYTES
       ) throw new Error("Payload unavailable");
       key = attachment.encryptionKey.slice();
-      downloaded = await downloadEncryptedAttachment(
+      const decrypted = await downloadAndDecryptAttachmentRecords(
         currentSession,
-        attachment.id,
-        { mediaType: attachment.mediaType, expectedPlaintextBytes: attachment.sizeBytes },
+        message,
+        attachment,
+        key,
+        cipherRef.current,
         operation.controller.signal,
       );
-      encrypted = downloaded.bytes;
+      plain = decrypted.plaintext;
+      claim = decrypted.claim;
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       try {
         plain = await decryptAndCompleteAttachment(
           currentSession,
           attachment.id,
-          downloaded,
+          claim,
           () => {
             if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
-            return cipherRef.current.decryptAttachment(
-              message.chatId,
-              message.id,
-              message.sender,
-              attachment.mediaType,
-              key,
-              encrypted,
-            );
+            return plain;
           },
           attachmentPlaintextPolicy(attachment),
           operation.controller.signal,
         );
       } finally {
-        claimHandled = downloaded.claim !== undefined;
+        claimHandled = claim !== undefined;
       }
-      if (downloaded.claim) wipeMessageAttachment(message);
+      if (claim) wipeMessageAttachment(message);
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       const blob = attachmentDownloadBlob(plain, attachment.mimeType);
       objectUrl = URL.createObjectURL(blob);
@@ -1843,8 +1898,8 @@ export function useAbyssalSession() {
       if (attachment.oneTime) wipeMessageAttachment(message);
     } catch {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
-      if (downloaded?.claim && !claimHandled) {
-        await releaseAttachmentDownloadClaim(currentSession, attachment.id, downloaded.claim).catch(() => undefined);
+      if (claim && !claimHandled) {
+        await releaseAttachmentDownloadClaim(currentSession, attachment.id, claim).catch(() => undefined);
       }
       if (attachmentOperationActive(operation, currentSession.token)) setNotice("Action unavailable.");
     } finally {
@@ -1871,55 +1926,49 @@ export function useAbyssalSession() {
       setNotice("Verify this direct chat's safety number before exporting attachments.");
       return;
     }
-    let encrypted: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-    let downloaded: DownloadedEncryptedAttachment | null = null;
+    let claim: string | undefined;
     let claimHandled = false;
     let exportUrl: string | null = null;
     const operation = startAttachmentOperation(() => {
       wipeBytes(key);
-      wipeBytes(encrypted);
       wipeBytes(plain);
     });
     try {
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       if (
         attachment.encryptionVersion !== ATTACHMENT_CIPHER_VERSION ||
-        attachment.encryptionKey.byteLength !== 32
+        attachment.encryptionKey.byteLength !== ATTACHMENT_KEY_BYTES
       ) throw new Error("Payload unavailable");
       key = attachment.encryptionKey.slice();
-      downloaded = await downloadEncryptedAttachment(
+      const decrypted = await downloadAndDecryptAttachmentRecords(
         currentSession,
-        attachment.id,
-        { mediaType: attachment.mediaType, expectedPlaintextBytes: attachment.sizeBytes },
+        message,
+        attachment,
+        key,
+        cipherRef.current,
         operation.controller.signal,
       );
-      encrypted = downloaded.bytes;
+      plain = decrypted.plaintext;
+      claim = decrypted.claim;
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       try {
         plain = await decryptAndCompleteAttachment(
           currentSession,
           attachment.id,
-          downloaded,
+          claim,
           () => {
             if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
-            return cipherRef.current.decryptAttachment(
-              message.chatId,
-              message.id,
-              message.sender,
-              attachment.mediaType,
-              key,
-              encrypted,
-            );
+            return plain;
           },
           attachmentPlaintextPolicy(attachment),
           operation.controller.signal,
         );
       } finally {
-        claimHandled = downloaded.claim !== undefined;
+        claimHandled = claim !== undefined;
       }
-      if (downloaded.claim) wipeMessageAttachment(message);
+      if (claim) wipeMessageAttachment(message);
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
       exportUrl = URL.createObjectURL(attachmentDownloadBlob(plain, attachment.mimeType));
       if (!attachmentOperationActive(operation, currentSession.token)) throw new Error("Action unavailable");
@@ -1939,8 +1988,8 @@ export function useAbyssalSession() {
       markRoomRead(message.chatId);
     } catch {
       if (exportUrl) revokeExportUrl(exportUrl);
-      if (downloaded?.claim && !claimHandled) {
-        await releaseAttachmentDownloadClaim(currentSession, attachment.id, downloaded.claim).catch(() => undefined);
+      if (claim && !claimHandled) {
+        await releaseAttachmentDownloadClaim(currentSession, attachment.id, claim).catch(() => undefined);
       }
       if (attachmentOperationActive(operation, currentSession.token)) setNotice("Action unavailable.");
     } finally {
@@ -2389,7 +2438,7 @@ function parsePayload(
   } catch {
     return null;
   }
-  if (encryptionKey.byteLength !== 32) {
+  if (encryptionKey.byteLength !== ATTACHMENT_KEY_BYTES) {
     wipeBytes(encryptionKey);
     return null;
   }

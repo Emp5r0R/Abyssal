@@ -4,8 +4,9 @@ import java.util.Locale
 
 /**
  * The wire protocol remains capped at 20/100/200 MiB. Android admits a
- * smaller buffer when the process heap cannot safely hold the plaintext,
- * encrypted blob, native bridge copies, and UI/runtime headroom together.
+ * smaller download buffer when the process heap cannot safely hold the final
+ * plaintext, decoded media/UI copies, per-record JNI buffers, and headroom.
+ * Uploads stream plaintext from the provider and use the protocol limit.
  */
 internal object AttachmentMemoryPolicy {
     const val IMAGE_LIMIT_BYTES = 20L * 1024L * 1024L
@@ -35,7 +36,7 @@ internal object AttachmentMemoryPolicy {
 
     fun effectiveWireLimitBytes(mediaType: String, runtime: Runtime = Runtime.getRuntime()): Long {
         val plaintextLimit = effectiveLimitBytes(mediaType, runtime)
-        return if (plaintextLimit <= 0L) 0L else plaintextLimit + ATTACHMENT_WIRE_OVERHEAD_BYTES
+        return expectedEncryptedAttachmentBytes(plaintextLimit) ?: 0L
     }
 }
 

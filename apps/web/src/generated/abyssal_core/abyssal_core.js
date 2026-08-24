@@ -1082,6 +1082,21 @@ export class WasmMlsRoomInfo {
 if (Symbol.dispose) WasmMlsRoomInfo.prototype[Symbol.dispose] = WasmMlsRoomInfo.prototype.free;
 
 /**
+ * @param {string} media_type
+ * @param {bigint} total_plaintext_bytes
+ * @returns {bigint}
+ */
+export function attachmentEncryptedSize(media_type, total_plaintext_bytes) {
+    const ptr0 = passStringToWasm0(media_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.attachmentEncryptedSize(ptr0, len0, total_plaintext_bytes);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return BigInt.asUintN(64, ret[0]);
+}
+
+/**
  * @param {Uint8Array} first_public_key
  * @param {Uint8Array} second_public_key
  * @returns {string}
@@ -1185,6 +1200,39 @@ export function decryptAttachment(chat_id, message_id, sender_username, media_ty
  * @param {string} message_id
  * @param {string} sender_username
  * @param {string} media_type
+ * @param {Uint8Array} key
+ * @param {bigint} expected_total_plaintext_bytes
+ * @param {number} expected_chunk_index
+ * @param {Uint8Array} record
+ * @returns {Uint8Array}
+ */
+export function decryptAttachmentChunk(chat_id, message_id, sender_username, media_type, key, expected_total_plaintext_bytes, expected_chunk_index, record) {
+    const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(media_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray8ToWasm0(key, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passArray8ToWasm0(record, wasm.__wbindgen_malloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.decryptAttachmentChunk(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, expected_total_plaintext_bytes, expected_chunk_index, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * @param {string} chat_id
+ * @param {string} message_id
+ * @param {string} sender_username
+ * @param {string} media_type
  * @param {Uint8Array} plaintext
  * @returns {string}
  */
@@ -1215,6 +1263,49 @@ export function encryptAttachment(chat_id, message_id, sender_username, media_ty
     } finally {
         wasm.__wbindgen_free(deferred7_0, deferred7_1, 1);
     }
+}
+
+/**
+ * @param {string} chat_id
+ * @param {string} message_id
+ * @param {string} sender_username
+ * @param {string} media_type
+ * @param {Uint8Array} key
+ * @param {bigint} total_plaintext_bytes
+ * @param {number} chunk_index
+ * @param {Uint8Array} plaintext
+ * @returns {Uint8Array}
+ */
+export function encryptAttachmentChunk(chat_id, message_id, sender_username, media_type, key, total_plaintext_bytes, chunk_index, plaintext) {
+    const ptr0 = passStringToWasm0(chat_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(message_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(sender_username, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(media_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ptr4 = passArray8ToWasm0(key, wasm.__wbindgen_malloc);
+    const len4 = WASM_VECTOR_LEN;
+    const ptr5 = passArray8ToWasm0(plaintext, wasm.__wbindgen_malloc);
+    const len5 = WASM_VECTOR_LEN;
+    const ret = wasm.encryptAttachmentChunk(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, total_plaintext_bytes, chunk_index, ptr5, len5);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v7 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v7;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function generateAttachmentKey() {
+    const ret = wasm.generateAttachmentKey();
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
 }
 
 /**

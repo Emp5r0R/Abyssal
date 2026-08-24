@@ -113,13 +113,21 @@ export class WasmMlsRoomInfo {
     readonly roomId: string;
 }
 
+export function attachmentEncryptedSize(media_type: string, total_plaintext_bytes: bigint): bigint;
+
 export function conversationSafetyNumber(first_public_key: Uint8Array, second_public_key: Uint8Array): string;
 
 export function conversationVerificationToken(node_id: string, chat_id: string, first_username: string, first_public_key: Uint8Array, second_username: string, second_public_key: Uint8Array): string;
 
 export function decryptAttachment(chat_id: string, message_id: string, sender_username: string, media_type: string, key: Uint8Array, blob: Uint8Array): Uint8Array;
 
+export function decryptAttachmentChunk(chat_id: string, message_id: string, sender_username: string, media_type: string, key: Uint8Array, expected_total_plaintext_bytes: bigint, expected_chunk_index: number, record: Uint8Array): Uint8Array;
+
 export function encryptAttachment(chat_id: string, message_id: string, sender_username: string, media_type: string, plaintext: Uint8Array): string;
+
+export function encryptAttachmentChunk(chat_id: string, message_id: string, sender_username: string, media_type: string, key: Uint8Array, total_plaintext_bytes: bigint, chunk_index: number, plaintext: Uint8Array): Uint8Array;
+
+export function generateAttachmentKey(): Uint8Array;
 
 export function inspectReleaseManifest(manifest_json: Uint8Array, signature: Uint8Array): string;
 
@@ -149,10 +157,13 @@ export interface InitOutput {
     readonly __wbg_wasmmlsprocessedcontrol_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlsroom_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlsroominfo_free: (a: number, b: number) => void;
+    readonly attachmentEncryptedSize: (a: number, b: number, c: bigint) => [bigint, number, number];
     readonly conversationSafetyNumber: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly conversationVerificationToken: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly decryptAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
+    readonly decryptAttachmentChunk: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number, m: number, n: number) => [number, number, number, number];
     readonly encryptAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
+    readonly encryptAttachmentChunk: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number, m: number, n: number) => [number, number, number, number];
     readonly ffi_abyssal_core_rust_future_cancel_f32: (a: bigint) => void;
     readonly ffi_abyssal_core_rust_future_complete_f32: (a: bigint, b: number) => number;
     readonly ffi_abyssal_core_rust_future_complete_f64: (a: bigint, b: number) => number;
@@ -182,6 +193,7 @@ export interface InitOutput {
     readonly ffi_abyssal_core_rustbuffer_from_bytes: (a: number, b: number, c: number) => void;
     readonly ffi_abyssal_core_rustbuffer_reserve: (a: number, b: number, c: bigint, d: number) => void;
     readonly ffi_abyssal_core_uniffi_contract_version: () => number;
+    readonly generateAttachmentKey: () => [number, number];
     readonly inspectReleaseManifest: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly opaqueClientFinishLogin: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly opaqueClientFinishRegistration: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
@@ -191,10 +203,14 @@ export interface InitOutput {
     readonly releaseTrustAnchorConfigured: () => number;
     readonly uniffi_abyssal_core_checksum_constructor_e2eesession_create: () => number;
     readonly uniffi_abyssal_core_checksum_constructor_e2eesession_recover: () => number;
+    readonly uniffi_abyssal_core_checksum_func_attachment_encrypted_size: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_safety_number: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_verification_token: () => number;
     readonly uniffi_abyssal_core_checksum_func_decrypt_attachment: () => number;
+    readonly uniffi_abyssal_core_checksum_func_decrypt_attachment_chunk: () => number;
     readonly uniffi_abyssal_core_checksum_func_encrypt_attachment: () => number;
+    readonly uniffi_abyssal_core_checksum_func_encrypt_attachment_chunk: () => number;
+    readonly uniffi_abyssal_core_checksum_func_generate_attachment_key: () => number;
     readonly uniffi_abyssal_core_checksum_func_inspect_release_manifest: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_finish_login: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_finish_registration: () => number;
@@ -242,10 +258,14 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_free_e2eesession: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_free_mlsprocessedcontrol: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_free_mlsroom: (a: bigint, b: number) => void;
+    readonly uniffi_abyssal_core_fn_func_attachment_encrypted_size: (a: number, b: bigint, c: number) => bigint;
     readonly uniffi_abyssal_core_fn_func_conversation_safety_number: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_conversation_verification_token: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly uniffi_abyssal_core_fn_func_decrypt_attachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly uniffi_abyssal_core_fn_func_decrypt_attachment_chunk: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly uniffi_abyssal_core_fn_func_encrypt_attachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly uniffi_abyssal_core_fn_func_encrypt_attachment_chunk: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
+    readonly uniffi_abyssal_core_fn_func_generate_attachment_key: (a: number, b: number) => void;
     readonly uniffi_abyssal_core_fn_func_inspect_release_manifest: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_finish_login: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_finish_registration: (a: number, b: number, c: number, d: number, e: number) => void;
@@ -390,9 +410,9 @@ export interface InitOutput {
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_start: () => void;
 }
 

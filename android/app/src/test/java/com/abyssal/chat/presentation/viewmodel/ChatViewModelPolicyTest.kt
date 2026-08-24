@@ -1,6 +1,7 @@
 package com.abyssal.chat.presentation.viewmodel
 
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
+import com.abyssal.chat.domain.model.AttachmentProtocol
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.ChatSession
@@ -1093,7 +1094,7 @@ class ChatViewModelPolicyTest {
             isMedia = true,
             mediaType = "FILE",
             attachmentId = "123e4567-e89b-12d3-a456-426614174000",
-            attachmentCipherVersion = ATTACHMENT_CIPHER_VERSION,
+            attachmentCipherVersion = AttachmentProtocol.CIPHER_VERSION,
             attachmentKey = key,
             attachmentName = "report.pdf",
             attachmentMimeType = "application/pdf",
@@ -1106,7 +1107,10 @@ class ChatViewModelPolicyTest {
             assertEquals("attachment", json.optString("kind"))
             assertEquals(message.id, json.optString("id"))
             assertEquals("android", json.optString("sender_client"))
-            assertEquals(ATTACHMENT_CIPHER_VERSION, json.optInt("attachment_cipher_version"))
+            assertEquals(
+                AttachmentProtocol.CIPHER_VERSION,
+                json.optInt("attachment_cipher_version")
+            )
             assertTrue(json.optString("attachment_key_b64").matches(Regex("^[A-Za-z0-9_-]{43}$")))
             assertFalse(json.has("attachment_crypto_id"))
         } finally {
@@ -1726,7 +1730,7 @@ class ChatViewModelPolicyTest {
         isMedia = true,
         mediaType = "FILE",
         attachmentId = "123e4567-e89b-12d3-a456-42661417400$seed",
-        attachmentCipherVersion = ATTACHMENT_CIPHER_VERSION,
+        attachmentCipherVersion = AttachmentProtocol.CIPHER_VERSION,
         attachmentKey = ByteArray(32) { (seed + it).toByte() },
         attachmentName = "report.pdf",
         attachmentMimeType = "application/pdf",

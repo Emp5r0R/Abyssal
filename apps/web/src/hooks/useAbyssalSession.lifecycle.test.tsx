@@ -222,14 +222,45 @@ const mocks = vi.hoisted(() => {
 
     encryptAttachment(_chatId: string, _messageId: string, _sender: string, _mediaType: string, plain: Uint8Array) {
       const key = new Uint8Array(32).fill(9);
-      const blob = new Uint8Array(plain.byteLength + 41).fill(8);
+      const blob = new Uint8Array(262_201).fill(8);
       FakeCipher.lastAttachmentPlain = plain;
       FakeCipher.lastAttachmentKey = key;
       FakeCipher.lastAttachmentBlob = blob;
-      return { version: 1, key, blob };
+      return { version: 2, key, blob };
+    }
+
+    generateAttachmentKey(): Uint8Array {
+      const key = new Uint8Array(32).fill(9);
+      FakeCipher.lastAttachmentKey = key;
+      return key;
+    }
+
+    attachmentEncryptedSize(_mediaType: string, plaintextBytes: number): number {
+      return Math.ceil(plaintextBytes / (256 * 1024)) * 262_201;
+    }
+
+    encryptAttachmentChunk(
+      _chatId: string,
+      _messageId: string,
+      _sender: string,
+      _mediaType: string,
+      _key: Uint8Array,
+      _totalPlaintextBytes: number,
+      _chunkIndex: number,
+      plain: Uint8Array,
+    ): Uint8Array {
+      const blob = new Uint8Array(262_201).fill(8);
+      blob[0] = 2;
+      FakeCipher.lastAttachmentPlain = plain;
+      FakeCipher.lastAttachmentBlob = blob;
+      return blob;
     }
 
     decryptAttachment(): Uint8Array {
+      return new Uint8Array([8, 9, 10]);
+    }
+
+    decryptAttachmentChunk(): Uint8Array {
       return new Uint8Array([8, 9, 10]);
     }
 
@@ -405,6 +436,11 @@ const mocks = vi.hoisted(() => {
     })),
     revokeSession: vi.fn(async () => undefined),
     downloadEncryptedAttachment: vi.fn(async () => ({ bytes: new Uint8Array([1, 2, 3]) })),
+    streamEncryptedAttachmentRecords: vi.fn(async (...args: unknown[]) => {
+      const onRecord = args[3] as (record: Uint8Array, index: number) => void | Promise<void>;
+      await onRecord(new Uint8Array(262_201).fill(2), 0);
+      return {};
+    }),
     decryptAndCompleteAttachment: vi.fn(async () => new Uint8Array([8, 9, 10])),
     uploadEncryptedAttachment: vi.fn(async () => "123e4567-e89b-42d3-a456-426614174000"),
     deleteUploadedAttachment: vi.fn(async () => undefined),
@@ -450,6 +486,7 @@ vi.mock("../transport/nodeClient", async () => {
     finishOpaqueAccount: mocks.finishOpaqueAccount,
     revokeSession: mocks.revokeSession,
     downloadEncryptedAttachment: mocks.downloadEncryptedAttachment,
+    streamEncryptedAttachmentRecords: mocks.streamEncryptedAttachmentRecords,
     decryptAndCompleteAttachment: mocks.decryptAndCompleteAttachment,
     uploadEncryptedAttachment: mocks.uploadEncryptedAttachment,
     deleteUploadedAttachment: mocks.deleteUploadedAttachment,
@@ -1590,7 +1627,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       mine: false,
       attachment: {
         id: "123e4567-e89b-42d3-a456-426614174000",
-        encryptionVersion: 1,
+        encryptionVersion: 2,
         encryptionKey: new Uint8Array(32).fill(9),
         name: "secret.txt",
         mediaType: "FILE" as const,
@@ -1649,7 +1686,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         mine: false,
         attachment: {
           id: "123e4567-e89b-42d3-a456-426614174000",
-          encryptionVersion: 1,
+          encryptionVersion: 2,
           encryptionKey: new Uint8Array(32).fill(9),
           name: "secret.txt",
           mediaType: "FILE",
@@ -1778,8 +1815,8 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("aborts an in-flight attachment download, wipes the copied key, and revokes exports on purge", async () => {
     let downloadSignal: AbortSignal | undefined;
-    mocks.downloadEncryptedAttachment.mockImplementationOnce((...args: unknown[]) => new Promise(( _resolve, reject) => {
-      downloadSignal = args[3] as AbortSignal;
+    mocks.streamEncryptedAttachmentRecords.mockImplementationOnce((...args: unknown[]) => new Promise(( _resolve, reject) => {
+      downloadSignal = args[4] as AbortSignal;
       downloadSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
     }));
     const { result, unmount } = renderHook(() => useAbyssalSession());
@@ -1811,7 +1848,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       mine: false,
       attachment: {
         id: "123e4567-e89b-42d3-a456-426614174000",
-        encryptionVersion: 1,
+        encryptionVersion: 2,
         encryptionKey: new Uint8Array(32).fill(9),
         name: "secret.txt",
         mediaType: "FILE" as const,
@@ -1845,7 +1882,11 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(copiedKeys[0]?.every((byte) => byte === 0)).toBe(true);
     expect(result.current.media).toBeNull();
 
-    mocks.downloadEncryptedAttachment.mockResolvedValueOnce({ bytes: new Uint8Array([1, 2, 3]) });
+    mocks.streamEncryptedAttachmentRecords.mockImplementationOnce(async (...args: unknown[]) => {
+      const onRecord = args[3] as (record: Uint8Array, index: number) => void | Promise<void>;
+      await onRecord(new Uint8Array(262_201).fill(2), 0);
+      return {};
+    });
     await act(async () => {
       await result.current.login({
         nodeUrl: "https://node.example.test",
@@ -2026,7 +2067,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       mine: false,
       attachment: {
         id: "123e4567-e89b-42d3-a456-426614174000",
-        encryptionVersion: 1,
+        encryptionVersion: 2,
         encryptionKey: new Uint8Array(32).fill(9),
         name: "secret.txt",
         mediaType: "FILE" as const,
@@ -2047,7 +2088,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(relay?.leasesRequested).toEqual([]);
     expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message")).toHaveLength(0);
     expect(mocks.uploadEncryptedAttachment).not.toHaveBeenCalled();
-    expect(mocks.downloadEncryptedAttachment).not.toHaveBeenCalled();
+    expect(mocks.streamEncryptedAttachmentRecords).not.toHaveBeenCalled();
 
     // An incoming message may be decrypted and acknowledged, but opening the
     // unverified direct chat must not emit a read receipt. Local read state is

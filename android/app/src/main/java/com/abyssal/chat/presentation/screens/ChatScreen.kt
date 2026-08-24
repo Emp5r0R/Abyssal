@@ -110,7 +110,11 @@ import com.abyssal.chat.domain.model.SenderClient
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.UserPresence
 import com.abyssal.chat.data.network.BoundedInputReader
+import com.abyssal.chat.data.network.ByteArrayAttachmentSource
+import com.abyssal.chat.data.network.ContentUriAttachmentSource
 import com.abyssal.chat.data.network.attachmentSelectionLimitBytes
+import com.abyssal.chat.data.network.protocolAttachmentLimitBytes
+import com.abyssal.chat.domain.repository.IAttachmentPlaintextSource
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.theme.DeepBlack
@@ -155,7 +159,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         directTrust = directTrust,
         onBack = { viewModel.navigateTo(Screen.Dashboard) },
         onSendMessage = viewModel::sendMessage,
-        onSendAttachment = viewModel::sendAttachment,
+        onSendAttachmentSource = viewModel::sendAttachmentSource,
         onMessageVisible = viewModel::markMessageAsRead,
         onViewAttachment = viewModel::viewAttachment,
         onSaveAttachment = viewModel::saveAttachment,
@@ -180,7 +184,17 @@ private fun ChatContent(
     directTrust: DirectTrustStatus,
     onBack: () -> Unit,
     onSendMessage: (String, Int, String?) -> Unit,
-    onSendAttachment: (String, String, String, ByteArray, Int, Boolean, Boolean, String?, String?) -> Unit,
+    onSendAttachmentSource: (
+        String,
+        String,
+        String,
+        IAttachmentPlaintextSource,
+        Int,
+        Boolean,
+        Boolean,
+        String?,
+        String?
+    ) -> Unit,
     onMessageVisible: (String) -> Unit,
     onViewAttachment: (Message) -> Unit,
     onSaveAttachment: (Message, Uri) -> Unit,
@@ -403,11 +417,11 @@ private fun ChatContent(
                                 val payload = withContext(Dispatchers.IO) {
                                     context.readBundledEmoji(reaction)
                                 } ?: return@launch
-                                onSendAttachment(
+                                onSendAttachmentSource(
                                     "IMAGE",
                                     payload.fileName,
                                     payload.mimeType,
-                                    payload.bytes,
+                                    ByteArrayAttachmentSource(payload.bytes),
                                     selectedTimerSec,
                                     false,
                                     false,
@@ -443,12 +457,12 @@ private fun ChatContent(
                 selectedTimerSec = selectedTimerSec,
                 attachmentError = attachmentError,
                 onDismiss = { showAttachmentDialog = false },
-                onSendAttachment = { type, name, mime, bytes, oneTime, deleteAfterDownload ->
-                    onSendAttachment(
+                onSendAttachment = { type, name, mime, source, oneTime, deleteAfterDownload ->
+                    onSendAttachmentSource(
                         type,
                         name,
                         mime,
-                        bytes,
+                        source,
                         selectedTimerSec,
                         oneTime,
                         deleteAfterDownload,
@@ -468,11 +482,11 @@ private fun ChatContent(
                 session = session,
                 onDismiss = { showBundledGifDialog = false },
                 onSend = { asset ->
-                    onSendAttachment(
+                    onSendAttachmentSource(
                         "IMAGE",
                         asset.fileName,
                         asset.mimeType,
-                        asset.bytes,
+                        ByteArrayAttachmentSource(asset.bytes),
                         selectedTimerSec,
                         false,
                         false,
@@ -988,7 +1002,14 @@ private fun AttachmentDialog(
     selectedTimerSec: Int,
     attachmentError: String?,
     onDismiss: () -> Unit,
-    onSendAttachment: (String, String, String, ByteArray, Boolean, Boolean) -> Unit,
+    onSendAttachment: (
+        String,
+        String,
+        String,
+        IAttachmentPlaintextSource,
+        Boolean,
+        Boolean
+    ) -> Unit,
     onExternalSystemUiStart: () -> Long,
     onExternalSystemUiEnd: (Long) -> Boolean
 ) {
@@ -1006,7 +1027,7 @@ private fun AttachmentDialog(
         scope.launch {
             try {
                 val picked = withContext(Dispatchers.IO) {
-                    context.readPickedAttachment(uri, mediaType, attachmentSelectionLimitBytes(mediaType))
+                    context.readPickedAttachment(uri, mediaType, protocolAttachmentLimitBytes(mediaType))
                 }
                 if (picked == null) {
                     localError = "Wrong information."
@@ -1017,13 +1038,13 @@ private fun AttachmentDialog(
                             picked.mediaType,
                             picked.name,
                             picked.mimeType,
-                            picked.bytes,
+                            picked.source,
                             oneTimeView && allowOneTime,
                             deleteAfterDownload || (oneTimeView && allowOneTime)
                         )
                         transferred = true
                     } finally {
-                        if (!transferred) picked.bytes.fill(0)
+                        if (!transferred) picked.source.destroy()
                     }
                 }
             } catch (error: CancellationException) {
@@ -2076,7 +2097,7 @@ private data class PickedAttachment(
     val mediaType: String,
     val name: String,
     val mimeType: String,
-    val bytes: ByteArray
+    val source: IAttachmentPlaintextSource
 )
 
 private data class BundledEmojiAsset(
@@ -2154,16 +2175,18 @@ private fun Context.readPickedAttachment(uri: Uri, mediaType: String, maxBytes: 
                 null
             }
         } ?: "attachment"
-        if (knownSize > maxBytes) return@runCatching null
+        if (knownSize <= 0L) {
+            knownSize = contentResolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
+                descriptor.length
+            } ?: -1L
+        }
+        if (knownSize !in 1L..maxBytes) return@runCatching null
         val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-        val bytes = contentResolver.openInputStream(uri)?.use { input ->
-            BoundedInputReader.read(input, maxBytes)
-        } ?: return@runCatching null
         PickedAttachment(
             mediaType = mediaType,
             name = AttachmentSavePolicy.sanitizedFileName(name),
             mimeType = mimeType.take(128),
-            bytes = bytes
+            source = ContentUriAttachmentSource(contentResolver, uri, knownSize)
         )
     }.getOrNull()
 }
@@ -2262,7 +2285,7 @@ private fun ChatContentPreview() {
         directTrust = DirectTrustStatus(),
         onBack = {},
         onSendMessage = { _, _, _ -> },
-        onSendAttachment = { _, _, _, _, _, _, _, _, _ -> },
+        onSendAttachmentSource = { _, _, _, source, _, _, _, _, _ -> source.destroy() },
         onMessageVisible = {},
         onViewAttachment = {},
         onSaveAttachment = { _, _ -> },

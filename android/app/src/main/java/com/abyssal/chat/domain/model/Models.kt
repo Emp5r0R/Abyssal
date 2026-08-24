@@ -324,10 +324,12 @@ data class PrekeyLease(
 
 data class AttachmentUploadResult(
     val accepted: Boolean,
-    val attachmentId: String? = null
+    val attachmentId: String? = null,
+    val cipherVersion: Int = 0,
+    val encryptionKey: ByteArray? = null
 )
 
-data class EncryptedAttachmentDownload(
+data class DecryptedAttachmentDownload(
     val bytes: ByteArray,
     val claim: String? = null
 )

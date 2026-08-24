@@ -687,13 +687,21 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_func_verify_release_manifest(
     ): Int
+    external fun uniffi_abyssal_core_checksum_func_attachment_encrypted_size(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_conversation_safety_number(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_conversation_verification_token(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_decrypt_attachment(
     ): Int
+    external fun uniffi_abyssal_core_checksum_func_decrypt_attachment_chunk(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_encrypt_attachment(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_encrypt_attachment_chunk(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_generate_attachment_key(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_opaque_client_finish_login(
     ): Int
@@ -879,13 +887,21 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_abyssal_core_fn_func_verify_release_manifest(`manifestJson`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,`nowMs`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_attachment_encrypted_size(`mediaType`: RustBuffer.ByValue,`totalPlaintextBytes`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
     external fun uniffi_abyssal_core_fn_func_conversation_safety_number(`firstPublicKey`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_conversation_verification_token(`nodeId`: RustBuffer.ByValue,`chatId`: RustBuffer.ByValue,`firstUsername`: RustBuffer.ByValue,`firstPublicKey`: RustBuffer.ByValue,`secondUsername`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_decrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`blob`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_decrypt_attachment_chunk(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`expectedTotalPlaintextBytes`: Long,`expectedChunkIndex`: Int,`record`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_encrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_encrypt_attachment_chunk(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`totalPlaintextBytes`: Long,`chunkIndex`: Int,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_generate_attachment_key(uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_opaque_client_finish_login(`password`: RustBuffer.ByValue,`loginState`: RustBuffer.ByValue,`credentialResponse`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -1030,6 +1046,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_verify_release_manifest() != 45958) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_func_attachment_encrypted_size() != 39031) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_func_conversation_safety_number() != 24566) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1039,7 +1058,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_decrypt_attachment() != 57237) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_func_decrypt_attachment_chunk() != 31214) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_func_encrypt_attachment() != 28381) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_encrypt_attachment_chunk() != 3416) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_generate_attachment_key() != 23074) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_func_opaque_client_finish_login() != 16464) {
@@ -3872,6 +3900,19 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
     }
 
 
+    @Throws(AbyssalException::class) fun `attachmentEncryptedSize`(`mediaType`: kotlin.String, `totalPlaintextBytes`: kotlin.ULong): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_attachment_encrypted_size(
+
+
+        FfiConverterString.lower(`mediaType`),
+        FfiConverterULong.lower(`totalPlaintextBytes`),_status)
+}
+    )
+    }
+
+
     @Throws(AbyssalException::class) fun `conversationSafetyNumber`(`firstPublicKey`: kotlin.ByteArray, `secondPublicKey`: kotlin.ByteArray): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCallWithError(AbyssalException) { _status ->
@@ -3927,6 +3968,25 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
     }
 
 
+    @Throws(AbyssalException::class) fun `decryptAttachmentChunk`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `mediaType`: kotlin.String, `key`: kotlin.ByteArray, `expectedTotalPlaintextBytes`: kotlin.ULong, `expectedChunkIndex`: kotlin.UInt, `record`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_decrypt_attachment_chunk(
+
+
+        FfiConverterString.lower(`chatId`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterString.lower(`senderUsername`),
+        FfiConverterString.lower(`mediaType`),
+        FfiConverterByteArray.lower(`key`),
+        FfiConverterULong.lower(`expectedTotalPlaintextBytes`),
+        FfiConverterUInt.lower(`expectedChunkIndex`),
+        FfiConverterByteArray.lower(`record`),_status)
+}
+    )
+    }
+
+
     @Throws(AbyssalException::class) fun `encryptAttachment`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `mediaType`: kotlin.String, `plaintext`: kotlin.ByteArray): AttachmentCiphertext {
             return FfiConverterTypeAttachmentCiphertext.lift(
     uniffiRustCallWithError(AbyssalException) { _status ->
@@ -3938,6 +3998,35 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
         FfiConverterString.lower(`senderUsername`),
         FfiConverterString.lower(`mediaType`),
         FfiConverterByteArray.lower(`plaintext`),_status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `encryptAttachmentChunk`(`chatId`: kotlin.String, `messageId`: kotlin.String, `senderUsername`: kotlin.String, `mediaType`: kotlin.String, `key`: kotlin.ByteArray, `totalPlaintextBytes`: kotlin.ULong, `chunkIndex`: kotlin.UInt, `plaintext`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_encrypt_attachment_chunk(
+
+
+        FfiConverterString.lower(`chatId`),
+        FfiConverterString.lower(`messageId`),
+        FfiConverterString.lower(`senderUsername`),
+        FfiConverterString.lower(`mediaType`),
+        FfiConverterByteArray.lower(`key`),
+        FfiConverterULong.lower(`totalPlaintextBytes`),
+        FfiConverterUInt.lower(`chunkIndex`),
+        FfiConverterByteArray.lower(`plaintext`),_status)
+}
+    )
+    }
+
+ fun `generateAttachmentKey`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_generate_attachment_key(
+
+        _status)
 }
     )
     }

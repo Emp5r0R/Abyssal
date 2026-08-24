@@ -1,8 +1,12 @@
 import initWasm, {
+  attachmentEncryptedSize as rustAttachmentEncryptedSize,
   conversationSafetyNumber as rustConversationSafetyNumber,
   conversationVerificationToken as rustConversationVerificationToken,
   decryptAttachment as rustDecryptAttachment,
+  decryptAttachmentChunk as rustDecryptAttachmentChunk,
   encryptAttachment as rustEncryptAttachment,
+  encryptAttachmentChunk as rustEncryptAttachmentChunk,
+  generateAttachmentKey as rustGenerateAttachmentKey,
   opaqueClientFinishLogin,
   opaqueClientFinishRegistration,
   opaqueClientStart,
@@ -27,11 +31,15 @@ export const IDENTITY_PUBLIC_KEY_BYTES = 608;
 export const STATE_SIGNATURE_BYTES = 64;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 export const PROTOCOL_VERSION = 9;
-export const ATTACHMENT_CIPHER_VERSION = 1;
-const ATTACHMENT_KEY_BYTES = 32;
-const ATTACHMENT_NONCE_BYTES = 24;
-const ATTACHMENT_BLOB_MIN_BYTES = 1 + ATTACHMENT_NONCE_BYTES + CHACHA20_POLY1305_TAG_BYTES;
-const MAX_ATTACHMENT_BLOB_BYTES = ATTACHMENT_BLOB_MIN_BYTES + MAX_ATTACHMENT_PLAINTEXT_BYTES;
+export const ATTACHMENT_CIPHER_VERSION = 2;
+export const ATTACHMENT_KEY_BYTES = 32;
+export const ATTACHMENT_CHUNK_PLAINTEXT_BYTES = 256 * 1024;
+export const ATTACHMENT_CHUNK_RECORD_BYTES = 1 + 4 + 4 + 8 + 24 +
+  ATTACHMENT_CHUNK_PLAINTEXT_BYTES + CHACHA20_POLY1305_TAG_BYTES;
+const ATTACHMENT_BLOB_MIN_BYTES = ATTACHMENT_CHUNK_RECORD_BYTES;
+const MAX_ATTACHMENT_BLOB_BYTES =
+  Math.ceil(MAX_ATTACHMENT_PLAINTEXT_BYTES / ATTACHMENT_CHUNK_PLAINTEXT_BYTES) *
+  ATTACHMENT_CHUNK_RECORD_BYTES;
 
 let wasmReady: Promise<unknown> | null = null;
 
@@ -509,6 +517,85 @@ export class InMemoryPayloadCipher {
     return { version: result.version, key, blob };
   }
 
+  generateAttachmentKey(): Uint8Array {
+    if (!this.#session) throw new Error("Payload cipher unavailable");
+    const key = rustGenerateAttachmentKey();
+    if (key.byteLength !== ATTACHMENT_KEY_BYTES) {
+      key.fill(0);
+      throw new Error("Payload unavailable");
+    }
+    return key;
+  }
+
+  attachmentEncryptedSize(mediaType: string, plaintextBytes: number): number {
+    if (!this.#session || !Number.isSafeInteger(plaintextBytes) || plaintextBytes <= 0) {
+      throw new Error("Payload unavailable");
+    }
+    const size = rustAttachmentEncryptedSize(mediaType, BigInt(plaintextBytes));
+    const result = Number(size);
+    if (!Number.isSafeInteger(result) || result < ATTACHMENT_CHUNK_RECORD_BYTES) {
+      throw new Error("Payload unavailable");
+    }
+    return result;
+  }
+
+  encryptAttachmentChunk(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    mediaType: string,
+    key: Uint8Array,
+    totalPlaintextBytes: number,
+    chunkIndex: number,
+    plaintext: Uint8Array,
+  ): Uint8Array {
+    if (!this.#session || key.byteLength !== ATTACHMENT_KEY_BYTES) {
+      throw new Error("Payload unavailable");
+    }
+    const record = rustEncryptAttachmentChunk(
+      chatId,
+      messageId,
+      senderUsername,
+      mediaType,
+      key,
+      BigInt(totalPlaintextBytes),
+      chunkIndex,
+      plaintext,
+    );
+    if (record.byteLength !== ATTACHMENT_CHUNK_RECORD_BYTES ||
+      record[0] !== ATTACHMENT_CIPHER_VERSION) {
+      record.fill(0);
+      throw new Error("Payload unavailable");
+    }
+    return record;
+  }
+
+  decryptAttachmentChunk(
+    chatId: string,
+    messageId: string,
+    senderUsername: string,
+    mediaType: string,
+    key: Uint8Array,
+    totalPlaintextBytes: number,
+    chunkIndex: number,
+    record: Uint8Array,
+  ): Uint8Array {
+    if (!this.#session || key.byteLength !== ATTACHMENT_KEY_BYTES ||
+      record.byteLength !== ATTACHMENT_CHUNK_RECORD_BYTES) {
+      throw new Error("Payload unavailable");
+    }
+    return rustDecryptAttachmentChunk(
+      chatId,
+      messageId,
+      senderUsername,
+      mediaType,
+      key,
+      BigInt(totalPlaintextBytes),
+      chunkIndex,
+      record,
+    );
+  }
+
   decryptAttachment(
     chatId: string,
     messageId: string,
@@ -847,7 +934,17 @@ export function maxSerializedAttachmentBytes(mediaType: string): number {
     : mediaType.toUpperCase() === "VIDEO"
       ? 100 * 1024 * 1024
       : MAX_ATTACHMENT_PLAINTEXT_BYTES;
-  return plainLimit + ATTACHMENT_BLOB_MIN_BYTES;
+  return Math.ceil(plainLimit / ATTACHMENT_CHUNK_PLAINTEXT_BYTES) *
+    ATTACHMENT_CHUNK_RECORD_BYTES;
+}
+
+export function serializedAttachmentBytes(plaintextBytes: number): number {
+  if (!Number.isSafeInteger(plaintextBytes) || plaintextBytes <= 0 ||
+    plaintextBytes > MAX_ATTACHMENT_PLAINTEXT_BYTES) {
+    throw new Error("Attachment unavailable");
+  }
+  return Math.ceil(plaintextBytes / ATTACHMENT_CHUNK_PLAINTEXT_BYTES) *
+    ATTACHMENT_CHUNK_RECORD_BYTES;
 }
 
 export function payloadToFrame(payload: EncryptedPayload): Record<string, unknown> {

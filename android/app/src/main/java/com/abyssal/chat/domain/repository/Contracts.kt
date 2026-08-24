@@ -7,9 +7,9 @@ import com.abyssal.chat.domain.model.AttachmentUploadResult
 import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.AppUpdateCheckResult
 import com.abyssal.chat.domain.model.DecryptedAttachment
+import com.abyssal.chat.domain.model.DecryptedAttachmentDownload
 import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.EncryptedTransportPayload
-import com.abyssal.chat.domain.model.EncryptedAttachmentDownload
 import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
@@ -22,6 +22,7 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
 import kotlinx.coroutines.flow.Flow
+import java.io.InputStream
 
 interface IIdentityService {
     /** Consumes and zeroes [password] before returning or throwing. */
@@ -222,25 +223,36 @@ interface IMlsTransport {
     ): OutboundSendResult
 }
 
+interface IAttachmentPlaintextSource {
+    val sizeBytes: Long
+    fun openStream(): InputStream
+    fun destroy()
+}
+
 interface IEncryptedAttachmentService {
     suspend fun uploadEncryptedAttachment(
         session: NodeSession,
         chatId: String,
         messageId: String,
+        senderUsername: String,
         mediaType: String,
-        encryptedBytes: ByteArray,
+        source: IAttachmentPlaintextSource,
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
         ttlSec: Int,
         onProgress: (sentBytes: Long, totalBytes: Long) -> Unit
     ): AttachmentUploadResult
 
-    suspend fun downloadEncryptedAttachment(
+    suspend fun downloadDecryptedAttachment(
         session: NodeSession,
         attachmentId: String,
+        chatId: String,
+        messageId: String,
+        senderUsername: String,
         mediaType: String,
+        encryptionKey: ByteArray,
         expectedPlaintextBytes: Long
-    ): EncryptedAttachmentDownload?
+    ): DecryptedAttachmentDownload?
     suspend fun deleteUploadedAttachment(session: NodeSession, attachmentId: String): Boolean
     suspend fun completeAttachmentDownload(
         session: NodeSession,

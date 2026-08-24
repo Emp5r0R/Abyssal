@@ -1,7 +1,8 @@
 package com.abyssal.chat.data.network
 
 import android.content.ContextWrapper
-import com.abyssal.chat.domain.model.EncryptedAttachmentDownload
+import com.abyssal.chat.domain.model.AttachmentProtocol
+import com.abyssal.chat.domain.model.DecryptedAttachmentDownload
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import kotlinx.coroutines.delay
@@ -35,58 +36,36 @@ import org.junit.Test
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import uniffi.abyssal_core.AttachmentCiphertext
+import uniffi.abyssal_core.decryptAttachment
+import uniffi.abyssal_core.encryptAttachment
 
 class EncryptedAttachmentServiceTest {
     @Test
-    fun statelessAttachmentBoundIncludesOnlyWireOverhead() {
+    fun chunkedAttachmentBoundsUseFixedAuthenticatedRecords() {
         assertEquals(
-            200L * 1024L * 1024L + ATTACHMENT_WIRE_OVERHEAD_BYTES,
+            800L * ATTACHMENT_CHUNK_RECORD_BYTES,
             maxSerializedAttachmentBytes("FILE")
         )
         assertTrue(maxSerializedAttachmentBytes("VIDEO") < maxSerializedAttachmentBytes("FILE"))
         assertTrue(maxSerializedAttachmentBytes("IMAGE") < maxSerializedAttachmentBytes("VIDEO"))
-        assertEquals(45L, expectedEncryptedAttachmentBytes(4L))
+        assertEquals(ATTACHMENT_CHUNK_RECORD_BYTES, expectedEncryptedAttachmentBytes(4L))
         assertNull(expectedEncryptedAttachmentBytes(0L))
         assertNull(expectedEncryptedAttachmentBytes(Long.MAX_VALUE))
     }
 
     @Test
-    fun acceptsEncryptedAttachmentAtConfiguredBound() {
-        val body = ByteArray(128) { it.toByte() }
-            .toResponseBody("application/octet-stream".toMediaType())
+    fun byteArrayAttachmentSourceIsOneShotAndDestroyZeroizesItsBackingBytes() {
+        val bytes = byteArrayOf(1, 2, 3)
+        val source = ByteArrayAttachmentSource(bytes)
 
-        val result = readBoundedAttachmentBody(body)
+        assertArrayEquals(byteArrayOf(1, 2, 3), source.openStream().use { it.readBytes() })
+        assertTrue(runCatching { source.openStream() }.isFailure)
+        source.destroy()
+        source.destroy()
 
-        assertArrayEquals(ByteArray(128) { it.toByte() }, result)
-    }
-
-    @Test
-    fun rejectsBodyWithDeclaredLengthBeyondConfiguredBound() {
-        val body = object : ResponseBody() {
-            override fun contentType() = "application/octet-stream".toMediaType()
-            override fun contentLength() = MAX_ENCRYPTED_ATTACHMENT_BYTES + 1L
-            override fun source(): BufferedSource = Buffer().writeByte(1)
-        }
-
-        assertNull(readBoundedAttachmentBody(body))
-    }
-
-    @Test
-    fun attachmentBodyRequiresPositiveExactContentLength() {
-        fun body(declaredLength: Long, bytes: ByteArray): ResponseBody = object : ResponseBody() {
-            override fun contentType() = "application/octet-stream".toMediaType()
-            override fun contentLength() = declaredLength
-            override fun source(): BufferedSource = Buffer().write(bytes)
-        }
-
-        assertNull(readBoundedAttachmentBody(body(-1L, byteArrayOf(1))))
-        assertNull(readBoundedAttachmentBody(body(0L, byteArrayOf())))
-        assertNull(readBoundedAttachmentBody(body(4L, byteArrayOf(1, 2, 3))))
-        assertNull(readBoundedAttachmentBody(body(3L, byteArrayOf(1, 2, 3, 4))))
-        assertArrayEquals(
-            byteArrayOf(1, 2, 3),
-            readBoundedAttachmentBody(body(3L, byteArrayOf(1, 2, 3)))
-        )
+        assertArrayEquals(ByteArray(3), bytes)
+        assertTrue(runCatching { source.openStream() }.isFailure)
     }
 
     @Test
@@ -112,20 +91,21 @@ class EncryptedAttachmentServiceTest {
 
     @Test
     fun downloadReadsClaimAndCompletionRequestsReuseAuthAndClaimHeaders() = runBlocking {
-        val wireBytes = ByteArray(45) { it.toByte() }
+        val plaintext = byteArrayOf(1, 2, 3, 4)
+        val encrypted = testEncrypted(plaintext)
         val server = MockWebServer()
         server.enqueue(
             MockResponse()
                 .setHeader(ATTACHMENT_CLAIM_HEADER, CLAIM)
-                .setBody(Buffer().write(wireBytes))
+                .setBody(Buffer().write(encrypted.blob))
         )
         server.start()
         try {
             val service = service()
-            val downloaded = service.downloadEncryptedAttachment(sessionFor(server), ATTACHMENT_ID, "FILE", 4L)
+            val downloaded = download(service, sessionFor(server), encrypted, "FILE", plaintext.size.toLong())
 
             assertEquals(CLAIM, downloaded?.claim)
-            assertArrayEquals(wireBytes, downloaded?.bytes)
+            assertArrayEquals(plaintext, downloaded?.bytes)
             assertEquals("Bearer token", server.takeRequest().getHeader("Authorization"))
 
             server.enqueue(MockResponse().setResponseCode(204))
@@ -143,6 +123,96 @@ class EncryptedAttachmentServiceTest {
             assertEquals("/v1/attachment/$ATTACHMENT_ID/claim", release.path)
             assertEquals(CLAIM, release.getHeader(ATTACHMENT_CLAIM_HEADER))
         } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun uploadStreamsFixedRecordsWipesSourceAndReturnsOnlyTheMetadataKey() = runBlocking {
+        val original = ByteArray(ATTACHMENT_CHUNK_PLAINTEXT_BYTES.toInt() + 3) { index ->
+            (index and 0xff).toByte()
+        }
+        val expected = original.copyOf()
+        val progress = mutableListOf<Long>()
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setBody("{\"accepted\":true,\"attachment_id\":\"$ATTACHMENT_ID\"}")
+        )
+        server.start()
+        try {
+            val result = service().uploadEncryptedAttachment(
+                session = sessionFor(server),
+                chatId = TEST_CHAT_ID,
+                messageId = ATTACHMENT_ID,
+                senderUsername = TEST_SENDER,
+                mediaType = "FILE",
+                source = ByteArrayAttachmentSource(original),
+                oneTimeView = false,
+                deleteAfterDownload = false,
+                ttlSec = 60,
+                onProgress = { sent, _ -> progress += sent }
+            )
+
+            assertTrue(result.accepted)
+            assertEquals(AttachmentProtocol.CIPHER_VERSION, result.cipherVersion)
+            assertEquals(32, result.encryptionKey?.size)
+            assertArrayEquals(ByteArray(original.size), original)
+            assertEquals(
+                listOf(0L, ATTACHMENT_CHUNK_PLAINTEXT_BYTES, expected.size.toLong()),
+                progress
+            )
+            val request = server.takeRequest()
+            val encrypted = request.body.readByteArray()
+            assertEquals(2L * ATTACHMENT_CHUNK_RECORD_BYTES, encrypted.size.toLong())
+            assertEquals(AttachmentProtocol.CIPHER_VERSION, encrypted[0].toInt())
+            assertEquals(
+                AttachmentProtocol.CIPHER_VERSION,
+                encrypted[ATTACHMENT_CHUNK_RECORD_BYTES.toInt()].toInt()
+            )
+            assertArrayEquals(
+                expected,
+                decryptAttachment(
+                    chatId = TEST_CHAT_ID,
+                    messageId = ATTACHMENT_ID,
+                    senderUsername = TEST_SENDER,
+                    mediaType = "FILE",
+                    key = requireNotNull(result.encryptionKey),
+                    blob = encrypted
+                )
+            )
+            result.encryptionKey?.fill(0)
+            encrypted.fill(0)
+            expected.fill(0)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun downloadDecryptsChunkedTransferWithoutRetainingCiphertext() = runBlocking<Unit> {
+        val plaintext = ByteArray(ATTACHMENT_CHUNK_PLAINTEXT_BYTES.toInt() + 7) { 0x5a }
+        val encrypted = testEncrypted(plaintext)
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setChunkedBody(Buffer().write(encrypted.blob), 31 * 1024)
+        )
+        server.start()
+        try {
+            val downloaded = download(
+                service(),
+                sessionFor(server),
+                encrypted,
+                "FILE",
+                plaintext.size.toLong()
+            )
+            assertArrayEquals(plaintext, downloaded?.bytes)
+            downloaded?.bytes?.fill(0)
+        } finally {
+            encrypted.key.fill(0)
+            encrypted.blob.fill(0)
+            plaintext.fill(0)
             server.shutdown()
         }
     }
@@ -199,8 +269,9 @@ class EncryptedAttachmentServiceTest {
                 session = capturedSession,
                 chatId = "dm_bob",
                 messageId = ATTACHMENT_ID,
+                senderUsername = "Alice",
                 mediaType = "FILE",
-                encryptedBytes = byteArrayOf(1),
+                source = ByteArrayAttachmentSource(byteArrayOf(1)),
                 oneTimeView = false,
                 deleteAfterDownload = false,
                 ttlSec = 0,
@@ -232,8 +303,9 @@ class EncryptedAttachmentServiceTest {
                 session = sessionFor(server),
                 chatId = "dm_bob",
                 messageId = "not-a-uuid",
+                senderUsername = "Alice",
                 mediaType = "FILE",
-                encryptedBytes = byteArrayOf(1),
+                source = ByteArrayAttachmentSource(byteArrayOf(1)),
                 oneTimeView = false,
                 deleteAfterDownload = false,
                 ttlSec = 60,
@@ -250,12 +322,13 @@ class EncryptedAttachmentServiceTest {
     fun downloadAndClaimLifecycleUseCapturedSessionInsteadOfActiveConfig() = runBlocking {
         val activeServer = MockWebServer()
         val capturedServer = MockWebServer()
-        val wireBytes = ByteArray(45) { it.toByte() }
+        val plaintext = byteArrayOf(4, 3, 2, 1)
+        val encrypted = testEncrypted(plaintext)
         activeServer.enqueue(MockResponse().setResponseCode(418))
         capturedServer.enqueue(
             MockResponse()
                 .setHeader(ATTACHMENT_CLAIM_HEADER, CLAIM)
-                .setBody(Buffer().write(wireBytes))
+                .setBody(Buffer().write(encrypted.blob))
         )
         capturedServer.enqueue(MockResponse().setResponseCode(204))
         capturedServer.enqueue(MockResponse().setResponseCode(204))
@@ -265,13 +338,8 @@ class EncryptedAttachmentServiceTest {
             val service = service()
             val capturedSession = sessionFor(capturedServer).copy(token = "captured-token")
 
-            val downloaded = service.downloadEncryptedAttachment(
-                capturedSession,
-                ATTACHMENT_ID,
-                "FILE",
-                4L
-            )
-            assertArrayEquals(wireBytes, downloaded?.bytes)
+            val downloaded = download(service, capturedSession, encrypted, "FILE", plaintext.size.toLong())
+            assertArrayEquals(plaintext, downloaded?.bytes)
             assertTrue(service.completeAttachmentDownload(capturedSession, ATTACHMENT_ID, CLAIM))
             assertTrue(service.releaseAttachmentDownloadClaim(capturedSession, ATTACHMENT_ID, CLAIM))
 
@@ -293,16 +361,17 @@ class EncryptedAttachmentServiceTest {
 
     @Test
     fun noClaimDownloadDoesNotRequireCompletion() = runBlocking {
-        val wireBytes = ByteArray(45) { (it + 1).toByte() }
+        val plaintext = byteArrayOf(8, 7, 6, 5)
+        val encrypted = testEncrypted(plaintext, "IMAGE")
         val server = MockWebServer()
-        server.enqueue(MockResponse().setBody(Buffer().write(wireBytes)))
+        server.enqueue(MockResponse().setBody(Buffer().write(encrypted.blob)))
         server.start()
         try {
             val service = service()
-            val downloaded = service.downloadEncryptedAttachment(sessionFor(server), ATTACHMENT_ID, "IMAGE", 4L)
+            val downloaded = download(service, sessionFor(server), encrypted, "IMAGE", plaintext.size.toLong())
 
             assertEquals(null, downloaded?.claim)
-            assertArrayEquals(wireBytes, downloaded?.bytes)
+            assertArrayEquals(plaintext, downloaded?.bytes)
         } finally {
             server.shutdown()
         }
@@ -321,13 +390,49 @@ class EncryptedAttachmentServiceTest {
         try {
             val service = service()
 
-            assertNull(service.downloadEncryptedAttachment(sessionFor(server), ATTACHMENT_ID, "FILE", 4L))
+            assertNull(download(service, sessionFor(server), testEncrypted(byteArrayOf(1, 2, 3, 4)), "FILE", 4L))
             server.takeRequest()
             val release = server.takeRequest()
             assertEquals("DELETE", release.method)
             assertEquals("/v1/attachment/$ATTACHMENT_ID/claim", release.path)
             assertEquals(CLAIM, release.getHeader(ATTACHMENT_CLAIM_HEADER))
         } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun tamperedClaimedDownloadReleasesClaimWithoutExposingPlaintext() = runBlocking<Unit> {
+        val plaintext = byteArrayOf(1, 2, 3, 4)
+        val encrypted = testEncrypted(plaintext)
+        encrypted.blob[100] = (encrypted.blob[100].toInt() xor 1).toByte()
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader(ATTACHMENT_CLAIM_HEADER, CLAIM)
+                .setBody(Buffer().write(encrypted.blob))
+        )
+        server.enqueue(MockResponse().setResponseCode(204))
+        server.start()
+        try {
+            assertNull(
+                download(
+                    service(),
+                    sessionFor(server),
+                    encrypted,
+                    "FILE",
+                    plaintext.size.toLong()
+                )
+            )
+            assertEquals("GET", server.takeRequest().method)
+            val release = server.takeRequest()
+            assertEquals("DELETE", release.method)
+            assertEquals("/v1/attachment/$ATTACHMENT_ID/claim", release.path)
+            assertEquals(CLAIM, release.getHeader(ATTACHMENT_CLAIM_HEADER))
+        } finally {
+            encrypted.key.fill(0)
+            encrypted.blob.fill(0)
+            plaintext.fill(0)
             server.shutdown()
         }
     }
@@ -382,8 +487,9 @@ class EncryptedAttachmentServiceTest {
                 session = session,
                 chatId = "dm_bob",
                 messageId = ATTACHMENT_ID,
+                senderUsername = "Alice",
                 mediaType = "FILE",
-                encryptedBytes = byteArrayOf(1),
+                source = ByteArrayAttachmentSource(byteArrayOf(1)),
                 oneTimeView = false,
                 deleteAfterDownload = false,
                 ttlSec = 0,
@@ -402,8 +508,9 @@ class EncryptedAttachmentServiceTest {
         val factory = ClaimCancellationCallFactory()
         val service = service(factory)
         val session = testSession().copy(token = "captured-token")
+        val encrypted = testEncrypted(byteArrayOf(1, 2, 3, 4))
         val job = launch(Dispatchers.Default) {
-            service.downloadEncryptedAttachment(session, ATTACHMENT_ID, "FILE", 4L)
+            download(service, session, encrypted, "FILE", 4L)
         }
 
         assertTrue(factory.claimCall.bodyReadStarted.await(2, TimeUnit.SECONDS))
@@ -422,8 +529,9 @@ class EncryptedAttachmentServiceTest {
         val factory = LateClaimResponseCallFactory()
         val service = service(factory)
         val session = testSession().copy(token = "captured-token")
+        val encrypted = testEncrypted(byteArrayOf(1, 2, 3, 4))
         val job = launch {
-            service.downloadEncryptedAttachment(session, ATTACHMENT_ID, "FILE", 4L)
+            download(service, session, encrypted, "FILE", 4L)
         }
         delay(100)
         job.cancelAndJoin()
@@ -451,18 +559,20 @@ class EncryptedAttachmentServiceTest {
 
     @Test
     fun downloadRejectsWrongMediaSizeAndAcceptsUnknownContentLengthOnlyAtExactExpectedSize() = runBlocking<Unit> {
+        val plaintext = byteArrayOf(1, 2, 3, 4)
+        val encrypted = testEncrypted(plaintext, "IMAGE")
         val server = MockWebServer()
-        server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(45))))
-        server.enqueue(MockResponse().setChunkedBody(Buffer().write(ByteArray(45)), 16))
+        server.enqueue(MockResponse().setBody(Buffer().write(encrypted.blob)))
+        server.enqueue(MockResponse().setChunkedBody(Buffer().write(encrypted.blob), 16 * 1024))
         server.start()
         try {
             val service = service()
-            assertNull(service.downloadEncryptedAttachment(sessionFor(server), ATTACHMENT_ID, "IMAGE", 5L))
+            assertNull(download(service, sessionFor(server), encrypted, "IMAGE", 5L))
             val request = server.takeRequest()
             assertEquals("/v1/attachment/$ATTACHMENT_ID", request.path)
 
-            val downloaded = service.downloadEncryptedAttachment(sessionFor(server), ATTACHMENT_ID, "IMAGE", 4L)
-            assertEquals(45, downloaded?.bytes?.size)
+            val downloaded = download(service, sessionFor(server), encrypted, "IMAGE", 4L)
+            assertArrayEquals(plaintext, downloaded?.bytes)
             downloaded?.bytes?.fill(0)
         } finally {
             server.shutdown()
@@ -473,7 +583,7 @@ class EncryptedAttachmentServiceTest {
     fun completionHappensBeforePlaintextIsReturned() = runBlocking {
         val plaintext = "secret".encodeToByteArray()
         val events = mutableListOf<String>()
-        val downloaded = EncryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM)
+        val downloaded = DecryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM)
 
         val result = decryptAndCompleteAttachment(
             downloaded = downloaded,
@@ -502,7 +612,7 @@ class EncryptedAttachmentServiceTest {
         val plaintext = ByteArray(6) { 4 }
         var releaseCalled = false
         val result = decryptAndCompleteAttachment(
-            downloaded = EncryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM),
+            downloaded = DecryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM),
             decrypt = { plaintext },
             complete = { false },
             release = {
@@ -520,7 +630,7 @@ class EncryptedAttachmentServiceTest {
     fun decryptFailureReleasesClaimAndDoesNotExposePlaintext() = runBlocking {
         var releaseCalled = false
         val result = decryptAndCompleteAttachment(
-            downloaded = EncryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM),
+            downloaded = DecryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM),
             decrypt = { throw IllegalArgumentException("invalid ciphertext") },
             complete = { throw IllegalStateException("must not complete") },
             release = {
@@ -539,7 +649,7 @@ class EncryptedAttachmentServiceTest {
         try {
             runBlocking {
                 decryptAndCompleteAttachment(
-                    downloaded = EncryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM),
+                    downloaded = DecryptedAttachmentDownload(ByteArray(3) { 9 }, CLAIM),
                     decrypt = { throw CancellationException("cancelled") },
                     complete = { throw IllegalStateException("must not complete") },
                     release = {
@@ -560,7 +670,7 @@ class EncryptedAttachmentServiceTest {
         var completeCalled = false
         var releaseCalled = false
         val result = decryptAndCompleteAttachment(
-            downloaded = EncryptedAttachmentDownload(ByteArray(2) { 8 }),
+            downloaded = DecryptedAttachmentDownload(ByteArray(2) { 8 }),
             decrypt = { plaintext },
             complete = {
                 completeCalled = true
@@ -578,6 +688,34 @@ class EncryptedAttachmentServiceTest {
         result?.fill(0)
         plaintext.fill(0)
     }
+
+    private fun testEncrypted(
+        plaintext: ByteArray,
+        mediaType: String = "FILE"
+    ): AttachmentCiphertext = encryptAttachment(
+        chatId = TEST_CHAT_ID,
+        messageId = ATTACHMENT_ID,
+        senderUsername = TEST_SENDER,
+        mediaType = mediaType,
+        plaintext = plaintext
+    )
+
+    private suspend fun download(
+        service: EncryptedAttachmentService,
+        session: NodeSession,
+        encrypted: AttachmentCiphertext,
+        mediaType: String,
+        expectedPlaintextBytes: Long
+    ): DecryptedAttachmentDownload? = service.downloadDecryptedAttachment(
+        session = session,
+        attachmentId = ATTACHMENT_ID,
+        chatId = TEST_CHAT_ID,
+        messageId = ATTACHMENT_ID,
+        senderUsername = TEST_SENDER,
+        mediaType = mediaType,
+        encryptionKey = encrypted.key,
+        expectedPlaintextBytes = expectedPlaintextBytes
+    )
 
     private fun service(client: OkHttpClient = OkHttpClient()): EncryptedAttachmentService =
         EncryptedAttachmentService(
@@ -713,11 +851,11 @@ class EncryptedAttachmentServiceTest {
             Thread {
                 val body = object : ResponseBody() {
                     override fun contentType() = "application/octet-stream".toMediaType()
-                    override fun contentLength() = 45L
+                    override fun contentLength() = ATTACHMENT_CHUNK_RECORD_BYTES
                     override fun source(): BufferedSource {
                         bodyReadStarted.countDown()
                         while (!cancelled) Thread.yield()
-                        return Buffer().write(ByteArray(45))
+                        return Buffer().write(ByteArray(ATTACHMENT_CHUNK_RECORD_BYTES.toInt()))
                     }
                 }
                 responseCallback.onResponse(
@@ -783,5 +921,7 @@ class EncryptedAttachmentServiceTest {
     private companion object {
         const val ATTACHMENT_ID = "123e4567-e89b-12d3-a456-426614174000"
         const val CLAIM = "123e4567-e89b-12d3-a456-426614174001"
+        const val TEST_CHAT_ID = "dm_alice_bob"
+        const val TEST_SENDER = "Alice"
     }
 }

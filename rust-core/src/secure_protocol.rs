@@ -54,13 +54,17 @@ const MAX_PAYLOAD_CIPHERTEXT_BYTES: usize = MAX_PADDED_PAYLOAD_BYTES + PAYLOAD_T
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 200 * 1024 * 1024;
-const ATTACHMENT_BLOB_VERSION: u8 = 1;
+pub const ATTACHMENT_BLOB_VERSION: u8 = 2;
 const ATTACHMENT_NONCE_BYTES: usize = 24;
 const ATTACHMENT_KEY_BYTES: usize = 32;
 const ATTACHMENT_TAG_BYTES: usize = 16;
-const ATTACHMENT_BLOB_HEADER_BYTES: usize = 1 + ATTACHMENT_NONCE_BYTES;
-const MAX_ATTACHMENT_BLOB_BYTES: usize =
-    ATTACHMENT_BLOB_HEADER_BYTES + MAX_ATTACHMENT_PLAINTEXT_BYTES + ATTACHMENT_TAG_BYTES;
+pub const ATTACHMENT_CHUNK_PLAINTEXT_BYTES: usize = 256 * 1024;
+const ATTACHMENT_CHUNK_HEADER_BYTES: usize = 1 + 4 + 4 + 8 + ATTACHMENT_NONCE_BYTES;
+pub const ATTACHMENT_CHUNK_RECORD_BYTES: usize =
+    ATTACHMENT_CHUNK_HEADER_BYTES + ATTACHMENT_CHUNK_PLAINTEXT_BYTES + ATTACHMENT_TAG_BYTES;
+const MAX_ATTACHMENT_CHUNKS: usize =
+    MAX_ATTACHMENT_PLAINTEXT_BYTES.div_ceil(ATTACHMENT_CHUNK_PLAINTEXT_BYTES);
+const MAX_ATTACHMENT_BLOB_BYTES: usize = MAX_ATTACHMENT_CHUNKS * ATTACHMENT_CHUNK_RECORD_BYTES;
 const MAX_IDENTITY_STATE_BYTES: usize = 512 * 1024;
 const MAX_RATCHET_ENVELOPE_BYTES: usize = 4096;
 const MAX_PEERS: usize = 256;
@@ -432,6 +436,205 @@ fn update_length_delimited(hasher: &mut Sha256, value: &[u8]) -> Result<(), Abys
 }
 
 #[uniffi::export]
+pub fn generate_attachment_key() -> Vec<u8> {
+    let mut key = [0_u8; ATTACHMENT_KEY_BYTES];
+    OsRng.fill_bytes(&mut key);
+    let result = key.to_vec();
+    key.zeroize();
+    result
+}
+
+#[uniffi::export]
+pub fn attachment_encrypted_size(
+    media_type: String,
+    total_plaintext_bytes: u64,
+) -> Result<u64, AbyssalError> {
+    let total_plaintext_bytes = usize::try_from(total_plaintext_bytes)
+        .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+    let plaintext_limit = attachment_plaintext_limit(&media_type).map_err(AbyssalError::from)?;
+    let (chunk_count, _) = attachment_chunk_layout(total_plaintext_bytes, 0)?;
+    if total_plaintext_bytes > plaintext_limit {
+        return Err("Payload unavailable".to_string().into());
+    }
+    u64::try_from(
+        chunk_count
+            .checked_mul(ATTACHMENT_CHUNK_RECORD_BYTES)
+            .ok_or_else(|| AbyssalError::from("Payload unavailable".to_string()))?,
+    )
+    .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))
+}
+
+pub fn attachment_plaintext_size_from_blob(media_type: &str, blob: &[u8]) -> Result<usize, String> {
+    let limit = attachment_plaintext_limit(media_type)?;
+    if blob.is_empty()
+        || blob.len() > attachment_blob_limit(media_type)
+        || !blob.len().is_multiple_of(ATTACHMENT_CHUNK_RECORD_BYTES)
+    {
+        return Err("Payload unavailable".to_string());
+    }
+    let actual_chunk_count = blob.len() / ATTACHMENT_CHUNK_RECORD_BYTES;
+    let mut total_plaintext_bytes = None;
+    for (expected_index, record) in blob.chunks_exact(ATTACHMENT_CHUNK_RECORD_BYTES).enumerate() {
+        let header = parse_attachment_chunk_header(record).map_err(|_| "Payload unavailable")?;
+        if header.chunk_index != expected_index || header.chunk_count != actual_chunk_count {
+            return Err("Payload unavailable".to_string());
+        }
+        match total_plaintext_bytes {
+            Some(total) if total != header.total_plaintext_bytes => {
+                return Err("Payload unavailable".to_string());
+            }
+            None => total_plaintext_bytes = Some(header.total_plaintext_bytes),
+            _ => {}
+        }
+    }
+    let total_plaintext_bytes =
+        total_plaintext_bytes.ok_or_else(|| "Payload unavailable".to_string())?;
+    if total_plaintext_bytes == 0 || total_plaintext_bytes > limit {
+        return Err("Payload unavailable".to_string());
+    }
+    Ok(total_plaintext_bytes)
+}
+
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_attachment_chunk(
+    chat_id: String,
+    message_id: String,
+    sender_username: String,
+    media_type: String,
+    key: Vec<u8>,
+    total_plaintext_bytes: u64,
+    chunk_index: u32,
+    plaintext: Vec<u8>,
+) -> Result<Vec<u8>, AbyssalError> {
+    let key = Zeroizing::new(key);
+    let plaintext = Zeroizing::new(plaintext);
+    validate_attachment_context(&chat_id, &message_id, &sender_username, &media_type)
+        .map_err(AbyssalError::from)?;
+    let plaintext_limit = attachment_plaintext_limit(&media_type).map_err(AbyssalError::from)?;
+    let total_plaintext_bytes = usize::try_from(total_plaintext_bytes)
+        .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+    let (chunk_count, expected_chunk_bytes) = attachment_chunk_layout(
+        total_plaintext_bytes,
+        usize::try_from(chunk_index)
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+    )?;
+    if key.len() != ATTACHMENT_KEY_BYTES
+        || total_plaintext_bytes > plaintext_limit
+        || plaintext.len() != expected_chunk_bytes
+    {
+        return Err("Payload unavailable".to_string().into());
+    }
+
+    let mut nonce = [0_u8; ATTACHMENT_NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce);
+    let mut padded = Zeroizing::new(vec![0_u8; ATTACHMENT_CHUNK_PLAINTEXT_BYTES]);
+    padded[..plaintext.len()].copy_from_slice(&plaintext);
+    if plaintext.len() < padded.len() {
+        OsRng.fill_bytes(&mut padded[plaintext.len()..]);
+    }
+    let header = attachment_chunk_header(
+        chunk_index,
+        u32::try_from(chunk_count)
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+        u64::try_from(total_plaintext_bytes)
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+        &nonce,
+    );
+    let aad = attachment_chunk_aad(
+        &chat_id,
+        &message_id,
+        &sender_username,
+        &media_type,
+        &header[..ATTACHMENT_CHUNK_HEADER_BYTES - ATTACHMENT_NONCE_BYTES],
+    );
+    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
+        .map_err(|_| "Payload unavailable".to_string())?;
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &padded,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+    let mut record = Vec::with_capacity(ATTACHMENT_CHUNK_RECORD_BYTES);
+    record.extend_from_slice(&header);
+    record.extend_from_slice(&ciphertext);
+    if record.len() != ATTACHMENT_CHUNK_RECORD_BYTES {
+        record.zeroize();
+        return Err("Payload unavailable".to_string().into());
+    }
+    Ok(record)
+}
+
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_attachment_chunk(
+    chat_id: String,
+    message_id: String,
+    sender_username: String,
+    media_type: String,
+    key: Vec<u8>,
+    expected_total_plaintext_bytes: u64,
+    expected_chunk_index: u32,
+    record: Vec<u8>,
+) -> Result<Vec<u8>, AbyssalError> {
+    let key = Zeroizing::new(key);
+    let record = Zeroizing::new(record);
+    validate_attachment_context(&chat_id, &message_id, &sender_username, &media_type)
+        .map_err(AbyssalError::from)?;
+    if key.len() != ATTACHMENT_KEY_BYTES || record.len() != ATTACHMENT_CHUNK_RECORD_BYTES {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let header = parse_attachment_chunk_header(&record)?;
+    let expected_total = usize::try_from(expected_total_plaintext_bytes)
+        .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+    let plaintext_limit = attachment_plaintext_limit(&media_type).map_err(AbyssalError::from)?;
+    let (expected_chunk_count, expected_chunk_bytes) = attachment_chunk_layout(
+        expected_total,
+        usize::try_from(expected_chunk_index)
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+    )?;
+    if expected_total > plaintext_limit
+        || header.total_plaintext_bytes != expected_total
+        || header.chunk_index != expected_chunk_index as usize
+        || header.chunk_count != expected_chunk_count
+    {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let aad = attachment_chunk_aad(
+        &chat_id,
+        &message_id,
+        &sender_username,
+        &media_type,
+        &record[..ATTACHMENT_CHUNK_HEADER_BYTES - ATTACHMENT_NONCE_BYTES],
+    );
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "Payload unavailable".to_string())?;
+    let mut plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(
+                    &record[ATTACHMENT_CHUNK_HEADER_BYTES - ATTACHMENT_NONCE_BYTES
+                        ..ATTACHMENT_CHUNK_HEADER_BYTES],
+                ),
+                Payload {
+                    msg: &record[ATTACHMENT_CHUNK_HEADER_BYTES..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+    );
+    if plaintext.len() != ATTACHMENT_CHUNK_PLAINTEXT_BYTES {
+        return Err("Payload unavailable".to_string().into());
+    }
+    plaintext.truncate(expected_chunk_bytes);
+    Ok(plaintext.to_vec())
+}
+
+#[uniffi::export]
 pub fn encrypt_attachment(
     chat_id: String,
     message_id: String,
@@ -440,39 +643,36 @@ pub fn encrypt_attachment(
     plaintext: Vec<u8>,
 ) -> Result<AttachmentCiphertext, AbyssalError> {
     let plaintext = Zeroizing::new(plaintext);
-    validate_attachment_context(&chat_id, &message_id, &sender_username, &media_type)
-        .map_err(AbyssalError::from)?;
     let plaintext_limit = attachment_plaintext_limit(&media_type).map_err(AbyssalError::from)?;
     if plaintext.is_empty() || plaintext.len() > plaintext_limit {
         return Err("Payload unavailable".to_string().into());
     }
-    let aad = attachment_aad(&chat_id, &message_id, &sender_username, &media_type);
-    let mut key = Zeroizing::new([0_u8; ATTACHMENT_KEY_BYTES]);
-    let mut nonce = [0_u8; ATTACHMENT_NONCE_BYTES];
-    OsRng.fill_bytes(key.as_mut());
-    OsRng.fill_bytes(&mut nonce);
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
-        .map_err(|_| "Payload unavailable".to_string())?;
-    let ciphertext = match cipher.encrypt(
-        XNonce::from_slice(&nonce),
-        Payload {
-            msg: &plaintext,
-            aad: &aad,
-        },
-    ) {
-        Ok(ciphertext) => ciphertext,
-        Err(_) => {
-            return Err("Payload unavailable".to_string().into());
-        }
-    };
-    let mut blob = Vec::with_capacity(ATTACHMENT_BLOB_HEADER_BYTES + ciphertext.len());
-    blob.push(ATTACHMENT_BLOB_VERSION);
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&ciphertext);
+    let key = Zeroizing::new(generate_attachment_key());
+    let chunk_count = plaintext.len().div_ceil(ATTACHMENT_CHUNK_PLAINTEXT_BYTES);
+    let mut blob = Zeroizing::new(Vec::with_capacity(
+        chunk_count.saturating_mul(ATTACHMENT_CHUNK_RECORD_BYTES),
+    ));
+    for chunk_index in 0..chunk_count {
+        let start = chunk_index * ATTACHMENT_CHUNK_PLAINTEXT_BYTES;
+        let end = plaintext
+            .len()
+            .min(start + ATTACHMENT_CHUNK_PLAINTEXT_BYTES);
+        let mut record = encrypt_attachment_chunk(
+            chat_id.clone(),
+            message_id.clone(),
+            sender_username.clone(),
+            media_type.clone(),
+            key.to_vec(),
+            plaintext.len() as u64,
+            chunk_index as u32,
+            plaintext[start..end].to_vec(),
+        )?;
+        blob.append(&mut record);
+    }
     Ok(AttachmentCiphertext {
         version: u32::from(ATTACHMENT_BLOB_VERSION),
         key: key.to_vec(),
-        blob,
+        blob: blob.to_vec(),
     })
 }
 
@@ -487,31 +687,37 @@ pub fn decrypt_attachment(
 ) -> Result<Vec<u8>, AbyssalError> {
     let key = Zeroizing::new(key);
     let blob = Zeroizing::new(blob);
-    validate_attachment_context(&chat_id, &message_id, &sender_username, &media_type)
-        .map_err(AbyssalError::from)?;
-    let blob_limit = attachment_blob_limit(&media_type);
     if key.len() != ATTACHMENT_KEY_BYTES
-        || blob.len() < ATTACHMENT_BLOB_HEADER_BYTES + ATTACHMENT_TAG_BYTES
-        || blob.len() > blob_limit
-        || blob.first() != Some(&ATTACHMENT_BLOB_VERSION)
+        || blob.is_empty()
+        || blob.len() > attachment_blob_limit(&media_type)
+        || !blob.len().is_multiple_of(ATTACHMENT_CHUNK_RECORD_BYTES)
     {
         return Err("Payload unavailable".to_string().into());
     }
-    let aad = attachment_aad(&chat_id, &message_id, &sender_username, &media_type);
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "Payload unavailable".to_string())?;
-    let plaintext = cipher
-        .decrypt(
-            XNonce::from_slice(&blob[1..ATTACHMENT_BLOB_HEADER_BYTES]),
-            Payload {
-                msg: &blob[ATTACHMENT_BLOB_HEADER_BYTES..],
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "Payload unavailable".to_string());
-    let plaintext = Zeroizing::new(plaintext?);
+    let first = parse_attachment_chunk_header(&blob[..ATTACHMENT_CHUNK_RECORD_BYTES])?;
     let plaintext_limit = attachment_plaintext_limit(&media_type).map_err(AbyssalError::from)?;
-    if plaintext.is_empty() || plaintext.len() > plaintext_limit {
+    if first.total_plaintext_bytes == 0 || first.total_plaintext_bytes > plaintext_limit {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let chunk_count = blob.len() / ATTACHMENT_CHUNK_RECORD_BYTES;
+    if first.chunk_count != chunk_count {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(first.total_plaintext_bytes));
+    for (chunk_index, record) in blob.chunks_exact(ATTACHMENT_CHUNK_RECORD_BYTES).enumerate() {
+        let mut chunk = decrypt_attachment_chunk(
+            chat_id.clone(),
+            message_id.clone(),
+            sender_username.clone(),
+            media_type.clone(),
+            key.to_vec(),
+            first.total_plaintext_bytes as u64,
+            chunk_index as u32,
+            record.to_vec(),
+        )?;
+        plaintext.append(&mut chunk);
+    }
+    if plaintext.len() != first.total_plaintext_bytes {
         return Err("Payload unavailable".to_string().into());
     }
     Ok(plaintext.to_vec())
@@ -1834,28 +2040,101 @@ fn attachment_plaintext_limit(media_type: &str) -> Result<usize, String> {
 }
 
 fn attachment_blob_limit(media_type: &str) -> usize {
-    match media_type {
-        "FILE" => MAX_ATTACHMENT_BLOB_BYTES,
-        _ => {
-            ATTACHMENT_BLOB_HEADER_BYTES
-                + attachment_plaintext_limit(media_type).unwrap_or(MAX_ATTACHMENT_PLAINTEXT_BYTES)
-                + ATTACHMENT_TAG_BYTES
-        }
-    }
+    attachment_plaintext_limit(media_type)
+        .unwrap_or(MAX_ATTACHMENT_PLAINTEXT_BYTES)
+        .div_ceil(ATTACHMENT_CHUNK_PLAINTEXT_BYTES)
+        .saturating_mul(ATTACHMENT_CHUNK_RECORD_BYTES)
+        .min(MAX_ATTACHMENT_BLOB_BYTES)
 }
 
-fn attachment_aad(
+#[derive(Clone, Copy)]
+struct AttachmentChunkHeader {
+    chunk_index: usize,
+    chunk_count: usize,
+    total_plaintext_bytes: usize,
+}
+
+fn attachment_chunk_layout(
+    total_plaintext_bytes: usize,
+    chunk_index: usize,
+) -> Result<(usize, usize), AbyssalError> {
+    if total_plaintext_bytes == 0 || total_plaintext_bytes > MAX_ATTACHMENT_PLAINTEXT_BYTES {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let chunk_count = total_plaintext_bytes.div_ceil(ATTACHMENT_CHUNK_PLAINTEXT_BYTES);
+    if chunk_count == 0 || chunk_count > MAX_ATTACHMENT_CHUNKS || chunk_index >= chunk_count {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let expected = if chunk_index + 1 == chunk_count {
+        total_plaintext_bytes - (chunk_index * ATTACHMENT_CHUNK_PLAINTEXT_BYTES)
+    } else {
+        ATTACHMENT_CHUNK_PLAINTEXT_BYTES
+    };
+    Ok((chunk_count, expected))
+}
+
+fn attachment_chunk_header(
+    chunk_index: u32,
+    chunk_count: u32,
+    total_plaintext_bytes: u64,
+    nonce: &[u8; ATTACHMENT_NONCE_BYTES],
+) -> Vec<u8> {
+    let mut header = Vec::with_capacity(ATTACHMENT_CHUNK_HEADER_BYTES);
+    header.push(ATTACHMENT_BLOB_VERSION);
+    header.extend_from_slice(&chunk_index.to_be_bytes());
+    header.extend_from_slice(&chunk_count.to_be_bytes());
+    header.extend_from_slice(&total_plaintext_bytes.to_be_bytes());
+    header.extend_from_slice(nonce);
+    header
+}
+
+fn parse_attachment_chunk_header(record: &[u8]) -> Result<AttachmentChunkHeader, AbyssalError> {
+    if record.len() != ATTACHMENT_CHUNK_RECORD_BYTES
+        || record.first() != Some(&ATTACHMENT_BLOB_VERSION)
+    {
+        return Err("Payload unavailable".to_string().into());
+    }
+    let chunk_index = u32::from_be_bytes(
+        record[1..5]
+            .try_into()
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+    ) as usize;
+    let chunk_count = u32::from_be_bytes(
+        record[5..9]
+            .try_into()
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+    ) as usize;
+    let total_plaintext_bytes = usize::try_from(u64::from_be_bytes(
+        record[9..17]
+            .try_into()
+            .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
+    ))
+    .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+    let (expected_count, _) = attachment_chunk_layout(total_plaintext_bytes, chunk_index)?;
+    if chunk_count != expected_count {
+        return Err("Payload unavailable".to_string().into());
+    }
+    Ok(AttachmentChunkHeader {
+        chunk_index,
+        chunk_count,
+        total_plaintext_bytes,
+    })
+}
+
+fn attachment_chunk_aad(
     chat_id: &str,
     message_id: &str,
     sender_username: &str,
     media_type: &str,
+    authenticated_header: &[u8],
 ) -> Vec<u8> {
     canonical_parts(&[
-        b"ABYSSAL_ATTACHMENT_AEAD_V1",
+        b"ABYSSAL_ATTACHMENT_CHUNK_AEAD_V2",
         chat_id.as_bytes(),
         message_id.as_bytes(),
         sender_username.as_bytes(),
         media_type.as_bytes(),
+        authenticated_header,
     ])
 }
 
@@ -2591,6 +2870,71 @@ pub fn wasm_encrypt_attachment(
     let result = encrypt_attachment(chat_id, message_id, sender_username, media_type, plaintext)
         .map_err(js_error)?;
     serde_json::to_string(&result).map_err(|_| js_error("Payload unavailable".to_string()))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = generateAttachmentKey)]
+pub fn wasm_generate_attachment_key() -> Vec<u8> {
+    generate_attachment_key()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = attachmentEncryptedSize)]
+pub fn wasm_attachment_encrypted_size(
+    media_type: String,
+    total_plaintext_bytes: u64,
+) -> Result<u64, JsValue> {
+    attachment_encrypted_size(media_type, total_plaintext_bytes).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = encryptAttachmentChunk)]
+pub fn wasm_encrypt_attachment_chunk(
+    chat_id: String,
+    message_id: String,
+    sender_username: String,
+    media_type: String,
+    key: Vec<u8>,
+    total_plaintext_bytes: u64,
+    chunk_index: u32,
+    plaintext: Vec<u8>,
+) -> Result<Vec<u8>, JsValue> {
+    encrypt_attachment_chunk(
+        chat_id,
+        message_id,
+        sender_username,
+        media_type,
+        key,
+        total_plaintext_bytes,
+        chunk_index,
+        plaintext,
+    )
+    .map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = decryptAttachmentChunk)]
+pub fn wasm_decrypt_attachment_chunk(
+    chat_id: String,
+    message_id: String,
+    sender_username: String,
+    media_type: String,
+    key: Vec<u8>,
+    expected_total_plaintext_bytes: u64,
+    expected_chunk_index: u32,
+    record: Vec<u8>,
+) -> Result<Vec<u8>, JsValue> {
+    decrypt_attachment_chunk(
+        chat_id,
+        message_id,
+        sender_username,
+        media_type,
+        key,
+        expected_total_plaintext_bytes,
+        expected_chunk_index,
+        record,
+    )
+    .map_err(js_error)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3510,7 +3854,7 @@ mod tests {
         )
         .is_err());
         let mut tampered = encrypted.blob.clone();
-        tampered[ATTACHMENT_BLOB_HEADER_BYTES] ^= 1;
+        tampered[ATTACHMENT_CHUNK_HEADER_BYTES] ^= 1;
         assert!(decrypt_attachment(
             "forum_media".to_string(),
             "attachment-1".to_string(),
@@ -3548,6 +3892,128 @@ mod tests {
             oversized,
         )
         .is_err());
+    }
+
+    #[test]
+    fn attachment_v2_chunks_are_fixed_size_ordered_and_context_authenticated() {
+        let total = ATTACHMENT_CHUNK_PLAINTEXT_BYTES + 17;
+        let plaintext = vec![0x5a; total];
+        let encrypted = encrypt_attachment(
+            "forum_media".to_string(),
+            "attachment-chunks".to_string(),
+            "Alice".to_string(),
+            "FILE".to_string(),
+            plaintext.clone(),
+        )
+        .expect("chunked attachment encrypt");
+
+        assert_eq!(encrypted.blob.len(), 2 * ATTACHMENT_CHUNK_RECORD_BYTES);
+        assert_eq!(
+            attachment_encrypted_size("FILE".to_string(), total as u64).expect("encrypted size"),
+            encrypted.blob.len() as u64
+        );
+        assert_eq!(
+            attachment_plaintext_size_from_blob("FILE", &encrypted.blob).expect("valid structure"),
+            total
+        );
+        assert_ne!(
+            &encrypted.blob[17..ATTACHMENT_CHUNK_HEADER_BYTES],
+            &encrypted.blob[ATTACHMENT_CHUNK_RECORD_BYTES + 17
+                ..ATTACHMENT_CHUNK_RECORD_BYTES + ATTACHMENT_CHUNK_HEADER_BYTES]
+        );
+        assert_eq!(
+            decrypt_attachment(
+                "forum_media".to_string(),
+                "attachment-chunks".to_string(),
+                "Alice".to_string(),
+                "FILE".to_string(),
+                encrypted.key.clone(),
+                encrypted.blob.clone(),
+            )
+            .expect("chunked attachment decrypt"),
+            plaintext
+        );
+
+        let mut reordered = encrypted.blob.clone();
+        let original = reordered.clone();
+        reordered[..ATTACHMENT_CHUNK_RECORD_BYTES]
+            .copy_from_slice(&original[ATTACHMENT_CHUNK_RECORD_BYTES..]);
+        reordered[ATTACHMENT_CHUNK_RECORD_BYTES..]
+            .copy_from_slice(&original[..ATTACHMENT_CHUNK_RECORD_BYTES]);
+        assert!(attachment_plaintext_size_from_blob("FILE", &reordered).is_err());
+        assert!(decrypt_attachment(
+            "forum_media".to_string(),
+            "attachment-chunks".to_string(),
+            "Alice".to_string(),
+            "FILE".to_string(),
+            encrypted.key.clone(),
+            reordered,
+        )
+        .is_err());
+
+        let mut duplicated = encrypted.blob.clone();
+        duplicated[ATTACHMENT_CHUNK_RECORD_BYTES..]
+            .copy_from_slice(&encrypted.blob[..ATTACHMENT_CHUNK_RECORD_BYTES]);
+        assert!(attachment_plaintext_size_from_blob("FILE", &duplicated).is_err());
+        assert!(decrypt_attachment(
+            "forum_media".to_string(),
+            "attachment-chunks".to_string(),
+            "Alice".to_string(),
+            "FILE".to_string(),
+            encrypted.key.clone(),
+            duplicated,
+        )
+        .is_err());
+
+        assert!(attachment_plaintext_size_from_blob(
+            "FILE",
+            &encrypted.blob[..ATTACHMENT_CHUNK_RECORD_BYTES]
+        )
+        .is_err());
+        assert!(decrypt_attachment_chunk(
+            "forum_media".to_string(),
+            "attachment-chunks".to_string(),
+            "Alice".to_string(),
+            "FILE".to_string(),
+            encrypted.key,
+            total as u64,
+            1,
+            encrypted.blob[..ATTACHMENT_CHUNK_RECORD_BYTES].to_vec(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn attachment_v2_size_buckets_enforce_media_limits_without_overflow() {
+        assert!(attachment_encrypted_size("FILE".to_string(), 0).is_err());
+        assert!(attachment_encrypted_size("AUDIO".to_string(), 1).is_err());
+        assert!(attachment_encrypted_size(
+            "IMAGE".to_string(),
+            (IMAGE_ATTACHMENT_LIMIT_BYTES + 1) as u64
+        )
+        .is_err());
+        assert_eq!(
+            attachment_encrypted_size("FILE".to_string(), 1).expect("one byte"),
+            ATTACHMENT_CHUNK_RECORD_BYTES as u64
+        );
+        assert_eq!(
+            attachment_encrypted_size("FILE".to_string(), ATTACHMENT_CHUNK_PLAINTEXT_BYTES as u64)
+                .expect("one full chunk"),
+            ATTACHMENT_CHUNK_RECORD_BYTES as u64
+        );
+        assert_eq!(
+            attachment_encrypted_size(
+                "FILE".to_string(),
+                (ATTACHMENT_CHUNK_PLAINTEXT_BYTES + 1) as u64
+            )
+            .expect("two chunks"),
+            (2 * ATTACHMENT_CHUNK_RECORD_BYTES) as u64
+        );
+        assert_eq!(
+            attachment_encrypted_size("FILE".to_string(), MAX_ATTACHMENT_PLAINTEXT_BYTES as u64)
+                .expect("maximum file"),
+            MAX_ATTACHMENT_BLOB_BYTES as u64
+        );
     }
 
     #[test]

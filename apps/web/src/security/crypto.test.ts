@@ -4,6 +4,7 @@ import {
   base64ToBytes,
   base64NoPaddingLength,
   bytesToBase64,
+  ATTACHMENT_CIPHER_VERSION,
   conversationSafetyNumber,
   conversationVerificationToken,
   finishOpaqueLogin,
@@ -73,7 +74,7 @@ describe("stateless attachment bounds", () => {
     const fileLimit = maxSerializedAttachmentBytes("FILE");
     expect(imageLimit).toBeLessThan(videoLimit);
     expect(videoLimit).toBeLessThan(fileLimit);
-    expect(fileLimit).toBe(200 * 1024 * 1024 + 41);
+    expect(fileLimit).toBe(800 * (256 * 1024 + 57));
   });
 });
 
@@ -570,7 +571,7 @@ describe("recipient E2EE", () => {
     const encrypted = alice.encryptAttachment(CHAT_ID, "attachment_1", "Alice", "FILE", plain);
     expect(encrypted.blob).not.toEqual(plain);
     expect(encrypted.key.byteLength).toBe(32);
-    expect(encrypted.blob[0]).toBe(1);
+    expect(encrypted.blob[0]).toBe(ATTACHMENT_CIPHER_VERSION);
     expect(bob.decryptAttachment(
       CHAT_ID,
       "attachment_1",

@@ -14,8 +14,10 @@ import { currentBuildAttestation } from "../buildIdentity";
 import {
   base64ToBytes,
   bytesToBase64,
+  ATTACHMENT_CHUNK_RECORD_BYTES,
   IDENTITY_PUBLIC_KEY_BYTES,
   maxSerializedAttachmentBytes,
+  serializedAttachmentBytes,
   STATE_SIGNATURE_BYTES,
   type IdentityStateSnapshot,
   wipeBytes,
@@ -65,12 +67,9 @@ const RECONNECT_JITTER_SAMPLE_RANGE = 2 ** 16;
 const RECONNECT_JITTER_SAMPLE_LIMIT =
   Math.floor(RECONNECT_JITTER_SAMPLE_RANGE / RECONNECT_JITTER_BOUND_MS) *
   RECONNECT_JITTER_BOUND_MS;
-const ATTACHMENT_BLOB_OVERHEAD_BYTES = 41;
-const MAX_ATTACHMENT_PLAINTEXT_BYTES =
-  maxSerializedAttachmentBytes("FILE") - ATTACHMENT_BLOB_OVERHEAD_BYTES;
+const MAX_ATTACHMENT_PLAINTEXT_BYTES = 200 * 1024 * 1024;
 
-export interface DownloadedEncryptedAttachment {
-  bytes: Uint8Array;
+export interface DownloadedEncryptedAttachmentStream {
   claim?: string;
 }
 
@@ -900,12 +899,18 @@ export function uploadEncryptedAttachment(
   chatId: string,
   messageId: string,
   mediaType: string,
-  encrypted: Uint8Array,
+  encrypted: Uint8Array | Blob,
   options: AttachmentOptions,
   onProgress: (progress: UploadProgress) => void,
   signal?: AbortSignal,
 ): Promise<string> {
   if (!validUuid(messageId)) return Promise.reject(new Error("Upload rejected"));
+  const encryptedBytes = encrypted instanceof Blob ? encrypted.size : encrypted.byteLength;
+  if (!Number.isSafeInteger(encryptedBytes) || encryptedBytes <= 0 ||
+    encryptedBytes > maxSerializedAttachmentBytes(mediaType) ||
+    encryptedBytes % ATTACHMENT_CHUNK_RECORD_BYTES !== 0) {
+    return Promise.reject(new Error("Upload rejected"));
+  }
   return new Promise((resolve, reject) => {
     const query = new URLSearchParams({
       chat_id: chatId,
@@ -933,7 +938,7 @@ export function uploadEncryptedAttachment(
     request.responseType = "text";
     request.setRequestHeader("Authorization", `Bearer ${session.token}`);
     request.setRequestHeader("Content-Type", "application/octet-stream");
-    request.upload.onprogress = (event) => onProgress({ loaded: event.loaded, total: event.total || encrypted.byteLength });
+    request.upload.onprogress = (event) => onProgress({ loaded: event.loaded, total: event.total || encryptedBytes });
     request.onprogress = (event) => {
       if (event.loaded > MAX_ATTACHMENT_UPLOAD_JSON_BYTES) {
         fail("Upload rejected");
@@ -967,24 +972,30 @@ export function uploadEncryptedAttachment(
       }
     };
     signal?.addEventListener("abort", abort, { once: true });
-    // XMLHttpRequest accepts ArrayBufferView at runtime. TypeScript's DOM
-    // declaration does not model the generic Uint8Array used here, so keep
-    // the view intact through the boundary instead of copying 200 MiB.
-    request.send(encrypted as unknown as ArrayBuffer);
+    if (encrypted instanceof Blob) {
+      request.send(encrypted);
+    } else {
+      // Keep the encrypted view intact through the boundary instead of copying it.
+      request.send(encrypted as unknown as ArrayBuffer);
+    }
   });
 }
 
-export async function downloadEncryptedAttachment(
+export async function streamEncryptedAttachmentRecords(
   session: AccountSession,
   attachmentId: string,
   policy: AttachmentDownloadPolicy,
+  onRecord: (record: Uint8Array, chunkIndex: number) => void | Promise<void>,
   signal?: AbortSignal,
-): Promise<DownloadedEncryptedAttachment> {
+): Promise<DownloadedEncryptedAttachmentStream> {
   const validatedAttachmentId = validateAttachmentId(attachmentId);
   const expectedEncryptedBytes = expectedAttachmentCiphertextBytes(policy);
   let claim: string | undefined;
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let encrypted: Uint8Array | undefined;
+  const record = new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES);
+  let recordOffset = 0;
+  let totalBytes = 0;
+  let chunkIndex = 0;
   try {
     const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}`, {
       cache: "no-store",
@@ -995,42 +1006,58 @@ export async function downloadEncryptedAttachment(
     });
     claim = readAttachmentClaim(response.headers);
     if (!response.ok) throw new Error("Attachment unavailable");
-    const contentLength = response.headers.get("content-length");
     const advertisedLength = parseAttachmentContentLength(
-      contentLength,
+      response.headers.get("content-length"),
       maxSerializedAttachmentBytes(policy.mediaType),
     );
     if (advertisedLength !== undefined && advertisedLength !== expectedEncryptedBytes) {
       throw new Error("Attachment unavailable");
     }
-    encrypted = new Uint8Array(expectedEncryptedBytes);
     reader = response.body?.getReader();
     if (!reader) throw new Error("Attachment unavailable");
-    let offset = 0;
     while (true) {
+      signal?.throwIfAborted();
       const result = await reader.read();
       if (result.done) break;
-      const chunk = result.value;
+      const networkChunk = result.value;
       try {
-        if (offset > expectedEncryptedBytes - chunk.byteLength) {
+        if (totalBytes > expectedEncryptedBytes - networkChunk.byteLength) {
           throw new Error("Attachment unavailable");
         }
-        encrypted.set(chunk, offset);
-        offset += chunk.byteLength;
+        let sourceOffset = 0;
+        while (sourceOffset < networkChunk.byteLength) {
+          const copied = Math.min(
+            ATTACHMENT_CHUNK_RECORD_BYTES - recordOffset,
+            networkChunk.byteLength - sourceOffset,
+          );
+          record.set(networkChunk.subarray(sourceOffset, sourceOffset + copied), recordOffset);
+          recordOffset += copied;
+          sourceOffset += copied;
+          totalBytes += copied;
+          if (recordOffset === ATTACHMENT_CHUNK_RECORD_BYTES) {
+            await onRecord(record, chunkIndex);
+            record.fill(0);
+            recordOffset = 0;
+            chunkIndex += 1;
+          }
+        }
       } finally {
-        chunk.fill(0);
+        networkChunk.fill(0);
       }
     }
-    if (offset !== expectedEncryptedBytes) {
+    if (totalBytes !== expectedEncryptedBytes || recordOffset !== 0 ||
+      chunkIndex !== expectedEncryptedBytes / ATTACHMENT_CHUNK_RECORD_BYTES) {
       throw new Error("Attachment unavailable");
     }
-    return claim ? { bytes: encrypted, claim } : { bytes: encrypted };
+    return claim ? { claim } : {};
   } catch (error) {
-    encrypted?.fill(0);
     if (reader) await reader.cancel().catch(() => undefined);
-    if (claim) await releaseAttachmentDownloadClaim(session, validatedAttachmentId, claim).catch(() => undefined);
+    if (claim) {
+      await releaseAttachmentDownloadClaim(session, validatedAttachmentId, claim).catch(() => undefined);
+    }
     throw error;
   } finally {
+    record.fill(0);
     reader?.releaseLock();
   }
 }
@@ -1102,7 +1129,7 @@ export async function deleteUploadedAttachment(
 export async function decryptAndCompleteAttachment(
   session: AccountSession,
   attachmentId: string,
-  downloaded: DownloadedEncryptedAttachment,
+  claim: string | undefined,
   decrypt: () => Uint8Array | Promise<Uint8Array>,
   policy?: AttachmentPlaintextPolicy,
   signal?: AbortSignal,
@@ -1128,16 +1155,16 @@ export async function decryptAndCompleteAttachment(
     ) {
       throw new Error("Attachment unavailable");
     }
-    if (downloaded.claim) {
-      await completeAttachmentDownload(session, attachmentId, downloaded.claim, signal);
+    if (claim) {
+      await completeAttachmentDownload(session, attachmentId, claim, signal);
       claimCompleted = true;
     }
     signal?.throwIfAborted();
     return plaintext;
   } catch (error) {
     if (plaintext) plaintext.fill(0);
-    if (downloaded.claim && !claimCompleted) {
-      await releaseAttachmentDownloadClaim(session, attachmentId, downloaded.claim).catch(() => undefined);
+    if (claim && !claimCompleted) {
+      await releaseAttachmentDownloadClaim(session, attachmentId, claim).catch(() => undefined);
     }
     throw error;
   }
@@ -1171,13 +1198,17 @@ function expectedAttachmentCiphertextBytes(policy: AttachmentDownloadPolicy): nu
   if (policy.mediaType !== "IMAGE" && policy.mediaType !== "VIDEO" && policy.mediaType !== "FILE") {
     throw new Error("Attachment unavailable");
   }
-  const maxBytes = maxSerializedAttachmentBytes(policy.mediaType);
+  const plaintextLimit = policy.mediaType === "IMAGE"
+    ? 20 * 1024 * 1024
+    : policy.mediaType === "VIDEO"
+      ? 100 * 1024 * 1024
+      : MAX_ATTACHMENT_PLAINTEXT_BYTES;
   if (!Number.isSafeInteger(policy.expectedPlaintextBytes) ||
     policy.expectedPlaintextBytes <= 0 ||
-    policy.expectedPlaintextBytes > maxBytes - ATTACHMENT_BLOB_OVERHEAD_BYTES) {
+    policy.expectedPlaintextBytes > plaintextLimit) {
     throw new Error("Attachment unavailable");
   }
-  return policy.expectedPlaintextBytes + ATTACHMENT_BLOB_OVERHEAD_BYTES;
+  return serializedAttachmentBytes(policy.expectedPlaintextBytes);
 }
 
 function validateAttachmentClaim(claim: string): string {

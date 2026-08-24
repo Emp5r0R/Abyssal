@@ -197,6 +197,10 @@ artifact_paths+=(
 
 WASM_TYPESCRIPT="$ROOT_DIR/apps/web/src/generated/abyssal_core/abyssal_core.d.ts"
 for symbol in \
+  "attachmentEncryptedSize" \
+  "decryptAttachmentChunk" \
+  "encryptAttachmentChunk" \
+  "generateAttachmentKey" \
   "conversationVerificationToken" \
   "mlsCreateRoom" \
   "mlsRecoverRoom" \
@@ -215,6 +219,10 @@ done
 
 KOTLIN_BINDINGS="$ROOT_DIR/android/app/src/main/java/uniffi/abyssal_core/abyssal_core.kt"
 for symbol in \
+  'fun `attachmentEncryptedSize`' \
+  'fun `decryptAttachmentChunk`' \
+  'fun `encryptAttachmentChunk`' \
+  'fun `generateAttachmentKey`' \
   'fun `conversationVerificationToken`' \
   'fun `createMlsRoom`' \
   'fun `recoverMlsRoom`' \
