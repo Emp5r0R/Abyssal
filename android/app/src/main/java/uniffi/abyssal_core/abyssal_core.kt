@@ -689,6 +689,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_func_conversation_safety_number(
     ): Int
+    external fun uniffi_abyssal_core_checksum_func_conversation_verification_token(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_decrypt_attachment(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_encrypt_attachment(
@@ -879,6 +881,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_conversation_safety_number(`firstPublicKey`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_conversation_verification_token(`nodeId`: RustBuffer.ByValue,`chatId`: RustBuffer.ByValue,`firstUsername`: RustBuffer.ByValue,`firstPublicKey`: RustBuffer.ByValue,`secondUsername`: RustBuffer.ByValue,`secondPublicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_decrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`key`: RustBuffer.ByValue,`blob`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_encrypt_attachment(`chatId`: RustBuffer.ByValue,`messageId`: RustBuffer.ByValue,`senderUsername`: RustBuffer.ByValue,`mediaType`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1027,6 +1031,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_func_conversation_safety_number() != 24566) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_conversation_verification_token() != 63134) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_func_decrypt_attachment() != 57237) {
@@ -3872,6 +3879,31 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
 
 
         FfiConverterByteArray.lower(`firstPublicKey`),
+        FfiConverterByteArray.lower(`secondPublicKey`),_status)
+}
+    )
+    }
+
+
+        /**
+         * Canonical out-of-band verification token for one direct conversation.
+         *
+         * Both participants derive the same token locally. The transcript binds the
+         * relay process identity, direct-chat identifier, canonical usernames, and
+         * stable long-term identity keys. One-time prekeys are deliberately excluded
+         * so routine prekey rotation does not invalidate a completed comparison.
+         */
+    @Throws(AbyssalException::class) fun `conversationVerificationToken`(`nodeId`: kotlin.String, `chatId`: kotlin.String, `firstUsername`: kotlin.String, `firstPublicKey`: kotlin.ByteArray, `secondUsername`: kotlin.String, `secondPublicKey`: kotlin.ByteArray): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_conversation_verification_token(
+
+
+        FfiConverterString.lower(`nodeId`),
+        FfiConverterString.lower(`chatId`),
+        FfiConverterString.lower(`firstUsername`),
+        FfiConverterByteArray.lower(`firstPublicKey`),
+        FfiConverterString.lower(`secondUsername`),
         FfiConverterByteArray.lower(`secondPublicKey`),_status)
 }
     )

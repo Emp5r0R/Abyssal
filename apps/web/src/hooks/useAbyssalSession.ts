@@ -34,6 +34,7 @@ import {
   base64ToBytes,
   bytesToBase64,
   conversationSafetyNumber,
+  conversationVerificationToken,
   ATTACHMENT_CIPHER_VERSION,
   finishOpaqueLogin,
   finishOpaqueRegistration,
@@ -180,6 +181,7 @@ export function useAbyssalSession() {
     active: false,
     peerUsername: null,
     safetyNumber: null,
+    verificationToken: null,
     verified: false,
   });
   const socketRef = useRef<RelaySocket | null>(null);
@@ -307,10 +309,19 @@ export function useAbyssalSession() {
     try {
       peerIdentity = base64ToBytes(peer.identity_public_b64);
       const safetyNumber = conversationSafetyNumber(currentSession.identityPublicKey, peerIdentity);
+      const verificationToken = conversationVerificationToken(
+        currentSession.nodeId,
+        direct.id,
+        currentSession.username,
+        currentSession.identityPublicKey,
+        direct.peer_username,
+        peerIdentity,
+      );
       return {
         chatId: direct.id,
         peerUsername: direct.peer_username,
         safetyNumber,
+        verificationToken,
         sessionGeneration: sessionGenerationRef.current,
         connectionGeneration: connectionGenerationRef.current,
         localIdentity: currentSession.identityPublicKey.slice(),
@@ -341,10 +352,10 @@ export function useAbyssalSession() {
     return isDirect ? allowed : isRoom;
   }, [activeDirectTrustContext]);
 
-  const verifyDirectSafetyNumber = useCallback((displayedSafetyNumber: string): boolean => {
+  const verifyDirectVerificationToken = useCallback((presentedToken: string): boolean => {
     const context = activeDirectTrustContext();
     if (!context) return false;
-    const accepted = directTrustRef.current.markVerified(context, displayedSafetyNumber);
+    const accepted = directTrustRef.current.markVerified(context, presentedToken.trim());
     context.localIdentity.fill(0);
     context.peerIdentity.fill(0);
     refreshDirectTrust();
@@ -2068,7 +2079,7 @@ export function useAbyssalSession() {
     touchActivity,
     openRoom,
     openDirect,
-    verifyDirectSafetyNumber,
+    verifyDirectVerificationToken,
     markRoomRead,
     sendText,
     sendAttachment,

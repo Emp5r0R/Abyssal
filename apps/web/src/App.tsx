@@ -275,7 +275,7 @@ function SecureWorkspace({
           onViewAttachment={abyssal.viewAttachment}
           onExportAttachment={abyssal.exportAttachment}
           onSendGif={sendGif}
-          onVerifySafetyNumber={abyssal.verifyDirectSafetyNumber}
+          onVerifyToken={abyssal.verifyDirectVerificationToken}
         />
       ) : undefined}
     </AppShell>

@@ -1,4 +1,5 @@
 use crate::AbyssalError;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{
     aead::{Aead, AeadCore, Payload},
     ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce,
@@ -363,6 +364,71 @@ pub fn conversation_safety_number(
         .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
         .collect::<Vec<_>>()
         .join(" "))
+}
+
+/// Canonical out-of-band verification token for one direct conversation.
+///
+/// Both participants derive the same token locally. The transcript binds the
+/// relay process identity, direct-chat identifier, canonical usernames, and
+/// stable long-term identity keys. One-time prekeys are deliberately excluded
+/// so routine prekey rotation does not invalidate a completed comparison.
+#[uniffi::export]
+pub fn conversation_verification_token(
+    node_id: String,
+    chat_id: String,
+    first_username: String,
+    first_public_key: Vec<u8>,
+    second_username: String,
+    second_public_key: Vec<u8>,
+) -> Result<String, AbyssalError> {
+    if !valid_node_identifier(&node_id) || !valid_context_identifier(&chat_id) {
+        return Err("Verification unavailable".to_string().into());
+    }
+    validate_username(&first_username).map_err(AbyssalError::from)?;
+    validate_username(&second_username).map_err(AbyssalError::from)?;
+    validate_identity_public_bundle(&first_public_key, None).map_err(AbyssalError::from)?;
+    validate_identity_public_bundle(&second_public_key, None).map_err(AbyssalError::from)?;
+
+    let first_name = first_username.to_ascii_lowercase();
+    let second_name = second_username.to_ascii_lowercase();
+    if first_name == second_name {
+        return Err("Verification unavailable".to_string().into());
+    }
+    let first_identity = &first_public_key[..IDENTITY_FINGERPRINT_BYTES];
+    let second_identity = &second_public_key[..IDENTITY_FINGERPRINT_BYTES];
+    let ((first_name, first_identity), (second_name, second_identity)) =
+        if (first_name.as_bytes(), first_identity) <= (second_name.as_bytes(), second_identity) {
+            (
+                (first_name.as_str(), first_identity),
+                (second_name.as_str(), second_identity),
+            )
+        } else {
+            (
+                (second_name.as_str(), second_identity),
+                (first_name.as_str(), first_identity),
+            )
+        };
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ABYSSAL_DIRECT_VERIFICATION_V1");
+    update_length_delimited(&mut hasher, node_id.as_bytes())?;
+    update_length_delimited(&mut hasher, chat_id.as_bytes())?;
+    update_length_delimited(&mut hasher, first_name.as_bytes())?;
+    update_length_delimited(&mut hasher, first_identity)?;
+    update_length_delimited(&mut hasher, second_name.as_bytes())?;
+    update_length_delimited(&mut hasher, second_identity)?;
+    Ok(format!(
+        "abyssal:verify:v1:{}",
+        URL_SAFE_NO_PAD.encode(hasher.finalize())
+    ))
+}
+
+fn update_length_delimited(hasher: &mut Sha256, value: &[u8]) -> Result<(), AbyssalError> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| AbyssalError::from("Verification unavailable".to_string()))?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(value);
+    Ok(())
 }
 
 #[uniffi::export]
@@ -2459,6 +2525,14 @@ fn valid_context_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
+fn valid_node_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+}
+
 fn protocol_error<E: core::fmt::Debug>(_: E) -> String {
     "Wrong information".to_string()
 }
@@ -2482,6 +2556,27 @@ pub fn wasm_conversation_safety_number(
     second_public_key: Vec<u8>,
 ) -> Result<String, JsValue> {
     conversation_safety_number(first_public_key, second_public_key).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(js_name = conversationVerificationToken)]
+pub fn wasm_conversation_verification_token(
+    node_id: String,
+    chat_id: String,
+    first_username: String,
+    first_public_key: Vec<u8>,
+    second_username: String,
+    second_public_key: Vec<u8>,
+) -> Result<String, JsValue> {
+    conversation_verification_token(
+        node_id,
+        chat_id,
+        first_username,
+        first_public_key,
+        second_username,
+        second_public_key,
+    )
+    .map_err(js_error)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2970,6 +3065,106 @@ mod tests {
             conversation_safety_number(alice.public_key(), eve.public_key())
                 .expect("different safety number")
         );
+    }
+
+    #[test]
+    fn verification_token_is_symmetric_and_binds_the_complete_direct_context() {
+        let alice = E2eeSession::create(vec![1; 64]).expect("alice");
+        let bob = E2eeSession::create(vec![2; 64]).expect("bob");
+        let eve = E2eeSession::create(vec![3; 64]).expect("eve");
+        let expected = conversation_verification_token(
+            "abyssal-node:1".to_string(),
+            "dm_alice_bob".to_string(),
+            "Alice".to_string(),
+            alice.public_key(),
+            "Bob".to_string(),
+            bob.public_key(),
+        )
+        .expect("verification token");
+        assert!(expected.starts_with("abyssal:verify:v1:"));
+        assert_eq!(expected.len(), "abyssal:verify:v1:".len() + 43);
+        assert_eq!(
+            expected,
+            conversation_verification_token(
+                "abyssal-node:1".to_string(),
+                "dm_alice_bob".to_string(),
+                "bob".to_string(),
+                bob.public_key(),
+                "ALICE".to_string(),
+                alice.public_key(),
+            )
+            .expect("symmetric verification token")
+        );
+
+        let changed_inputs = [
+            conversation_verification_token(
+                "abyssal-node:2".to_string(),
+                "dm_alice_bob".to_string(),
+                "Alice".to_string(),
+                alice.public_key(),
+                "Bob".to_string(),
+                bob.public_key(),
+            ),
+            conversation_verification_token(
+                "abyssal-node:1".to_string(),
+                "dm_alice_eve".to_string(),
+                "Alice".to_string(),
+                alice.public_key(),
+                "Eve".to_string(),
+                eve.public_key(),
+            ),
+        ];
+        for changed in changed_inputs {
+            assert_ne!(expected, changed.expect("changed verification token"));
+        }
+    }
+
+    #[test]
+    fn verification_token_rejects_ambiguous_or_malformed_context() {
+        let alice = E2eeSession::create(vec![1; 64]).expect("alice");
+        let bob = E2eeSession::create(vec![2; 64]).expect("bob");
+        let valid = || {
+            (
+                "abyssal-node:1".to_string(),
+                "dm_alice_bob".to_string(),
+                "Alice".to_string(),
+                alice.public_key(),
+                "Bob".to_string(),
+                bob.public_key(),
+            )
+        };
+        let (_, chat, first_name, first_key, second_name, second_key) = valid();
+        assert!(conversation_verification_token(
+            "node/invalid".to_string(),
+            chat,
+            first_name,
+            first_key,
+            second_name,
+            second_key,
+        )
+        .is_err());
+
+        let (node, chat, first_name, first_key, _, second_key) = valid();
+        assert!(conversation_verification_token(
+            node,
+            chat,
+            first_name,
+            first_key,
+            "alice".to_string(),
+            second_key,
+        )
+        .is_err());
+
+        let (node, chat, first_name, first_key, second_name, _) = valid();
+        assert!(conversation_verification_token(
+            node,
+            chat,
+            first_name,
+            first_key,
+            second_name,
+            vec![0; IDENTITY_PUBLIC_BYTES],
+        )
+        .is_err());
     }
 
     #[test]

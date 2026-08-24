@@ -416,6 +416,7 @@ vi.mock("../security/crypto", async () => {
   return {
     ...actual,
     conversationSafetyNumber: vi.fn(() => "1234 5678 9012"),
+    conversationVerificationToken: vi.fn(() => "abyssal:verify:v1:test-token"),
     startOpaque: vi.fn(async () => ({
       registrationState: new Uint8Array([1]),
       registrationRequest: new Uint8Array([2]),
@@ -1944,7 +1945,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     act(() => result.current.openRoom("dm_bob"));
     await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
     expect(result.current.safetyNumber).toBeTruthy();
-    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+    expect(result.current.verifyDirectVerificationToken(result.current.directTrust.verificationToken!)).toBe(true);
 
     mocks.FakeCipher.requiredPeers.add("Bob");
     await act(async () => expect(await result.current.sendText("first")).toBe(true));
@@ -1980,8 +1981,8 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await act(async () => expect(await result.current.sendText("blocked")).toBe(false));
     expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(0);
     expect(relay?.sent.some((frame) => (frame as { type?: string }).type === "message")).toBe(false);
-    expect(result.current.verifyDirectSafetyNumber("wrong safety number")).toBe(false);
-    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+    expect(result.current.verifyDirectVerificationToken("abyssal:verify:v1:wrong-token")).toBe(false);
+    expect(result.current.verifyDirectVerificationToken(result.current.directTrust.verificationToken!)).toBe(true);
     await act(async () => expect(await result.current.sendText("allowed")).toBe(true));
     unmount();
   });
@@ -2101,7 +2102,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     });
     act(() => result.current.openRoom("dm_bob"));
     await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
-    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+    expect(result.current.verifyDirectVerificationToken(result.current.directTrust.verificationToken!)).toBe(true);
     await waitFor(() => expect(result.current.directTrust.verified).toBe(true));
 
     act(() => relay?.close());
@@ -2135,7 +2136,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await waitFor(() => expect(result.current.presence).toHaveLength(1));
     act(() => result.current.openRoom("dm_bob"));
     await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
-    expect(result.current.verifyDirectSafetyNumber(result.current.safetyNumber!)).toBe(true);
+    expect(result.current.verifyDirectVerificationToken(result.current.directTrust.verificationToken!)).toBe(true);
 
     let resolveSend!: (result: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
     mocks.FakeRelay.encryptedResult = new Promise((resolve) => { resolveSend = resolve; });

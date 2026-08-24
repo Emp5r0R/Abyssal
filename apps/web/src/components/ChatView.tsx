@@ -23,15 +23,16 @@ import { splitMentionText } from "../domain/messageAttention";
 import { isWebSender, senderOriginNotice } from "../domain/senderClient";
 import { exactReactionShortcut, reactionByShortcode, searchReactions, type ReactionAsset } from "../domain/reactions";
 import type { ChatMessage, PresenceUser, RoomRecord, UploadProgress } from "../domain/types";
+import { DirectVerificationQr } from "./DirectVerificationQr";
 import { GifPicker } from "./GifPicker";
-import { Dialog, IconButton } from "./Ui";
+import { Dialog, Field, IconButton } from "./Ui";
 
 interface ChatViewProps {
   room: RoomRecord;
   username: string;
   connected: boolean;
   safetyNumber: string | null;
-  directTrust?: { verified: boolean };
+  directTrust?: { verified: boolean; verificationToken?: string | null };
   messages: ChatMessage[];
   users: PresenceUser[];
   upload: UploadProgress & { active: boolean; name: string };
@@ -43,7 +44,7 @@ interface ChatViewProps {
   onViewAttachment: (message: ChatMessage) => void;
   onExportAttachment: (message: ChatMessage) => void;
   onSendGif: (reaction: ReactionAsset, replyToId?: string, retentionSec?: number) => Promise<boolean>;
-  onVerifySafetyNumber?: (safetyNumber: string) => boolean;
+  onVerifyToken?: (presentedToken: string) => boolean;
 }
 
 export function ChatView({
@@ -63,7 +64,7 @@ export function ChatView({
   onViewAttachment,
   onExportAttachment,
   onSendGif,
-  onVerifySafetyNumber,
+  onVerifyToken,
 }: ChatViewProps) {
   const isDirect = room.conversation_type === "direct";
   const [draft, setDraft] = useState("");
@@ -73,6 +74,8 @@ export function ChatView({
   const [now, setNow] = useState(0);
   const [flashTargetId, setFlashTargetId] = useState<string | null>(null);
   const [showTrustDialog, setShowTrustDialog] = useState(false);
+  const [presentedVerificationToken, setPresentedVerificationToken] = useState("");
+  const [verificationRejected, setVerificationRejected] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const wasNearBottom = useRef(true);
@@ -167,7 +170,7 @@ export function ChatView({
               type="button"
               className={`trust-status ${directTrust.verified ? "is-verified" : "is-unverified"}`}
               onClick={() => setShowTrustDialog(true)}
-              disabled={!safetyNumber || !onVerifySafetyNumber}
+              disabled={!safetyNumber || !directTrust.verificationToken || !onVerifyToken}
               aria-label={directTrust.verified
                 ? "Direct chat safety number comparison confirmed"
                 : "Confirm direct chat safety number comparison"}
@@ -356,27 +359,55 @@ export function ChatView({
           <IconButton className="send-button" label="Send message" disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
         </form>
       </footer>
-      {showTrustDialog && isDirect && safetyNumber && onVerifySafetyNumber ? (
+      {showTrustDialog && isDirect && safetyNumber && directTrust.verificationToken && onVerifyToken ? (
         <Dialog
           title="Verify direct chat"
-          description="Compare this safety number with your peer through a separate trusted channel."
+          description="Scan your peer's QR through a separate trusted channel."
           actions={
             <>
-              <button className="secondary-button" type="button" onClick={() => setShowTrustDialog(false)}>CANCEL</button>
+              <button className="secondary-button" type="button" onClick={() => {
+                setPresentedVerificationToken("");
+                setVerificationRejected(false);
+                setShowTrustDialog(false);
+              }}>CANCEL</button>
               <button
                 className="primary-button"
                 type="button"
+                disabled={!presentedVerificationToken.trim()}
                 onClick={() => {
-                  if (onVerifySafetyNumber(safetyNumber)) setShowTrustDialog(false);
+                  const accepted = onVerifyToken(presentedVerificationToken);
+                  setVerificationRejected(!accepted);
+                  if (accepted) {
+                    setPresentedVerificationToken("");
+                    setShowTrustDialog(false);
+                  }
                 }}
               >
-                I COMPARED — CONFIRM
+                VERIFY TOKEN
               </button>
             </>
           }
         >
+          <DirectVerificationQr
+            token={directTrust.verificationToken}
+            onScanned={(token) => {
+              setPresentedVerificationToken(token);
+              setVerificationRejected(false);
+            }}
+          />
           <p className="safety-number-value" aria-label={`Safety number ${safetyNumber}`}>{safetyNumber}</p>
-          <p>Only confirm when every digit matches. Verification is held in this session and clears after reconnect, identity change, logout, wipe, or expiry.</p>
+          <Field
+            label="Peer verification token"
+            value={presentedVerificationToken}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => {
+              setPresentedVerificationToken(event.target.value);
+              setVerificationRejected(false);
+            }}
+          />
+          {verificationRejected ? <p className="field-error" role="alert">Verification did not match.</p> : null}
+          <p>The QR and safety number are derived locally. Trust stays in RAM and clears after reconnect, identity change, logout, wipe, or expiry.</p>
         </Dialog>
       ) : null}
     </section>

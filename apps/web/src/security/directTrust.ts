@@ -2,6 +2,7 @@ export interface DirectTrustContext {
   chatId: string;
   peerUsername: string;
   safetyNumber: string;
+  verificationToken: string;
   sessionGeneration: number;
   connectionGeneration: number;
   localIdentity: Uint8Array;
@@ -12,6 +13,7 @@ export interface DirectTrustStatus {
   active: boolean;
   peerUsername: string | null;
   safetyNumber: string | null;
+  verificationToken: string | null;
   verified: boolean;
 }
 
@@ -21,6 +23,7 @@ const EMPTY_STATUS: DirectTrustStatus = {
   active: false,
   peerUsername: null,
   safetyNumber: null,
+  verificationToken: null,
   verified: false,
 };
 
@@ -28,6 +31,7 @@ interface VerifiedDirect {
   chatId: string;
   peerUsername: string;
   safetyNumber: string;
+  verificationToken: string;
   sessionGeneration: number;
   connectionGeneration: number;
   localIdentity: Uint8Array;
@@ -43,9 +47,10 @@ export class DirectTrustStore {
   static readonly MAX_PEERS = 128;
   #verified = new Map<string, VerifiedDirect>();
 
-  markVerified(context: DirectTrustContext, displayedSafetyNumber: string): boolean {
+  markVerified(context: DirectTrustContext, presentedToken: string): boolean {
     if (!context.chatId || !context.peerUsername || !context.safetyNumber ||
-      displayedSafetyNumber !== context.safetyNumber || context.sessionGeneration < 0 ||
+      !context.verificationToken || presentedToken !== context.verificationToken ||
+      context.sessionGeneration < 0 ||
       context.connectionGeneration < 0 ||
       context.localIdentity.byteLength < STABLE_IDENTITY_BYTES ||
       context.peerIdentity.byteLength < STABLE_IDENTITY_BYTES) {
@@ -66,6 +71,7 @@ export class DirectTrustStore {
       chatId: context.chatId,
       peerUsername: context.peerUsername,
       safetyNumber: context.safetyNumber,
+      verificationToken: context.verificationToken,
       sessionGeneration: context.sessionGeneration,
       connectionGeneration: context.connectionGeneration,
       localIdentity: context.localIdentity.slice(0, STABLE_IDENTITY_BYTES),
@@ -80,6 +86,7 @@ export class DirectTrustStore {
       verified.chatId === context.chatId &&
       verified.peerUsername === context.peerUsername &&
       verified.safetyNumber === context.safetyNumber &&
+      verified.verificationToken === context.verificationToken &&
       verified.sessionGeneration === context.sessionGeneration &&
       verified.connectionGeneration === context.connectionGeneration &&
       context.localIdentity.byteLength >= STABLE_IDENTITY_BYTES &&
@@ -107,6 +114,7 @@ export class DirectTrustStore {
       active: true,
       peerUsername: context.peerUsername,
       safetyNumber: context.safetyNumber,
+      verificationToken: context.verificationToken,
       verified: this.isVerified(context),
     };
   }

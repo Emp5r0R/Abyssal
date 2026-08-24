@@ -63,7 +63,7 @@ describe("direct message retention", () => {
         username="Self"
         connected
         safetyNumber="1234 5678 9012"
-        directTrust={{ verified: false }}
+        directTrust={{ verified: false, verificationToken: "abyssal:verify:v1:test-token" }}
         messages={[]}
         users={[]}
         upload={{ active: false, name: "", loaded: 0, total: 0 }}
@@ -75,7 +75,7 @@ describe("direct message retention", () => {
         onViewAttachment={vi.fn()}
         onExportAttachment={vi.fn()}
         onSendGif={vi.fn().mockResolvedValue(true)}
-        onVerifySafetyNumber={verify}
+        onVerifyToken={verify}
       />,
     );
 
@@ -84,8 +84,11 @@ describe("direct message retention", () => {
     fireEvent.click(verifyButton!);
     expect(screen.getByRole("heading", { name: "Verify direct chat" })).toBeInTheDocument();
     expect(screen.getByText(/separate trusted channel/i)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "I COMPARED — CONFIRM" }));
-    await waitFor(() => expect(verify).toHaveBeenCalledWith("1234 5678 9012"));
+    fireEvent.change(screen.getByLabelText("Peer verification token"), {
+      target: { value: "abyssal:verify:v1:test-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "VERIFY TOKEN" }));
+    await waitFor(() => expect(verify).toHaveBeenCalledWith("abyssal:verify:v1:test-token"));
   });
 });
 

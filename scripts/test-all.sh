@@ -92,6 +92,10 @@ run_shell() {
       echo "Stale MLS protocol v10 artifact: $artifact" >&2
       exit 1
     fi
+    if ! grep -aFq "ABYSSAL_DIRECT_VERIFICATION_V1" "$artifact"; then
+      echo "Stale direct-verification artifact: $artifact" >&2
+      exit 1
+    fi
   done
 }
 

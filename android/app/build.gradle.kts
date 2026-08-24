@@ -135,6 +135,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.okhttp)
     implementation("net.java.dev.jna:jna:5.18.1@aar")
+    implementation("com.google.zxing:core:3.5.4")
 
     testImplementation(libs.junit)
     testImplementation("net.java.dev.jna:jna:5.18.1")

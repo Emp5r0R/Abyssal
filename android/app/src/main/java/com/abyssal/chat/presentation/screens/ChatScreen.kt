@@ -163,7 +163,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         onExternalSystemUiStart = viewModel::beginExternalSystemUi,
         onExternalSystemUiEnd = viewModel::endExternalSystemUi,
         onUserActivity = viewModel::recordUserActivity,
-        onVerifySafetyNumber = viewModel::verifyDirectSafetyNumber
+        onVerifyToken = viewModel::verifyDirectVerificationToken
     )
 }
 
@@ -188,7 +188,7 @@ private fun ChatContent(
     onExternalSystemUiStart: () -> Long,
     onExternalSystemUiEnd: (Long) -> Boolean,
     onUserActivity: () -> Unit,
-    onVerifySafetyNumber: (String) -> Boolean
+    onVerifyToken: (String) -> Boolean
 ) {
     var textInput by remember { mutableStateOf("") }
     var selectedTimerSec by remember(session) { mutableIntStateOf(session?.selfDestructTimerSec ?: 5) }
@@ -426,13 +426,14 @@ private fun ChatContent(
             )
         }
 
-        if (showTrustDialog && directTrust.active && directTrust.safetyNumber != null) {
+        if (showTrustDialog && directTrust.active && directTrust.safetyNumber != null &&
+            directTrust.verificationToken != null
+        ) {
             DirectTrustDialog(
                 safetyNumber = directTrust.safetyNumber,
+                verificationToken = directTrust.verificationToken,
                 onDismiss = { showTrustDialog = false },
-                onConfirm = {
-                    if (onVerifySafetyNumber(directTrust.safetyNumber)) showTrustDialog = false
-                }
+                onVerify = onVerifyToken
             )
         }
 
@@ -577,16 +578,22 @@ private fun ChatHeader(
 @Composable
 private fun DirectTrustDialog(
     safetyNumber: String,
+    verificationToken: String,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit
+    onVerify: (String) -> Boolean
 ) {
+    var presentedToken by remember(verificationToken) { mutableStateOf("") }
+    var rejected by remember(verificationToken) { mutableStateOf(false) }
     MirageDialog(title = "Verify direct chat", onDismiss = onDismiss, accent = NeonCyan) {
         Text(
-            text = "Compare this safety number with your peer using a separate trusted channel, such as an in-person exchange or a known voice call.",
+            text = "Scan this QR through a separate trusted channel, then paste your peer's token below.",
             color = SteelMuted,
             fontSize = 13.sp,
             lineHeight = 19.sp
         )
+        Box(modifier = Modifier.fillMaxWidth().padding(top = 16.dp), contentAlignment = Alignment.Center) {
+            DirectVerificationQr(verificationToken)
+        }
         Text(
             text = safetyNumber,
             color = NeonGreen,
@@ -598,18 +605,60 @@ private fun DirectTrustDialog(
                 .padding(vertical = 16.dp)
                 .semantics { contentDescription = "Safety number $safetyNumber" }
         )
+        OutlinedTextField(
+            value = presentedToken,
+            onValueChange = {
+                presentedToken = it.take(96)
+                rejected = false
+            },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Peer verification token") },
+            singleLine = true,
+            textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 11.sp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = NeonCyan,
+                unfocusedBorderColor = GlassBorder,
+                focusedTextColor = PureWhite,
+                unfocusedTextColor = PureWhite,
+                focusedLabelColor = NeonCyan,
+                unfocusedLabelColor = SteelMuted,
+                cursorColor = NeonCyan
+            ),
+            isError = rejected
+        )
+        if (rejected) {
+            Text(
+                text = "Verification did not match.",
+                color = SelfDestructAmber,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
         Text(
-            text = "Only confirm when every digit matches. This verification stays in RAM and clears after reconnect, identity change, logout, wipe, or session expiry.",
+            text = "The QR and safety number are derived locally. Trust stays in RAM and clears after reconnect, identity change, logout, wipe, or session expiry.",
             color = SteelMuted,
             fontSize = 12.sp,
-            lineHeight = 17.sp
+            lineHeight = 17.sp,
+            modifier = Modifier.padding(top = 12.dp)
         )
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             MirageSecondaryButton(text = "CANCEL", onClick = onDismiss, modifier = Modifier.weight(1f))
-            MiragePrimaryButton(text = "I COMPARED", onClick = onConfirm, modifier = Modifier.weight(1f))
+            MiragePrimaryButton(
+                text = "VERIFY TOKEN",
+                onClick = {
+                    val accepted = onVerify(presentedToken)
+                    rejected = !accepted
+                    if (accepted) {
+                        presentedToken = ""
+                        onDismiss()
+                    }
+                },
+                enabled = presentedToken.isNotBlank(),
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
@@ -2221,6 +2270,6 @@ private fun ChatContentPreview() {
         onExternalSystemUiStart = { 1L },
         onExternalSystemUiEnd = { true },
         onUserActivity = {},
-        onVerifySafetyNumber = { false }
+        onVerifyToken = { false }
     )
 }

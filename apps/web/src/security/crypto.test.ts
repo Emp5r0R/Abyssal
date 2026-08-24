@@ -5,6 +5,7 @@ import {
   base64NoPaddingLength,
   bytesToBase64,
   conversationSafetyNumber,
+  conversationVerificationToken,
   finishOpaqueLogin,
   finishOpaqueRegistration,
   FatalCipherError,
@@ -85,6 +86,23 @@ describe("conversation safety numbers", () => {
     expect(conversationSafetyNumber(alice, bob)).toBe(conversationSafetyNumber(bob, alice));
     expect(conversationSafetyNumber(alice, bob)).not.toBe(conversationSafetyNumber(alice, eve));
     expect(conversationSafetyNumber(alice, bob)).toMatch(/^[0-9A-F]{4}( [0-9A-F]{4}){4}$/);
+  });
+
+  it("binds a symmetric verification token to node, chat, users, and identities", () => {
+    const alice = identity(1).publicKey();
+    const bob = identity(2).publicKey();
+    const expected = conversationVerificationToken(
+      "abyssal-node:1", "dm_alice_bob", "Alice", alice, "Bob", bob,
+    );
+    expect(expected).toBe(conversationVerificationToken(
+      "abyssal-node:1", "dm_alice_bob", "bob", bob, "ALICE", alice,
+    ));
+    expect(expected).toMatch(/^abyssal:verify:v1:[A-Za-z0-9_-]{43}$/u);
+    expect(expected).not.toBe(conversationVerificationToken(
+      "abyssal-node:2", "dm_alice_bob", "Alice", alice, "Bob", bob,
+    ));
+    alice.fill(0);
+    bob.fill(0);
   });
 });
 

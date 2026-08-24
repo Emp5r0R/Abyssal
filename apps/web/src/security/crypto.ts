@@ -1,5 +1,6 @@
 import initWasm, {
   conversationSafetyNumber as rustConversationSafetyNumber,
+  conversationVerificationToken as rustConversationVerificationToken,
   decryptAttachment as rustDecryptAttachment,
   encryptAttachment as rustEncryptAttachment,
   opaqueClientFinishLogin,
@@ -226,6 +227,28 @@ export function conversationSafetyNumber(firstPublicKey: Uint8Array, secondPubli
     throw new Error("Identity unavailable");
   }
   return rustConversationSafetyNumber(firstPublicKey, secondPublicKey);
+}
+
+export function conversationVerificationToken(
+  nodeId: string,
+  chatId: string,
+  firstUsername: string,
+  firstPublicKey: Uint8Array,
+  secondUsername: string,
+  secondPublicKey: Uint8Array,
+): string {
+  if (firstPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+    secondPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES) {
+    throw new Error("Identity unavailable");
+  }
+  return rustConversationVerificationToken(
+    nodeId,
+    chatId,
+    firstUsername,
+    firstPublicKey,
+    secondUsername,
+    secondPublicKey,
+  );
 }
 
 export class InMemoryPayloadCipher {

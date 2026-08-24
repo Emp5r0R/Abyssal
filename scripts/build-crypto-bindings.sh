@@ -172,6 +172,10 @@ for artifact in "${binary_artifacts[@]}"; do
     echo "Generated crypto artifact does not contain MLS protocol v10: $artifact" >&2
     exit 1
   fi
+  if ! grep -aFq "ABYSSAL_DIRECT_VERIFICATION_V1" "$artifact"; then
+    echo "Generated crypto artifact does not contain direct verification v1: $artifact" >&2
+    exit 1
+  fi
 done
 
 artifact_paths=(
@@ -193,6 +197,7 @@ artifact_paths+=(
 
 WASM_TYPESCRIPT="$ROOT_DIR/apps/web/src/generated/abyssal_core/abyssal_core.d.ts"
 for symbol in \
+  "conversationVerificationToken" \
   "mlsCreateRoom" \
   "mlsRecoverRoom" \
   "mlsPendingJoin" \
@@ -210,6 +215,7 @@ done
 
 KOTLIN_BINDINGS="$ROOT_DIR/android/app/src/main/java/uniffi/abyssal_core/abyssal_core.kt"
 for symbol in \
+  'fun `conversationVerificationToken`' \
   'fun `createMlsRoom`' \
   'fun `recoverMlsRoom`' \
   'fun `pendingMlsJoin`' \

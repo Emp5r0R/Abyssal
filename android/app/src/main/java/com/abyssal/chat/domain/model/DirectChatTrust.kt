@@ -4,6 +4,7 @@ data class DirectTrustContext(
     val chatId: String,
     val peerUsername: String,
     val safetyNumber: String,
+    val verificationToken: String,
     val sessionGeneration: Long,
     val connectionGeneration: Long,
     val localIdentity: ByteArray,
@@ -14,6 +15,7 @@ data class DirectTrustStatus(
     val active: Boolean = false,
     val peerUsername: String? = null,
     val safetyNumber: String? = null,
+    val verificationToken: String? = null,
     val verified: Boolean = false
 )
 
@@ -23,6 +25,7 @@ private data class VerifiedDirect(
     val chatId: String,
     val peerUsername: String,
     val safetyNumber: String,
+    val verificationToken: String,
     val sessionGeneration: Long,
     val connectionGeneration: Long,
     val localIdentity: ByteArray,
@@ -38,9 +41,10 @@ class DirectChatTrustStore {
     private val verified = LinkedHashMap<String, VerifiedDirect>()
 
     @Synchronized
-    fun markVerified(context: DirectTrustContext, displayedSafetyNumber: String): Boolean {
+    fun markVerified(context: DirectTrustContext, presentedToken: String): Boolean {
         if (context.chatId.isBlank() || context.peerUsername.isBlank() ||
-            context.safetyNumber.isBlank() || displayedSafetyNumber != context.safetyNumber ||
+            context.safetyNumber.isBlank() || context.verificationToken.isBlank() ||
+            presentedToken != context.verificationToken ||
             context.sessionGeneration < 0L || context.connectionGeneration < 0L ||
             context.localIdentity.size < STABLE_IDENTITY_BYTES ||
             context.peerIdentity.size < STABLE_IDENTITY_BYTES
@@ -56,6 +60,7 @@ class DirectChatTrustStore {
             chatId = context.chatId,
             peerUsername = context.peerUsername,
             safetyNumber = context.safetyNumber,
+            verificationToken = context.verificationToken,
             sessionGeneration = context.sessionGeneration,
             connectionGeneration = context.connectionGeneration,
             localIdentity = context.localIdentity.copyOfRange(0, STABLE_IDENTITY_BYTES),
@@ -70,6 +75,7 @@ class DirectChatTrustStore {
         return candidate.chatId == context.chatId &&
             candidate.peerUsername == context.peerUsername &&
             candidate.safetyNumber == context.safetyNumber &&
+            candidate.verificationToken == context.verificationToken &&
             candidate.sessionGeneration == context.sessionGeneration &&
             candidate.connectionGeneration == context.connectionGeneration &&
             context.localIdentity.size >= STABLE_IDENTITY_BYTES &&
@@ -101,6 +107,7 @@ class DirectChatTrustStore {
             active = true,
             peerUsername = context.peerUsername,
             safetyNumber = context.safetyNumber,
+            verificationToken = context.verificationToken,
             verified = isVerified(context)
         )
     }

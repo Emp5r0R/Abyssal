@@ -9,6 +9,7 @@ class DirectChatTrustTest {
         chatId = "dm_peer",
         peerUsername = "Peer",
         safetyNumber = "1234 5678 9012",
+        verificationToken = "abyssal:verify:v1:test-token",
         sessionGeneration = 3L,
         connectionGeneration = generation,
         localIdentity = ByteArray(608) { if (it < STABLE_IDENTITY_BYTES) 1 else 2 },
@@ -19,9 +20,9 @@ class DirectChatTrustTest {
     fun verificationRequiresExactNumberIdentitiesAndGeneration() {
         val store = DirectChatTrustStore()
         val trusted = context()
-        assertFalse(store.markVerified(trusted, "1234 5678 9013"))
+        assertFalse(store.markVerified(trusted, "abyssal:verify:v1:wrong-token"))
         assertFalse(store.isVerified(trusted))
-        assertTrue(store.markVerified(trusted, trusted.safetyNumber))
+        assertTrue(store.markVerified(trusted, trusted.verificationToken))
         assertTrue(store.isVerified(trusted))
         assertFalse(store.isVerified(context(8L)))
         assertFalse(store.isVerified(trusted.copy(sessionGeneration = 4L)))
@@ -38,14 +39,15 @@ class DirectChatTrustTest {
     fun invalidContextsAndStaleNumbersCannotCreateTrust() {
         val store = DirectChatTrustStore()
         val trusted = context()
-        assertFalse(store.markVerified(trusted, "1234 5678 9013"))
-        assertFalse(store.markVerified(trusted.copy(chatId = ""), trusted.safetyNumber))
-        assertFalse(store.markVerified(trusted.copy(peerUsername = ""), trusted.safetyNumber))
-        assertFalse(store.markVerified(trusted.copy(safetyNumber = ""), ""))
-        assertFalse(store.markVerified(trusted.copy(sessionGeneration = -1L), trusted.safetyNumber))
-        assertFalse(store.markVerified(trusted.copy(connectionGeneration = -1L), trusted.safetyNumber))
-        assertFalse(store.markVerified(trusted.copy(localIdentity = ByteArray(STABLE_IDENTITY_BYTES - 1)), trusted.safetyNumber))
-        assertFalse(store.markVerified(trusted.copy(peerIdentity = ByteArray(STABLE_IDENTITY_BYTES - 1)), trusted.safetyNumber))
+        assertFalse(store.markVerified(trusted, "abyssal:verify:v1:wrong-token"))
+        assertFalse(store.markVerified(trusted.copy(chatId = ""), trusted.verificationToken))
+        assertFalse(store.markVerified(trusted.copy(peerUsername = ""), trusted.verificationToken))
+        assertFalse(store.markVerified(trusted.copy(safetyNumber = ""), trusted.verificationToken))
+        assertFalse(store.markVerified(trusted.copy(verificationToken = ""), ""))
+        assertFalse(store.markVerified(trusted.copy(sessionGeneration = -1L), trusted.verificationToken))
+        assertFalse(store.markVerified(trusted.copy(connectionGeneration = -1L), trusted.verificationToken))
+        assertFalse(store.markVerified(trusted.copy(localIdentity = ByteArray(STABLE_IDENTITY_BYTES - 1)), trusted.verificationToken))
+        assertFalse(store.markVerified(trusted.copy(peerIdentity = ByteArray(STABLE_IDENTITY_BYTES - 1)), trusted.verificationToken))
         assertFalse(store.isVerified(null))
     }
 
@@ -53,7 +55,7 @@ class DirectChatTrustTest {
     fun prekeyRotationDoesNotChangeIdentityTrustAndClearWipesTrust() {
         val store = DirectChatTrustStore()
         val trusted = context()
-        assertTrue(store.markVerified(trusted, trusted.safetyNumber))
+        assertTrue(store.markVerified(trusted, trusted.verificationToken))
         // Prekey IDs are deliberately not part of the trust context.
         assertTrue(store.isVerified(trusted))
         store.clear()
@@ -64,10 +66,10 @@ class DirectChatTrustTest {
     fun verificationIsBoundPerPeerWithBoundedMemory() {
         val store = DirectChatTrustStore()
         val first = context()
-        assertTrue(store.markVerified(first, first.safetyNumber))
+        assertTrue(store.markVerified(first, first.verificationToken))
         repeat(DirectChatTrustStore.MAX_PEERS) { index ->
             val peer = first.copy(chatId = "dm_peer_$index", peerUsername = "Peer$index")
-            assertTrue(store.markVerified(peer, peer.safetyNumber))
+            assertTrue(store.markVerified(peer, peer.verificationToken))
         }
         assertFalse(store.isVerified(first))
         val newest = first.copy(

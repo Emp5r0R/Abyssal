@@ -94,6 +94,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import uniffi.abyssal_core.conversationSafetyNumber
+import uniffi.abyssal_core.conversationVerificationToken
 import uniffi.abyssal_core.decryptAttachment as decryptAttachmentBlob
 import uniffi.abyssal_core.encryptAttachment as encryptAttachmentBlob
 
@@ -2264,9 +2265,9 @@ class ChatViewModel(
         }
     }
 
-    fun verifyDirectSafetyNumber(displayedSafetyNumber: String): Boolean {
+    fun verifyDirectVerificationToken(presentedToken: String): Boolean {
         val context = currentDirectTrustContext() ?: return false
-        val accepted = directTrustStore.markVerified(context, displayedSafetyNumber)
+        val accepted = directTrustStore.markVerified(context, presentedToken.trim())
         wipeDirectTrustContext(context)
         refreshDirectTrust()
         return accepted
@@ -2305,13 +2306,25 @@ class ChatViewModel(
         val session = sessions.value.firstOrNull { it.id == chatId } ?: return null
         if (session.isForum) return null
         val peer = presence.value.firstOrNull { it.username.equals(session.name, ignoreCase = true) } ?: return null
+        val activeNode = nodeConfigService.getActiveSession() ?: return null
         val safetyNumber = runCatching {
             conversationSafetyNumber(currentUser.publicKey, peer.publicKey)
+        }.getOrNull() ?: return null
+        val verificationToken = runCatching {
+            conversationVerificationToken(
+                activeNode.nodeId,
+                session.id,
+                currentUser.username,
+                currentUser.publicKey,
+                peer.username,
+                peer.publicKey
+            )
         }.getOrNull() ?: return null
         return DirectTrustContext(
             chatId = session.id,
             peerUsername = session.name,
             safetyNumber = safetyNumber,
+            verificationToken = verificationToken,
             sessionGeneration = sessionGeneration.get(),
             connectionGeneration = chatTransport.currentConnectionGeneration(),
             localIdentity = currentUser.publicKey.copyOf(),
