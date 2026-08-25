@@ -507,23 +507,38 @@ fn write_public_key(path: PathBuf, public_key: &[u8; 32]) -> Result<(), String> 
 }
 
 fn root_source(public_key: &[u8; 32]) -> String {
-    let values = public_key
-        .iter()
-        .map(|byte| format!("0x{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let format_values = |bytes: &[u8]| {
+        bytes
+            .chunks(16)
+            .map(|chunk| {
+                format!(
+                    "    {},\n",
+                    chunk
+                        .iter()
+                        .map(|byte| format!("0x{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<String>()
+    };
+    let values = format_values(public_key);
+    let integration_values = format_values(&[
+        0xea, 0x4a, 0x6c, 0x63, 0xe2, 0x9c, 0x52, 0x0a, 0xbe, 0xf5, 0x50, 0x7b, 0x13, 0x2e, 0xc5,
+        0xf9, 0x95, 0x47, 0x76, 0xae, 0xbe, 0xbe, 0x7b, 0x92, 0x42, 0x1e, 0xea, 0x69, 0x14, 0x46,
+        0xd2, 0x2c,
+    ]);
     format!(
         "// Generated from the offline Abyssal release public key.\n\
          #[cfg(not(feature = \"integration-release-root\"))]\n\
-         pub const RELEASE_PUBKEY: [u8; 32] = [{values}];\n\n\
+         pub const RELEASE_PUBKEY: [u8; 32] = [\n\
+         {values}\
+         ];\n\n\
          #[cfg(all(feature = \"integration-release-root\", not(debug_assertions)))]\n\
          compile_error!(\"the integration release root is forbidden in release builds\");\n\n\
          #[cfg(feature = \"integration-release-root\")]\n\
          pub const RELEASE_PUBKEY: [u8; 32] = [\n\
-             0xea, 0x4a, 0x6c, 0x63, 0xe2, 0x9c, 0x52, 0x0a,\n\
-             0xbe, 0xf5, 0x50, 0x7b, 0x13, 0x2e, 0xc5, 0xf9,\n\
-             0x95, 0x47, 0x76, 0xae, 0xbe, 0xbe, 0x7b, 0x92,\n\
-             0x42, 0x1e, 0xea, 0x69, 0x14, 0x46, 0xd2, 0x2c,\n\
+         {integration_values}\
          ];\n"
     )
 }
@@ -720,6 +735,9 @@ mod tests {
         assert!(source.contains("RELEASE_PUBKEY"));
         assert!(source.contains("not(debug_assertions)"));
         assert_eq!(source.matches("integration-release-root").count(), 3);
+        assert!(!source.contains("= [0x"));
+        assert_eq!(source.matches("    0x5a").count(), 2);
+        assert!(!source.lines().any(|line| line.starts_with("0x")));
     }
 
     #[test]

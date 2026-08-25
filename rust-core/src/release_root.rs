@@ -1,14 +1,13 @@
-// Replaced only through the documented offline release-key ceremony. This
-// sentinel is intentionally unusable: every production verification fails
-// closed until a real public key is reviewed and committed.
+// Generated from the offline Abyssal release public key.
 #[cfg(not(feature = "integration-release-root"))]
-pub const RELEASE_PUBKEY: [u8; 32] = [0; 32];
+pub const RELEASE_PUBKEY: [u8; 32] = [
+    0x4e, 0xdf, 0x58, 0x23, 0xea, 0x64, 0x7d, 0x89, 0xf5, 0x91, 0x41, 0xd6, 0x09, 0x9e, 0x62, 0xc8,
+    0x21, 0xa6, 0xec, 0xa2, 0x77, 0x53, 0x33, 0x47, 0x75, 0xd6, 0xd6, 0x94, 0x2b, 0x2a, 0x20, 0x47,
+];
 
 #[cfg(all(feature = "integration-release-root", not(debug_assertions)))]
 compile_error!("the integration release root is forbidden in release builds");
 
-// Public half of the fixed test-only seed used by the loopback integration
-// harness. Production and release builds never enable this feature.
 #[cfg(feature = "integration-release-root")]
 pub const RELEASE_PUBKEY: [u8; 32] = [
     0xea, 0x4a, 0x6c, 0x63, 0xe2, 0x9c, 0x52, 0x0a, 0xbe, 0xf5, 0x50, 0x7b, 0x13, 0x2e, 0xc5, 0xf9,
