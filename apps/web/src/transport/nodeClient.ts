@@ -23,7 +23,12 @@ import {
   wipeBytes,
 } from "../security/crypto";
 import {
+  CONTROL_TRANSPORT_MAX_BYTES,
+  LEGACY_RELAY_DOMAIN_MAX_BYTES,
+  MLS_RELAY_DOMAIN_MAX_BYTES,
+  padOutgoingControlFrame,
   padOutgoingMessageFrame,
+  validateAndStripIncomingControlPadding,
   validateAndStripIncomingMessagePadding,
 } from "./messagePadding";
 import { MLS_MAX_FRAME_BYTES, parseMlsIncomingFrame, validMlsControlFrame } from "./mlsWire";
@@ -660,7 +665,7 @@ export class RelaySocket {
     try {
       ticketHolder.value = await requestWebSocketTicket(this.session, ticketAbort.signal);
       if (!this.isCurrentConnectionAttempt(generation, ticketAbort)) return;
-      protocols = ["abyssal-v1", `ticket.${ticketHolder.value}`];
+      protocols = ["abyssal-v2", `ticket.${ticketHolder.value}`];
       const socket = new WebSocket(`${this.session.endpoint.wsBaseUrl}/v1/ws`, protocols);
       protocols[1] = "ticket.";
       this.#socket = socket;
@@ -674,7 +679,7 @@ export class RelaySocket {
       socket.onmessage = (event) => {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         if (typeof event.data !== "string") return;
-        if (!utf8LengthWithin(event.data, MLS_MAX_FRAME_BYTES) ||
+        if (!utf8LengthWithin(event.data, CONTROL_TRANSPORT_MAX_BYTES) ||
           (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES) && !looksLikeMlsFrame(event.data))) {
           this.#manualClose = true;
           socket.close(1009, "frame too large");
@@ -1497,7 +1502,7 @@ type ParsedRelayFrame =
   | { kind: "ignored" };
 
 function parseRelayFrame(text: string): ParsedRelayFrame {
-  if (!utf8LengthWithin(text, MLS_MAX_FRAME_BYTES)) return { kind: "ignored" };
+  if (!utf8LengthWithin(text, CONTROL_TRANSPORT_MAX_BYTES)) return { kind: "ignored" };
   let value: unknown;
   try {
     value = JSON.parse(text) as unknown;
@@ -1507,7 +1512,17 @@ function parseRelayFrame(text: string): ParsedRelayFrame {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "ignored" };
   const frame = value as Record<string, unknown>;
   const mls = typeof frame.type === "string" && frame.type.startsWith("mls_");
-  if (!mls && !utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES)) return { kind: "invalid-result" };
+  if (frame.type === "message") {
+    if (!validateAndStripIncomingMessagePadding(text, frame)) {
+      return { kind: "invalid-result" };
+    }
+  } else if (!validateAndStripIncomingControlPadding(
+    text,
+    frame,
+    mls ? MLS_RELAY_DOMAIN_MAX_BYTES : LEGACY_RELAY_DOMAIN_MAX_BYTES,
+  )) {
+    return { kind: "invalid-result" };
+  }
   if (mls) {
     const parsed = parseMlsIncomingFrame(frame);
     if (!parsed) return { kind: "invalid-result" };
@@ -1563,9 +1578,6 @@ function parseRelayFrame(text: string): ParsedRelayFrame {
         accepted: frame.accepted,
       },
     };
-  }
-  if (frame.type === "message" && !validateAndStripIncomingMessagePadding(text, frame)) {
-    return { kind: "invalid-result" };
   }
   const parsed = parseIncomingFrameValue(frame);
   if (parsed) return { kind: "frame", frame: parsed };
@@ -1629,15 +1641,13 @@ function prekeyLeaseKey(chatId: string, messageId: string, recipientUsername: st
 }
 
 function serializeRelayFrame(frame: object, maxBytes = MAX_RELAY_TEXT_BYTES): string | null {
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(frame);
-  } catch {
-    return null;
-  }
-  return typeof serialized === "string" && utf8LengthWithin(serialized, maxBytes)
-    ? serialized
-    : null;
+  if (maxBytes !== MAX_RELAY_TEXT_BYTES && maxBytes !== MLS_MAX_FRAME_BYTES) return null;
+  return padOutgoingControlFrame(
+    frame,
+    maxBytes === MLS_MAX_FRAME_BYTES
+      ? MLS_RELAY_DOMAIN_MAX_BYTES
+      : LEGACY_RELAY_DOMAIN_MAX_BYTES,
+  );
 }
 
 function frameDirectoryStampMatches(frame: object, stamp: DirectoryStamp): boolean {

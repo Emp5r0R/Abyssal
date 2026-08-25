@@ -5,6 +5,15 @@ export const MESSAGE_TRANSPORT_BUCKETS = [
   262_144,
   1_048_576,
 ] as const;
+export const CONTROL_TRANSPORT_BUCKETS = [
+  ...MESSAGE_TRANSPORT_BUCKETS,
+  4_194_304,
+  16_777_216,
+  17_825_792,
+] as const;
+export const LEGACY_RELAY_DOMAIN_MAX_BYTES = 1_048_576;
+export const MLS_RELAY_DOMAIN_MAX_BYTES = 16_777_216;
+export const CONTROL_TRANSPORT_MAX_BYTES = 17_825_792;
 
 const MAX_BUCKET = MESSAGE_TRANSPORT_BUCKETS.at(-1)!;
 const PROTOCOL_VERSION = 9;
@@ -48,6 +57,29 @@ export function padOutgoingMessageFrame(frame: object): string | null {
   return null;
 }
 
+export function padOutgoingControlFrame(
+  frame: object,
+  domainLimit: number,
+): string | null {
+  if (!validControlFrame(frame) || !validDomainLimit(domainLimit)) return null;
+  const inner = safeSerialize(frame);
+  if (inner === null || utf8ByteLength(inner, domainLimit) === null) return null;
+  const wireLimit = controlWireLimit(domainLimit);
+  for (const bucket of CONTROL_TRANSPORT_BUCKETS) {
+    if (bucket > wireLimit) break;
+    const empty = serializePaddedFrame(frame, bucket, "");
+    if (empty === null) return null;
+    const emptyBytes = utf8ByteLength(empty, bucket);
+    if (emptyBytes === null || emptyBytes > bucket) continue;
+    const padding = randomFiller(bucket - emptyBytes, wireLimit);
+    if (padding === null) return null;
+    const serialized = serializePaddedFrame(frame, bucket, padding);
+    if (serialized !== null && utf8ByteLength(serialized, bucket) === bucket) return serialized;
+    return null;
+  }
+  return null;
+}
+
 /**
  * Validates relay message padding and removes transport-only fields in place.
  * Failure never mutates the supplied record.
@@ -82,6 +114,52 @@ export function validateAndStripIncomingMessagePadding(
   if (canonical === null || utf8ByteLength(canonical, canonicalBucket) !== canonicalBucket) {
     return false;
   }
+  delete frame.padding_bucket;
+  delete frame.padding;
+  return true;
+}
+
+/**
+ * Validates the exact transport suffix on every non-message relay frame and
+ * removes it only after the smallest bucket and raw UTF-8 length are proven.
+ */
+export function validateAndStripIncomingControlPadding(
+  text: string,
+  frame: Record<string, unknown>,
+  domainLimit: number,
+): boolean {
+  if (!validDomainLimit(domainLimit) || !plainRecord(frame) ||
+    typeof frame.type !== "string" || frame.type === "message" ||
+    typeof frame.padding_bucket !== "number" ||
+    !Number.isSafeInteger(frame.padding_bucket) ||
+    typeof frame.padding !== "string") return false;
+  const bucket = frame.padding_bucket;
+  const padding = frame.padding;
+  const wireLimit = controlWireLimit(domainLimit);
+  if (!CONTROL_TRANSPORT_BUCKETS.some((candidate) => candidate === bucket) ||
+    bucket > wireLimit || padding.length > wireLimit || !FILLER_PATTERN.test(padding)) return false;
+  const suffix = controlSuffix(bucket, padding);
+  if (!text.endsWith(suffix)) return false;
+
+  const base = withoutPadding(frame);
+  const inner = safeSerialize(base);
+  if (inner === null || utf8ByteLength(inner, domainLimit) === null) return false;
+  let canonicalBucket: number | null = null;
+  let emptyBytes = 0;
+  for (const candidate of CONTROL_TRANSPORT_BUCKETS) {
+    if (candidate > wireLimit) break;
+    const empty = serializePaddedFrame(base, candidate, "");
+    if (empty === null) return false;
+    const bytes = utf8ByteLength(empty, candidate);
+    if (bytes !== null && bytes <= candidate) {
+      canonicalBucket = candidate;
+      emptyBytes = bytes;
+      break;
+    }
+  }
+  if (canonicalBucket === null || bucket !== canonicalBucket ||
+    padding.length !== canonicalBucket - emptyBytes ||
+    utf8ByteLength(text, canonicalBucket) !== canonicalBucket) return false;
   delete frame.padding_bucket;
   delete frame.padding;
   return true;
@@ -160,8 +238,8 @@ function serializePaddedFrame(
   }
 }
 
-function randomFiller(length: number): string | null {
-  if (!Number.isSafeInteger(length) || length < 0 || length > MAX_BUCKET) return null;
+function randomFiller(length: number, max: number = MAX_BUCKET): string | null {
+  if (!Number.isSafeInteger(length) || length < 0 || length > max) return null;
   const bytes = new Uint8Array(length);
   try {
     for (let offset = 0; offset < bytes.length; offset += RANDOM_CHUNK_BYTES) {
@@ -179,6 +257,37 @@ function randomFiller(length: number): string | null {
     return null;
   } finally {
     bytes.fill(0);
+  }
+}
+
+function validControlFrame(value: object): value is Record<string, unknown> {
+  return plainRecord(value) &&
+    typeof value.type === "string" &&
+    value.type !== "message" &&
+    !Object.hasOwn(value, "padding_bucket") &&
+    !Object.hasOwn(value, "padding");
+}
+
+function validDomainLimit(value: number): boolean {
+  return value === LEGACY_RELAY_DOMAIN_MAX_BYTES || value === MLS_RELAY_DOMAIN_MAX_BYTES;
+}
+
+function controlWireLimit(domainLimit: number): number {
+  return domainLimit === LEGACY_RELAY_DOMAIN_MAX_BYTES
+    ? LEGACY_RELAY_DOMAIN_MAX_BYTES
+    : CONTROL_TRANSPORT_MAX_BYTES;
+}
+
+function controlSuffix(bucket: number, padding: string): string {
+  return `,"padding_bucket":${bucket},"padding":"${padding}"}`;
+}
+
+function safeSerialize(value: object): string | null {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? serialized : null;
+  } catch {
+    return null;
   }
 }
 

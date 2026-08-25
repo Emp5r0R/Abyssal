@@ -227,7 +227,7 @@ internal fun websocketUpgradeRequest(endpoint: NodeEndpoint, ticket: String): Re
     require(WS_TICKET_REGEX.matches(ticket))
     return Request.Builder()
         .url("${endpoint.wsBaseUrl}/v1/ws")
-        .header("Sec-WebSocket-Protocol", "abyssal-v1, ticket.$ticket")
+        .header("Sec-WebSocket-Protocol", "abyssal-v2, ticket.$ticket")
         .build()
 }
 
@@ -474,7 +474,8 @@ internal class RealChatTransport(
         val frame = JSONObject()
             .put("type", "join")
             .put("chat_id", chatId)
-            .toString()
+            .padOutgoingControl(ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES)
+            ?: return
         synchronized(connectionLock) {
             val generation = connectionGeneration.get()
             if (expectedConnectionGeneration != null &&
@@ -793,13 +794,18 @@ internal class RealChatTransport(
             SocketSnapshot(socket, generation)
         }
 
-    private fun sendCommandFrame(frame: String, expectedGeneration: Long?): Boolean {
+    private fun sendCommandFrame(
+        frame: JSONObject,
+        expectedGeneration: Long?,
+        domainLimit: Int = ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES
+    ): Boolean {
+        val wireFrame = frame.padOutgoingControl(domainLimit) ?: return false
         return synchronized(connectionLock) {
             val snapshot = captureSocketSnapshot(expectedGeneration) ?: return@synchronized false
             // The socket snapshot and write are atomic with invalidation. This
             // prevents a queued command from reaching a socket after its epoch
             // has been purged.
-            val sent = runCatching { snapshot.socket.send(frame) }.getOrDefault(false)
+            val sent = runCatching { snapshot.socket.send(wireFrame) }.getOrDefault(false)
             if (!sent && isCurrentSocket(snapshot.socket, snapshot.generation)) {
                 _serverStatus.value = _serverStatus.value.copy(state = "DISCONNECTED")
             }
@@ -809,9 +815,11 @@ internal class RealChatTransport(
 
     override suspend fun sendMlsControl(frame: JSONObject, expectedConnectionGeneration: Long): Boolean {
         if (!MlsWireCodec.isStrictControl(frame)) return false
-        val text = frame.toString()
-        if (exceedsUtf8ByteLimit(text, MlsWireCodec.MAX_FRAME_BYTES)) return false
-        return sendCommandFrame(text, expectedConnectionGeneration)
+        return sendCommandFrame(
+            frame,
+            expectedConnectionGeneration,
+            ControlTransportPadding.MLS_DOMAIN_MAX_BYTES
+        )
     }
 
     override suspend fun sendMlsTransaction(
@@ -844,8 +852,8 @@ internal class RealChatTransport(
             MlsWireCodec.canonicalU64(frame.opt("revision")) != revision ||
             (if (snapshot) !MlsWireCodec.isStrictSnapshot(frame) else !MlsWireCodec.isStrictTransaction(frame))
         ) return OutboundSendResult.NOT_SENT
-        val text = frame.toString()
-        if (exceedsUtf8ByteLimit(text, MlsWireCodec.MAX_FRAME_BYTES)) return OutboundSendResult.NOT_SENT
+        val text = frame.padOutgoingControl(ControlTransportPadding.MLS_DOMAIN_MAX_BYTES)
+            ?: return OutboundSendResult.NOT_SENT
         val result = CompletableDeferred<OutboundSendResult>()
         lateinit var operation: PendingMlsOperation
         val socket: WebSocket
@@ -928,7 +936,6 @@ internal class RealChatTransport(
         val frame = JSONObject()
             .put("type", "open_direct")
             .put("peer_username", peerUsername)
-            .toString()
         sendCommandFrame(frame, expectedGeneration)
     }
 
@@ -1145,7 +1152,8 @@ internal class RealChatTransport(
             .put("chat_id", chatId)
             .put("message_id", messageId)
             .put("recipient_username", recipientUsername)
-            .toString()
+            .padOutgoingControl(ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES)
+            ?: return null
         lateinit var socket: WebSocket
         val generation: Long
         var operation: PendingPrekeyLease
@@ -1242,7 +1250,8 @@ internal class RealChatTransport(
             .put("message_id", messageId)
             .put("recipient_username", recipientUsername)
             .put("prekey_id", prekeyId)
-            .toString()
+            .padOutgoingControl(ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES)
+            ?: return false
         return synchronized(connectionLock) {
             val snapshot = captureSocketSnapshot(expectedGeneration) ?: return false
             // A release is deliberately fire-and-forget: relay rejection is
@@ -1316,11 +1325,14 @@ internal class RealChatTransport(
                 .put("state_signature_b64", encode(state.stateSignature))
                 .put("ack_signature_b64", encode(ackSignature))
                 .put("used_prekey_id", usedPrekeyId)
-                .toString()
+                .padOutgoingControl(ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES)
+                ?: return OutboundSendResult.NOT_SENT
         } catch (_: Exception) {
             return OutboundSendResult.NOT_SENT
         }
-        if (frame.length > MAX_WEBSOCKET_FRAME_BYTES) return OutboundSendResult.NOT_SENT
+        if (exceedsUtf8ByteLimit(frame, ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES)) {
+            return OutboundSendResult.NOT_SENT
+        }
         val result = CompletableDeferred<OutboundSendResult>()
         lateinit var operation: PendingOperation
         lateinit var socket: WebSocket
@@ -1410,8 +1422,7 @@ internal class RealChatTransport(
                 .put("identity_envelope_b64", encode(state.envelope))
                 .put("identity_public_b64", encode(state.identityPublicKey))
                 .put("prekey_id", state.prekeyId)
-                .put("state_signature_b64", encode(state.stateSignature))
-                .toString(),
+                .put("state_signature_b64", encode(state.stateSignature)),
             expectedGeneration
         )
     }
@@ -1424,7 +1435,7 @@ internal class RealChatTransport(
         signalUserActivityInternal(expectedConnectionGeneration)
 
     private fun signalUserActivityInternal(expectedGeneration: Long?): Boolean =
-        sendCommandFrame(JSONObject().put("type", "activity").toString(), expectedGeneration)
+        sendCommandFrame(JSONObject().put("type", "activity"), expectedGeneration)
 
     override suspend fun broadcastGlobalWipe() {
         broadcastGlobalWipeInternal(expectedGeneration = null)
@@ -1435,9 +1446,7 @@ internal class RealChatTransport(
     }
 
     private fun broadcastGlobalWipeInternal(expectedGeneration: Long?) {
-        val frame = JSONObject()
-            .put("type", "global_wipe")
-            .toString()
+        val frame = JSONObject().put("type", "global_wipe")
         sendCommandFrame(frame, expectedGeneration)
     }
 
@@ -1470,14 +1479,30 @@ internal class RealChatTransport(
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (!isCurrentSocket(webSocket, generation)) return
                 val appearsMls = text.take(160).trimStart().startsWith("{\"type\":\"mls_")
-                val limit = if (appearsMls) MlsWireCodec.MAX_FRAME_BYTES else MAX_WEBSOCKET_FRAME_BYTES
+                val limit = if (appearsMls) {
+                    ControlTransportPadding.MAX_WIRE_BYTES
+                } else {
+                    ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES
+                }
                 if (exceedsUtf8ByteLimit(text, limit)) {
                     closeCurrentSocket(webSocket, nodeId, "message too big", closeCode = 1009)
                     return
                 }
                 runCatching {
                     val json = JSONObject(text)
-                    when (json.optString("type")) {
+                    val type = json.optString("type")
+                    if (type != "message") {
+                        val domainLimit = if (type.startsWith("mls_")) {
+                            ControlTransportPadding.MLS_DOMAIN_MAX_BYTES
+                        } else {
+                            ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES
+                        }
+                        if (!json.validateAndStripIncomingControlPadding(text, domainLimit)) {
+                            closeCurrentSocket(webSocket, nodeId, "invalid control padding")
+                            return
+                        }
+                    }
+                    when (type) {
                         "mls_room_result", "mls_snapshot_result" -> {
                             val frame = MlsWireCodec.parse(json) as? MlsIncomingFrame.RoomResult ?: run {
                                 closeCurrentSocket(webSocket, nodeId, "invalid MLS result")
@@ -1897,7 +1922,8 @@ internal class RealChatTransport(
         val frame = JSONObject()
             .put("type", "join")
             .put("chat_id", chatId)
-            .toString()
+            .padOutgoingControl(ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES)
+            ?: return
         synchronized(connectionLock) {
             if (isCurrentSocket(socket, generation)) socket.send(frame)
         }

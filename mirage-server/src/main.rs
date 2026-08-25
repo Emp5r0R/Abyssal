@@ -72,9 +72,11 @@ use transaction_receipts::{
     TransactionKey, TransactionKind, TransactionReceiptStore, TransactionTicket,
 };
 use transport_padding::{
-    json_array_len, json_bool_len, json_field_len, json_number_len, json_object_len,
-    json_string_field_len, random_message_transport_padding, valid_message_transport_padding,
-    MESSAGE_TRANSPORT_BUCKETS, MESSAGE_TRANSPORT_MAX_BUCKET,
+    control_transport_frame_len, json_array_len, json_bool_len, json_field_len, json_number_len,
+    json_object_len, json_string_field_len, pad_control_transport_frame,
+    random_message_transport_padding, strip_control_transport_frame,
+    valid_message_transport_padding, CONTROL_TRANSPORT_MAX_BUCKET, MESSAGE_TRANSPORT_BUCKETS,
+    MESSAGE_TRANSPORT_MAX_BUCKET,
 };
 
 const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
@@ -99,7 +101,7 @@ const LARGE_MLS_INBOUND_PREFIXES: [&str; 5] = [
     r#"{"type":"mls_application","protocol_version":10,"#,
     r#"{"type":"mls_state_snapshot","protocol_version":10,"#,
 ];
-const MLS_CLIENT_OUTBOUND_BYTES: usize = MLS_WS_MAX_FRAME_BYTES;
+const MLS_CLIENT_OUTBOUND_BYTES: usize = CONTROL_TRANSPORT_MAX_BUCKET;
 const STATE_REVISION_WINDOW_BITS: u32 = u128::BITS;
 const MAX_PENDING_FRAMES_PER_ROOM: usize = 500;
 const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
@@ -138,7 +140,7 @@ const MAX_CODE_BYTES: usize = 128;
 const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
 const MAX_LOGIN_LIMIT_ENTRIES: usize = 4_096;
-const WEB_SOCKET_PROTOCOL: &str = "abyssal-v1";
+const WEB_SOCKET_PROTOCOL: &str = "abyssal-v2";
 const WS_TICKET_BYTES: usize = 32;
 const WS_TICKET_B64_LEN: usize = 43;
 const WS_TICKET_TTL_MS: u64 = 30_000;
@@ -4611,8 +4613,8 @@ async fn ws_handler(
             }
             drop(active_connections);
             let failed_state = state.clone();
-            ws.max_frame_size(MLS_WS_MAX_FRAME_BYTES)
-                .max_message_size(MLS_WS_MAX_FRAME_BYTES)
+            ws.max_frame_size(CONTROL_TRANSPORT_MAX_BUCKET)
+                .max_message_size(CONTROL_TRANSPORT_MAX_BUCKET)
                 .protocols([WEB_SOCKET_PROTOCOL])
                 .on_failed_upgrade(move |_| {
                     debug!("websocket_upgrade_failed reason=transport");
@@ -4859,7 +4861,14 @@ async fn socket_loop(
                             warn!("closing limited frame connection from {client_id}: {err}");
                             break;
                         }
-                        if let Err(err) = handle_frame(&state, client_id, text.as_str()).await {
+                        let inner = match strip_inbound_control_transport(text.as_str()) {
+                            Ok(inner) => inner,
+                            Err(err) => {
+                                warn!("closing invalid transport frame from {client_id}: {err}");
+                                break;
+                            }
+                        };
+                        if let Err(err) = handle_frame(&state, client_id, inner.as_str()).await {
                             warn!("dropping invalid frame from {client_id}: {err}");
                         }
                     }
@@ -4892,10 +4901,10 @@ async fn check_ws_frame_allowed(
     client_id: Uuid,
     frame_bytes: usize,
 ) -> Result<(), String> {
-    if frame_bytes > MLS_WS_MAX_FRAME_BYTES {
+    if frame_bytes > CONTROL_TRANSPORT_MAX_BUCKET {
         return Err(format!(
             "frame too large: bytes={} max={}",
-            frame_bytes, MLS_WS_MAX_FRAME_BYTES
+            frame_bytes, CONTROL_TRANSPORT_MAX_BUCKET
         ));
     }
 
@@ -4952,11 +4961,53 @@ fn validate_inbound_text_socket_admission(
     text: &str,
     frame_limit: Result<(), String>,
 ) -> Result<(), String> {
-    // Size classification is repeated here even though handle_frame keeps the
-    // same check as defense in depth for direct callers and tests.  Returning
-    // an error from this function is the socket-loop's terminal branch.
-    validate_inbound_frame_size_before_parse(text)?;
+    validate_inbound_transport_size_before_parse(text)?;
     frame_limit
+}
+
+fn validate_inbound_transport_size_before_parse(text: &str) -> Result<(), String> {
+    let frame_bytes = text.len();
+    if frame_bytes <= WS_MAX_FRAME_BYTES {
+        return Ok(());
+    }
+    if frame_bytes > CONTROL_TRANSPORT_MAX_BUCKET {
+        return Err(format!(
+            "transport frame too large: bytes={} max={}",
+            frame_bytes, CONTROL_TRANSPORT_MAX_BUCKET
+        ));
+    }
+    if LARGE_MLS_INBOUND_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "oversized transport frame is not a canonical protocol-v10 MLS frame: bytes={} legacy_max={}",
+        frame_bytes, WS_MAX_FRAME_BYTES
+    ))
+}
+
+fn strip_inbound_control_transport(text: &str) -> Result<String, String> {
+    let value = serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|_| "transport frame rejected".to_string())?;
+    let frame_type = value
+        .as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "transport frame rejected".to_string())?;
+    if frame_type == "message" {
+        if text.len() > MESSAGE_TRANSPORT_MAX_BUCKET {
+            return Err("message transport frame too large".to_string());
+        }
+        return Ok(text.to_string());
+    }
+    let domain_limit = if frame_type.starts_with("mls_") {
+        MLS_WS_MAX_FRAME_BYTES
+    } else {
+        WS_MAX_FRAME_BYTES
+    };
+    strip_control_transport_frame(text, domain_limit)
 }
 
 enum RecoverableTransaction {
@@ -8493,23 +8544,34 @@ fn serialize_outbound_frame(frame: &OutboundFrame) -> Option<String> {
     if !outbound_message_padding_is_canonical(frame, serialized.len()) {
         return None;
     }
-    let limit = if frame.is_mls() {
+    if matches!(frame, OutboundFrame::Message { .. }) {
+        return (serialized.len() <= MESSAGE_TRANSPORT_MAX_BUCKET).then_some(serialized);
+    }
+    let domain_limit = if frame.is_mls() {
         MLS_WS_MAX_FRAME_BYTES
     } else {
         WS_MAX_FRAME_BYTES
     };
-    (serialized.len() <= limit).then_some(serialized)
+    pad_control_transport_frame(&serialized, domain_limit).ok()
 }
 
 fn outbound_queue_bytes(frame: &OutboundFrame) -> usize {
     if matches!(frame, OutboundFrame::Message { .. }) {
         return outbound_frame_bytes(frame);
     }
-    serialize_outbound_frame(frame)
-        .map(|serialized| serialized.len())
+    serde_json::to_string(frame)
+        .ok()
+        .and_then(|serialized| {
+            let domain_limit = if frame.is_mls() {
+                MLS_WS_MAX_FRAME_BYTES
+            } else {
+                WS_MAX_FRAME_BYTES
+            };
+            control_transport_frame_len(&serialized, domain_limit)
+        })
         .unwrap_or_else(|| {
             if frame.is_mls() {
-                MLS_WS_MAX_FRAME_BYTES.saturating_add(1)
+                CONTROL_TRANSPORT_MAX_BUCKET.saturating_add(1)
             } else {
                 WS_MAX_FRAME_BYTES.saturating_add(1)
             }
@@ -8727,7 +8789,7 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
     };
     let bytes = outbound_queue_bytes(frame);
     let (frame_limit, queue_limit) = if frame.is_mls() {
-        (MLS_WS_MAX_FRAME_BYTES, MLS_CLIENT_OUTBOUND_BYTES)
+        (CONTROL_TRANSPORT_MAX_BUCKET, MLS_CLIENT_OUTBOUND_BYTES)
     } else {
         (WS_MAX_FRAME_BYTES, CLIENT_OUTBOUND_BYTES)
     };
@@ -11610,12 +11672,12 @@ mod tests {
     }
 
     #[test]
-    fn websocket_ticket_requires_protocol_v1_and_rejects_bearer() {
+    fn websocket_ticket_requires_protocol_v2_and_rejects_bearer() {
         let raw_ticket = URL_SAFE_NO_PAD.encode([7_u8; WS_TICKET_BYTES]);
         let mut headers = HeaderMap::new();
         headers.insert(
             header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_str(&format!("abyssal-v1, ticket.{raw_ticket}"))
+            HeaderValue::from_str(&format!("abyssal-v2, ticket.{raw_ticket}"))
                 .expect("valid subprotocol"),
         );
 
@@ -11625,7 +11687,7 @@ mod tests {
         );
         headers.insert(
             header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_str(&format!("abyssal-v1, bearer.{raw_ticket}"))
+            HeaderValue::from_str(&format!("abyssal-v2, bearer.{raw_ticket}"))
                 .expect("valid subprotocol"),
         );
         assert!(websocket_ticket_header(&headers).is_none());
@@ -11636,7 +11698,7 @@ mod tests {
         assert!(websocket_ticket_header(&headers).is_none());
         headers.insert(
             header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("abyssal-v1, ticket.invalid"),
+            HeaderValue::from_static("abyssal-v2, ticket.invalid"),
         );
         assert!(websocket_ticket_header(&headers).is_none());
     }
@@ -14758,11 +14820,13 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(
-            check_ws_frame_allowed(&test_state(), Uuid::new_v4(), MLS_WS_MAX_FRAME_BYTES + 1)
-                .await
-                .is_err()
-        );
+        assert!(check_ws_frame_allowed(
+            &test_state(),
+            Uuid::new_v4(),
+            CONTROL_TRANSPORT_MAX_BUCKET + 1
+        )
+        .await
+        .is_err());
 
         let oversized_legacy = serde_json::json!({"type":"dummy","padding_b64":"x".repeat(WS_MAX_FRAME_BYTES),"bytes":1}).to_string();
         assert!(

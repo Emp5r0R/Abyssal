@@ -42,24 +42,24 @@ node -e '
 
 "$RELEASE_TOOL" sign-build \
   --private-key "$RELEASE_KEY" \
-  --build-id "android@2.1.0" \
+  --build-id "android@2.2.0" \
   --source-commit "$SOURCE_COMMIT" \
   --output "$ANDROID_SIGNATURE"
 "$RELEASE_TOOL" sign-build \
   --private-key "$RELEASE_KEY" \
-  --build-id "web@2.1.0" \
+  --build-id "web@2.2.0" \
   --source-commit "$SOURCE_COMMIT" \
   --output "$WEB_SIGNATURE"
 "$RELEASE_TOOL" create-build-record \
   --private-key "$RELEASE_KEY" \
-  --build-id "android@2.1.0" \
+  --build-id "android@2.2.0" \
   --source-commit "$SOURCE_COMMIT" \
   --expected-signature "$ANDROID_SIGNATURE" \
   --output "$ANDROID_RECORD" \
   --asset "integration.apk" "$ANDROID_ASSET"
 "$RELEASE_TOOL" create-build-record \
   --private-key "$RELEASE_KEY" \
-  --build-id "web@2.1.0" \
+  --build-id "web@2.2.0" \
   --source-commit "$SOURCE_COMMIT" \
   --expected-signature "$WEB_SIGNATURE" \
   --output "$WEB_RECORD" \

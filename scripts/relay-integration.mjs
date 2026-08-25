@@ -40,6 +40,15 @@ const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
 const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
 const PREKEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/u;
 const MESSAGE_TRANSPORT_BUCKETS = [4096, 16_384, 65_536, 262_144, 1_048_576];
+const CONTROL_TRANSPORT_BUCKETS = [
+  ...MESSAGE_TRANSPORT_BUCKETS,
+  4_194_304,
+  16_777_216,
+  17_825_792,
+];
+const LEGACY_RELAY_DOMAIN_MAX_BYTES = 1_048_576;
+const MLS_RELAY_DOMAIN_MAX_BYTES = 16_777_216;
+const CONTROL_TRANSPORT_MAX_BYTES = 17_825_792;
 const MESSAGE_PADDING_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const MESSAGE_PADDING_PATTERN = /^[A-Za-z0-9_-]*$/u;
@@ -141,6 +150,96 @@ function validateIncomingMessagePadding(frame) {
   delete frame.padding_bucket;
   delete frame.padding;
   return canonical;
+}
+
+function controlDomainLimit(type) {
+  return type.startsWith("mls_")
+    ? MLS_RELAY_DOMAIN_MAX_BYTES
+    : LEGACY_RELAY_DOMAIN_MAX_BYTES;
+}
+
+function controlWireLimit(domainLimit) {
+  return domainLimit === LEGACY_RELAY_DOMAIN_MAX_BYTES
+    ? LEGACY_RELAY_DOMAIN_MAX_BYTES
+    : CONTROL_TRANSPORT_MAX_BYTES;
+}
+
+function controlSuffix(bucket, padding) {
+  return `,"padding_bucket":${bucket},"padding":"${padding}"}`;
+}
+
+function padOutgoingControlFrame(frame) {
+  assert.ok(frame && typeof frame === "object" && !Array.isArray(frame));
+  assert.equal(typeof frame.type, "string");
+  assert.notEqual(frame.type, "message");
+  assert.equal("padding_bucket" in frame, false);
+  assert.equal("padding" in frame, false);
+  const inner = JSON.stringify(frame);
+  const domainLimit = controlDomainLimit(frame.type);
+  assert.ok(Buffer.byteLength(inner, "utf8") <= domainLimit);
+  const prefix = inner.slice(0, -1);
+  const wireLimit = controlWireLimit(domainLimit);
+  for (const bucket of CONTROL_TRANSPORT_BUCKETS) {
+    if (bucket > wireLimit) break;
+    const emptyBytes = Buffer.byteLength(prefix, "utf8") + controlSuffix(bucket, "").length;
+    if (emptyBytes > bucket) continue;
+    const padding = randomControlPadding(bucket - emptyBytes, wireLimit);
+    const serialized = prefix + controlSuffix(bucket, padding);
+    assert.equal(Buffer.byteLength(serialized, "utf8"), bucket);
+    return serialized;
+  }
+  throw new Error("control frame exceeds transport buckets");
+}
+
+function randomControlPadding(length, max) {
+  assert.ok(Number.isSafeInteger(length) && length >= 0 && length <= max);
+  const bytes = Buffer.allocUnsafe(length);
+  try {
+    randomFillSync(bytes);
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = MESSAGE_PADDING_ALPHABET.charCodeAt(bytes[index] & 63);
+    }
+    return bytes.toString("ascii");
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function parseIncomingRelayFrame(raw) {
+  const frame = JSON.parse(raw);
+  assert.ok(frame && typeof frame === "object" && !Array.isArray(frame));
+  assert.equal(typeof frame.type, "string");
+  if (frame.type === "message") {
+    rawFrameText.set(frame, raw);
+    return frame;
+  }
+  const domainLimit = controlDomainLimit(frame.type);
+  const wireLimit = controlWireLimit(domainLimit);
+  assert.ok(CONTROL_TRANSPORT_BUCKETS.includes(frame.padding_bucket));
+  assert.ok(frame.padding_bucket <= wireLimit);
+  assert.equal(typeof frame.padding, "string");
+  assert.match(frame.padding, MESSAGE_PADDING_PATTERN);
+  const suffix = controlSuffix(frame.padding_bucket, frame.padding);
+  assert.ok(raw.endsWith(suffix));
+  const { padding_bucket: bucket, padding, ...base } = frame;
+  const inner = JSON.stringify(base);
+  assert.ok(Buffer.byteLength(inner, "utf8") <= domainLimit);
+  const prefix = inner.slice(0, -1);
+  const canonical = CONTROL_TRANSPORT_BUCKETS.find((candidate) =>
+    candidate <= wireLimit &&
+    Buffer.byteLength(prefix, "utf8") + controlSuffix(candidate, "").length <= candidate
+  );
+  assert.equal(bucket, canonical);
+  const emptyBytes = Buffer.byteLength(prefix, "utf8") + controlSuffix(canonical, "").length;
+  assert.equal(padding.length, canonical - emptyBytes);
+  assert.equal(Buffer.byteLength(raw, "utf8"), canonical);
+  delete frame.padding_bucket;
+  delete frame.padding;
+  return frame;
+}
+
+function sendControlFrame(socket, frame) {
+  socket.send(padOutgoingControlFrame(frame));
 }
 
 function assertCanonicalBytes(value, size, label) {
@@ -261,7 +360,7 @@ function installDirectoryTracker(socket, expectedNodeId) {
   const onMessage = (event) => {
     let frame;
     try {
-      frame = JSON.parse(String(event.data));
+      frame = parseIncomingRelayFrame(String(event.data));
     } catch {
       return;
     }
@@ -296,7 +395,7 @@ function installMlsTracker(socket) {
   const onMessage = (event) => {
     let frame;
     try {
-      frame = JSON.parse(String(event.data));
+      frame = parseIncomingRelayFrame(String(event.data));
     } catch {
       return;
     }
@@ -450,7 +549,7 @@ function installResultWaiter(socket, expectedType, messageId) {
   const onMessage = (event) => {
     let frame;
     try {
-      frame = JSON.parse(String(event.data));
+      frame = parseIncomingRelayFrame(String(event.data));
     } catch {
       failAmbiguous("malformed result frame");
       return;
@@ -516,11 +615,19 @@ async function selfCheckResultWaiterCorrelation() {
   const first = installResultWaiter(socket, "message_result", "self-first");
   const second = installResultWaiter(socket, "message_result", "self-second");
   socket.dispatch("message", {
-    data: JSON.stringify({ type: "message_result", message_id: "self-second", accepted: true }),
+    data: padOutgoingControlFrame({
+      type: "message_result",
+      message_id: "self-second",
+      accepted: true,
+    }),
   });
   assert.equal(await second.promise, "ACCEPTED");
   socket.dispatch("message", {
-    data: JSON.stringify({ type: "message_result", message_id: "self-first", accepted: true }),
+    data: padOutgoingControlFrame({
+      type: "message_result",
+      message_id: "self-first",
+      accepted: true,
+    }),
   });
   assert.equal(await first.promise, "ACCEPTED");
   assert.equal(pendingResultWaiters.size, 0);
@@ -544,7 +651,7 @@ function waitForFrame(socket, predicate) {
       const raw = String(event.data);
       let frame;
       try {
-        frame = JSON.parse(raw);
+        frame = parseIncomingRelayFrame(raw);
       } catch {
         return;
       }
@@ -714,7 +821,7 @@ async function requestWsTicket(account) {
     },
     body: JSON.stringify({
       platform: "web",
-      version: "2.1.0",
+      version: "2.2.0",
       build_signature_b64: buildSignatureB64,
     }),
   });
@@ -752,7 +859,7 @@ function connectWithTicket(ticket, expectedNodeId) {
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(
       `${baseUrl.replace(/^http/, "ws")}/v1/ws`,
-      ["abyssal-v1", `ticket.${ticket}`],
+      ["abyssal-v2", `ticket.${ticket}`],
     );
     const timeout = setTimeout(() => reject(new Error("WebSocket connection timed out")), 5_000);
     socket.addEventListener("open", () => {
@@ -818,12 +925,12 @@ async function requestPrekeyLease(socket, chatId, messageId, recipientUsername) 
       frame.message_id === messageId &&
       frame.recipient_username === recipientUsername,
   );
-  socket.send(JSON.stringify({
+  sendControlFrame(socket, {
     type: "prekey_lease",
     chat_id: chatId,
     message_id: messageId,
     recipient_username: recipientUsername,
-  }));
+  });
   const lease = await response;
   assert.deepEqual(Object.keys(lease).sort(), [
     "chat_id",
@@ -849,13 +956,13 @@ async function requestPrekeyLease(socket, chatId, messageId, recipientUsername) 
 }
 
 function releaseUnusedPrekeyLease(socket, lease) {
-  socket.send(JSON.stringify({
+  sendControlFrame(socket, {
     type: "prekey_lease_release",
     chat_id: lease.chat_id,
     message_id: lease.message_id,
     recipient_username: lease.recipient_username,
     prekey_id: lease.prekey_id,
-  }));
+  });
   releasedPrekeysAwaitingReuse.set(
     `${lease.chat_id}:${lease.recipient_username}`,
     lease.prekey_id,
@@ -1116,7 +1223,7 @@ async function acknowledgeFrame(recipient, socket, frame, decrypted) {
     // The ACK result waiter must exist before the acknowledgement is sent.
     waiter = installResultWaiter(socket, "ack_result", frame.message_id);
     try {
-      socket.send(JSON.stringify(acknowledgement));
+      sendControlFrame(socket, acknowledgement);
     } catch {
       waiter.cancel();
     }
@@ -1311,7 +1418,7 @@ async function sendMlsRoomTransaction(socket, frame) {
     (candidate) => candidate.type === "mls_room_result" &&
       candidate.room_id === frame.room_id && candidate.message_id === frame.message_id,
   );
-  socket.send(JSON.stringify(frame));
+  sendControlFrame(socket, frame);
   const outcome = await result;
   exactKeys(outcome, ["type", "protocol_version", "room_id", "message_id", "revision", "accepted"]);
   assert.equal(outcome.protocol_version, MLS_PROTOCOL_VERSION);
@@ -1326,7 +1433,7 @@ async function sendMlsSnapshot(socket, frame) {
     (candidate) => candidate.type === "mls_snapshot_result" &&
       candidate.room_id === frame.room_id && candidate.message_id === frame.message_id,
   );
-  socket.send(JSON.stringify(frame));
+  sendControlFrame(socket, frame);
   const outcome = await result;
   exactKeys(outcome, ["type", "protocol_version", "room_id", "message_id", "revision", "accepted"]);
   assert.equal(outcome.protocol_version, MLS_PROTOCOL_VERSION);
@@ -1449,14 +1556,18 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
       "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy",
     ]);
     const created = waitForMlsFrame(aliceSocket, (frame) => frame.type === "mls_room_created" && frame.room?.room_id === roomId);
-    aliceSocket.send(JSON.stringify(createFrame));
+    sendControlFrame(aliceSocket, createFrame);
     const createdFrame = await created;
     exactKeys(createdFrame, ["type", "protocol_version", "room"]);
     assert.equal(createdFrame.protocol_version, MLS_PROTOCOL_VERSION);
     assertMlsRoomWire(createdFrame.room, roomId, alice.username);
 
     const discoveredOnBob = waitForMlsFrame(bobSocket, (frame) => frame.type === "mls_room_discovered" && frame.room_id === roomId);
-    bobSocket.send(JSON.stringify({ type: "mls_discover_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId }));
+    sendControlFrame(bobSocket, {
+      type: "mls_discover_room",
+      protocol_version: MLS_PROTOCOL_VERSION,
+      room_id: roomId,
+    });
     const discoveredFrame = await discoveredOnBob;
     exactKeys(discoveredFrame, ["type", "protocol_version", "room_id", "group_id_b64", "owner_username"]);
     assert.equal(discoveredFrame.protocol_version, MLS_PROTOCOL_VERSION);
@@ -1473,7 +1584,7 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
       key_package_b64: encode(bobKeyPackage), state_envelope_b64: encode(bobPendingState),
     };
     const joinRequested = waitForMlsFrame(aliceSocket, (frame) => frame.type === "mls_join_requested" && frame.request_id === joinRequestId);
-    bobSocket.send(JSON.stringify(joinFrame));
+    sendControlFrame(bobSocket, joinFrame);
     const joinRequestedFrame = await joinRequested;
     exactKeys(joinRequestedFrame, ["type", "protocol_version", "room_id", "request_id", "username", "stable_identity_b64", "key_package_b64"]);
     assert.equal(joinRequestedFrame.protocol_version, MLS_PROTOCOL_VERSION);
@@ -1483,7 +1594,12 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
 
     // A non-owner rejection is dropped by the relay; the pending request remains
     // available to the owner and the exact valid commit below still succeeds.
-    bobSocket.send(JSON.stringify({ type: "mls_join_reject", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId, request_id: joinRequestId }));
+    sendControlFrame(bobSocket, {
+      type: "mls_join_reject",
+      protocol_version: MLS_PROTOCOL_VERSION,
+      room_id: roomId,
+      request_id: joinRequestId,
+    });
     const invalidMembership = {
       type: "mls_membership_commit", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId,
       message_id: randomUUID(), request_id: randomUUID(), from_epoch: "0", to_epoch: "1",
@@ -1695,8 +1811,14 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
     try {
       firstFrame = await sendAliceApplication(firstPlaintext, firstMessageId);
       assert.equal(JSON.stringify(firstFrame).includes("MLS application secret"), false);
+      const noDuplicateDelivery = waitForNoMlsFrame(
+        bobSocket,
+        (candidate) => candidate.type === "mls_application" &&
+          candidate.message_id === firstMessageId,
+      );
       const replayResult = await sendMlsRoomTransaction(aliceSocket, firstFrame);
-      assert.equal(replayResult, "REJECTED", "duplicate MLS application must be rejected");
+      assert.equal(replayResult, "ACCEPTED", "exact MLS replay must return its terminal result");
+      await noDuplicateDelivery;
     } finally {
       firstPlaintext.fill(0);
     }
@@ -1835,7 +1957,12 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
       const leaveRequestId = randomUUID();
       const leaveRequested = waitForMlsFrame(aliceSocket, (candidate) => candidate.type === "mls_leave_requested" && candidate.request_id === leaveRequestId);
       const leavePending = waitForMlsFrame(bobSocket, (candidate) => candidate.type === "mls_leave_pending" && candidate.request_id === leaveRequestId);
-      bobSocket.send(JSON.stringify({ type: "mls_leave_request", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId, request_id: leaveRequestId }));
+      sendControlFrame(bobSocket, {
+        type: "mls_leave_request",
+        protocol_version: MLS_PROTOCOL_VERSION,
+        room_id: roomId,
+        request_id: leaveRequestId,
+      });
       const [leaveRequestedFrame] = await Promise.all([leaveRequested, leavePending]);
       exactKeys(leaveRequestedFrame, ["type", "protocol_version", "room_id", "request_id", "username", "stable_identity_b64"]);
       assert.equal(leaveRequestedFrame.username, bob.username);
@@ -1902,7 +2029,11 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
     } finally {
       // The room is owner-controlled; deletion must remove it for every later catalog.
       const deleted = waitForMlsFrame(aliceSocket, (candidate) => candidate.type === "mls_room_deleted" && candidate.room_id === roomId);
-      aliceSocket.send(JSON.stringify({ type: "mls_delete_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: roomId }));
+      sendControlFrame(aliceSocket, {
+        type: "mls_delete_room",
+        protocol_version: MLS_PROTOCOL_VERSION,
+        room_id: roomId,
+      });
       await deleted;
       aliceSocket.close();
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1945,9 +2076,9 @@ assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
 
 await expectBuildAdmissionRejected(alice);
 const aliceTicket = await requestWsTicket(alice);
-await expectWebSocketRejected(["abyssal-v1", `bearer.${alice.token}`]);
+await expectWebSocketRejected(["abyssal-v2", `bearer.${alice.token}`]);
 let aliceSocket = await connectWithTicket(aliceTicket, alice.node_id);
-await expectWebSocketRejected(["abyssal-v1", `ticket.${aliceTicket}`]);
+await expectWebSocketRejected(["abyssal-v2", `ticket.${aliceTicket}`]);
 let bobSocket = await connect(bob);
 let bobReconnect;
 try {
@@ -1967,17 +2098,18 @@ try {
     bobSocket,
     (frame) => frame.type === "direct_opened" && frame.direct.peer_username === alice.username,
   );
-  aliceSocket.send(JSON.stringify({ type: "open_direct", peer_username: bob.username }));
+  sendControlFrame(aliceSocket, { type: "open_direct", peer_username: bob.username });
   const [aliceOpened, bobOpened] = await Promise.all([aliceDirect, bobDirect]);
   assert.equal(aliceOpened.direct.id, bobOpened.direct.id);
   assert.match(aliceOpened.direct.id, /^dm_[a-f0-9]{32}$/);
 
-  aliceSocket.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
-  bobSocket.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
+  sendControlFrame(aliceSocket, { type: "join", chat_id: aliceOpened.direct.id });
+  sendControlFrame(bobSocket, { type: "join", chat_id: aliceOpened.direct.id });
 
   // Empty directory evidence is a deliberately rejected first-contact frame.
-  // Its staged ratchet must roll back and its lease must be released for the
-  // exact valid retry below to reuse.
+  // Its staged ratchet must roll back and its lease must be released. The
+  // rejected transaction ID remains terminal, so the corrected send uses a
+  // fresh ID while proving the released one-time prekey is reusable.
   const missingStampMessageId = randomUUID();
   const missingStampPlaintext = JSON.stringify({
     kind: "text",
@@ -2004,18 +2136,26 @@ try {
   );
   assert.equal(missingStampOutcome, "REJECTED");
   assert.equal(releasedPrekeysAwaitingReuse.size, 1);
+  const missingStampRetryMessageId = randomUUID();
+  const missingStampRetryPlaintext = JSON.stringify({
+    kind: "text",
+    id: missingStampRetryMessageId,
+    sender: alice.username,
+    content: "missing directory stamp",
+    ...directoryStamp,
+  });
   const missingStampRetryDelivered = waitForFrame(
     bobSocket,
-    (frame) => frame.type === "message" && frame.message_id === missingStampMessageId,
+    (frame) => frame.type === "message" && frame.message_id === missingStampRetryMessageId,
   );
   const missingStampRetryOutcome = await sendEncryptedMessage(
     alice,
     bob,
     aliceSocket,
     aliceOpened.direct.id,
-    missingStampPlaintext,
+    missingStampRetryPlaintext,
     latestDirectoryStamp(aliceSocket),
-    { messageId: missingStampMessageId },
+    { messageId: missingStampRetryMessageId },
   );
   assert.equal(missingStampRetryOutcome, "ACCEPTED");
   const missingStampRetryFrame = await missingStampRetryDelivered;
@@ -2309,7 +2449,8 @@ try {
   assert.equal(retryGone.status, 404);
 
   // A stale, otherwise well-formed checkpoint must reject before fanout. The
-  // same message ID then succeeds after the native ratchet rollback.
+  // ratchet rolls back, but the terminal receipt reserves that message ID, so
+  // the corrected send uses a fresh ID.
   const staleMessageId = randomUUID();
   const stalePlaintext = JSON.stringify({
     kind: "text",
@@ -2331,18 +2472,26 @@ try {
     },
   );
   assert.equal(staleOutcome, "REJECTED");
+  const staleRetryMessageId = randomUUID();
+  const staleRetryPlaintext = JSON.stringify({
+    kind: "text",
+    id: staleRetryMessageId,
+    sender: alice.username,
+    content: "stale directory stamp",
+    ...directoryStamp,
+  });
   const staleRetryDelivered = waitForFrame(
     bobSocket,
-    (frame) => frame.type === "message" && frame.message_id === staleMessageId,
+    (frame) => frame.type === "message" && frame.message_id === staleRetryMessageId,
   );
   const staleRetryOutcome = await sendEncryptedMessage(
     alice,
     bob,
     aliceSocket,
     aliceOpened.direct.id,
-    stalePlaintext,
+    staleRetryPlaintext,
     latestDirectoryStamp(aliceSocket),
-    { messageId: staleMessageId },
+    { messageId: staleRetryMessageId },
   );
   assert.equal(staleRetryOutcome, "ACCEPTED");
   const staleRetryFrame = await staleRetryDelivered;
@@ -2457,7 +2606,7 @@ try {
     bobReconnect,
     (frame) => frame.type === "message" && frame.message_id === offlineMessageId,
   );
-  bobReconnect.send(JSON.stringify({ type: "join", chat_id: aliceOpened.direct.id }));
+  sendControlFrame(bobReconnect, { type: "join", chat_id: aliceOpened.direct.id });
   const replayedFrame = await replayed;
   const replayedPlain = decryptFrame(bob, replayedFrame, bobReconnectStamp);
   assert.equal(replayedPlain.payload.content, "offline secret");

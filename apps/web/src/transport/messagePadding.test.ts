@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  CONTROL_TRANSPORT_MAX_BYTES,
+  LEGACY_RELAY_DOMAIN_MAX_BYTES,
+  MLS_RELAY_DOMAIN_MAX_BYTES,
   MESSAGE_TRANSPORT_BUCKETS,
+  padOutgoingControlFrame,
   padOutgoingMessageFrame,
+  validateAndStripIncomingControlPadding,
   validateAndStripIncomingMessagePadding,
 } from "./messagePadding";
 
@@ -162,5 +167,70 @@ describe("message transport padding", () => {
 
     const oversized = incomingFrame("x".repeat(1_048_576));
     expect(paddedIncoming(oversized)).toBeNull();
+  });
+});
+
+describe("control transport padding", () => {
+  it("pads every small control into the same exact minimum bucket", () => {
+    const first = padOutgoingControlFrame(
+      { type: "activity" },
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    );
+    const second = padOutgoingControlFrame(
+      { type: "message_ack", message_id: "message-1", accepted: true },
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    );
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(new TextEncoder().encode(first!).byteLength).toBe(4096);
+    expect(new TextEncoder().encode(second!).byteLength).toBe(4096);
+
+    const frame = JSON.parse(first!) as Record<string, unknown>;
+    expect(validateAndStripIncomingControlPadding(
+      first!,
+      frame,
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    )).toBe(true);
+    expect(frame).toEqual({ type: "activity" });
+  });
+
+  it("uses bounded large buckets only for MLS-domain frames", () => {
+    const frame = { type: "mls_application", ciphertext_b64: "A".repeat(1_100_000) };
+    expect(padOutgoingControlFrame(frame, LEGACY_RELAY_DOMAIN_MAX_BYTES)).toBeNull();
+    const padded = padOutgoingControlFrame(frame, MLS_RELAY_DOMAIN_MAX_BYTES);
+    expect(padded).not.toBeNull();
+    expect(new TextEncoder().encode(padded!).byteLength).toBe(4_194_304);
+    expect(new TextEncoder().encode(padded!).byteLength).toBeLessThanOrEqual(
+      CONTROL_TRANSPORT_MAX_BYTES,
+    );
+  });
+
+  it("rejects changed suffixes, wrong buckets, and embedded transport fields", () => {
+    const padded = padOutgoingControlFrame(
+      { type: "activity" },
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    )!;
+    const changedBucket = padded.replace(
+      "\"padding_bucket\":4096",
+      "\"padding_bucket\":16384",
+    );
+    expect(validateAndStripIncomingControlPadding(
+      changedBucket,
+      JSON.parse(changedBucket) as Record<string, unknown>,
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    )).toBe(false);
+    expect(validateAndStripIncomingControlPadding(
+      `${padded} `,
+      JSON.parse(padded) as Record<string, unknown>,
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    )).toBe(false);
+    expect(padOutgoingControlFrame(
+      { type: "activity", padding: "hidden" },
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    )).toBeNull();
+    expect(padOutgoingControlFrame(
+      { type: "message" },
+      LEGACY_RELAY_DOMAIN_MAX_BYTES,
+    )).toBeNull();
   });
 });

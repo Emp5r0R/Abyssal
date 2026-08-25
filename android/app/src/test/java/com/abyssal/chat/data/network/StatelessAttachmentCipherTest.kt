@@ -22,7 +22,7 @@ class StatelessAttachmentCipherTest {
         val blob = encrypted.blob
 
         try {
-            assertEquals(1u, encrypted.version)
+            assertEquals(2u, encrypted.version)
             assertArrayEquals(
                 plaintext,
                 decryptAttachment(

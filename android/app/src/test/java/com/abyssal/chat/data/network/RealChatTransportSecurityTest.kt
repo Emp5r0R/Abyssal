@@ -57,7 +57,7 @@ class RealChatTransportSecurityTest {
         const val ACK_CAPACITY = 64
         const val ACK_SIZE = 64
         val TEST_BUILD_ATTESTATION = BuildAttestationProvider {
-            BuildAttestation("android", "2.1.0", "A".repeat(86), "1".repeat(40))
+            BuildAttestation("android", "2.2.0", "A".repeat(86), "1".repeat(40))
         }
     }
 
@@ -136,7 +136,7 @@ class RealChatTransportSecurityTest {
             transport.requestPrekeyLease("dm_alice", "message-lease", "Alice")
         }
         awaitSent(socket, 1)
-        val request = JSONObject(socket.sentTexts.single())
+        val request = sentControl(socket.sentTexts.single())
         assertEquals(
             setOf("type", "chat_id", "message_id", "recipient_username"),
             request.keys().asSequence().toSet()
@@ -151,9 +151,9 @@ class RealChatTransportSecurityTest {
             .put("recipient_public_key_b64", encode(ByteArray(608) { 4 }))
             .put("prekey_id", "prekey-2")
             .put("expires_at_ms", System.currentTimeMillis() + 5_000L)
-        listener.onMessage(socket, response.put("message_id", "wrong").toString())
+        listener.onMessage(socket, paddedControl(response.put("message_id", "wrong")))
         assertFalse(pending.isCompleted)
-        listener.onMessage(socket, response.put("message_id", "message-lease").toString())
+        listener.onMessage(socket, paddedControl(response.put("message_id", "message-lease")))
         val lease = pending.await()
         assertEquals("prekey-2", lease?.prekeyId)
         lease?.recipientPublicKey?.fill(0)
@@ -199,7 +199,7 @@ class RealChatTransportSecurityTest {
         val socket = RecordingWebSocket()
         installSocket(transport, socket)
         assertTrue(transport.releasePrekeyLease("dm_alice", "message-1", "Alice", "prekey-1"))
-        val frame = JSONObject(socket.sentTexts.single())
+        val frame = sentControl(socket.sentTexts.single())
         assertEquals(
             setOf("type", "chat_id", "message_id", "recipient_username", "prekey_id"),
             frame.keys().asSequence().toSet()
@@ -265,7 +265,7 @@ class RealChatTransportSecurityTest {
             )
         }
         awaitSent(socket, 1)
-        val acceptedFrame = JSONObject(socket.sentTexts.single())
+        val acceptedFrame = sentControl(socket.sentTexts.single())
         assertEquals("message_ack", acceptedFrame.getString("type"))
         assertFalse(acceptedFrame.has("directory_node_id"))
         assertFalse(acceptedFrame.has("directory_revision"))
@@ -298,7 +298,7 @@ class RealChatTransportSecurityTest {
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket)
 
-        listener.onMessage(socket, JSONObject().put("type", "ack_result").toString())
+        listener.onMessage(socket, paddedControl(JSONObject().put("type", "ack_result")))
         assertEquals(1008, socket.closeCode)
 
         val unknownSocket = RecordingWebSocket()
@@ -454,7 +454,7 @@ class RealChatTransportSecurityTest {
             )
         )
 
-        socket.sentTexts.mapNotNull { runCatching { JSONObject(it) }.getOrNull() }
+        socket.sentTexts.mapNotNull { runCatching { sentControl(it) }.getOrNull() }
             .filter { it.optString("type") == "message_ack" }
             .forEach { frame ->
                 listener.onMessage(
@@ -511,13 +511,17 @@ class RealChatTransportSecurityTest {
         transport.joinChat("forum_manual")
         oldListener.onMessage(
             oldSocket,
-            JSONObject().put("type", "presence")
-                .put("users", JSONArray().put(presence("Alice"))).toString()
+            paddedControl(
+                JSONObject().put("type", "presence")
+                    .put("users", JSONArray().put(presence("Alice")))
+            )
         )
         oldListener.onMessage(
             oldSocket,
-            JSONObject().put("type", "directs")
-                .put("directs", JSONArray().put(direct("dm_alice", "Alice"))).toString()
+            paddedControl(
+                JSONObject().put("type", "directs")
+                    .put("directs", JSONArray().put(direct("dm_alice", "Alice")))
+            )
         )
 
         oldListener.onFailure(oldSocket, IllegalStateException("abnormal socket"), null)
@@ -533,7 +537,7 @@ class RealChatTransportSecurityTest {
 
         assertTrue(
             "a fresh socket must not replay joins from the invalidated account",
-            newSocket.sentTexts.none { JSONObject(it).optString("type") == "join" }
+            newSocket.sentTexts.none { sentControl(it).optString("type") == "join" }
         )
     }
 
@@ -547,8 +551,10 @@ class RealChatTransportSecurityTest {
         currentListener.onOpen(currentSocket, openResponse(currentSocket))
         currentListener.onMessage(
             currentSocket,
-            JSONObject().put("type", "presence")
-                .put("users", JSONArray().put(presence("Alice"))).toString()
+            paddedControl(
+                JSONObject().put("type", "presence")
+                    .put("users", JSONArray().put(presence("Alice")))
+            )
         )
 
         oldListener.onMessage(oldSocket, mlsRoomDeletedFrame("forum_stale_callback"))
@@ -752,7 +758,7 @@ class RealChatTransportSecurityTest {
         }
         awaitSent(socket, 1)
 
-        listener.onMessage(socket, JSONObject().put("type", "GLOBAL_WIPE").toString())
+        listener.onMessage(socket, paddedControl(JSONObject().put("type", "GLOBAL_WIPE")))
         listener.onFailure(socket, IllegalStateException("failure after wipe"), null)
 
         assertEquals(OutboundSendResult.AMBIGUOUS, pending.await())
@@ -778,7 +784,7 @@ class RealChatTransportSecurityTest {
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket, generation = 83L)
 
-        listener.onMessage(socket, JSONObject().put("type", "GLOBAL_WIPE").toString())
+        listener.onMessage(socket, paddedControl(JSONObject().put("type", "GLOBAL_WIPE")))
         listener.onFailure(socket, IllegalStateException("failure after wipe"), null)
         assertEquals(84L, transport.currentConnectionGeneration())
 
@@ -1004,7 +1010,7 @@ class RealChatTransportSecurityTest {
 
         val request = websocketUpgradeRequest(endpoint, ticket)
         val protocols = request.header("Sec-WebSocket-Protocol")
-        assertEquals("abyssal-v1, ticket.$ticket", protocols)
+        assertEquals("abyssal-v2, ticket.$ticket", protocols)
         assertFalse(protocols.orEmpty().contains("bearer."))
         assertNull(request.header("Authorization"))
     }
@@ -1175,7 +1181,7 @@ class RealChatTransportSecurityTest {
 
         listener.onMessage(
             socket,
-            JSONObject().put("type", "presence").put("users", foreignCatalog).toString()
+            paddedControl(JSONObject().put("type", "presence").put("users", foreignCatalog))
         )
 
         assertEquals(1008, socket.closeCode)
@@ -1349,23 +1355,47 @@ class RealChatTransportSecurityTest {
         stateSignature = ByteArray(64) { 3 }
     )
 
-    private fun messageResult(messageId: String, accepted: Boolean): String = JSONObject()
-        .put("type", "message_result")
-        .put("message_id", messageId)
-        .put("accepted", accepted)
-        .toString()
+    private fun messageResult(messageId: String, accepted: Boolean): String = paddedControl(
+        JSONObject()
+            .put("type", "message_result")
+            .put("message_id", messageId)
+            .put("accepted", accepted)
+    )
 
-    private fun ackResult(messageId: String, accepted: Boolean): String = JSONObject()
-        .put("type", "ack_result")
-        .put("message_id", messageId)
-        .put("accepted", accepted)
-        .toString()
+    private fun ackResult(messageId: String, accepted: Boolean): String = paddedControl(
+        JSONObject()
+            .put("type", "ack_result")
+            .put("message_id", messageId)
+            .put("accepted", accepted)
+    )
 
-    private fun mlsRoomDeletedFrame(id: String): String = JSONObject()
-        .put("type", "mls_room_deleted")
-        .put("protocol_version", 10)
-        .put("room_id", id)
-        .toString()
+    private fun mlsRoomDeletedFrame(id: String): String = paddedControl(
+        JSONObject()
+            .put("type", "mls_room_deleted")
+            .put("protocol_version", 10)
+            .put("room_id", id),
+        ControlTransportPadding.MLS_DOMAIN_MAX_BYTES
+    )
+
+    private fun paddedControl(
+        frame: JSONObject,
+        domainLimit: Int = if (frame.optString("type").startsWith("mls_")) {
+            ControlTransportPadding.MLS_DOMAIN_MAX_BYTES
+        } else {
+            ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES
+        }
+    ): String = frame.padOutgoingControl(domainLimit) ?: error("invalid control fixture")
+
+    private fun sentControl(raw: String): JSONObject {
+        val frame = JSONObject(raw)
+        val domainLimit = if (frame.optString("type").startsWith("mls_")) {
+            ControlTransportPadding.MLS_DOMAIN_MAX_BYTES
+        } else {
+            ControlTransportPadding.LEGACY_DOMAIN_MAX_BYTES
+        }
+        check(frame.validateAndStripIncomingControlPadding(raw, domainLimit))
+        return frame
+    }
 
     private fun outboundMlsApplicationFrame(messageId: String, revision: String): JSONObject = JSONObject()
         .put("type", "mls_application").put("protocol_version", 10).put("room_id", "forum_alpha")
@@ -1498,7 +1528,7 @@ class RealChatTransportSecurityTest {
         awaitSent(socket, 1)
         val wrong = JSONObject().put("type", "mls_snapshot_result").put("protocol_version", 10)
             .put("room_id", "forum_alpha").put("message_id", "message_1").put("revision", "9").put("accepted", true)
-        listener.onMessage(socket, wrong.toString())
+        listener.onMessage(socket, paddedControl(wrong))
         assertEquals(1008, socket.closeCode)
         assertEquals(OutboundSendResult.AMBIGUOUS, pending.await())
     }
@@ -1515,7 +1545,7 @@ class RealChatTransportSecurityTest {
         awaitSent(socket, 1)
         val result = JSONObject().put("type", "mls_room_result").put("protocol_version", 10)
             .put("room_id", "forum_alpha").put("message_id", "message_2").put("revision", "4").put("accepted", true)
-        listener.onMessage(socket, result.toString())
+        listener.onMessage(socket, paddedControl(result))
         assertEquals(OutboundSendResult.ACCEPTED, pending.await())
         assertNull(socket.closeCode)
     }
@@ -1525,7 +1555,14 @@ class RealChatTransportSecurityTest {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket)
-        listener.onMessage(socket, JSONObject().put("type", "mls_application").put("protocol_version", 10).put("room_id", "forum_alpha").toString())
+        listener.onMessage(
+            socket,
+            paddedControl(
+                JSONObject().put("type", "mls_application")
+                    .put("protocol_version", 10)
+                    .put("room_id", "forum_alpha")
+            )
+        )
         assertEquals(1008, socket.closeCode)
         assertEquals("DISCONNECTED", runBlocking { transport.getServerStatus().first() }.state)
     }
@@ -1535,7 +1572,10 @@ class RealChatTransportSecurityTest {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val socket = RecordingWebSocket()
         val listener = installSocket(transport, socket)
-        listener.onMessage(socket, JSONObject().put("type", "rooms").put("rooms", JSONArray()).toString())
+        listener.onMessage(
+            socket,
+            paddedControl(JSONObject().put("type", "rooms").put("rooms", JSONArray()))
+        )
         assertEquals(1008, socket.closeCode)
         assertEquals("legacy room protocol", socket.closeReason)
     }
@@ -1704,7 +1744,7 @@ class RealChatTransportSecurityTest {
                 payload.keys().asSequence().toSet()
             )
             assertEquals("android", payload.getString("platform"))
-            assertEquals("2.1.0", payload.getString("version"))
+            assertEquals("2.2.0", payload.getString("version"))
             assertEquals("A".repeat(86), payload.getString("build_signature_b64"))
             assertTrue(request.url.encodedPath.endsWith("/v1/ws-ticket"))
             return call

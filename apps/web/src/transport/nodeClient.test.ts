@@ -21,6 +21,11 @@ import {
   uploadEncryptedAttachment,
   type AttachmentDownloadPolicy,
 } from "./nodeClient";
+import {
+  LEGACY_RELAY_DOMAIN_MAX_BYTES,
+  MLS_RELAY_DOMAIN_MAX_BYTES,
+  padOutgoingControlFrame,
+} from "./messagePadding";
 
 const endpoint: NodeEndpoint = {
   apiBaseUrl: "https://node.example",
@@ -118,6 +123,23 @@ function paddedRelayMessage(): { text: string; frame: Record<string, unknown> } 
   const text = JSON.stringify({ ...base, padding_bucket: bucket, padding });
   if (new TextEncoder().encode(text).byteLength !== bucket) throw new Error("bad padded fixture");
   return { text, frame: JSON.parse(text) as Record<string, unknown> };
+}
+
+function paddedControlFrame(frame: Record<string, unknown>): string {
+  const domainLimit = typeof frame.type === "string" && frame.type.startsWith("mls_")
+    ? MLS_RELAY_DOMAIN_MAX_BYTES
+    : LEGACY_RELAY_DOMAIN_MAX_BYTES;
+  return padOutgoingControlFrame(frame, domainLimit) ?? (() => {
+    throw new Error("bad padded control fixture");
+  })();
+}
+
+function unpaddedControlFrame(text: string | undefined): Record<string, unknown> {
+  if (text === undefined) throw new Error("missing control frame");
+  const frame = JSON.parse(text) as Record<string, unknown>;
+  delete frame.padding_bucket;
+  delete frame.padding;
+  return frame;
 }
 
 function websocketTicketResponse(expiresInSec = 30): Response {
@@ -1041,13 +1063,13 @@ describe("RelaySocket", () => {
     const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
     try {
       const pending = relay.requestPrekeyLease("dm_123", "lease-1", "Bob");
-      expect(socket.sent.at(-1)).toBe(JSON.stringify({
+      expect(unpaddedControlFrame(socket.sent.at(-1))).toEqual({
         type: "prekey_lease",
         chat_id: "dm_123",
         message_id: "lease-1",
         recipient_username: "Bob",
-      }));
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      });
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "prekey_lease",
         chat_id: "dm_123",
         message_id: "lease-1",
@@ -1067,13 +1089,13 @@ describe("RelaySocket", () => {
       });
       expect(lease.recipientPublicKey).toEqual(publicKey);
       expect(relay.releasePrekeyLease(lease)).toBe(true);
-      expect(socket.sent.at(-1)).toBe(JSON.stringify({
+      expect(unpaddedControlFrame(socket.sent.at(-1))).toEqual({
         type: "prekey_lease_release",
         chat_id: "dm_123",
         message_id: "lease-1",
         recipient_username: "Bob",
         prekey_id: "pool-key-1",
-      }));
+      });
     } finally {
       publicKey.fill(0);
       relay.close();
@@ -1090,7 +1112,7 @@ describe("RelaySocket", () => {
       const first = relay.requestPrekeyLease("dm_123", "lease-2", "Bob");
       await expect(relay.requestPrekeyLease("dm_123", "lease-2", "Bob"))
         .rejects.toMatchObject({ code: "NOT_SENT" });
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "prekey_lease",
         chat_id: "dm_123",
         message_id: "lease-2",
@@ -1193,7 +1215,7 @@ describe("RelaySocket", () => {
       );
       const socket = sockets[0];
       expect(socket.url).toBe("wss://node.example/v1/ws");
-      expect(socket.protocols).toEqual(["abyssal-v1", `ticket.${WS_TICKET}`]);
+      expect(socket.protocols).toEqual(["abyssal-v2", `ticket.${WS_TICKET}`]);
       expect(socket.protocols.join(" ")).not.toContain(SESSION_TOKEN);
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
@@ -1206,9 +1228,9 @@ describe("RelaySocket", () => {
         prekeyId: "test-prekey",
         stateSignature: new Uint8Array(64).fill(8),
       }, ACK_SIGNATURE, "used-prekey");
-      expect(socket.sent).toEqual([
-        JSON.stringify({ type: "open_direct", peer_username: "Bob" }),
-        JSON.stringify({
+      expect(socket.sent.map((frame) => unpaddedControlFrame(frame))).toEqual([
+        { type: "open_direct", peer_username: "Bob" },
+        {
           type: "message_ack",
           chat_id: "dm_123",
           message_id: "message_1",
@@ -1220,9 +1242,9 @@ describe("RelaySocket", () => {
           state_signature_b64: bytesToBase64(new Uint8Array(64).fill(8)),
           ack_signature_b64: bytesToBase64(ACK_SIGNATURE),
           used_prekey_id: "used-prekey",
-        }),
+        },
       ]);
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "message_1",
         accepted: true,
@@ -1248,11 +1270,11 @@ describe("RelaySocket", () => {
       parserSocket.readyState = 1;
       parserSocket.onopen?.(new Event("open"));
       parserRelay.setDirectoryStamp(DIRECTORY_STAMP);
-      parserSocket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      parserSocket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "direct_opened",
         direct: { id: "dm_123", peer_username: "Bob" },
       }) }));
-      parserSocket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      parserSocket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "presence",
         users: { username: "Mallory" },
       }) }));
@@ -1321,7 +1343,9 @@ describe("RelaySocket", () => {
       expect(relay.send(cyclic)).toBe(false);
       expect(socket.sent).toEqual([]);
       expect(relay.activity()).toBe(true);
-      expect(socket.sent).toEqual([JSON.stringify({ type: "activity" })]);
+      expect(socket.sent.map((frame) => unpaddedControlFrame(frame))).toEqual([
+        { type: "activity" },
+      ]);
       relay.close();
     } finally {
       globalThis.WebSocket = original;
@@ -1447,7 +1471,9 @@ describe("RelaySocket", () => {
         padding_bucket: 4096,
       });
       socket.onmessage?.(new MessageEvent("message", {
-        data: JSON.stringify({ type: "message_result", message_id: "message-1", accepted: true }),
+        data: paddedControlFrame({
+          type: "message_result", message_id: "message-1", accepted: true,
+        }),
       }));
       await expect(pending).resolves.toBe("ACCEPTED");
       expect(frames).toHaveLength(0);
@@ -1528,7 +1554,9 @@ describe("RelaySocket", () => {
       relay.setDirectoryStamp(DIRECTORY_STAMP);
       const pending = relay.sendEncryptedPayload("message-rejected", encryptedFrame("message-rejected"));
       socket.onmessage?.(new MessageEvent("message", {
-        data: JSON.stringify({ type: "message_result", message_id: "message-rejected", accepted: false }),
+        data: paddedControlFrame({
+          type: "message_result", message_id: "message-rejected", accepted: false,
+        }),
       }));
       await expect(pending).resolves.toBe("REJECTED");
       relay.close();
@@ -1560,7 +1588,7 @@ describe("RelaySocket", () => {
       relay.setDirectoryStamp(DIRECTORY_STAMP);
       const pending = relay.sendEncryptedPayload("message-2", encryptedFrame("message-2"));
       socket.onmessage?.(new MessageEvent("message", {
-        data: JSON.stringify({
+        data: paddedControlFrame({
           type: "message_result",
           message_id: "message-2",
           accepted: true,
@@ -1603,7 +1631,7 @@ describe("RelaySocket", () => {
       recovered.readyState = 1;
       recovered.onopen?.(new Event("open"));
       expect(recovered.sent).toEqual([exactFrame]);
-      recovered.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      recovered.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "message_result",
         message_id: "message-3",
         accepted: true,
@@ -1702,7 +1730,7 @@ describe("RelaySocket", () => {
       expect(ackFrame).not.toHaveProperty("directory_node_id");
       expect(ackFrame).not.toHaveProperty("directory_revision");
       expect(ackFrame).not.toHaveProperty("directory_digest");
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-accepted",
         accepted: true,
@@ -1717,7 +1745,7 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-rejected",
         accepted: false,
@@ -1768,7 +1796,7 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       )).resolves.toBe("NOT_SENT");
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-duplicate",
         accepted: true,
@@ -1792,7 +1820,7 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-malformed",
         accepted: true,
@@ -1817,7 +1845,7 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
-      unknownContext.socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      unknownContext.socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-unknown",
         accepted: true,
@@ -1839,7 +1867,9 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
-      const result = JSON.stringify({ type: "ack_result", message_id: "ack-once", accepted: true });
+      const result = paddedControlFrame({
+        type: "ack_result", message_id: "ack-once", accepted: true,
+      });
       duplicateContext.socket.onmessage?.(new MessageEvent("message", { data: result }));
       await expect(pending).resolves.toBe("ACCEPTED");
       duplicateContext.socket.onmessage?.(new MessageEvent("message", { data: result }));
@@ -1894,7 +1924,7 @@ describe("RelaySocket", () => {
         ACK_SIGNATURE,
         "used-prekey",
       );
-      trigger(socket, relay);
+      trigger(socket);
       await vi.advanceTimersByTimeAsync(30_000);
       await expect(message).resolves.toBe("AMBIGUOUS");
       await expect(ack).resolves.toBe("AMBIGUOUS");
@@ -1940,7 +1970,7 @@ describe("RelaySocket", () => {
       await expect(message).resolves.toBe("AMBIGUOUS");
       await expect(ack).resolves.toBe("AMBIGUOUS");
       expect(purges).toBe(1);
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-purge",
         accepted: true,
@@ -2016,12 +2046,12 @@ describe("RelaySocket", () => {
       second.onopen?.(new Event("open"));
       relay.setDirectoryStamp(DIRECTORY_STAMP);
       expect(second.sent).toContain(exactAck);
-      first.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      first.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-stale",
         accepted: true,
       }) }));
-      first.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      first.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "prekey_lease",
         chat_id: "dm_123",
         message_id: "lease-stale",
@@ -2031,7 +2061,7 @@ describe("RelaySocket", () => {
         expires_at_ms: Date.now() + 60_000,
       }) }));
       expect(frames).toEqual([]);
-      second.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      second.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "ack_result",
         message_id: "ack-stale",
         accepted: true,
@@ -2048,16 +2078,16 @@ describe("RelaySocket", () => {
     try {
       const frame = { type: "mls_application", protocol_version: 10, room_id: "forum_alpha", message_id: "mls-message", revision: "7" };
       const pending = relay.sendMlsTransaction("forum_alpha", "mls-message", 7n, frame);
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "mls_room_result", protocol_version: 10, room_id: "forum_alpha", message_id: "mls-message", revision: "7", accepted: true,
       }) }));
       await expect(pending).resolves.toBe("ACCEPTED");
-      expect(JSON.parse(socket.sent.at(-1)!)).toEqual(frame);
+      expect(unpaddedControlFrame(socket.sent.at(-1))).toEqual(frame);
 
       const snapshot = relay.sendMlsSnapshot("forum_alpha", "snapshot-message", 8n, {
         type: "mls_state_snapshot", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-message", revision: "8",
       });
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "mls_room_result", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-message", revision: "8", accepted: true,
       }) }));
       await expect(snapshot).resolves.toBe("AMBIGUOUS");
@@ -2071,11 +2101,11 @@ describe("RelaySocket", () => {
       const pending = relay.sendMlsSnapshot("forum_alpha", "snapshot-ok", 9n, {
         type: "mls_state_snapshot", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-ok", revision: "9",
       });
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "mls_snapshot_result", protocol_version: 10, room_id: "forum_alpha", message_id: "snapshot-ok", revision: "9", accepted: false,
       }) }));
       await expect(pending).resolves.toBe("REJECTED");
-      socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({
+      socket.onmessage?.(new MessageEvent("message", { data: paddedControlFrame({
         type: "mls_snapshot_result", protocol_version: 10, room_id: "forum_alpha", message_id: "bad", revision: "09", accepted: true,
       }) }));
       expect(socket.readyState).toBe(3);
