@@ -23,6 +23,7 @@ import { splitMentionText } from "../domain/messageAttention";
 import { isWebSender, senderOriginNotice } from "../domain/senderClient";
 import { exactReactionShortcut, reactionByShortcode, searchReactions, type ReactionAsset } from "../domain/reactions";
 import type { ChatMessage, PresenceUser, RoomRecord, UploadProgress } from "../domain/types";
+import { PRIVACY_BLUR_CLASS, PrivacyBlur } from "./PrivacyBlur";
 import { DirectVerificationQr } from "./DirectVerificationQr";
 import { GifPicker } from "./GifPicker";
 import { Dialog, Field, IconButton } from "./Ui";
@@ -164,7 +165,7 @@ export function ChatView({
         <IconButton className="mobile-only" label="Back to conversations" onClick={onBack}><ArrowLeft size={20} /></IconButton>
         <div className={`room-avatar ${isDirect ? "is-direct" : ""}`}>{isDirect ? "@" : "#"}</div>
         <div className="chat-title">
-          <h1>{room.name}</h1>
+          <h1><PrivacyBlur>{room.name}</PrivacyBlur></h1>
           {isDirect ? (
             <button
               type="button"
@@ -217,8 +218,8 @@ export function ChatView({
               id={`message-${message.id}`}
             >
               <div className="message-meta">
-                {message.mine ? <span>{username}</span> : (
-                  <button type="button" className="message-author" onClick={() => insertComposerToken(`@${message.sender}`)}>
+                {message.mine ? <PrivacyBlur>{username}</PrivacyBlur> : (
+                  <button type="button" className={`message-author ${PRIVACY_BLUR_CLASS}`} onClick={() => insertComposerToken(`@${message.sender}`)}>
                     {message.sender}
                   </button>
                 )}
@@ -241,7 +242,7 @@ export function ChatView({
                 ) : null}
               </div>
               <div className="message-line">
-                <div className="message-bubble">
+                <div className={`message-bubble ${PRIVACY_BLUR_CLASS}`} tabIndex={0} data-privacy-blur="true">
                   {message.replyToId ? (
                     <button
                       className="reply-preview"
@@ -300,7 +301,7 @@ export function ChatView({
         {replyTarget ? (
           <div className="composer-reply">
             <MessageSquareReply size={16} />
-            <span><strong>{replyTarget.sender}</strong>{replyTarget.content}</span>
+            <PrivacyBlur><strong>{replyTarget.sender}</strong>{replyTarget.content}</PrivacyBlur>
             <IconButton label="Cancel reply" onClick={() => onReply(null)}><X size={17} /></IconButton>
           </div>
         ) : null}
@@ -310,7 +311,7 @@ export function ChatView({
             {mentionSuggestions.map((user) => (
               <button key={user.username} type="button" role="option" onClick={() => insertComposerToken(`@${user.username}`)}>
                 <AtSign size={14} />
-                <strong>{user.username}</strong>
+                <PrivacyBlur><strong>{user.username}</strong></PrivacyBlur>
                 <span className={user.connected ? "is-online" : ""}>{user.connected ? "ONLINE" : "OFFLINE"}</span>
               </button>
             ))}

@@ -131,6 +131,7 @@ Web client behavior:
 
 - Account entry automatically creates an account for an unused code or logs into its existing RAM account. Each account request body is capped at 16 KiB; OPAQUE handshakes expire after 60 seconds and code attempts are rate-limited to six per minute.
 - Rooms, owner quotas, room media policy, live presence, encrypted messages, replies, read expiry, absolute expiry, GIFs, upload progress, images, videos, and explicit attachment downloads use the existing relay protocol. Dashboard room and DM entries never render message plaintext.
+- Web room names, usernames, message bubbles, reply previews, GIFs, attachment summaries, and decrypted media are visually blurred until pointer hover or keyboard focus. This is a shoulder-surfing control, not encryption or a browser screenshot defense.
 - Existing DMs are listed in the sidebar. Select any other account in `DIRECT` or the live presence rail to create/open the canonical pairwise conversation. The relay sends DM frames only to its two participants and rejects unauthorized joins and attachment requests.
 - Every bundled reaction has a `:filename:` shortcut, such as `:fire:`. Picker reactions carry a validated shortcut inside encrypted attachment metadata and render in equal-size inline frames without exposing the selection to the relay.
 - Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
@@ -156,7 +157,7 @@ Targeted modes are available for `quick`, `web`, `rust`, `android`, `android-pac
 
 Release builds additionally require an offline Ed25519 provenance key and a signed `release-manifest-v1.json`. The relay admits only the exact Android/web version and build signature named by its current verified RAM manifest. Web verifies its origin-served bundle before account entry; Android verifies its baked build identity and any downloaded update. The repository intentionally ships with an unusable zero production root until the one-time public-key ceremony is completed, so ordinary builds fail closed instead of silently trusting a placeholder. See [docs/RELEASE.md](docs/RELEASE.md) and [SECURITY.md](SECURITY.md).
 
-The 2026-08-23 integrated gate ran 332 web tests across 24 files, 63 Rust-core tests, 15 release-tool tests, 215 relay tests, and 234 Android JVM tests. Web lint/build, Rust formatting and warning-denied Clippy, the forbidden integration-root release compile check, Android release lint/debug and release compilation, live disposable-relay integration with strict build admission, generated-artifact and deployment checks, and npm/RustSec audits passed. No Android packaging task was invoked; the applicable tests had zero skips, failures, or errors.
+The 2026-08-25 integrated gate ran 350 web tests across 31 files, 67 Rust-core tests, 15 release-tool tests, 230 relay tests, and 241 Android JVM tests. Web lint/build, Rust formatting and warning-denied Clippy, the forbidden integration-root release compile check, Android release lint/debug and release compilation, live disposable-relay integration with strict build admission, generated-artifact and deployment checks, and npm/RustSec audits passed. No Android packaging task was invoked; the applicable tests had zero skips, failures, or errors.
 
 Security-sensitive build inputs are pinned and checked: Rust `1.97.1`, Gradle `8.7` plus its wrapper/distribution hashes, Android NDK `27.3.13750724`, `wasm-bindgen-cli` `0.2.126`, and `cargo-ndk` `4.1.2`. Gradle resolves against tracked SHA-256 dependency-verification metadata. CI action revisions and Docker image/frontend digests are immutable. A separate CI job regenerates every WASM/JNI binding and rejects any byte-level difference from the tracked artifacts. Dependabot covers Cargo, npm, Gradle, Actions, and Docker; advisory scans and CodeQL cover the supported Rust and JavaScript/TypeScript surfaces. Docker build context rules exclude local toolchains, deployment configuration, npm credentials, and release keystores before data reaches the builder.
 
@@ -180,6 +181,8 @@ ABYSSAL_MAX_ROOMS_PER_USER=5 \
 ABYSSAL_PENDING_MESSAGE_TTL_HOURS=24 \
 ABYSSAL_SESSION_INACTIVITY_MINUTES=15 \
 ABYSSAL_INACTIVITY_LIMIT_HOURS=0 \
+ABYSSAL_ALLOW_ANDROID_TO_WEB=false \
+ABYSSAL_ALLOW_WEB_TO_ANDROID=true \
 cargo run --release
 ```
 
@@ -208,6 +211,9 @@ Security-related relay knobs:
 - `ABYSSAL_PENDING_MESSAGE_TTL_HOURS`: maximum RAM lifetime for an undelivered encrypted pending frame. Default: `24`; accepted range: `1` to `168` hours. `0` is clamped to the one-hour minimum and never means unbounded. Expired frames are removed, their byte budget is returned, and matching prekey leases are released together.
 - `ABYSSAL_SESSION_INACTIVITY_MINUTES`: strict bearer-token and WebSocket inactivity limit. Default: `15`; accepted range: `1` to `1440`. The Android client displays the node policy and enforces the same deadline locally.
 - `ABYSSAL_INACTIVITY_LIMIT_HOURS`: dead-man switch. `0` disables it. A positive value wipes relay RAM state and broadcasts `GLOBAL_WIPE` after that many idle hours.
+- `ABYSSAL_ALLOW_ANDROID_TO_WEB`: permits Android-origin direct messages, MLS room applications, pending delivery, and attachments to web recipients. Default: `false`.
+- `ABYSSAL_ALLOW_WEB_TO_ANDROID`: permits web-origin direct messages, MLS room applications, pending delivery, and attachments to Android recipients. Default: `true`.
+- Platform delivery values accept only exact `true` or `false`; invalid values stop relay startup. Same-platform delivery is always allowed. The platform comes from the signed build attestation consumed by the authenticated session's first one-time WebSocket ticket, not from an editable message field. That session cannot switch platform without a fresh OPAQUE login. Unknown recipient platforms and forbidden mixed-platform fanout fail closed before publication. The policy constrains honest signed clients admitted by an honest relay; it is not hardware attestation and cannot constrain a client or relay an attacker has patched.
 - `ABYSSAL_WEB_ORIGINS`: comma-separated exact browser origins allowed to call the relay cross-origin and open WebSockets. Leave empty when web and relay share one origin.
 - `ABYSSAL_WEB_ROOT`: optional built web directory containing `index.html`. Docker sets this to `/opt/abyssal/web`.
 

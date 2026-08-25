@@ -157,4 +157,14 @@ describe("AppShell direct-message navigation", () => {
     expect(screen.queryByText(/DIRECT SECRET PREVIEW/u)).not.toBeInTheDocument();
     expect(screen.getByText("OWNER Alice")).toBeInTheDocument();
   });
+
+  it("conceals room names and peer usernames across navigation and dashboard surfaces", () => {
+    renderShell();
+    const concealed = [...document.querySelectorAll<HTMLElement>("[data-privacy-blur='true']")]
+      .map((element) => element.textContent);
+
+    expect(concealed).toContain("Operations");
+    expect(concealed).toContain("Bob");
+    expect(concealed).toContain("OWNER Alice");
+  });
 });

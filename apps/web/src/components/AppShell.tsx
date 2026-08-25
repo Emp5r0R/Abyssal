@@ -17,6 +17,7 @@ import {
 import { useState } from "react";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
 import { Brand, Dialog, Field, IconButton } from "./Ui";
+import { PrivacyBlur } from "./PrivacyBlur";
 
 interface AppShellProps {
   username: string;
@@ -98,7 +99,7 @@ export function AppShell({
 
         <button className="identity-row" type="button" onClick={() => onOpenRoom(null)}>
           <div className="identity-avatar"><UserRound size={19} /></div>
-          <div><strong>{username}</strong><span>{shortNode(nodeId)}</span></div>
+          <div><PrivacyBlur><strong>{username}</strong></PrivacyBlur><span>{shortNode(nodeId)}</span></div>
           <span className={`connection-dot state-${connection}`} title={connection} />
         </button>
 
@@ -119,7 +120,7 @@ export function AppShell({
                 onClick={() => { onOpenRoom(room.id); setMobileMenu(false); }}
               >
                 <Hash size={17} />
-                <span>{room.name}</span>
+                <PrivacyBlur>{room.name}</PrivacyBlur>
                 {unread > 0 ? <strong>{Math.min(unread, 99)}</strong> : null}
               </button>
             );
@@ -143,7 +144,7 @@ export function AppShell({
                 onClick={() => { onOpenRoom(direct.id); setMobileMenu(false); }}
               >
                 <span className={`direct-status ${online ? "is-online" : ""}`} />
-                <span>{direct.peer_username}</span>
+                <PrivacyBlur>{direct.peer_username}</PrivacyBlur>
                 {unread > 0 ? <strong>{Math.min(unread, 99)}</strong> : null}
               </button>
             );
@@ -158,7 +159,7 @@ export function AppShell({
                 onClick={() => { onOpenDirect(user.username); setMobileMenu(false); }}
               >
                 <MessageCircle size={15} />
-                <span>{user.username}</span>
+                <PrivacyBlur>{user.username}</PrivacyBlur>
                 <small>{user.connected ? "ONLINE" : "OFFLINE"}</small>
               </button>
             ))}
@@ -217,10 +218,10 @@ export function AppShell({
               className={user.connected ? "is-online" : ""}
               disabled={user.username === username}
               onClick={() => onOpenDirect(user.username)}
-              title={user.username === username ? "Current account" : `Message ${user.username}`}
+              title={user.username === username ? "Current account" : "Open direct conversation"}
             >
-              <span className="presence-avatar">{initials(user.username)}</span>
-              <div><strong>{user.username}</strong><span>{user.connected ? "ONLINE" : "OFFLINE"}</span></div>
+              <span className="presence-avatar"><PrivacyBlur>{initials(user.username)}</PrivacyBlur></span>
+              <div><PrivacyBlur><strong>{user.username}</strong></PrivacyBlur><span>{user.connected ? "ONLINE" : "OFFLINE"}</span></div>
               {user.username === username ? <i /> : <MessageCircle size={14} />}
             </button>
           ))}
@@ -307,7 +308,7 @@ function Dashboard({
 
       {pendingRoomJoins.length > 0 ? <div className="pending-room-joins" aria-label="Pending room joins">
         {pendingRoomJoins.map((request) => <div key={request.requestId}>
-          <span><strong>{request.username}</strong><small>{request.roomId}</small></span>
+          <span><PrivacyBlur><strong>{request.username}</strong></PrivacyBlur><small>{request.roomId}</small></span>
           <button className="secondary-button" type="button" onClick={() => void onAcceptRoomJoin(request.requestId)}>ACCEPT</button>
           <button className="danger-button" type="button" onClick={() => onRejectRoomJoin(request.requestId)}>REJECT</button>
         </div>)}
@@ -315,7 +316,7 @@ function Dashboard({
 
       {ownerLeaveRequests.length > 0 ? <div className="pending-room-joins" aria-label="Pending room leaves">
         {ownerLeaveRequests.map((request) => <div key={request.requestId}>
-          <span><strong>{request.username}</strong><small>{request.roomId}</small></span>
+          <span><PrivacyBlur><strong>{request.username}</strong></PrivacyBlur><small>{request.roomId}</small></span>
           <button className="danger-button" type="button" onClick={() => void onAcceptRoomLeave(request.requestId)}>REMOVE</button>
           <button className="secondary-button" type="button" onClick={() => onRejectRoomLeave(request.requestId)}>KEEP</button>
         </div>)}
@@ -336,8 +337,8 @@ function Dashboard({
           <div className="direct-empty">Select a peer from the Direct list to begin.</div>
         ) : directs.map((direct) => (
             <button type="button" key={direct.id} onClick={() => onOpenRoom(direct.id)} role="listitem">
-              <span className="presence-avatar">{initials(direct.peer_username)}</span>
-              <span><strong>{direct.peer_username}</strong><small>DIRECT</small></span>
+              <span className="presence-avatar"><PrivacyBlur>{initials(direct.peer_username)}</PrivacyBlur></span>
+              <span><PrivacyBlur><strong>{direct.peer_username}</strong></PrivacyBlur><small>DIRECT</small></span>
               <MessageCircle size={16} />
             </button>
           ))}
@@ -357,8 +358,8 @@ function Dashboard({
               <button className="room-row-open" type="button" onClick={() => onOpenRoom(room.id)} aria-label={`Open room ${room.name}`}>
                 <span className="room-row-icon"><Hash size={20} /></span>
                 <span className="room-row-main">
-                  <strong>{room.name}</strong>
-                  <span>{room.owner_username ? `OWNER ${room.owner_username}` : "NODE ROOM"}</span>
+                  <PrivacyBlur><strong>{room.name}</strong></PrivacyBlur>
+                  <PrivacyBlur>{room.owner_username ? `OWNER ${room.owner_username}` : "NODE ROOM"}</PrivacyBlur>
                 </span>
                 <span className="room-policy">{room.self_destruct_timer_sec === 0 ? "NEVER" : `${room.self_destruct_timer_sec}s`}</span>
                 <span className="room-media">{[room.allow_images && "IMG", room.allow_videos && "VID", room.allow_files && "FILE"].filter(Boolean).join(" · ") || "TEXT"}</span>
@@ -367,7 +368,7 @@ function Dashboard({
                 <IconButton label="Delete room" onClick={() => onDeleteRoom(room.id)}><Trash2 size={17} /></IconButton>
               ) : (
                 <span className="room-row-actions">
-                  <span className="room-owner">{room.owner_username || "NODE"}</span>
+                  <PrivacyBlur className="room-owner">{room.owner_username || "NODE"}</PrivacyBlur>
                   <IconButton label="Leave room" onClick={() => onLeaveRoom(room.id)}><DoorOpen size={17} /></IconButton>
                 </span>
               )}

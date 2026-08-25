@@ -3,6 +3,7 @@ import { useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { classifyMedia, MEDIA_LIMIT_BYTES, mediaAllowed } from "../domain/messagePolicy";
 import { formatBytes } from "../domain/format";
 import type { AttachmentOptions, RoomRecord } from "../domain/types";
+import { PrivacyBlur } from "./PrivacyBlur";
 import { Dialog, IconButton, Toggle } from "./Ui";
 
 export function AttachmentDialog({
@@ -72,8 +73,8 @@ export function AttachmentDialog({
           <div className="selected-file">
             <div className={`file-type-mark type-${mediaType?.toLowerCase()}`}>{mediaIcon(mediaType)}</div>
             <div>
-              <strong>{file.name}</strong>
-              <span>{formatBytes(file.size)} · {mediaType}</span>
+              <PrivacyBlur><strong>{file.name}</strong></PrivacyBlur>
+              <PrivacyBlur><span>{formatBytes(file.size)} · {mediaType}</span></PrivacyBlur>
             </div>
             <IconButton label="Remove attachment" onClick={() => setFile(null)}><X size={18} /></IconButton>
           </div>

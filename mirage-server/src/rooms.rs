@@ -12,6 +12,8 @@ use std::{
 };
 use zeroize::Zeroize;
 
+use crate::client_platform::ClientPlatform;
+
 pub const GROUP_ID_BYTES: usize = 32;
 pub const MLS_PROTOCOL_VERSION: u32 = 10;
 pub const MEMBERSHIP_DIGEST_BYTES: usize = 32;
@@ -267,6 +269,7 @@ pub enum DeliveryPayload {
     Application {
         sender_code_id: CodeId,
         sender_username: String,
+        sender_platform: ClientPlatform,
         ciphertext: Vec<u8>,
         authenticated_data: Vec<u8>,
     },
@@ -471,6 +474,7 @@ impl Drop for DeliveryPayload {
                 sender_username,
                 ciphertext,
                 authenticated_data,
+                ..
             } => {
                 sender_code_id.zeroize();
                 sender_username.zeroize();
@@ -1601,9 +1605,40 @@ impl RoomAuthority {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn admit_application(
         &mut self,
         sender_code_id: CodeId,
+        room_id: &str,
+        message_id: String,
+        group_id: Vec<u8>,
+        epoch: u64,
+        sender_revision: u64,
+        membership_digest: Vec<u8>,
+        ciphertext: Vec<u8>,
+        authenticated_data: Vec<u8>,
+        state_envelope: Vec<u8>,
+    ) -> Result<ApplicationAdmission, String> {
+        self.admit_application_for_platform(
+            sender_code_id,
+            ClientPlatform::Android,
+            room_id,
+            message_id,
+            group_id,
+            epoch,
+            sender_revision,
+            membership_digest,
+            ciphertext,
+            authenticated_data,
+            state_envelope,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_application_for_platform(
+        &mut self,
+        sender_code_id: CodeId,
+        sender_platform: ClientPlatform,
         room_id: &str,
         message_id: String,
         group_id: Vec<u8>,
@@ -1810,6 +1845,7 @@ impl RoomAuthority {
                     payload: DeliveryPayload::Application {
                         sender_code_id,
                         sender_username: sender_username.clone(),
+                        sender_platform,
                         ciphertext: ciphertext.clone(),
                         authenticated_data: authenticated_data.clone(),
                     },
@@ -3118,6 +3154,7 @@ fn delivery_size(delivery: &PendingDelivery) -> Result<usize, String> {
             sender_username,
             ciphertext,
             authenticated_data,
+            ..
         } => sender_code_id
             .len()
             .checked_add(sender_username.len())

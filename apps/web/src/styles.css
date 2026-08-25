@@ -1487,6 +1487,25 @@ button:disabled {
   overscroll-behavior: contain;
 }
 
+.privacy-blur {
+  filter: blur(7px);
+  transition: filter 120ms ease;
+}
+
+.privacy-blur:hover,
+.privacy-blur:focus,
+.privacy-blur:focus-visible,
+.privacy-blur:focus-within {
+  filter: none;
+  outline: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .privacy-blur {
+    transition: none;
+  }
+}
+
 .message-row {
   width: min(680px, 86%);
   margin: 0 0 20px;

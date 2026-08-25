@@ -182,4 +182,32 @@ describe("sender-client origin badges", () => {
 
     expect(screen.queryByRole("img", { name: /sent from/i })).toBeNull();
   });
+
+  it("conceals the chat label, sender, and complete message surface by default", () => {
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected
+        safetyNumber={null}
+        messages={[baseMessage({ content: "concealed body" })]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn()}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: direct.name }).querySelector("[data-privacy-blur='true']")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Peer" })).toHaveClass("privacy-blur");
+    const body = screen.getByText("concealed body").closest(".message-bubble");
+    expect(body).toHaveClass("privacy-blur");
+    expect(body).toHaveAttribute("tabindex", "0");
+  });
 });

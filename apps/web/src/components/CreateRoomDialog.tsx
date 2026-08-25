@@ -32,8 +32,7 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const next = clampRoom(room);
-    const slug = next.name.toLowerCase().replace(/[^a-z0-9]+/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 72) || "room";
-    next.id = `forum_${slug}_${crypto.randomUUID().slice(0, 8)}`;
+    next.id = `forum_${crypto.randomUUID().replaceAll("-", "")}`;
     if (next.name && onCreate(next)) onCancel();
   };
 

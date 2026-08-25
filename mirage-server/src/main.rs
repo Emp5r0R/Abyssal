@@ -58,12 +58,14 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod client_platform;
 mod mls_wire;
 mod release_admission;
 mod rooms;
 mod transaction_receipts;
 mod transport_padding;
 
+use client_platform::{ClientPlatform, InteropPolicy};
 use release_admission::{
     BuildAttestationRequest, InstallOutcome, ReleaseAdmissionStore, ReleaseManifestMirror,
 };
@@ -216,6 +218,7 @@ struct AppState {
     attachment_account_record_limit: usize,
     attachment_max_lifetime_sec: u64,
     max_rooms_per_user: usize,
+    interop_policy: InteropPolicy,
     conversation_ops: Arc<Mutex<()>>,
     presence_broadcast_ops: Arc<Mutex<()>>,
     pending_message_ttl_ms: u64,
@@ -272,6 +275,7 @@ struct Account {
     state_revision: u64,
     state_revision_window: u128,
     connected: bool,
+    client_platform: Option<ClientPlatform>,
     attachment_uploads: Arc<Semaphore>,
 }
 
@@ -306,6 +310,7 @@ struct AuthSession {
 struct WsTicket {
     session_token: Zeroizing<String>,
     expires_at_ms: u64,
+    client_platform: ClientPlatform,
 }
 
 impl Drop for WsTicket {
@@ -339,6 +344,7 @@ impl Drop for SessionToken {
 struct ClientHandle {
     code_id: CodeId,
     username: String,
+    platform: ClientPlatform,
     tx: mpsc::Sender<OutboundFrame>,
     control_tx: mpsc::Sender<ClientControl>,
     result_tx: mpsc::Sender<ClientResult>,
@@ -395,13 +401,24 @@ struct PendingKey {
 struct PendingFrame {
     frame: OutboundFrame,
     enqueued_at_ms: u64,
+    sender_platform: ClientPlatform,
 }
 
 impl PendingFrame {
+    #[cfg(test)]
     fn new(frame: OutboundFrame, enqueued_at_ms: u64) -> Self {
+        Self::new_for_platform(frame, enqueued_at_ms, ClientPlatform::Android)
+    }
+
+    fn new_for_platform(
+        frame: OutboundFrame,
+        enqueued_at_ms: u64,
+        sender_platform: ClientPlatform,
+    ) -> Self {
         Self {
             frame,
             enqueued_at_ms,
+            sender_platform,
         }
     }
 
@@ -504,6 +521,7 @@ struct AttachmentRecord {
     message_id: String,
     media_type: String,
     owner_code_id: CodeId,
+    sender_platform: ClientPlatform,
     published: bool,
     staged_expires_at_ms: Option<u64>,
     one_time: bool,
@@ -1711,6 +1729,7 @@ impl AppState {
         )
         .clamp(1, MAX_ATTACHMENT_UPLOAD_CONCURRENCY);
         let max_rooms_per_user = read_usize_env("ABYSSAL_MAX_ROOMS_PER_USER", 5).clamp(1, 100);
+        let interop_policy = InteropPolicy::from_env();
         let pending_message_ttl_ms = pending_message_ttl_ms_from_env();
         let web_origins = parse_origins_from_env("ABYSSAL_WEB_ORIGINS");
         let session_inactivity_minutes =
@@ -1743,6 +1762,7 @@ impl AppState {
             attachment_account_record_limit,
             attachment_max_lifetime_sec,
             max_rooms_per_user,
+            interop_policy,
             conversation_ops: Arc::new(Mutex::new(())),
             presence_broadcast_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms,
@@ -1835,6 +1855,11 @@ impl AppState {
         info!(
             "ABYSSAL_ROOM_LIMIT max_rooms_per_user={}",
             self.max_rooms_per_user
+        );
+        info!(
+            "ABYSSAL_INTEROP_POLICY android_to_web={} web_to_android={}",
+            self.interop_policy.allow_android_to_web(),
+            self.interop_policy.allow_web_to_android()
         );
         info!(
             "ABYSSAL_PENDING_MESSAGE_TTL pending_message_ttl_ms={}",
@@ -3219,6 +3244,12 @@ async fn reserve_attachment_download(
     requester_code_id: &CodeId,
 ) -> Result<AttachmentDownloadReservation, StatusCode> {
     prune_expired_attachments_locked(state).await;
+    let requester_platform = state
+        .accounts
+        .lock()
+        .await
+        .get(requester_code_id)
+        .and_then(|account| account.client_platform);
     let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
@@ -3247,16 +3278,25 @@ async fn reserve_attachment_download(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let destructive = record.one_time || record.delete_after_download;
-    let claim_id = if !destructive || *requester_code_id == record.owner_code_id {
-        None
-    } else {
+    let owner = *requester_code_id == record.owner_code_id;
+    if !owner {
+        let Some(requester_platform) = requester_platform else {
+            return Err(StatusCode::FORBIDDEN);
+        };
         if !record
             .eligible_recipient_code_ids
             .contains(requester_code_id)
+            || !state
+                .interop_policy
+                .allows(record.sender_platform, requester_platform)
         {
             return Err(StatusCode::FORBIDDEN);
         }
+    }
+    let destructive = record.one_time || record.delete_after_download;
+    let claim_id = if !destructive || owner {
+        None
+    } else {
         if record
             .completed_recipient_code_ids
             .contains(requester_code_id)
@@ -3722,6 +3762,7 @@ async fn finish_opaque_account(
                         state_revision: 0,
                         state_revision_window: 1,
                         connected: false,
+                        client_platform: None,
                         attachment_uploads: Arc::new(Semaphore::new(
                             MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT,
                         )),
@@ -4076,16 +4117,27 @@ async fn issue_ws_ticket(
     {
         return StatusCode::UPGRADE_REQUIRED.into_response();
     }
+    let Some(client_platform) = ClientPlatform::parse(&build_attestation.platform) else {
+        return StatusCode::UPGRADE_REQUIRED.into_response();
+    };
     let Some(session_token) = bearer_token(&headers).map(Zeroizing::new) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let _account_guard = state.account_ops.lock().await;
-    if active_session(&state, session_token.as_str(), false)
-        .await
-        .is_none()
-    {
+    let Some(auth_session) = active_session(&state, session_token.as_str(), false).await else {
         return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let accounts = state.accounts.lock().await;
+    let Some(account) = accounts.get(&auth_session.code_id) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if account
+        .client_platform
+        .is_some_and(|bound_platform| bound_platform != client_platform)
+    {
+        return StatusCode::UPGRADE_REQUIRED.into_response();
     }
+    drop(accounts);
 
     let now = now_ms();
     let mut tickets = state.ws_tickets.lock().await;
@@ -4120,14 +4172,31 @@ async fn issue_ws_ticket(
             break (ticket, digest);
         }
     };
-    tickets.insert(
+    // account_ops serializes ticket issuance and session replacement. Bind the
+    // session only after all ticket-capacity checks pass so a rejected request
+    // cannot relabel the account or pin a platform without a usable ticket.
+    drop(tickets);
+    let mut accounts = state.accounts.lock().await;
+    let Some(account) = accounts.get_mut(&auth_session.code_id) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if account
+        .client_platform
+        .is_some_and(|bound_platform| bound_platform != client_platform)
+    {
+        return StatusCode::UPGRADE_REQUIRED.into_response();
+    }
+    account.client_platform = Some(client_platform);
+    drop(accounts);
+
+    state.ws_tickets.lock().await.insert(
         digest,
         WsTicket {
             session_token,
             expires_at_ms: now.saturating_add(WS_TICKET_TTL_MS),
+            client_platform,
         },
     );
-    drop(tickets);
     touch_activity(&state).await;
 
     let mut response = Json(WsTicketResponse {
@@ -4144,7 +4213,7 @@ async fn issue_ws_ticket(
 async fn consume_ws_ticket(
     state: &AppState,
     ticket_value: &str,
-) -> Option<(Zeroizing<String>, AuthSession)> {
+) -> Option<(Zeroizing<String>, AuthSession, ClientPlatform)> {
     let mut digest = ws_ticket_digest(ticket_value)?;
     let ticket = {
         let mut tickets = state.ws_tickets.lock().await;
@@ -4157,10 +4226,11 @@ async fn consume_ws_ticket(
     // Removal happens before session validation and before the websocket
     // upgrade, making this ticket single-use even when the upgrade fails.
     let session_token = Zeroizing::new(ticket.session_token.as_str().to_owned());
+    let client_platform = ticket.client_platform;
     drop(ticket);
     let session = active_session(state, session_token.as_str(), true).await?;
     touch_activity(state).await;
-    Some((session_token, session))
+    Some((session_token, session, client_platform))
 }
 
 async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
@@ -4240,6 +4310,16 @@ async fn upload_attachment(
         Ok(auth) if auth.code_id == initial_auth.code_id => auth,
         Ok(_) | Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
+    let sender_platform = match state
+        .accounts
+        .lock()
+        .await
+        .get(&auth.code_id)
+        .and_then(|account| account.client_platform)
+    {
+        Some(platform) => platform,
+        None => return StatusCode::FORBIDDEN.into_response(),
+    };
     if !valid_encrypted_attachment_body(&media_type, &encrypted_body) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -4264,12 +4344,9 @@ async fn upload_attachment(
     let one_time = query.one_time.unwrap_or(false);
     let delete_after_download = query.delete_after_download.unwrap_or(one_time);
     let destructive = one_time || delete_after_download;
-    let eligible_recipient_code_ids = if destructive {
+    let eligible_recipient_code_ids =
         snapshot_attachment_recipients(&state, &access, &chat_id, &auth.username, &auth.code_id)
-            .await
-    } else {
-        HashSet::new()
-    };
+            .await;
     if destructive && eligible_recipient_code_ids.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -4340,6 +4417,7 @@ async fn upload_attachment(
             message_id,
             media_type,
             owner_code_id: auth.code_id,
+            sender_platform,
             published: false,
             staged_expires_at_ms,
             one_time,
@@ -4535,13 +4613,19 @@ async fn issue_session(
     username: String,
     created: bool,
 ) -> (StatusCode, Json<AccountResponse>) {
-    let account_identity = state.accounts.lock().await.get(&code_id).map(|account| {
-        (
-            URL_SAFE_NO_PAD.encode(&account.identity_public),
-            account.prekey_id.clone(),
-            URL_SAFE_NO_PAD.encode(&account.identity_envelope),
-        )
-    });
+    let account_identity = {
+        let mut accounts = state.accounts.lock().await;
+        accounts.get_mut(&code_id).map(|account| {
+            // A newly authenticated session must attest its platform again.
+            // Existing sockets use the replaced session token and fail closed.
+            account.client_platform = None;
+            (
+                URL_SAFE_NO_PAD.encode(&account.identity_public),
+                account.prekey_id.clone(),
+                URL_SAFE_NO_PAD.encode(&account.identity_envelope),
+            )
+        })
+    };
     let Some((identity_public_b64, identity_prekey_id, identity_envelope_b64)) = account_identity
     else {
         return account_error(StatusCode::UNAUTHORIZED, state, String::new()).await;
@@ -4603,7 +4687,7 @@ async fn ws_handler(
     let auth = consume_ws_ticket(&state, ticket.as_str()).await;
 
     match auth {
-        Some((token, session)) => {
+        Some((token, session, client_platform)) => {
             let client_id = Uuid::new_v4();
             let code_id = session.code_id;
             let mut active_connections = state.active_connections.lock().await;
@@ -4622,7 +4706,9 @@ async fn ws_handler(
                         release_connection_reservation(&failed_state, &code_id, client_id).await;
                     });
                 })
-                .on_upgrade(move |socket| socket_loop(state, token, session, client_id, socket))
+                .on_upgrade(move |socket| {
+                    socket_loop(state, token, session, client_platform, client_id, socket)
+                })
                 .into_response()
         }
         None => {
@@ -4689,6 +4775,7 @@ async fn socket_loop(
     state: AppState,
     session_token: Zeroizing<String>,
     auth: AuthSession,
+    client_platform: ClientPlatform,
     client_id: Uuid,
     socket: WebSocket,
 ) {
@@ -4711,6 +4798,7 @@ async fn socket_loop(
         ClientHandle {
             code_id: auth.code_id,
             username: auth.username.clone(),
+            platform: client_platform,
             tx,
             control_tx,
             result_tx,
@@ -5811,7 +5899,7 @@ async fn touch_activity_on_success(
 
 async fn join_room(state: &AppState, client_id: Uuid, chat_id: String) -> Result<(), String> {
     let _conversation_guard = state.conversation_ops.lock().await;
-    let (_, username) = client_identity(state, client_id).await?;
+    let (_, username, recipient_platform) = client_identity_and_platform(state, client_id).await?;
     if conversation_access(state, &username, &chat_id)
         .await
         .is_none()
@@ -5838,7 +5926,12 @@ async fn join_room(state: &AppState, client_id: Uuid, chat_id: String) -> Result
         .cloned()
         .unwrap_or_default();
     for mut pending_frame in pending {
-        send_to_client(state, client_id, &pending_frame.frame).await;
+        if state
+            .interop_policy
+            .allows(pending_frame.sender_platform, recipient_platform)
+        {
+            send_to_client(state, client_id, &pending_frame.frame).await;
+        }
         pending_frame.zeroize_sensitive();
     }
     Ok(())
@@ -5962,7 +6055,8 @@ async fn route_encrypted_message_with_directory(
 
     decode_bounded(&identity_envelope_b64, MAX_IDENTITY_ENVELOPE_BYTES)?;
 
-    let (sender_code_id, sender_username) = client_identity(state, sender_id).await?;
+    let (sender_code_id, sender_username, sender_platform) =
+        client_identity_and_platform(state, sender_id).await?;
     let sender_identity_public =
         Zeroizing::new(decode_exact(&identity_public_b64, IDENTITY_PUBLIC_BYTES)?);
     // Validate the complete bundle before any recipient fanout.  The relay
@@ -6017,6 +6111,7 @@ async fn route_encrypted_message_with_directory(
             HashSet::from([peer])
         }
     };
+    require_recipient_platforms(state, sender_platform, &expected_recipients).await?;
 
     if envelopes.len() != expected_recipients.len() {
         return Err("recipient envelope set rejected".to_string());
@@ -6125,7 +6220,7 @@ async fn route_encrypted_message_with_directory(
     )
     .await?;
     let mut pending_plan = preflight_pending_frames(state, &prepared_frames).await?;
-    commit_pending_frames(state, &prepared_frames, &mut pending_plan).await?;
+    commit_pending_frames(state, &prepared_frames, &mut pending_plan, sender_platform).await?;
     if let Err(error) = register_message_id(state, &chat_id, &sender_username, &message_id).await {
         rollback_pending_frames(state, &prepared_frames, &mut pending_plan).await;
         return Err(error);
@@ -6168,8 +6263,12 @@ async fn route_encrypted_message_with_directory(
         let recipient_ids = clients
             .iter()
             .filter_map(|(client_id, client)| {
-                (client.username == recipient_username && joined.contains(client_id))
-                    .then_some(*client_id)
+                (client.username == recipient_username
+                    && joined.contains(client_id)
+                    && state
+                        .interop_policy
+                        .allows(sender_platform, client.platform))
+                .then_some(*client_id)
             })
             .collect::<Vec<_>>();
         if !recipient_ids.is_empty() {
@@ -6457,6 +6556,7 @@ async fn commit_pending_frames(
     state: &AppState,
     frames: &[(String, OutboundFrame)],
     plan: &mut [PendingQueuePlan],
+    sender_platform: ClientPlatform,
 ) -> Result<(), String> {
     if frames.len() != plan.len() {
         return Err("pending frame plan mismatch".to_string());
@@ -6534,7 +6634,11 @@ async fn commit_pending_frames(
         let Some(next_pending_bytes) = pending_bytes.checked_add(incoming_bytes) else {
             return Err("pending message budget changed during commit".to_string());
         };
-        queue.push(PendingFrame::new(frame.clone(), now));
+        queue.push(PendingFrame::new_for_platform(
+            frame.clone(),
+            now,
+            sender_platform,
+        ));
         *pending_bytes = next_pending_bytes;
     }
     Ok(())
@@ -6596,7 +6700,7 @@ async fn queue_pending_frame(
 ) -> Result<(), String> {
     let frames = vec![(recipient_username, frame)];
     let mut plan = preflight_pending_frames(state, &frames).await?;
-    commit_pending_frames(state, &frames, &mut plan).await
+    commit_pending_frames(state, &frames, &mut plan, ClientPlatform::Android).await
 }
 
 async fn update_identity_state(
@@ -7588,7 +7692,9 @@ async fn send_mls_delivery(state: &AppState, delivery: &rooms::PendingDelivery) 
         .await
         .iter()
         .filter_map(|(client_id, client)| {
-            (client.code_id == delivery.recipient_code_id).then_some(*client_id)
+            (client.code_id == delivery.recipient_code_id
+                && mls_delivery_allowed(state.interop_policy, &delivery.payload, client.platform))
+            .then_some(*client_id)
         })
         .collect::<Vec<_>>();
     let frame = mls_delivery_frame(delivery);
@@ -7598,6 +7704,15 @@ async fn send_mls_delivery(state: &AppState, delivery: &rooms::PendingDelivery) 
 }
 
 async fn send_mls_pending(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    let Some(recipient_platform) = state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| client.platform)
+    else {
+        return;
+    };
     let room_ids = state
         .mls_rooms
         .lock()
@@ -7612,10 +7727,15 @@ async fn send_mls_pending(state: &AppState, client_id: Uuid, code_id: &CodeId) {
         for (room_id, active) in room_ids {
             if let Ok(room_deliveries) = authority.deliveries_for_member(&room_id, code_id) {
                 deliveries.extend(room_deliveries.into_iter().filter(|delivery| {
-                    active
+                    (active
                         || matches!(
                             &delivery.payload,
                             rooms::DeliveryPayload::Membership { welcome, .. } if !welcome.is_empty()
+                        ))
+                        && mls_delivery_allowed(
+                            state.interop_policy,
+                            &delivery.payload,
+                            recipient_platform,
                         )
                 }));
             }
@@ -7810,21 +7930,38 @@ async fn mls_application(
     state_envelope_b64: String,
 ) -> Result<(), String> {
     let _conversation_guard = state.conversation_ops.lock().await;
-    let (sender_code_id, _) = client_identity(state, sender_id).await?;
+    let (sender_code_id, _, sender_platform) =
+        client_identity_and_platform(state, sender_id).await?;
     let staged_attachment_id =
         staged_attachment_for_message(state, &sender_code_id, &room_id, &message_id).await?;
-    let admission = state.mls_rooms.lock().await.admit_application(
-        sender_code_id,
-        &room_id,
-        message_id.clone(),
-        decode_exact(&group_id_b64, rooms::GROUP_ID_BYTES)?,
-        epoch,
-        revision,
-        decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?,
-        decode_bounded(&ciphertext_b64, rooms::MAX_APPLICATION_CIPHERTEXT_BYTES)?,
-        decode_bounded(&authenticated_data_b64, rooms::MAX_AUTHENTICATED_DATA_BYTES)?,
-        decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
-    )?;
+    let admission = state
+        .mls_rooms
+        .lock()
+        .await
+        .admit_application_for_platform(
+            sender_code_id,
+            sender_platform,
+            &room_id,
+            message_id.clone(),
+            decode_exact(&group_id_b64, rooms::GROUP_ID_BYTES)?,
+            epoch,
+            revision,
+            decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?,
+            decode_bounded(&ciphertext_b64, rooms::MAX_APPLICATION_CIPHERTEXT_BYTES)?,
+            decode_bounded(&authenticated_data_b64, rooms::MAX_AUTHENTICATED_DATA_BYTES)?,
+            decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
+        )?;
+    if let Err(error) =
+        require_recipient_code_platforms(state, sender_platform, &admission.recipient_code_ids)
+            .await
+    {
+        let _ = state
+            .mls_rooms
+            .lock()
+            .await
+            .rollback_application(&room_id, &message_id);
+        return Err(error);
+    }
     let mut attachment_rollback = None;
     if let Some(attachment_id) = staged_attachment_id {
         let application_recipients = admission
@@ -8121,6 +8258,75 @@ async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(CodeId, S
         .get(&client_id)
         .map(|client| (client.code_id, client.username.clone()))
         .ok_or_else(|| "authenticated client required".to_string())
+}
+
+async fn client_identity_and_platform(
+    state: &AppState,
+    client_id: Uuid,
+) -> Result<(CodeId, String, ClientPlatform), String> {
+    state
+        .clients
+        .lock()
+        .await
+        .get(&client_id)
+        .map(|client| (client.code_id, client.username.clone(), client.platform))
+        .ok_or_else(|| "authenticated client required".to_string())
+}
+
+async fn require_recipient_platforms(
+    state: &AppState,
+    sender_platform: ClientPlatform,
+    recipients: &HashSet<String>,
+) -> Result<(), String> {
+    let accounts = state.accounts.lock().await;
+    for recipient in recipients {
+        let recipient_platform = accounts
+            .values()
+            .find(|account| account.username == *recipient)
+            .and_then(|account| account.client_platform)
+            .ok_or_else(|| "recipient client unavailable".to_string())?;
+        if !state
+            .interop_policy
+            .allows(sender_platform, recipient_platform)
+        {
+            return Err("client interoperability policy rejected".to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn require_recipient_code_platforms(
+    state: &AppState,
+    sender_platform: ClientPlatform,
+    recipients: &[CodeId],
+) -> Result<(), String> {
+    let accounts = state.accounts.lock().await;
+    for recipient in recipients {
+        let recipient_platform = accounts
+            .get(recipient)
+            .and_then(|account| account.client_platform)
+            .ok_or_else(|| "recipient client unavailable".to_string())?;
+        if !state
+            .interop_policy
+            .allows(sender_platform, recipient_platform)
+        {
+            return Err("client interoperability policy rejected".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn mls_delivery_allowed(
+    policy: InteropPolicy,
+    payload: &rooms::DeliveryPayload,
+    recipient_platform: ClientPlatform,
+) -> bool {
+    match payload {
+        rooms::DeliveryPayload::Application {
+            sender_platform, ..
+        } => policy.allows(*sender_platform, recipient_platform),
+        rooms::DeliveryPayload::Membership { .. } => true,
+    }
 }
 
 #[allow(dead_code)]
@@ -9359,6 +9565,7 @@ mod tests {
                     message_id: "application-1".to_string(),
                     media_type: "FILE".to_string(),
                     owner_code_id: owner,
+                    sender_platform: ClientPlatform::Android,
                     published: false,
                     staged_expires_at_ms: Some(now_ms().saturating_add(60_000)),
                     one_time: true,
@@ -9422,6 +9629,7 @@ mod tests {
                         message_id: message_id.to_string(),
                         media_type: "FILE".to_string(),
                         owner_code_id: owner,
+                        sender_platform: ClientPlatform::Android,
                         published: false,
                         staged_expires_at_ms,
                         one_time: false,
@@ -9515,6 +9723,7 @@ mod tests {
                     message_id: "exact-message".to_string(),
                     media_type: "FILE".to_string(),
                     owner_code_id: owner,
+                    sender_platform: ClientPlatform::Android,
                     published: false,
                     staged_expires_at_ms: Some(now.saturating_add(60_000)),
                     one_time: false,
@@ -9533,6 +9742,7 @@ mod tests {
                     message_id: "unrelated-message".to_string(),
                     media_type: "FILE".to_string(),
                     owner_code_id: owner,
+                    sender_platform: ClientPlatform::Android,
                     published: false,
                     staged_expires_at_ms: Some(now.saturating_sub(1)),
                     one_time: false,
@@ -9742,6 +9952,7 @@ mod tests {
                 message_id: "staged-download-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: false,
                 staged_expires_at_ms: Some(now_ms().saturating_add(60_000)),
                 one_time: false,
@@ -9827,6 +10038,7 @@ mod tests {
                         message_id: message_id.to_string(),
                         media_type: "FILE".to_string(),
                         owner_code_id: owner,
+                        sender_platform: ClientPlatform::Android,
                         published: false,
                         staged_expires_at_ms: Some(now.saturating_add(60_000)),
                         one_time: false,
@@ -9910,6 +10122,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -9967,6 +10180,7 @@ mod tests {
                     message_id: "binding-completion-message".to_string(),
                     media_type: "FILE".to_string(),
                     owner_code_id: owner,
+                    sender_platform: ClientPlatform::Android,
                     published: true,
                     staged_expires_at_ms: None,
                     one_time: true,
@@ -10018,6 +10232,7 @@ mod tests {
                     message_id: "expired-publication-message".to_string(),
                     media_type: "FILE".to_string(),
                     owner_code_id: owner,
+                    sender_platform: ClientPlatform::Android,
                     published: false,
                     staged_expires_at_ms: Some(now_ms().saturating_sub(1)),
                     one_time: false,
@@ -10068,6 +10283,7 @@ mod tests {
                     message_id: "actual-message".to_string(),
                     media_type: "FILE".to_string(),
                     owner_code_id: owner,
+                    sender_platform: ClientPlatform::Android,
                     published: false,
                     staged_expires_at_ms: Some(now_ms().saturating_add(60_000)),
                     one_time: false,
@@ -10369,6 +10585,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -10405,6 +10622,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -10467,6 +10685,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id("queue-client"),
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -10589,6 +10808,13 @@ mod tests {
         let attachment_id = Uuid::new_v4();
         let owner = test_code_id("download-owner");
         let recipient = test_code_id("download-recipient");
+        add_test_account_with_id(
+            &state,
+            recipient,
+            "DownloadRecipient",
+            ClientPlatform::Android,
+        )
+        .await;
         let expected = vec![11_u8, 22, 33, 44];
         state.attachments.lock().await.insert(
             attachment_id,
@@ -10598,6 +10824,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: true,
@@ -10654,6 +10881,13 @@ mod tests {
         let attachment_id = Uuid::new_v4();
         let owner = test_code_id("interrupted-owner");
         let recipient = test_code_id("interrupted-recipient");
+        add_test_account_with_id(
+            &state,
+            recipient,
+            "InterruptedRecipient",
+            ClientPlatform::Android,
+        )
+        .await;
         let expected = vec![55_u8; ATTACHMENT_DOWNLOAD_CHUNK_BYTES + 1];
         state.attachments.lock().await.insert(
             attachment_id,
@@ -10663,6 +10897,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: true,
@@ -10730,6 +10965,13 @@ mod tests {
         let attachment_id = Uuid::new_v4();
         let owner = test_code_id("expired-owner");
         let recipient = test_code_id("expired-recipient");
+        add_test_account_with_id(
+            &state,
+            recipient,
+            "ExpiredRecipient",
+            ClientPlatform::Android,
+        )
+        .await;
         state.attachments.lock().await.insert(
             attachment_id,
             AttachmentRecord {
@@ -10738,6 +10980,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: true,
@@ -10783,6 +11026,13 @@ mod tests {
         let attachment_id = Uuid::new_v4();
         let owner = test_code_id("concurrent-owner");
         let recipient = test_code_id("concurrent-recipient");
+        add_test_account_with_id(
+            &state,
+            recipient,
+            "ConcurrentRecipient",
+            ClientPlatform::Android,
+        )
+        .await;
         state.attachments.lock().await.insert(
             attachment_id,
             AttachmentRecord {
@@ -10791,6 +11041,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -10827,6 +11078,8 @@ mod tests {
         let owner = test_code_id("claim-owner");
         let recipient = test_code_id("claim-recipient");
         let other = test_code_id("claim-other");
+        add_test_account_with_id(&state, recipient, "ClaimRecipient", ClientPlatform::Android)
+            .await;
         state.attachments.lock().await.insert(
             attachment_id,
             AttachmentRecord {
@@ -10835,6 +11088,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: true,
@@ -10869,6 +11123,7 @@ mod tests {
         let attachment_id = Uuid::new_v4();
         let owner = test_code_id("dm-owner");
         let recipient = test_code_id("dm-recipient");
+        add_test_account_with_id(&state, recipient, "DmRecipient", ClientPlatform::Android).await;
         state.attachments.lock().await.insert(
             attachment_id,
             AttachmentRecord {
@@ -10877,6 +11132,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "IMAGE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: true,
@@ -10911,6 +11167,8 @@ mod tests {
         let owner = test_code_id("room-owner");
         let bob = test_code_id("room-bob");
         let carol = test_code_id("room-carol");
+        add_test_account_with_id(&state, bob, "RoomBob", ClientPlatform::Android).await;
+        add_test_account_with_id(&state, carol, "RoomCarol", ClientPlatform::Android).await;
         state.attachments.lock().await.insert(
             attachment_id,
             AttachmentRecord {
@@ -10919,6 +11177,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -10956,6 +11215,75 @@ mod tests {
         .await
         .expect("Carol completion");
         assert!(!state.attachments.lock().await.contains_key(&attachment_id));
+    }
+
+    #[tokio::test]
+    async fn attachment_download_requires_recipient_membership_and_platform_policy() {
+        let mut state = test_state();
+        let attachment_id = Uuid::new_v4();
+        let owner = test_code_id("policy-owner");
+        let android_recipient = test_code_id("policy-android");
+        let web_recipient = test_code_id("policy-web");
+        let unrelated_recipient = test_code_id("policy-unrelated");
+        add_test_account_with_id(
+            &state,
+            android_recipient,
+            "PolicyAndroid",
+            ClientPlatform::Android,
+        )
+        .await;
+        add_test_account_with_id(&state, web_recipient, "PolicyWeb", ClientPlatform::Web).await;
+        add_test_account_with_id(
+            &state,
+            unrelated_recipient,
+            "PolicyUnrelated",
+            ClientPlatform::Android,
+        )
+        .await;
+        state.attachments.lock().await.insert(
+            attachment_id,
+            AttachmentRecord {
+                blob: test_attachment_blob(vec![1, 2, 3]),
+                chat_id: "forum_policy".to_string(),
+                message_id: "policy-message".to_string(),
+                media_type: "FILE".to_string(),
+                owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
+                published: true,
+                staged_expires_at_ms: None,
+                one_time: false,
+                delete_after_download: false,
+                expires_at_ms: None,
+                eligible_recipient_code_ids: HashSet::from([android_recipient, web_recipient]),
+                download_claims: HashMap::new(),
+                completed_recipient_code_ids: HashSet::new(),
+            },
+        );
+
+        assert!(
+            reserve_attachment_download(&state, attachment_id, &android_recipient)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            reserve_attachment_download(&state, attachment_id, &unrelated_recipient)
+                .await
+                .map(|_| ()),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            reserve_attachment_download(&state, attachment_id, &web_recipient)
+                .await
+                .map(|_| ()),
+            Err(StatusCode::FORBIDDEN)
+        );
+
+        state.interop_policy = InteropPolicy::new(true, true);
+        assert!(
+            reserve_attachment_download(&state, attachment_id, &web_recipient)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -11167,6 +11495,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -11730,12 +12059,16 @@ mod tests {
         headers
     }
 
-    fn ticket_build_attestation() -> BuildAttestationRequest {
+    fn ticket_build_attestation_for(platform: &str) -> BuildAttestationRequest {
         BuildAttestationRequest {
-            platform: "web".to_string(),
+            platform: platform.to_string(),
             version: "2.1.0".to_string(),
             build_signature_b64: URL_SAFE_NO_PAD.encode([2_u8; 64]),
         }
+    }
+
+    fn ticket_build_attestation() -> BuildAttestationRequest {
+        ticket_build_attestation_for("web")
     }
 
     async fn issue_test_ticket(state: &AppState, token: &str) -> (StatusCode, WsTicketResponse) {
@@ -11754,6 +12087,21 @@ mod tests {
     }
 
     async fn add_test_session(state: &AppState, token: &str, code: &str, username: &str) {
+        if !state
+            .accounts
+            .lock()
+            .await
+            .contains_key(&test_code_id(code))
+        {
+            add_test_account(state, code, username).await;
+        }
+        state
+            .accounts
+            .lock()
+            .await
+            .get_mut(&test_code_id(code))
+            .expect("test account")
+            .client_platform = None;
         state.sessions.lock().await.insert(
             SessionToken::new(token.to_string()),
             AuthSession {
@@ -11780,11 +12128,21 @@ mod tests {
         assert!(!tickets.contains_key(&[0_u8; WS_TICKET_BYTES]));
         drop(tickets);
 
-        let (token, session) = consume_ws_ticket(&state, &response.ticket)
+        let (token, session, platform) = consume_ws_ticket(&state, &response.ticket)
             .await
             .expect("first consumption");
         assert_eq!(token.as_str(), "ticket-session");
         assert_eq!(session.username, "Alice");
+        assert_eq!(platform, ClientPlatform::Web);
+        assert_eq!(
+            state
+                .accounts
+                .lock()
+                .await
+                .get(&test_code_id("ticket-code"))
+                .and_then(|account| account.client_platform),
+            Some(ClientPlatform::Web)
+        );
         assert!(consume_ws_ticket(&state, &response.ticket).await.is_none());
         assert!(state.ws_tickets.lock().await.is_empty());
     }
@@ -11832,6 +12190,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_ticket_cannot_reclassify_an_authenticated_session() {
+        let state = test_state();
+        add_test_session(&state, "platform-session", "platform-code", "Alice").await;
+
+        let (status, _) = issue_test_ticket(&state, "platform-session").await;
+        assert_eq!(status, StatusCode::OK);
+        let response = issue_ws_ticket(
+            State(state.clone()),
+            ticket_auth_headers("platform-session"),
+            Json(ticket_build_attestation_for("android")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(state.ws_tickets.lock().await.len(), 1);
+        assert_eq!(
+            state
+                .accounts
+                .lock()
+                .await
+                .get(&test_code_id("platform-code"))
+                .and_then(|account| account.client_platform),
+            Some(ClientPlatform::Web)
+        );
+    }
+
+    #[tokio::test]
+    async fn new_authenticated_session_requires_fresh_platform_attestation() {
+        let state = test_state();
+        add_test_account(&state, "fresh-platform-code", "Alice").await;
+        state
+            .accounts
+            .lock()
+            .await
+            .get_mut(&test_code_id("fresh-platform-code"))
+            .expect("Alice account")
+            .client_platform = Some(ClientPlatform::Web);
+
+        let (status, response) = issue_session(
+            &state,
+            test_code_id("fresh-platform-code"),
+            "Alice".to_string(),
+            false,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(response.accepted);
+        assert_eq!(
+            state
+                .accounts
+                .lock()
+                .await
+                .get(&test_code_id("fresh-platform-code"))
+                .and_then(|account| account.client_platform),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn websocket_ticket_expiry_is_pruned_before_session_validation() {
         let state = test_state();
         let digest = ws_ticket_digest(&URL_SAFE_NO_PAD.encode([9_u8; WS_TICKET_BYTES]))
@@ -11841,6 +12259,7 @@ mod tests {
             WsTicket {
                 session_token: Zeroizing::new("expired-session".to_string()),
                 expires_at_ms: now_ms().saturating_sub(1),
+                client_platform: ClientPlatform::Web,
             },
         );
         assert!(
@@ -11864,6 +12283,7 @@ mod tests {
                 WsTicket {
                     session_token: Zeroizing::new(format!("other-session-{index}")),
                     expires_at_ms: now_ms().saturating_add(WS_TICKET_TTL_MS),
+                    client_platform: ClientPlatform::Web,
                 },
             );
         }
@@ -12931,7 +13351,7 @@ mod tests {
         let mut plan = preflight_pending_frames(&state, &frames)
             .await
             .expect("duplicate admission preflight");
-        commit_pending_frames(&state, &frames, &mut plan)
+        commit_pending_frames(&state, &frames, &mut plan, ClientPlatform::Android)
             .await
             .expect("duplicate admission commit");
         assert_eq!(
@@ -12970,6 +13390,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id("result-client"),
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -13005,6 +13426,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id("ack-result-client"),
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -13044,6 +13466,7 @@ mod tests {
             ClientHandle {
                 code_id,
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -13082,6 +13505,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id("ack-activity"),
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -13131,6 +13555,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id("unsafe-ack"),
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -13173,6 +13598,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id("ack-atomic-recipient"),
                 username: "Bob".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -13306,6 +13732,7 @@ mod tests {
             ClientHandle {
                 code_id,
                 username: "Alice".to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx: result_tx.clone(),
@@ -13407,6 +13834,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: test_code_id("code-a"),
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -13801,6 +14229,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -13842,6 +14271,7 @@ mod tests {
                 message_id: "test-message".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: true,
@@ -14670,6 +15100,7 @@ mod tests {
             payload: rooms::DeliveryPayload::Application {
                 sender_code_id: [1_u8; rooms::GROUP_ID_BYTES],
                 sender_username: "Alice".to_string(),
+                sender_platform: ClientPlatform::Android,
                 ciphertext: vec![9_u8],
                 authenticated_data: authenticated_data.clone(),
             },
@@ -14882,6 +15313,7 @@ mod tests {
                 message_id: "message-1".to_string(),
                 media_type: "FILE".to_string(),
                 owner_code_id: owner,
+                sender_platform: ClientPlatform::Android,
                 published: true,
                 staged_expires_at_ms: None,
                 one_time: false,
@@ -15323,6 +15755,7 @@ mod tests {
             ClientHandle {
                 code_id: recipient,
                 username: "Bob".to_string(),
+                platform: ClientPlatform::Android,
                 tx: data_tx,
                 control_tx,
                 result_tx,
@@ -17095,6 +17528,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn interop_policy_requires_a_known_allowed_recipient_platform() {
+        let state = test_state();
+        add_test_account(&state, "code-b", "Bob").await;
+        let recipients = HashSet::from(["Bob".to_string()]);
+
+        state
+            .accounts
+            .lock()
+            .await
+            .get_mut(&test_code_id("code-b"))
+            .expect("Bob account")
+            .client_platform = Some(ClientPlatform::Web);
+        assert!(
+            require_recipient_platforms(&state, ClientPlatform::Android, &recipients)
+                .await
+                .is_err()
+        );
+        assert!(
+            require_recipient_platforms(&state, ClientPlatform::Web, &recipients)
+                .await
+                .is_ok()
+        );
+
+        state
+            .accounts
+            .lock()
+            .await
+            .get_mut(&test_code_id("code-b"))
+            .expect("Bob account")
+            .client_platform = None;
+        assert!(
+            require_recipient_platforms(&state, ClientPlatform::Web, &recipients)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_android_ciphertext_is_not_delivered_to_a_web_connection() {
+        let state = test_state();
+        add_test_account(&state, "code-a", "Alice").await;
+        add_test_account(&state, "code-b", "Bob").await;
+        let (alice_id, _alice_rx) = add_test_client(&state, "code-a", "Alice").await;
+        let (bob_id, mut bob_rx) = add_test_client(&state, "code-b", "Bob").await;
+        state
+            .clients
+            .lock()
+            .await
+            .get_mut(&bob_id)
+            .expect("Bob client")
+            .platform = ClientPlatform::Web;
+        state
+            .accounts
+            .lock()
+            .await
+            .get_mut(&test_code_id("code-b"))
+            .expect("Bob account")
+            .client_platform = Some(ClientPlatform::Web);
+
+        open_direct(&state, alice_id, "Bob")
+            .await
+            .expect("direct opens");
+        let direct_id = state
+            .direct_catalog
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("direct catalog entry")
+            .id
+            .clone();
+        while bob_rx.try_recv().is_ok() {}
+        let frame = test_message_frame(&direct_id, "android-only", "Alice", "", false);
+        state.pending.lock().await.insert(
+            PendingKey {
+                chat_id: direct_id.clone(),
+                recipient_username: "Bob".to_string(),
+            },
+            vec![PendingFrame::new_for_platform(
+                frame,
+                now_ms(),
+                ClientPlatform::Android,
+            )],
+        );
+
+        join_room(&state, bob_id, direct_id)
+            .await
+            .expect("authorized peer joins");
+        assert!(bob_rx.try_recv().is_err());
+    }
+
     fn test_state() -> AppState {
         AppState {
             node_id: "test-node".to_string(),
@@ -17105,6 +17630,7 @@ mod tests {
             attachment_account_record_limit: DEFAULT_ATTACHMENT_ACCOUNT_RECORD_LIMIT,
             attachment_max_lifetime_sec: DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS as u64 * 60 * 60,
             max_rooms_per_user: 2,
+            interop_policy: InteropPolicy::new(false, true),
             conversation_ops: Arc::new(Mutex::new(())),
             presence_broadcast_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms: pending_message_ttl_ms_from_value(None),
@@ -17149,11 +17675,21 @@ mod tests {
     }
 
     async fn add_test_account(state: &AppState, code: &str, username: &str) {
+        add_test_account_with_id(state, test_code_id(code), username, ClientPlatform::Android)
+            .await;
+    }
+
+    async fn add_test_account_with_id(
+        state: &AppState,
+        code_id: CodeId,
+        username: &str,
+        client_platform: ClientPlatform,
+    ) {
         let identity_fill = username.as_bytes()[0];
         let mut identity_envelope = vec![0; 256];
         identity_envelope[0] = IDENTITY_ENVELOPE_VERSION;
         state.accounts.lock().await.insert(
-            test_code_id(code),
+            code_id,
             Account {
                 username: username.to_string(),
                 password_file: vec![1; 192],
@@ -17163,6 +17699,7 @@ mod tests {
                 state_revision: 0,
                 state_revision_window: 1,
                 connected: true,
+                client_platform: Some(client_platform),
                 attachment_uploads: Arc::new(Semaphore::new(1)),
             },
         );
@@ -17387,6 +17924,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id(code),
                 username: username.to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
@@ -17414,6 +17952,7 @@ mod tests {
             ClientHandle {
                 code_id: test_code_id(code),
                 username: username.to_string(),
+                platform: ClientPlatform::Android,
                 tx,
                 control_tx,
                 result_tx,
