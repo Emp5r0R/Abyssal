@@ -18,7 +18,7 @@ const MANIFEST_DOMAIN: &[u8] = b"ABYSSAL-RELEASE-MANIFEST-V1\0";
 const BUILD_DOMAIN: &[u8] = b"ABYSSAL-RELEASE-BUILD-V1\0";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_BUILDS: usize = 2;
-const MAX_ASSETS_PER_BUILD: usize = 16;
+pub const MAX_ASSETS_PER_BUILD: usize = 128;
 const MAX_REVOKED_BUILDS: usize = 128;
 const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANIFEST_LIFETIME_MS: u64 = 35 * 24 * 60 * 60 * 1000;
@@ -748,6 +748,45 @@ mod tests {
         );
         assert!(verified.is_revoked("android@1.9.0"));
         assert!(!verified.is_revoked("android@2.1.0"));
+    }
+
+    #[test]
+    fn manifest_asset_limit_matches_complete_web_bundle_attestation() {
+        let key = signing_key();
+        let mut document = document(&key);
+        document.builds[1].assets = (0..MAX_ASSETS_PER_BUILD)
+            .map(|index| asset(&format!("assets/bundle-{index:03}.gif"), index as u8))
+            .collect();
+
+        let manifest = canonical_manifest_bytes(&document).expect("bounded manifest");
+        let signature = key.sign(&manifest_transcript(&manifest)).to_bytes();
+        let verified =
+            verify_release_manifest_with_key(&key.verifying_key(), &manifest, &signature, NOW_MS)
+                .expect("manifest at asset limit");
+        assert_eq!(
+            verified
+                .build_for_platform("web")
+                .expect("web build")
+                .assets
+                .len(),
+            MAX_ASSETS_PER_BUILD
+        );
+
+        document.builds[1].assets.push(asset(
+            &format!("assets/bundle-{:03}.gif", MAX_ASSETS_PER_BUILD),
+            0xff,
+        ));
+        let oversized = canonical_manifest_bytes(&document).expect("oversized manifest encoding");
+        let oversized_signature = key.sign(&manifest_transcript(&oversized)).to_bytes();
+        assert_eq!(
+            verify_release_manifest_with_key(
+                &key.verifying_key(),
+                &oversized,
+                &oversized_signature,
+                NOW_MS,
+            ),
+            Err(ReleaseVerificationError::InvalidManifestPolicy)
+        );
     }
 
     #[test]

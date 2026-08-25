@@ -1,8 +1,8 @@
 use abyssal_core::release_provenance::{
     build_signing_transcript, canonical_manifest_bytes, manifest_signing_transcript,
     validate_release_manifest_for_signing_with_key, verify_build_signature_with_key,
-    ReleaseAssetDocument, ReleaseBuildDocument, ReleaseManifestDocument, RELEASE_CHANNEL,
-    RELEASE_MANIFEST_SCHEMA, RELEASE_PROJECT, RELEASE_PUBKEY,
+    ReleaseAssetDocument, ReleaseBuildDocument, ReleaseManifestDocument, MAX_ASSETS_PER_BUILD,
+    RELEASE_CHANNEL, RELEASE_MANIFEST_SCHEMA, RELEASE_PROJECT, RELEASE_PUBKEY,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
@@ -289,7 +289,7 @@ fn parse_build_record_options(arguments: &[String]) -> Result<BuildRecordArgumen
         }
         index += 2;
     }
-    if options.len() != expected.len() || assets.is_empty() || assets.len() > 16 {
+    if options.len() != expected.len() || assets.is_empty() || assets.len() > MAX_ASSETS_PER_BUILD {
         return Err(usage());
     }
     Ok(BuildRecordArguments { options, assets })
@@ -724,6 +724,37 @@ mod tests {
             expected,
         )
         .is_err());
+    }
+
+    #[test]
+    fn build_record_parser_enforces_shared_manifest_asset_limit() {
+        fn arguments(asset_count: usize) -> Vec<String> {
+            let mut arguments = vec![
+                "--private-key".to_string(),
+                "release.key".to_string(),
+                "--build-id".to_string(),
+                "web@2.2.0".to_string(),
+                "--source-commit".to_string(),
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+                "--expected-signature".to_string(),
+                "build.sig".to_string(),
+                "--output".to_string(),
+                "web-record.json".to_string(),
+            ];
+            for index in 0..asset_count {
+                arguments.extend([
+                    "--asset".to_string(),
+                    format!("assets/bundle-{index:03}.gif"),
+                    format!("dist/assets/bundle-{index:03}.gif"),
+                ]);
+            }
+            arguments
+        }
+
+        let parsed = parse_build_record_options(&arguments(MAX_ASSETS_PER_BUILD))
+            .expect("asset limit must be accepted");
+        assert_eq!(parsed.assets.len(), MAX_ASSETS_PER_BUILD);
+        assert!(parse_build_record_options(&arguments(MAX_ASSETS_PER_BUILD + 1)).is_err());
     }
 
     #[test]

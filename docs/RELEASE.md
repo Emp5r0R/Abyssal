@@ -36,7 +36,7 @@ This creates an ignored keystore under `.secrets/` and an ignored `deploy/releas
 ./check.sh all
 ```
 
-The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without invoking Android packaging, and a live disposable-relay integration test. Android packaging remains an explicit release-only step. The 2026-08-25 integrated local gate ran 350 web tests across 31 files, 67 Rust-core tests, 15 release-tool tests, 230 relay tests, and 241 Android JVM tests; the forbidden integration-root release compile check, release lint, debug/release compilation, protocol-v9 direct/protocol-v10 MLS integration with strict build admission, deterministic generated-artifact/deployment checks, and npm/RustSec audits also passed. All applicable tests had zero skips, failures, or errors; no Android packaging task was invoked. CodeQL must pass remotely after push.
+The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without invoking Android packaging, and a live disposable-relay integration test. Android packaging remains an explicit release-only step. The 2026-08-25 integrated local gate ran 350 web tests across 31 files, 68 Rust-core tests, 16 release-tool tests, 230 relay tests, and 241 Android JVM tests; the forbidden integration-root release compile check, release lint, debug/release compilation, protocol-v9 direct/protocol-v10 MLS integration with strict build admission, deterministic generated-artifact/deployment checks, and npm/RustSec audits also passed. All applicable tests had zero skips, failures, or errors; no Android packaging task was invoked. CodeQL must pass remotely after push.
 
 ## Signed Android artifacts
 
@@ -67,7 +67,7 @@ ABYSSAL_RELEASE_EXPIRES_AT_MS=<expiry-unix-ms-within-35-days> \
   /secure/work/revocations.txt
 ```
 
-The web builder bakes the signed build identity into JavaScript and `/build-id.json`, records every served asset plus the deterministic web archive, and requires the Android/web version and source commit to agree. Manifest assembly is canonical, refuses overwrite, signs with the offline root, and supports one revoked build ID per line. Keep each validity window operationally short; the verifier enforces a maximum of 35 days.
+The web builder bakes the signed build identity into JavaScript and `/build-id.json`, records every served asset plus the deterministic web archive, and requires the Android/web version and source commit to agree. Each platform build is bounded to 128 authenticated assets; exceeding that limit fails before manifest creation. Manifest assembly is canonical, refuses overwrite, signs with the offline root, and supports one revoked build ID per line. Keep each validity window operationally short; the verifier enforces a maximum of 35 days.
 
 ## Publish
 
