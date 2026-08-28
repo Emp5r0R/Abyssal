@@ -1,4 +1,4 @@
-import initWasm, {
+import {
   attachmentEncryptedSize as rustAttachmentEncryptedSize,
   conversationSafetyNumber as rustConversationSafetyNumber,
   conversationVerificationToken as rustConversationVerificationToken,
@@ -13,6 +13,7 @@ import initWasm, {
   WasmE2eeSession,
 } from "../generated/abyssal_core/abyssal_core";
 import { MlsRoomManager } from "./mls";
+import { initializeSecurityRuntime } from "./runtime";
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -40,8 +41,6 @@ const ATTACHMENT_BLOB_MIN_BYTES = ATTACHMENT_CHUNK_RECORD_BYTES;
 const MAX_ATTACHMENT_BLOB_BYTES =
   Math.ceil(MAX_ATTACHMENT_PLAINTEXT_BYTES / ATTACHMENT_CHUNK_PLAINTEXT_BYTES) *
   ATTACHMENT_CHUNK_RECORD_BYTES;
-
-let wasmReady: Promise<unknown> | null = null;
 
 export class FatalCipherError extends Error {
   constructor() {
@@ -167,8 +166,7 @@ interface RustE2eeDecryption {
 }
 
 export async function initializeCrypto(): Promise<void> {
-  wasmReady ??= initWasm();
-  await wasmReady;
+  await initializeSecurityRuntime();
 }
 
 export async function startOpaque(password: Uint8Array): Promise<OpaqueStartState> {
