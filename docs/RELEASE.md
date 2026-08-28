@@ -93,7 +93,7 @@ ABYSSAL_WEB_RELEASE_ARCHIVE=/secure/release-output/abyssal-web-VERSION.tar.gz \
 curl --fail https://chat.example.com/health
 ```
 
-Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appeared once in the attached deployment terminal. Codes must not exist in Docker logs, relay files, or environment configuration. The public health response exposes only liveness, node identity, and the RAM-only storage label; there is deliberately no code-retrieval workflow. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments. Docker automatic restart must remain disabled because an unattended restart rotates the unrecoverable one-time code set.
+Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appeared once in the attached deployment terminal. Codes must not exist in Docker logs, relay files, or environment configuration. Confirm public responses preserve both `no-store` and `no-transform`; CDN analytics or challenge injection changes signed HTML and must remain disabled. The public health response exposes only liveness, node identity, and the RAM-only storage label; there is deliberately no code-retrieval workflow. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments. Docker automatic restart must remain disabled because an unattended restart rotates the unrecoverable one-time code set.
 
 Before any rsync, the sync helper verifies the offline-root signature, canonical
 manifest validity window, current web build and revocation state, exact

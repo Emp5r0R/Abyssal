@@ -2040,6 +2040,7 @@ fn release_material_response(body: Option<Vec<u8>>, content_type: &'static str) 
 }
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:* http://[::1]:* ws://localhost:* ws://127.0.0.1:* ws://[::1]:*; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'";
+const CACHE_CONTROL_POLICY: &str = "no-store, no-cache, no-transform, max-age=0, must-revalidate";
 
 async fn security_headers(request: Request, next: Next) -> Response {
     let clear_site_data = request.uri().path() == "/v1/account/logout";
@@ -2047,7 +2048,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, no-cache, max-age=0, must-revalidate"),
+        HeaderValue::from_static(CACHE_CONTROL_POLICY),
     );
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
@@ -9141,6 +9142,17 @@ mod tests {
         assert!(CONTENT_SECURITY_POLICY.contains("http://127.0.0.1:*"));
         assert!(CONTENT_SECURITY_POLICY.contains("ws://localhost:*"));
         assert!(!CONTENT_SECURITY_POLICY.contains(" wss: http: ws:;"));
+    }
+
+    #[test]
+    fn cache_policy_forbids_storage_and_edge_transformation() {
+        let directives = CACHE_CONTROL_POLICY.split(", ").collect::<HashSet<_>>();
+        assert!(directives.contains("no-store"));
+        assert!(directives.contains("no-cache"));
+        assert!(directives.contains("no-transform"));
+        assert!(directives.contains("max-age=0"));
+        assert!(directives.contains("must-revalidate"));
+        assert!(!directives.contains("public"));
     }
 
     #[test]
