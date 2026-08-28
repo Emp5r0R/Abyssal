@@ -125,7 +125,7 @@ For local cross-origin development, start the relay from the repository root wit
 ABYSSAL_WEB_ORIGINS=http://localhost:4173 cargo run --package mirage-server
 ```
 
-Open `http://localhost:4173`, then enter `http://127.0.0.1:4020` as the node URL. Production Docker builds the web client and serves it from the relay root, so a URL such as `https://chat.example.com/` and the API use one origin. Leave `ABYSSAL_WEB_ORIGINS` empty for that deployment.
+Open `http://localhost:4173`, then enter `http://127.0.0.1:4020` as the node URL. Production Docker serves the exact signed web release archive from the relay root, so a URL such as `https://chat.example.com/` and the API use one origin. The relay mirrors its already verified release manifest and detached signature through fixed same-origin well-known endpoints; the browser verifies those bytes and every served asset before account entry. Leave `ABYSSAL_WEB_ORIGINS` empty for that deployment.
 
 Web client behavior:
 
@@ -137,7 +137,7 @@ Web client behavior:
 - Type `@` to complete an active or offline username. Mentions and replies to one of the current process's own message IDs receive the same recipient-only attention treatment; other users do not see that highlight.
 - Direct composers apply a per-message `Never`, `5s`, `10s`, `30s`, or `1m` timer to text, GIFs, and attachments. Room composers show the creator's locked room timer; room policy can also be configured as no read expiry.
 - The calculator cover PIN and optional duress PIN exist only in the current tab. Reload, tab close, logout, wipe, session expiry, or process termination loses them.
-- WebSockets use a negotiated `abyssal-v2` plus a random 32-byte `ticket.*` subprotocol. Tickets are issued by authenticated `POST /v1/ws-ticket`, expire after 30 seconds, are stored only as digests, and are single-use; bearer tokens are rejected in WebSocket subprotocols. Protocol-v9 E2EE with per-recipient signatures, signed ratchet state, bounded revisions, mandatory message/control transport buckets, a 608-byte public bundle (stable 64-byte identity portion, 16 canonical 32-byte one-time keys covered by the signed identity bundle, and a 32-byte fallback key), recipient-bound prekey leases, and ratcheted metadata requires Abyssal `2.2.0` clients plus matching web/Android transport implementations. Protocol-v8 shapes/checkpoints fail closed, as do older pre-v8 clients; all are wire-incompatible with v9.
+- WebSockets use a negotiated `abyssal-v2` plus a random 32-byte `ticket.*` subprotocol. Tickets are issued by authenticated `POST /v1/ws-ticket`, expire after 30 seconds, are stored only as digests, and are single-use; bearer tokens are rejected in WebSocket subprotocols. Protocol-v9 E2EE with per-recipient signatures, signed ratchet state, bounded revisions, mandatory message/control transport buckets, a 608-byte public bundle (stable 64-byte identity portion, 16 canonical 32-byte one-time keys covered by the signed identity bundle, and a 32-byte fallback key), recipient-bound prekey leases, and ratcheted metadata requires matching current web/Android transport implementations. Protocol-v8 shapes/checkpoints fail closed, as do older pre-v8 clients; all are wire-incompatible with v9.
 
 Run web checks:
 
@@ -157,7 +157,7 @@ Targeted modes are available for `quick`, `web`, `rust`, `android`, `android-pac
 
 Release builds additionally require the offline Ed25519 provenance key matching the installed production root and a signed `release-manifest-v1.json`. The relay admits only the exact Android/web version and build signature named by its current verified RAM manifest. Web verifies its origin-served bundle before account entry; Android verifies its baked build identity and any downloaded update. The installed public-root fingerprint is documented in [SECURITY.md](SECURITY.md); the private key remains outside Git and production hosts. See [docs/RELEASE.md](docs/RELEASE.md) for the release ceremony.
 
-The 2026-08-25 integrated gate ran 350 web tests across 31 files, 68 Rust-core tests, 16 release-tool tests, 230 relay tests, and 241 Android JVM tests. Web lint/build, Rust formatting and warning-denied Clippy, the forbidden integration-root release compile check, Android release lint/debug and release compilation, live disposable-relay integration with strict build admission, generated-artifact and deployment checks, and npm/RustSec audits passed. No Android packaging task was invoked; the applicable tests had zero skips, failures, or errors.
+The 2026-08-28 integrated gate ran 352 web tests across 31 files, 68 Rust-core tests, 20 release-tool tests, 232 relay tests, and 241 Android JVM tests. Web lint/build, Rust formatting and warning-denied Clippy, the forbidden integration-root release compile check, Android release lint/debug and release compilation, live disposable-relay integration with strict build admission, generated-artifact and deployment checks, and npm/RustSec audits passed. No Android packaging task was invoked; the applicable tests had zero skips, failures, or errors.
 
 Security-sensitive build inputs are pinned and checked: Rust `1.97.1`, Gradle `8.7` plus its wrapper/distribution hashes, Android NDK `27.3.13750724`, `wasm-bindgen-cli` `0.2.126`, and `cargo-ndk` `4.1.2`. Gradle resolves against tracked SHA-256 dependency-verification metadata. CI action revisions and Docker image/frontend digests are immutable. A separate CI job regenerates every WASM/JNI binding and rejects any byte-level difference from the tracked artifacts. Dependabot covers Cargo, npm, Gradle, Actions, and Docker; advisory scans and CodeQL cover the supported Rust and JavaScript/TypeScript surfaces. Docker build context rules exclude local toolchains, deployment configuration, npm credentials, and release keystores before data reaches the builder.
 
@@ -277,13 +277,24 @@ The file must already exist and be readable. The helpers require
 fail closed when the host is absent or changes. Do not use an unauthenticated
 `ssh-keyscan` result or an `accept-new` policy to trust a first connection.
 
-Sync the repo and rebuild/restart Docker on the server:
+Sync the committed source plus its matching signed web release archive, then
+rebuild/restart Docker on the server:
 
 ```bash
-./deploy/deploy-server.sh
+ABYSSAL_RELEASE_OUTPUT_DIR=/secure/release-output \
+ABYSSAL_WEB_RELEASE_MANIFEST=/secure/release-output/release-manifest-v1.json \
+ABYSSAL_WEB_RELEASE_SIGNATURE=/secure/release-output/release-manifest-v1.sig \
+ABYSSAL_WEB_RELEASE_ARCHIVE=/secure/release-output/abyssal-web-VERSION.tar.gz \
+  ./deploy/deploy-server.sh
 ```
 
-The first deploy creates `mirage-server/.env` from the tracked template with mode `600`. Later syncs preserve that file and its node-specific settings. Review it on the server before issuing production invite codes.
+Before any network transfer, the helper verifies the offline-root signature,
+manifest validity and revocation state, exact committed `HEAD`, and the archive's
+name, size, and SHA-256 digest. It then stages only that verified archive inside
+the clean committed snapshot. Docker extracts it without rebuilding the browser
+bundle. The first deploy creates `mirage-server/.env` from the tracked template
+with mode `600`. Later syncs preserve that file and its node-specific settings.
+Review it on the server before issuing production invite codes.
 
 Run that command from your local machine, not from inside the server shell. It uses SSH and rsync to reach the configured remote host.
 
@@ -304,7 +315,9 @@ invite codes.
 Run only the sync:
 
 ```bash
-./deploy/sync-server.sh
+ABYSSAL_RELEASE_OUTPUT_DIR=/secure/release-output \
+ABYSSAL_WEB_RELEASE_ARCHIVE=/secure/release-output/abyssal-web-VERSION.tar.gz \
+  ./deploy/sync-server.sh
 ```
 
 Run only the Docker rebuild/restart:
@@ -342,34 +355,9 @@ Stop the server:
 ./deploy/stop-docker.sh
 ```
 
-Equivalent raw `rsync` command (the helper above is preferred because it
-performs these checks automatically):
-
-```bash
-SSH_HOST=ubuntu@chat.example.com
-SSH_KEY="$HOME/.ssh/abyssal"
-KNOWN_HOSTS="$HOME/.ssh/known_hosts"
-REMOTE_DIR=/home/ubuntu/abyssal
-[[ "$SSH_HOST" =~ ^[A-Za-z_][A-Za-z0-9._-]*@([A-Za-z0-9._-]+|\[[A-Fa-f0-9:]+\])$ ]] || exit 1
-[[ "$REMOTE_DIR" =~ ^/([A-Za-z0-9._~+-]+/)*[A-Za-z0-9._~+-]+$ ]] || exit 1
-case "$REMOTE_DIR" in */*//*|*/./*|*/../*|*/.|*/..) exit 1 ;; esac
-[[ -f "$SSH_KEY" ]] || exit 1
-[[ -f "$KNOWN_HOSTS" && -r "$KNOWN_HOSTS" ]] || exit 1
-printf -v SSH_COMMAND 'ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q -i %q' "$KNOWN_HOSTS" "$SSH_KEY"
-printf -v REMOTE_RSYNC_PATH 'mkdir -p -- %q && rsync' "$REMOTE_DIR"
-SYNC_DIR="$(mktemp -d)"
-trap 'rm -rf "$SYNC_DIR"' EXIT
-
-git archive --format=tar HEAD | tar -xf - -C "$SYNC_DIR"
-
-rsync -az --delete \
-  -e "$SSH_COMMAND" \
-  --rsync-path="$REMOTE_RSYNC_PATH" \
-  --exclude '.git/' --exclude '.secrets/' --exclude 'README.local.md' \
-  --exclude 'deploy/deploy.env' --exclude 'deploy/release.env' \
-  --exclude 'mirage-server/.env' \
-  "$SYNC_DIR/" "$SSH_HOST:$REMOTE_DIR/"
-```
+Raw `rsync` is intentionally unsupported for production. It bypasses signed
+archive verification and staging, so use `sync-server.sh` or
+`deploy-server.sh`.
 
 Override the target without editing scripts:
 
@@ -378,7 +366,9 @@ ABYSSAL_SSH_HOST=ubuntu@chat.example.com \
 ABYSSAL_SSH_KEY="$HOME/.ssh/abyssal" \
 ABYSSAL_SSH_KNOWN_HOSTS="$HOME/.ssh/known_hosts" \
 ABYSSAL_REMOTE_DIR=/home/ubuntu/abyssal \
-./deploy/deploy-server.sh
+ABYSSAL_RELEASE_OUTPUT_DIR=/secure/release-output \
+ABYSSAL_WEB_RELEASE_ARCHIVE=/secure/release-output/abyssal-web-VERSION.tar.gz \
+  ./deploy/deploy-server.sh
 ```
 
 Command-line environment values override `deploy/deploy.env`. Set `ABYSSAL_DEPLOY_ENV` to use a different local configuration file.
@@ -391,20 +381,11 @@ before any network connection.
 
 ## ARM64 Server Deployment
 
-On Ubuntu ARM64, including Oracle Ampere instances:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config libssl-dev curl
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-. "$HOME/.cargo/env"
-cd /opt/abyssal
-npm ci
-npm run web:build
-cargo build --release --package mirage-server
-```
-
-For production, use the supplied Docker launcher and put Caddy or Nginx in front of port `4020` with HTTPS/WSS. The Android app will derive `wss://.../v1/ws` from a `https://...` node URL entered by the user.
+On Ubuntu ARM64, including Oracle Ampere instances, install Docker Engine with
+the Compose plugin and use the signed-archive deployment flow above. Do not
+rebuild the browser bundle manually on the relay. Put Cloudflare Tunnel, Caddy,
+or Nginx in front of private port `4020` with HTTPS/WSS. The Android app derives
+`wss://.../v1/ws` from the user-entered `https://...` node URL.
 
 ## License
 

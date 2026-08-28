@@ -1623,6 +1623,14 @@ async fn main() {
     let web_origins = state.web_origins.clone();
     let mut app = Router::new()
         .route("/health", get(health))
+        .route(
+            release_admission::RELEASE_MANIFEST_ENDPOINT,
+            get(release_manifest_endpoint),
+        )
+        .route(
+            release_admission::RELEASE_SIGNATURE_ENDPOINT,
+            get(release_signature_endpoint),
+        )
         .merge(account_routes)
         .merge(attachment_routes)
         .route("/v1/ws", get(ws_handler))
@@ -1999,6 +2007,36 @@ fn resolve_web_root() -> Option<PathBuf> {
 
 async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+async fn release_manifest_endpoint(State(state): State<AppState>) -> Response {
+    release_material_response(
+        state.release_admission.manifest_bytes().await,
+        "application/json",
+    )
+}
+
+async fn release_signature_endpoint(State(state): State<AppState>) -> Response {
+    release_material_response(
+        state.release_admission.signature_bytes().await,
+        "application/octet-stream",
+    )
+}
+
+fn release_material_response(body: Option<Vec<u8>>, content_type: &'static str) -> Response {
+    match body {
+        Some(body) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            Body::from(body),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https: wss: http://localhost:* http://127.0.0.1:* http://[::1]:* ws://localhost:* ws://127.0.0.1:* ws://[::1]:*; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; worker-src 'none'; manifest-src 'none'";
@@ -12174,6 +12212,55 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
         assert!(state.ws_tickets.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_material_endpoints_are_absent_until_install_and_serve_exact_bytes() {
+        let mut absent = test_state();
+        absent.release_admission = Arc::new(ReleaseAdmissionStore::new());
+        let response = release_manifest_endpoint(State(absent.clone())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = release_signature_endpoint(State(absent)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let state = test_state();
+        let response = release_manifest_endpoint(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("manifest response body");
+        assert_eq!(body.as_ref(), b"test");
+
+        let response = release_signature_endpoint(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/octet-stream"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("signature response body");
+        assert_eq!(body.as_ref(), &[3; 64]);
     }
 
     #[tokio::test]

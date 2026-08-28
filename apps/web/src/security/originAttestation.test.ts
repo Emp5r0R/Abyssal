@@ -8,9 +8,8 @@ vi.mock("../generated/abyssal_core/abyssal_core", () => ({
 import { verifyOriginAttestation } from "./originAttestation";
 
 const ORIGIN = "https://abyssal.example";
-const API = "https://api.github.com/repos/Emp5r0R/Abyssal/releases/latest";
-const MANIFEST_URL = "https://github.com/Emp5r0R/Abyssal/releases/download/v2/release-manifest-v1.json";
-const SIGNATURE_URL = "https://github.com/Emp5r0R/Abyssal/releases/download/v2/release-manifest-v1.sig";
+const MANIFEST_URL = `${ORIGIN}/.well-known/abyssal-release-manifest-v1.json`;
+const SIGNATURE_URL = `${ORIGIN}/.well-known/abyssal-release-manifest-v1.sig`;
 const IDENTITY = Object.freeze({
   buildId: "web@2.1.0",
   buildSignatureB64: "A".repeat(86),
@@ -31,7 +30,6 @@ describe("origin release attestation", () => {
     });
     expect(result).toEqual({ status: "OK" });
     expect(fixture.requested).toEqual([
-      API,
       MANIFEST_URL,
       SIGNATURE_URL,
       `${ORIGIN}/build-id.json`,
@@ -40,6 +38,18 @@ describe("origin release attestation", () => {
       `${ORIGIN}/build-id.json`,
       `${ORIGIN}/index.html`,
     ]);
+    expect(fixture.requested.every((url) => new URL(url).origin === ORIGIN)).toBe(true);
+    expect(fixture.requests).toHaveLength(fixture.requested.length);
+    for (const { init } of fixture.requests) {
+      expect(init).toMatchObject({
+        method: "GET",
+        cache: "no-store",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        redirect: "error",
+      });
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+    }
   });
 
   it("fails closed for a changed asset, stale approval, and network failure", async () => {
@@ -64,6 +74,27 @@ describe("origin release attestation", () => {
     expect(result.status).toBe("MISMATCH");
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it("rejects a release response redirected outside the page origin", async () => {
+    const redirected = await releaseFixture({
+      manifestFinalUrl: "https://evil.example/release-manifest-v1.json",
+    });
+    await expectStatus(redirected.fetcher, 1_500, "MISMATCH");
+    expect(redirected.requested.every((url) => new URL(url).origin === ORIGIN)).toBe(true);
+  });
+
+  it("accepts an explicit port when every response remains on that exact origin", async () => {
+    const portOrigin = "https://abyssal.example:4443";
+    const fixture = await releaseFixture({ origin: portOrigin });
+    const result = await verifyOriginAttestation({
+      fetch: fixture.fetcher,
+      origin: portOrigin,
+      nowMs: 1_500,
+      identity: IDENTITY,
+    });
+    expect(result).toEqual({ status: "OK" });
+    expect(fixture.requested.every((url) => new URL(url).origin === portOrigin)).toBe(true);
+  });
 });
 
 async function expectStatus(
@@ -80,10 +111,18 @@ async function expectStatus(
   expect(result.status).toBe(status);
 }
 
-async function releaseFixture(options: { corrupt?: string } = {}): Promise<{
+async function releaseFixture(options: {
+  corrupt?: string;
+  manifestFinalUrl?: string;
+  origin?: string;
+} = {}): Promise<{
   fetcher: typeof fetch;
   requested: string[];
+  requests: Array<{ url: string; init: RequestInit }>;
 }> {
+  const origin = options.origin ?? ORIGIN;
+  const manifestUrl = `${origin}/.well-known/abyssal-release-manifest-v1.json`;
+  const signatureUrl = `${origin}/.well-known/abyssal-release-manifest-v1.sig`;
   const identityBytes = bytes(JSON.stringify({
     schema: "abyssal-build-identity-v1",
     build_id: IDENTITY.buildId,
@@ -91,13 +130,13 @@ async function releaseFixture(options: { corrupt?: string } = {}): Promise<{
     build_signature_b64: IDENTITY.buildSignatureB64,
   }));
   const content = new Map<string, Uint8Array>([
-    [`${ORIGIN}/assets/app.js`, bytes("console.log('verified')")],
-    [`${ORIGIN}/assets/core.wasm`, new Uint8Array([0, 97, 115, 109])],
-    [`${ORIGIN}/build-id.json`, identityBytes],
-    [`${ORIGIN}/index.html`, bytes("<!doctype html><main>Abyssal</main>")],
+    [`${origin}/assets/app.js`, bytes("console.log('verified')")],
+    [`${origin}/assets/core.wasm`, new Uint8Array([0, 97, 115, 109])],
+    [`${origin}/build-id.json`, identityBytes],
+    [`${origin}/index.html`, bytes("<!doctype html><main>Abyssal</main>")],
   ]);
   const assets = await Promise.all([...content.entries()].map(async ([name, data]) => ({
-    name: name.slice(ORIGIN.length + 1),
+    name: name.slice(origin.length + 1),
     sha256_hex: await sha256(data),
     size: String(data.byteLength),
   })));
@@ -113,27 +152,20 @@ async function releaseFixture(options: { corrupt?: string } = {}): Promise<{
     }],
     revoked_build_ids: [],
   }));
-  const api = bytes(JSON.stringify({
-    draft: false,
-    prerelease: false,
-    assets: [
-      { name: "release-manifest-v1.json", browser_download_url: MANIFEST_URL },
-      { name: "release-manifest-v1.sig", browser_download_url: SIGNATURE_URL },
-    ],
-  }));
   const requested: string[] = [];
-  const fetcher = vi.fn<typeof fetch>(async (input) => {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     requested.push(url);
-    if (url === API) return response(api, API);
-    if (url === MANIFEST_URL) return response(manifest, MANIFEST_URL);
-    if (url === SIGNATURE_URL) return response(new Uint8Array(64), SIGNATURE_URL);
+    requests.push({ url, init: init ?? {} });
+    if (url === manifestUrl) return response(manifest, options.manifestFinalUrl ?? manifestUrl);
+    if (url === signatureUrl) return response(new Uint8Array(64), signatureUrl);
     const expected = content.get(url);
     if (!expected) return response(bytes("missing"), url, 404);
     const body = options.corrupt === url ? bytes("changed") : expected;
     return response(body, url);
   });
-  return { fetcher, requested };
+  return { fetcher, requested, requests };
 }
 
 function response(body: Uint8Array, url: string, status = 200): Response {

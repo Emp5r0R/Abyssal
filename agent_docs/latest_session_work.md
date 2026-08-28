@@ -1,5 +1,48 @@
 # Latest Session Work
 
+## 2026-08-25 - Release v2.2.0 published and production deployed
+
+Released the first attested-distribution stable build and deployed it to
+production. No repository source changes were made in this session.
+
+### Released (GitHub v2.2.0, tag on `b8d1c74`)
+
+- Rebuilt all release artifacts in a clean detached worktree at the green
+  commit `b8d1c743dcf6f479b53d63623f29a87679d63b92` using the offline
+  provenance key (`~/.abyssal-release/`) and the Android signing env; each
+  build script re-ran the full non-packaging gate before packaging.
+- Published `abyssal-android-2.2.0-universal-release.apk`,
+  `abyssal-android-2.2.0-release.aab`, `abyssal-android-2.2.0-SHA256SUMS.txt`,
+  `abyssal-web-2.2.0.tar.gz`, and signed `release-manifest-v1.json`/`.sig`
+  (sequence 1, 30-day validity, no revocations). `releases/latest` serves them.
+- Release notes follow the RELEASE.md disclosure requirements.
+
+### Deployed (abyssal.nsa.tools)
+
+- Synced committed HEAD, then restarted prod via tracked helpers. The running
+  container serves the extracted verified web archive (image `/opt/abyssal/web`
+  byte-identical to the published archive), loopback-only port 4020, health OK,
+  CSP/HSTS present, interop defaults `android_to_web=false web_to_android=true`.
+- Two ephemeral remote-only edits were required because HEAD's tracked
+  Dockerfile cannot build HEAD as committed:
+  1. `COPY tools ./tools` added to the rust-builder stage (root Cargo.toml
+     declares the `tools/release-tool` workspace member but the Dockerfile never
+     copied it). This is a latent repo bug to fix upstream.
+  2. Final COPY switched from the web-builder stage output to the uploaded
+     verified archive directory, per RELEASE.md "extract rather than rebuild".
+  Both edits are wiped by the next `sync-server.sh`; fix item 1 in-tree before
+  the next deployment and keep serving the verified archive.
+
+### Operational deadlines / warnings
+
+- Manifest expires ~2026-09-24 (30-day window): publish a successor release
+  with a higher sequence before expiry or strict admission fails closed for
+  every client.
+- Fresh invite codes printed once into this session's transcript; treat as
+  exposed if that transcript is shared and rotate via restart.
+- Old clients (pre-2.2.0) are intentionally disconnected by current-only
+  admission once this manifest is installed.
+
 ## 2026-08-23 - Sender-client origin disclosure (SECURITY.md residual limit)
 
 Closed the next repository-fixable item from `SECURITY.md`: the browser

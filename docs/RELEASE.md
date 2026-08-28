@@ -36,7 +36,7 @@ This creates an ignored keystore under `.secrets/` and an ignored `deploy/releas
 ./check.sh all
 ```
 
-The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without invoking Android packaging, and a live disposable-relay integration test. Android packaging remains an explicit release-only step. The 2026-08-25 integrated local gate ran 350 web tests across 31 files, 68 Rust-core tests, 16 release-tool tests, 230 relay tests, and 241 Android JVM tests; the forbidden integration-root release compile check, release lint, debug/release compilation, protocol-v9 direct/protocol-v10 MLS integration with strict build admission, deterministic generated-artifact/deployment checks, and npm/RustSec audits also passed. All applicable tests had zero skips, failures, or errors; no Android packaging task was invoked. CodeQL must pass remotely after push.
+The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without invoking Android packaging, and a live disposable-relay integration test. Android packaging remains an explicit release-only step. The 2026-08-28 integrated local gate ran 352 web tests across 31 files, 68 Rust-core tests, 20 release-tool tests, 232 relay tests, and 241 Android JVM tests; the forbidden integration-root release compile check, release lint, debug/release compilation, protocol-v9 direct/protocol-v10 MLS integration with strict build admission, deterministic generated-artifact/deployment checks, and npm/RustSec audits also passed. All applicable tests had zero skips, failures, or errors; no Android packaging task was invoked. CodeQL must pass remotely after push.
 
 ## Signed Android artifacts
 
@@ -85,10 +85,23 @@ The web builder bakes the signed build identity into JavaScript and `/build-id.j
 ## Deploy relay
 
 ```bash
-./deploy/deploy-server.sh
+ABYSSAL_RELEASE_OUTPUT_DIR=/secure/release-output \
+ABYSSAL_WEB_RELEASE_MANIFEST=/secure/release-output/release-manifest-v1.json \
+ABYSSAL_WEB_RELEASE_SIGNATURE=/secure/release-output/release-manifest-v1.sig \
+ABYSSAL_WEB_RELEASE_ARCHIVE=/secure/release-output/abyssal-web-VERSION.tar.gz \
+  ./deploy/deploy-server.sh
 curl --fail https://chat.example.com/health
 ```
 
 Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appeared once in the attached deployment terminal. Codes must not exist in Docker logs, relay files, or environment configuration. The public health response exposes only liveness, node identity, and the RAM-only storage label; there is deliberately no code-retrieval workflow. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments. Docker automatic restart must remain disabled because an unattended restart rotates the unrecoverable one-time code set.
 
-The sync helper transfers a clean archive of committed `HEAD` only. It explicitly protects the remote relay `.env` and excludes local signing credentials even if future ignore rules change. If the relay environment is missing on a first deployment, the restart helper installs the tracked template with mode `600`; review that file before distributing its generated invite codes.
+Before any rsync, the sync helper verifies the offline-root signature, canonical
+manifest validity window, current web build and revocation state, exact
+committed `HEAD`, and archive filename, size, and SHA-256 digest. It transfers a
+clean archive of that commit plus only the verified web archive. The Docker
+build extracts those exact web bytes and never rebuilds the browser bundle from
+source. The helper explicitly protects the remote relay `.env` and excludes
+local signing credentials even if future ignore rules change. If the relay
+environment is missing on a first deployment, the restart helper installs the
+tracked template with mode `600`; review that file before distributing its
+generated invite codes.

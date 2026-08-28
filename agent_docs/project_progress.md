@@ -1,5 +1,31 @@
 # Project Progress
 
+## Active Deployment: Attested Release Recovery
+
+Production v2.2.0 serves the exact signed web archive, but browser account entry
+is blocked because the web verifier follows GitHub release-download redirects
+that do not provide a browser CORS contract. This package restores the
+fail-closed attestation path and makes production deployment reproducible.
+
+### Bounded Plan
+
+1. Serve the relay's exact RAM-held, signature-verified release manifest and
+   detached signature through fixed same-origin well-known endpoints; keep web
+   verification of signature, validity, revocation, build identity, and every
+   served asset.
+2. Fix the tracked container build and deployment flow so production consumes
+   an explicitly supplied, validated signed web archive instead of rebuilding
+   an unattested bundle or relying on remote-only Dockerfile edits.
+3. Add regression tests for manifest delivery, browser request origins,
+   archive staging, and fail-closed deployment prerequisites; reconcile public
+   release/security text with the implemented behavior.
+4. Run the complete repository gate, require CI and CodeQL success on the exact
+   commit, build v2.2.1 Android/web artifacts from a clean worktree, verify the
+   existing Android signer, publish sequence 2, and deploy the exact web
+   archive.
+5. Verify production health, browser attestation/account-entry rendering,
+   release digests/signatures, and the installed Android artifact.
+
 ## Completed Deployment: Sender-Client Origin Disclosure
 
 This package makes the web-versus-Android security asymmetry visible per

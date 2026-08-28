@@ -1,8 +1,9 @@
 use abyssal_core::release_provenance::{
     build_signing_transcript, canonical_manifest_bytes, manifest_signing_transcript,
     validate_release_manifest_for_signing_with_key, verify_build_signature_with_key,
-    ReleaseAssetDocument, ReleaseBuildDocument, ReleaseManifestDocument, MAX_ASSETS_PER_BUILD,
-    RELEASE_CHANNEL, RELEASE_MANIFEST_SCHEMA, RELEASE_PROJECT, RELEASE_PUBKEY,
+    verify_release_manifest_with_embedded_key, ReleaseAssetDocument, ReleaseBuildDocument,
+    ReleaseManifestDocument, VerifiedReleaseManifest, MAX_ASSETS_PER_BUILD, RELEASE_CHANNEL,
+    RELEASE_MANIFEST_SCHEMA, RELEASE_PROJECT, RELEASE_PUBKEY,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
@@ -14,6 +15,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
@@ -108,6 +110,7 @@ fn run() -> Result<(), String> {
         }
         "create-build-record" => create_build_record(&remainder),
         "assemble-manifest" => assemble_manifest(&remainder),
+        "verify-web-archive" | "verify-web-release" => verify_web_archive_command(&remainder),
         "hash-file" => {
             let options = parse_options(&remainder, &["--input"])?;
             println!("{}", hash_file(path(&options, "--input")?)?);
@@ -118,7 +121,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: abyssal-release-tool <generate-key|derive-public|render-root|fingerprint-public|check-root|sign-build|sign-manifest|create-build-record|assemble-manifest|hash-file> [options]".to_string()
+    "usage: abyssal-release-tool <generate-key|derive-public|render-root|fingerprint-public|check-root|sign-build|sign-manifest|create-build-record|assemble-manifest|verify-web-archive|hash-file> [options]".to_string()
 }
 
 fn parse_options(
@@ -366,6 +369,123 @@ fn assemble_manifest(arguments: &[String]) -> Result<(), String> {
         lower_hex(&Sha256::digest(&manifest))
     );
     Ok(())
+}
+
+struct VerifiedWebArchive {
+    name: String,
+    size: u64,
+    sha256_hex: String,
+}
+
+fn verify_web_archive_command(arguments: &[String]) -> Result<(), String> {
+    let options = parse_options(
+        arguments,
+        &["--manifest", "--signature", "--archive", "--source-commit"],
+    )?;
+    let source_commit = value(&options, "--source-commit")?;
+    if !is_exact_source_commit(source_commit) {
+        return Err(
+            "committed source SHA must be exactly 40 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "current time exceeds the supported range".to_string())?;
+    let manifest_path = path(&options, "--manifest")?;
+    let signature_path = path(&options, "--signature")?;
+    let archive_path = path(&options, "--archive")?;
+    let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let signature = read_bounded(&signature_path, 64)?;
+    if signature.len() != 64 {
+        return Err("release manifest signature must contain exactly 64 raw bytes".to_string());
+    }
+    let verified_manifest =
+        verify_release_manifest_with_embedded_key(&manifest_bytes, &signature, now_ms)
+            .map_err(|error| format!("release manifest verification failed: {error}"))?;
+    let verified =
+        verify_web_archive_against_manifest(&verified_manifest, &archive_path, source_commit)?;
+    println!(
+        "verified web archive: name={} size={} sha256={}",
+        verified.name, verified.size, verified.sha256_hex
+    );
+    Ok(())
+}
+
+fn verify_web_archive_against_manifest(
+    manifest: &VerifiedReleaseManifest,
+    archive_path: &Path,
+    source_commit: &str,
+) -> Result<VerifiedWebArchive, String> {
+    if !is_exact_source_commit(source_commit) {
+        return Err(
+            "committed source SHA must be exactly 40 lowercase hexadecimal characters".to_string(),
+        );
+    }
+    let web_builds = manifest
+        .builds
+        .iter()
+        .filter(|build| build.build_id.platform == "web")
+        .collect::<Vec<_>>();
+    if web_builds.len() != 1 {
+        return Err("release manifest must contain exactly one web build".to_string());
+    }
+    let web_build = web_builds[0];
+    let build_id = format!("web@{}", web_build.build_id.version);
+    if manifest.is_revoked(&build_id) {
+        return Err(format!("web build is revoked: {build_id}"));
+    }
+    if web_build.source_commit != source_commit {
+        return Err("web build source commit does not match committed HEAD".to_string());
+    }
+
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "web archive path must have an ASCII file name".to_string())?;
+    let expected_name = format!("abyssal-web-{}.tar.gz", web_build.build_id.version);
+    if archive_name != expected_name {
+        return Err(format!(
+            "web archive name does not match the signed build: expected {expected_name}"
+        ));
+    }
+    let matching_assets = web_build
+        .assets
+        .iter()
+        .filter(|asset| asset.name == archive_name)
+        .collect::<Vec<_>>();
+    if matching_assets.len() != 1 {
+        return Err("signed web build must contain exactly one matching archive asset".to_string());
+    }
+    let asset = matching_assets[0];
+    let file = open_regular_nofollow(archive_path)?;
+    let actual_size = file
+        .metadata()
+        .map_err(io_error("inspect web archive"))?
+        .len();
+    drop(file);
+    if actual_size == 0 || actual_size != asset.size {
+        return Err("web archive size does not match the signed asset".to_string());
+    }
+    let actual_sha256 = hash_file(archive_path.to_path_buf())?;
+    let expected_sha256 = lower_hex(&asset.sha256);
+    if actual_sha256 != expected_sha256 {
+        return Err("web archive SHA-256 does not match the signed asset".to_string());
+    }
+    Ok(VerifiedWebArchive {
+        name: archive_name.to_string(),
+        size: actual_size,
+        sha256_hex: actual_sha256,
+    })
+}
+
+fn is_exact_source_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn read_build_record(path: &Path) -> Result<ReleaseBuildDocument, String> {
@@ -620,7 +740,10 @@ fn io_error(action: &'static str) -> impl FnOnce(io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use abyssal_core::release_provenance::verify_release_manifest_with_key;
+    use abyssal_core::release_provenance::{
+        verify_release_manifest_with_key, ReleaseBuildId, ReleaseVerificationError,
+        VerifiedReleaseAsset, VerifiedReleaseBuild,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[cfg(unix)]
@@ -1144,5 +1267,162 @@ mod tests {
         write_new(&output, b"first", false).expect("initial output");
         assert!(write_new(&output, b"second", false).is_err());
         assert_eq!(fs::read(output).expect("read output"), b"first");
+    }
+
+    fn verified_web_manifest(
+        archive_name: &str,
+        archive_bytes: &[u8],
+        source_commit: &str,
+        revoked: bool,
+    ) -> VerifiedReleaseManifest {
+        VerifiedReleaseManifest {
+            canonical_json: Vec::new(),
+            sequence: 1,
+            issued_at_ms: 1,
+            not_before_ms: 1,
+            expires_at_ms: u64::MAX,
+            builds: vec![VerifiedReleaseBuild {
+                build_id: ReleaseBuildId {
+                    platform: "web".to_string(),
+                    version: "2.2.0".to_string(),
+                },
+                source_commit: source_commit.to_string(),
+                build_signature: [0; 64],
+                assets: vec![VerifiedReleaseAsset {
+                    name: archive_name.to_string(),
+                    sha256: Sha256::digest(archive_bytes).into(),
+                    size: archive_bytes.len() as u64,
+                }],
+            }],
+            revoked_build_ids: if revoked {
+                vec!["web@2.2.0".to_string()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn web_archive_verification_binds_name_source_digest_and_revocation() {
+        let directory = TestDirectory::create();
+        let source_commit = "0123456789abcdef0123456789abcdef01234567";
+        let bytes = b"verified web archive";
+        let archive = directory.path("abyssal-web-2.2.0.tar.gz");
+        write_new(&archive, bytes, false).expect("archive");
+        let manifest =
+            verified_web_manifest("abyssal-web-2.2.0.tar.gz", bytes, source_commit, false);
+        let verified = verify_web_archive_against_manifest(&manifest, &archive, source_commit)
+            .expect("archive verification");
+        assert_eq!(verified.name, "abyssal-web-2.2.0.tar.gz");
+        assert_eq!(verified.size, bytes.len() as u64);
+
+        fs::write(&archive, b"tampered web archive").expect("tamper archive");
+        assert!(verify_web_archive_against_manifest(&manifest, &archive, source_commit).is_err());
+        assert!(verify_web_archive_against_manifest(
+            &manifest,
+            &archive,
+            "89abcdef0123456789abcdef0123456789abcdef",
+        )
+        .is_err());
+        for invalid_source in [
+            "0123456789abcdef0123456789abcdef0123456",
+            "0123456789abcdef0123456789abcdef012345678",
+            "0123456789ABCDEF0123456789abcdef01234567",
+        ] {
+            assert!(
+                verify_web_archive_against_manifest(&manifest, &archive, invalid_source).is_err()
+            );
+        }
+
+        let revoked = verified_web_manifest(
+            "abyssal-web-2.2.0.tar.gz",
+            b"tampered web archive",
+            source_commit,
+            true,
+        );
+        assert!(verify_web_archive_against_manifest(&revoked, &archive, source_commit).is_err());
+    }
+
+    #[test]
+    fn signed_manifest_verification_rejects_bad_signature_and_time_boundaries() {
+        let directory = TestDirectory::create();
+        let (_, key) = test_private_key(&directory);
+        let manifest = canonical_manifest_bytes(&manifest_document(&key)).expect("manifest");
+        let signature = key.sign(&manifest_signing_transcript(&manifest)).to_bytes();
+
+        assert_eq!(
+            verify_release_manifest_with_key(
+                &key.verifying_key(),
+                &manifest,
+                &signature,
+                1_799_999_999_999,
+            ),
+            Err(ReleaseVerificationError::ManifestNotActive)
+        );
+        assert_eq!(
+            verify_release_manifest_with_key(
+                &key.verifying_key(),
+                &manifest,
+                &signature,
+                1_800_000_060_000,
+            ),
+            Err(ReleaseVerificationError::ManifestExpired)
+        );
+
+        let mut bad_signature = signature;
+        bad_signature[0] ^= 1;
+        assert_eq!(
+            verify_release_manifest_with_key(
+                &key.verifying_key(),
+                &manifest,
+                &bad_signature,
+                1_800_000_000_000,
+            ),
+            Err(ReleaseVerificationError::InvalidManifestSignature)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn web_archive_verification_rejects_symlink_and_wrong_name() {
+        let directory = TestDirectory::create();
+        let source_commit = "0123456789abcdef0123456789abcdef01234567";
+        let bytes = b"verified web archive";
+        let real_archive = directory.path("abyssal-web-2.2.0.tar.gz");
+        write_new(&real_archive, bytes, false).expect("archive");
+        let manifest =
+            verified_web_manifest("abyssal-web-2.2.0.tar.gz", bytes, source_commit, false);
+        let link = directory.path("archive-link.tar.gz");
+        symlink(&real_archive, &link).expect("archive link");
+        assert!(verify_web_archive_against_manifest(&manifest, &link, source_commit).is_err());
+
+        let wrong_name = directory.path("other-web-2.2.0.tar.gz");
+        write_new(&wrong_name, bytes, false).expect("wrong archive");
+        assert!(
+            verify_web_archive_against_manifest(&manifest, &wrong_name, source_commit,).is_err()
+        );
+    }
+
+    #[test]
+    fn web_archive_verification_rejects_duplicate_and_wrong_size_assets() {
+        let directory = TestDirectory::create();
+        let source_commit = "0123456789abcdef0123456789abcdef01234567";
+        let bytes = b"verified web archive";
+        let archive = directory.path("abyssal-web-2.2.0.tar.gz");
+        write_new(&archive, bytes, false).expect("archive");
+
+        let mut duplicate =
+            verified_web_manifest("abyssal-web-2.2.0.tar.gz", bytes, source_commit, false);
+        duplicate.builds[0].assets.push(VerifiedReleaseAsset {
+            name: "abyssal-web-2.2.0.tar.gz".to_string(),
+            sha256: Sha256::digest(bytes).into(),
+            size: bytes.len() as u64,
+        });
+        assert!(verify_web_archive_against_manifest(&duplicate, &archive, source_commit).is_err());
+
+        let mut wrong_size =
+            verified_web_manifest("abyssal-web-2.2.0.tar.gz", bytes, source_commit, false);
+        wrong_size.builds[0].assets[0].size += 1;
+        assert!(verify_web_archive_against_manifest(&wrong_size, &archive, source_commit).is_err());
     }
 }

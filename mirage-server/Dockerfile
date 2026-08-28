@@ -1,20 +1,12 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM node:26.7.0-bookworm-slim@sha256:cd565714d4da3e84bfd341e31448f81d47c6362198f152345297c9c1154e6341 AS web-builder
-
-WORKDIR /repo
-COPY package.json package-lock.json ./
-COPY apps/web/package.json ./apps/web/package.json
-RUN npm ci --ignore-scripts --workspace @abyssal/web
-COPY apps/web ./apps/web
-RUN npm run build --workspace @abyssal/web
-
 FROM rust:1.97.1-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS rust-builder
 
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock ./
 COPY mirage-server ./mirage-server
 COPY rust-core ./rust-core
+COPY tools/release-tool ./tools/release-tool
 RUN --mount=type=cache,id=abyssal-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=abyssal-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=abyssal-rust-target,target=/repo/target,sharing=locked \
@@ -22,12 +14,22 @@ RUN --mount=type=cache,id=abyssal-cargo-registry,target=/usr/local/cargo/registr
     && mkdir -p /out \
     && cp /repo/target/release/mirage-server /out/mirage-server
 
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS web-runtime
+
+ADD .web-release/abyssal-web-*.tar.gz /opt/abyssal/web/
+RUN set -eux; \
+    test -f /opt/abyssal/web/index.html; \
+    test ! -L /opt/abyssal/web/index.html; \
+    test -f /opt/abyssal/web/build-id.json; \
+    test ! -L /opt/abyssal/web/build-id.json; \
+    test -z "$(find /opt/abyssal/web -type l -print -quit)"
+
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
 
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin mirage
 
 COPY --from=rust-builder /out/mirage-server /usr/local/bin/mirage-server
-COPY --from=web-builder /repo/apps/web/dist /opt/abyssal/web
+COPY --from=web-runtime /opt/abyssal/web /opt/abyssal/web
 
 USER mirage:mirage
 EXPOSE 4020

@@ -11,6 +11,8 @@ use tokio::sync::RwLock;
 const RELEASE_API_URL: &str = "https://api.github.com/repos/Emp5r0R/Abyssal/releases/latest";
 const RELEASE_MANIFEST_ASSET: &str = "release-manifest-v1.json";
 const RELEASE_SIGNATURE_ASSET: &str = "release-manifest-v1.sig";
+pub(crate) const RELEASE_MANIFEST_ENDPOINT: &str = "/.well-known/abyssal-release-manifest-v1.json";
+pub(crate) const RELEASE_SIGNATURE_ENDPOINT: &str = "/.well-known/abyssal-release-manifest-v1.sig";
 const MAX_RELEASE_API_BYTES: usize = 512 * 1024;
 const MAX_RELEASE_MANIFEST_BYTES: usize = 256 * 1024;
 const RELEASE_SIGNATURE_BYTES: usize = 64;
@@ -47,7 +49,12 @@ pub(crate) enum InstallError {
 
 #[derive(Default)]
 pub(crate) struct ReleaseAdmissionStore {
-    current: RwLock<Option<VerifiedReleaseManifest>>,
+    current: RwLock<Option<InstalledReleaseManifest>>,
+}
+
+struct InstalledReleaseManifest {
+    manifest: VerifiedReleaseManifest,
+    signature: [u8; RELEASE_SIGNATURE_BYTES],
 }
 
 impl ReleaseAdmissionStore {
@@ -70,7 +77,7 @@ impl ReleaseAdmissionStore {
             .ok_or(AdmissionError::InvalidBuild)?;
 
         let guard = self.current.read().await;
-        let manifest = guard.as_ref().ok_or(AdmissionError::Unavailable)?;
+        let manifest = &guard.as_ref().ok_or(AdmissionError::Unavailable)?.manifest;
         if now_ms < manifest.not_before_ms {
             return Err(AdmissionError::Unavailable);
         }
@@ -93,27 +100,56 @@ impl ReleaseAdmissionStore {
     pub(crate) async fn install(
         &self,
         manifest: VerifiedReleaseManifest,
+        signature: [u8; RELEASE_SIGNATURE_BYTES],
     ) -> Result<InstallOutcome, InstallError> {
         let mut guard = self.current.write().await;
         if let Some(current) = guard.as_ref() {
-            if manifest.sequence < current.sequence {
+            if manifest.sequence < current.manifest.sequence {
                 return Err(InstallError::Rollback);
             }
-            if manifest.sequence == current.sequence {
-                return if manifest.canonical_json == current.canonical_json {
+            if manifest.sequence == current.manifest.sequence {
+                return if manifest.canonical_json == current.manifest.canonical_json
+                    && signature == current.signature
+                {
                     Ok(InstallOutcome::Unchanged)
                 } else {
                     Err(InstallError::SequenceConflict)
                 };
             }
         }
-        *guard = Some(manifest);
+        *guard = Some(InstalledReleaseManifest {
+            manifest,
+            signature,
+        });
         Ok(InstallOutcome::Installed)
     }
 
+    pub(crate) async fn manifest_bytes(&self) -> Option<Vec<u8>> {
+        self.current
+            .read()
+            .await
+            .as_ref()
+            .map(|installed| installed.manifest.canonical_json.clone())
+    }
+
+    pub(crate) async fn signature_bytes(&self) -> Option<Vec<u8>> {
+        self.current
+            .read()
+            .await
+            .as_ref()
+            .map(|installed| installed.signature.to_vec())
+    }
+
     #[cfg(test)]
-    pub(crate) async fn install_for_test(&self, manifest: VerifiedReleaseManifest) {
-        *self.current.write().await = Some(manifest);
+    pub(crate) async fn install_for_test(
+        &self,
+        manifest: VerifiedReleaseManifest,
+        signature: [u8; RELEASE_SIGNATURE_BYTES],
+    ) {
+        *self.current.write().await = Some(InstalledReleaseManifest {
+            manifest,
+            signature,
+        });
     }
 
     #[cfg(test)]
@@ -121,33 +157,36 @@ impl ReleaseAdmissionStore {
         use abyssal_core::release_provenance::{ReleaseBuildId, VerifiedReleaseBuild};
 
         Self {
-            current: RwLock::new(Some(VerifiedReleaseManifest {
-                canonical_json: b"test".to_vec(),
-                sequence: 1,
-                issued_at_ms: 0,
-                not_before_ms: 0,
-                expires_at_ms: u64::MAX,
-                builds: vec![
-                    VerifiedReleaseBuild {
-                        build_id: ReleaseBuildId {
-                            platform: "android".to_string(),
-                            version: "2.1.0".to_string(),
+            current: RwLock::new(Some(InstalledReleaseManifest {
+                manifest: VerifiedReleaseManifest {
+                    canonical_json: b"test".to_vec(),
+                    sequence: 1,
+                    issued_at_ms: 0,
+                    not_before_ms: 0,
+                    expires_at_ms: u64::MAX,
+                    builds: vec![
+                        VerifiedReleaseBuild {
+                            build_id: ReleaseBuildId {
+                                platform: "android".to_string(),
+                                version: "2.1.0".to_string(),
+                            },
+                            source_commit: "11".repeat(20),
+                            build_signature: [1; RELEASE_SIGNATURE_BYTES],
+                            assets: Vec::new(),
                         },
-                        source_commit: "11".repeat(20),
-                        build_signature: [1; RELEASE_SIGNATURE_BYTES],
-                        assets: Vec::new(),
-                    },
-                    VerifiedReleaseBuild {
-                        build_id: ReleaseBuildId {
-                            platform: "web".to_string(),
-                            version: "2.1.0".to_string(),
+                        VerifiedReleaseBuild {
+                            build_id: ReleaseBuildId {
+                                platform: "web".to_string(),
+                                version: "2.1.0".to_string(),
+                            },
+                            source_commit: "11".repeat(20),
+                            build_signature: [2; RELEASE_SIGNATURE_BYTES],
+                            assets: Vec::new(),
                         },
-                        source_commit: "11".repeat(20),
-                        build_signature: [2; RELEASE_SIGNATURE_BYTES],
-                        assets: Vec::new(),
-                    },
-                ],
-                revoked_build_ids: Vec::new(),
+                    ],
+                    revoked_build_ids: Vec::new(),
+                },
+                signature: [3; RELEASE_SIGNATURE_BYTES],
             })),
         }
     }
@@ -186,7 +225,11 @@ pub(crate) async fn install_integration_manifest_from_env(
     let verified = verify_release_manifest_with_embedded_key(&manifest, &signature, now_ms)
         .map_err(|_| RefreshError::InvalidManifest)?;
     store
-        .install(verified)
+        .install(
+            verified,
+            <[u8; RELEASE_SIGNATURE_BYTES]>::try_from(signature)
+                .map_err(|_| RefreshError::InvalidResponse)?,
+        )
         .await
         .map_err(|_| RefreshError::Rollback)?;
     Ok(true)
@@ -283,9 +326,16 @@ impl ReleaseManifestMirror {
 
         let verified = verify_release_manifest_with_embedded_key(&manifest, &signature, now_ms)
             .map_err(|_| RefreshError::InvalidManifest)?;
-        store.install(verified).await.map_err(|error| match error {
-            InstallError::Rollback | InstallError::SequenceConflict => RefreshError::Rollback,
-        })
+        store
+            .install(
+                verified,
+                <[u8; RELEASE_SIGNATURE_BYTES]>::try_from(signature)
+                    .map_err(|_| RefreshError::InvalidResponse)?,
+            )
+            .await
+            .map_err(|error| match error {
+                InstallError::Rollback | InstallError::SequenceConflict => RefreshError::Rollback,
+            })
     }
 }
 
@@ -432,7 +482,9 @@ mod tests {
             store.admit(&valid, 1_500).await,
             Err(AdmissionError::Unavailable)
         );
-        store.install_for_test(manifest(1, b"one")).await;
+        store
+            .install_for_test(manifest(1, b"one"), [9; RELEASE_SIGNATURE_BYTES])
+            .await;
         assert_eq!(
             store.admit(&valid, 999).await,
             Err(AdmissionError::Unavailable)
@@ -475,25 +527,63 @@ mod tests {
     async fn install_is_monotonic_and_same_sequence_must_be_identical() {
         let store = ReleaseAdmissionStore::new();
         assert_eq!(
-            store.install(manifest(2, b"two")).await,
+            store
+                .install(manifest(2, b"two"), [1; RELEASE_SIGNATURE_BYTES])
+                .await,
             Ok(InstallOutcome::Installed)
         );
         assert_eq!(
-            store.install(manifest(2, b"two")).await,
+            store
+                .install(manifest(2, b"two"), [1; RELEASE_SIGNATURE_BYTES])
+                .await,
             Ok(InstallOutcome::Unchanged)
         );
         assert_eq!(
-            store.install(manifest(1, b"one")).await,
-            Err(InstallError::Rollback)
+            store
+                .install(manifest(2, b"two"), [2; RELEASE_SIGNATURE_BYTES])
+                .await,
+            Err(InstallError::SequenceConflict)
+        );
+        assert_eq!(store.manifest_bytes().await.as_deref(), Some(&b"two"[..]));
+        assert_eq!(
+            store.signature_bytes().await.as_deref(),
+            Some(&[1; RELEASE_SIGNATURE_BYTES][..])
         );
         assert_eq!(
-            store.install(manifest(2, b"altered")).await,
+            store
+                .install(manifest(1, b"one"), [1; RELEASE_SIGNATURE_BYTES])
+                .await,
+            Err(InstallError::Rollback)
+        );
+        assert_eq!(store.manifest_bytes().await.as_deref(), Some(&b"two"[..]));
+        assert_eq!(
+            store.signature_bytes().await.as_deref(),
+            Some(&[1; RELEASE_SIGNATURE_BYTES][..])
+        );
+        assert_eq!(
+            store
+                .install(manifest(2, b"altered"), [1; RELEASE_SIGNATURE_BYTES])
+                .await,
             Err(InstallError::SequenceConflict)
         );
         assert_eq!(
-            store.install(manifest(3, b"three")).await,
+            store
+                .install(manifest(3, b"three"), [1; RELEASE_SIGNATURE_BYTES])
+                .await,
             Ok(InstallOutcome::Installed)
         );
+        assert_eq!(store.manifest_bytes().await.as_deref(), Some(&b"three"[..]));
+        assert_eq!(
+            store.signature_bytes().await.as_deref(),
+            Some(&[1; RELEASE_SIGNATURE_BYTES][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn material_endpoints_are_unavailable_without_an_install() {
+        let store = ReleaseAdmissionStore::new();
+        assert_eq!(store.manifest_bytes().await, None);
+        assert_eq!(store.signature_bytes().await, None);
     }
 
     #[tokio::test]
@@ -501,7 +591,9 @@ mod tests {
         let store = ReleaseAdmissionStore::new();
         let mut revoked = manifest(1, b"one");
         revoked.revoked_build_ids.push("web@2.1.0".to_string());
-        store.install_for_test(revoked).await;
+        store
+            .install_for_test(revoked, [9; RELEASE_SIGNATURE_BYTES])
+            .await;
         assert_eq!(
             store.admit(&request("web", "2.1.0", [2; 64]), 1_500).await,
             Err(AdmissionError::InvalidBuild)
