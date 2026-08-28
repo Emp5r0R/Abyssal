@@ -31,8 +31,10 @@ set -euo pipefail
     if [[ "$argument" == */ ]]; then
       source_dir="${argument%/}"
       if [[ -n "${EXPECTED_ARCHIVE_NAME:-}" && -d "$source_dir/.web-release" ]]; then
-        [[ "$(find "$source_dir/.web-release" -mindepth 1 -maxdepth 1 -print | wc -l)" == 1 ]] || exit 1
+        [[ -f "$source_dir/.web-release/.gitignore" ]] || exit 1
         [[ -f "$source_dir/.web-release/$EXPECTED_ARCHIVE_NAME" ]] || exit 1
+        [[ -z "$(find "$source_dir/.web-release" -mindepth 1 -maxdepth 1 \
+          ! -name .gitignore ! -name "$EXPECTED_ARCHIVE_NAME" -print -quit)" ]] || exit 1
         [[ -z "$(find "$source_dir" -mindepth 2 -type d -name .web-release -print -quit)" ]] || exit 1
       fi
     fi
