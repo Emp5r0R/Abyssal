@@ -49,6 +49,7 @@ const MAX_MANIFEST_BYTES = 256 * 1024;
 const SIGNATURE_BYTES = 64;
 const MAX_WEB_ASSET_BYTES = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_ATTEMPTS = 3;
 const ASSET_VERIFICATION_CONCURRENCY = 4;
 const SAFE_ASSET_NAME = /^(?!\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9._/-]{1,192}$/u;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
@@ -69,10 +70,18 @@ export async function verifyOriginAttestation(
   try {
     if (!context.identity.configured || !releaseTrustAnchorConfigured()) throw new MismatchError();
     const manifestUrl = sameOriginUrl(context.origin, RELEASE_MANIFEST_ENDPOINT);
-    const manifestResponse = await boundedFetch(context.fetch, manifestUrl, MAX_MANIFEST_BYTES);
+    const manifestResponse = await boundedFetchWithRetry(
+      context.fetch,
+      manifestUrl,
+      MAX_MANIFEST_BYTES,
+    );
     requireSameOriginResponse(manifestResponse.url, context.origin, RELEASE_MANIFEST_ENDPOINT);
     const signatureUrl = sameOriginUrl(context.origin, RELEASE_SIGNATURE_ENDPOINT);
-    const signatureResponse = await boundedFetch(context.fetch, signatureUrl, SIGNATURE_BYTES);
+    const signatureResponse = await boundedFetchWithRetry(
+      context.fetch,
+      signatureUrl,
+      SIGNATURE_BYTES,
+    );
     requireSameOriginResponse(signatureResponse.url, context.origin, RELEASE_SIGNATURE_ENDPOINT);
     let canonical: string;
     try {
@@ -114,7 +123,7 @@ async function verifyOriginBuildIdentity(
 ): Promise<void> {
   const url = new URL("/build-id.json", context.origin);
   if (url.origin !== context.origin) throw new MismatchError();
-  const response = await boundedFetch(context.fetch, url.toString(), 1024);
+  const response = await boundedFetchWithRetry(context.fetch, url.toString(), 1024);
   requireSameOriginResponse(response.url, context.origin, "/build-id.json");
   const identity = parseObjectJson(response.bytes);
   if (Object.keys(identity).sort().join("\0") !==
@@ -175,7 +184,7 @@ async function verifyServedAsset(
   candidate: { asset: ManifestAsset; expectedSize: number; url: URL },
 ): Promise<void> {
   const { asset, expectedSize, url } = candidate;
-  const response = await boundedFetch(context.fetch, url.toString(), expectedSize);
+  const response = await boundedFetchWithRetry(context.fetch, url.toString(), expectedSize);
   let actual: string;
   try {
     requireSameOriginResponse(response.url, context.origin, url.pathname);
@@ -242,6 +251,24 @@ async function boundedFetch(
     chunks.forEach((chunk) => chunk.fill(0));
     reader.releaseLock();
   }
+}
+
+async function boundedFetchWithRetry(
+  fetcher: typeof globalThis.fetch,
+  url: string,
+  maximum: number,
+  init: RequestInit = {},
+): Promise<{ bytes: Uint8Array; url: string }> {
+  let lastAvailabilityError: unknown;
+  for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
+    try {
+      return await boundedFetch(fetcher, url, maximum, init);
+    } catch (error) {
+      if (error instanceof MismatchError) throw error;
+      lastAvailabilityError = error;
+    }
+  }
+  throw lastAvailabilityError;
 }
 
 function sameOriginUrl(origin: string, path: string): string {

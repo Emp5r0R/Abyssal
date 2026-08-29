@@ -16,7 +16,7 @@ const COPY: Record<Exclude<OriginAttestationStatus, "OK">, { title: string; deta
   },
   UNAVAILABLE: {
     title: "Verification unavailable",
-    detail: "The signed release record could not be reached. Account access remains blocked.",
+    detail: "Required signed release data could not be retrieved. Account access remains blocked.",
   },
   ATTESTATION_REJECTED: {
     title: "Build rejected by node",

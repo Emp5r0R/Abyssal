@@ -55,12 +55,29 @@ describe("origin release attestation", () => {
   it("fails closed for a changed asset, stale approval, and network failure", async () => {
     const changed = await releaseFixture({ corrupt: `${ORIGIN}/assets/app.js` });
     await expectStatus(changed.fetcher, 1_500, "MISMATCH");
+    expect(changed.requested.filter((url) => url === `${ORIGIN}/assets/app.js`)).toHaveLength(1);
 
     const stale = await releaseFixture();
     await expectStatus(stale.fetcher, 2_000, "STALE");
 
     const unavailable = vi.fn<typeof fetch>().mockRejectedValue(new TypeError("offline"));
     await expectStatus(unavailable, 1_500, "UNAVAILABLE");
+    expect(unavailable).toHaveBeenCalledTimes(3);
+  });
+
+  it("recovers from bounded transient body availability failures", async () => {
+    const assetUrl = `${ORIGIN}/assets/app.js`;
+    const fixture = await releaseFixture({
+      transientFailures: { [assetUrl]: 2 },
+    });
+    const result = await verifyOriginAttestation({
+      fetch: fixture.fetcher,
+      origin: ORIGIN,
+      nowMs: 1_500,
+      identity: IDENTITY,
+    });
+    expect(result).toEqual({ status: "OK" });
+    expect(fixture.requested.filter((url) => url === assetUrl)).toHaveLength(3);
   });
 
   it("rejects unconfigured build identity before making a request", async () => {
@@ -131,6 +148,7 @@ async function releaseFixture(options: {
   origin?: string;
   extraAssets?: number;
   assetDelayMs?: number;
+  transientFailures?: Readonly<Record<string, number>>;
 } = {}): Promise<{
   fetcher: typeof fetch;
   requested: string[];
@@ -176,10 +194,16 @@ async function releaseFixture(options: {
   const requests: Array<{ url: string; init: RequestInit }> = [];
   let activeAssetRequests = 0;
   let maxActiveAssetRequests = 0;
+  const transientFailures = new Map(Object.entries(options.transientFailures ?? {}));
   const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     requested.push(url);
     requests.push({ url, init: init ?? {} });
+    const failuresRemaining = transientFailures.get(url) ?? 0;
+    if (failuresRemaining > 0) {
+      transientFailures.set(url, failuresRemaining - 1);
+      throw new TypeError("transient body failure");
+    }
     if (url === manifestUrl) return response(manifest, options.manifestFinalUrl ?? manifestUrl);
     if (url === signatureUrl) return response(new Uint8Array(64), signatureUrl);
     const expected = content.get(url);
