@@ -49,8 +49,9 @@ const MAX_MANIFEST_BYTES = 256 * 1024;
 const SIGNATURE_BYTES = 64;
 const MAX_WEB_ASSET_BYTES = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
-const REQUEST_ATTEMPTS = 3;
-const ASSET_VERIFICATION_CONCURRENCY = 4;
+const REQUEST_RETRY_DELAYS_MS = [250, 750] as const;
+const REQUEST_ATTEMPTS = REQUEST_RETRY_DELAYS_MS.length + 1;
+const ASSET_VERIFICATION_CONCURRENCY = 2;
 const SAFE_ASSET_NAME = /^(?!\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9._/-]{1,192}$/u;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
@@ -266,6 +267,10 @@ async function boundedFetchWithRetry(
     } catch (error) {
       if (error instanceof MismatchError) throw error;
       lastAvailabilityError = error;
+      const retryDelay = REQUEST_RETRY_DELAYS_MS[attempt];
+      if (retryDelay !== undefined) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelay));
+      }
     }
   }
   throw lastAvailabilityError;

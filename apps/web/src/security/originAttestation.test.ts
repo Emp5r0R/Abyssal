@@ -113,7 +113,7 @@ describe("origin release attestation", () => {
     expect(fixture.requested.every((url) => new URL(url).origin === portOrigin)).toBe(true);
   });
 
-  it("verifies the complete asset set with bounded parallelism", async () => {
+  it("verifies the complete asset set with conservative bounded parallelism", async () => {
     const fixture = await releaseFixture({ extraAssets: 12, assetDelayMs: 10 });
     const result = await verifyOriginAttestation({
       fetch: fixture.fetcher,
@@ -124,7 +124,7 @@ describe("origin release attestation", () => {
     expect(result).toEqual({ status: "OK" });
     expect(fixture.requested.filter((url) => url.includes("/assets/parallel-"))).toHaveLength(12);
     expect(fixture.maxActiveAssetRequests()).toBeGreaterThan(1);
-    expect(fixture.maxActiveAssetRequests()).toBeLessThanOrEqual(4);
+    expect(fixture.maxActiveAssetRequests()).toBeLessThanOrEqual(2);
   });
 });
 
