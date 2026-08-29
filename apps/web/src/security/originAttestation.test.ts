@@ -95,6 +95,20 @@ describe("origin release attestation", () => {
     expect(result).toEqual({ status: "OK" });
     expect(fixture.requested.every((url) => new URL(url).origin === portOrigin)).toBe(true);
   });
+
+  it("verifies the complete asset set with bounded parallelism", async () => {
+    const fixture = await releaseFixture({ extraAssets: 12, assetDelayMs: 10 });
+    const result = await verifyOriginAttestation({
+      fetch: fixture.fetcher,
+      origin: ORIGIN,
+      nowMs: 1_500,
+      identity: IDENTITY,
+    });
+    expect(result).toEqual({ status: "OK" });
+    expect(fixture.requested.filter((url) => url.includes("/assets/parallel-"))).toHaveLength(12);
+    expect(fixture.maxActiveAssetRequests()).toBeGreaterThan(1);
+    expect(fixture.maxActiveAssetRequests()).toBeLessThanOrEqual(4);
+  });
 });
 
 async function expectStatus(
@@ -115,10 +129,13 @@ async function releaseFixture(options: {
   corrupt?: string;
   manifestFinalUrl?: string;
   origin?: string;
+  extraAssets?: number;
+  assetDelayMs?: number;
 } = {}): Promise<{
   fetcher: typeof fetch;
   requested: string[];
   requests: Array<{ url: string; init: RequestInit }>;
+  maxActiveAssetRequests: () => number;
 }> {
   const origin = options.origin ?? ORIGIN;
   const manifestUrl = `${origin}/.well-known/abyssal-release-manifest-v1.json`;
@@ -135,6 +152,9 @@ async function releaseFixture(options: {
     [`${origin}/build-id.json`, identityBytes],
     [`${origin}/index.html`, bytes("<!doctype html><main>Abyssal</main>")],
   ]);
+  for (let index = 0; index < (options.extraAssets ?? 0); index += 1) {
+    content.set(`${origin}/assets/parallel-${index}.bin`, bytes(`asset-${index}`));
+  }
   const assets = await Promise.all([...content.entries()].map(async ([name, data]) => ({
     name: name.slice(origin.length + 1),
     sha256_hex: await sha256(data),
@@ -154,6 +174,8 @@ async function releaseFixture(options: {
   }));
   const requested: string[] = [];
   const requests: Array<{ url: string; init: RequestInit }> = [];
+  let activeAssetRequests = 0;
+  let maxActiveAssetRequests = 0;
   const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = String(input);
     requested.push(url);
@@ -162,10 +184,24 @@ async function releaseFixture(options: {
     if (url === signatureUrl) return response(new Uint8Array(64), signatureUrl);
     const expected = content.get(url);
     if (!expected) return response(bytes("missing"), url, 404);
+    if ((options.assetDelayMs ?? 0) > 0 && url.startsWith(`${origin}/assets/`)) {
+      activeAssetRequests += 1;
+      maxActiveAssetRequests = Math.max(maxActiveAssetRequests, activeAssetRequests);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, options.assetDelayMs));
+      } finally {
+        activeAssetRequests -= 1;
+      }
+    }
     const body = options.corrupt === url ? bytes("changed") : expected;
     return response(body, url);
   });
-  return { fetcher, requested, requests };
+  return {
+    fetcher,
+    requested,
+    requests,
+    maxActiveAssetRequests: () => maxActiveAssetRequests,
+  };
 }
 
 function response(body: Uint8Array, url: string, status = 200): Response {

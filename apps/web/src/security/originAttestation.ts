@@ -48,7 +48,8 @@ const RELEASE_SIGNATURE_ENDPOINT = "/.well-known/abyssal-release-manifest-v1.sig
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const SIGNATURE_BYTES = 64;
 const MAX_WEB_ASSET_BYTES = 64 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 12_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+const ASSET_VERIFICATION_CONCURRENCY = 4;
 const SAFE_ASSET_NAME = /^(?!\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9._/-]{1,192}$/u;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
@@ -136,7 +137,7 @@ async function verifyServedAssets(context: AttestationContext, build: ManifestBu
     !servedAssets.some((asset) => asset.name.endsWith(".wasm"))) {
     throw new MismatchError();
   }
-  for (const asset of servedAssets) {
+  const candidates = servedAssets.map((asset) => {
     if (!SAFE_ASSET_NAME.test(asset.name) || !LOWER_SHA256.test(asset.sha256_hex)) {
       throw new MismatchError();
     }
@@ -144,25 +145,54 @@ async function verifyServedAssets(context: AttestationContext, build: ManifestBu
     if (expectedSize > MAX_WEB_ASSET_BYTES) throw new MismatchError();
     const url = new URL(`/${asset.name}`, context.origin);
     if (url.origin !== context.origin || url.pathname !== `/${asset.name}`) throw new MismatchError();
-    const response = await boundedFetch(context.fetch, url.toString(), expectedSize);
-    let actual: string;
-    try {
-      requireSameOriginResponse(response.url, context.origin, url.pathname);
-      if (response.bytes.byteLength !== expectedSize) throw new MismatchError();
-      const digestInput = Uint8Array.from(response.bytes);
-      let digest: Uint8Array | null = null;
+    return { asset, expectedSize, url };
+  });
+
+  let nextIndex = 0;
+  let failed = false;
+  let failure: unknown;
+  async function worker(): Promise<void> {
+    while (!failed) {
+      const index = nextIndex++;
+      if (index >= candidates.length) return;
       try {
-        digest = new Uint8Array(await crypto.subtle.digest("SHA-256", digestInput));
-        actual = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
-      } finally {
-        digestInput.fill(0);
-        digest?.fill(0);
+        await verifyServedAsset(context, candidates[index]);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
       }
-    } finally {
-      response.bytes.fill(0);
     }
-    if (actual !== asset.sha256_hex) throw new MismatchError();
   }
+  const workerCount = Math.min(ASSET_VERIFICATION_CONCURRENCY, candidates.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (failed) throw failure;
+}
+
+async function verifyServedAsset(
+  context: AttestationContext,
+  candidate: { asset: ManifestAsset; expectedSize: number; url: URL },
+): Promise<void> {
+  const { asset, expectedSize, url } = candidate;
+  const response = await boundedFetch(context.fetch, url.toString(), expectedSize);
+  let actual: string;
+  try {
+    requireSameOriginResponse(response.url, context.origin, url.pathname);
+    if (response.bytes.byteLength !== expectedSize) throw new MismatchError();
+    const digestInput = Uint8Array.from(response.bytes);
+    let digest: Uint8Array | null = null;
+    try {
+      digest = new Uint8Array(await crypto.subtle.digest("SHA-256", digestInput));
+      actual = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    } finally {
+      digestInput.fill(0);
+      digest?.fill(0);
+    }
+  } finally {
+    response.bytes.fill(0);
+  }
+  if (actual !== asset.sha256_hex) throw new MismatchError();
 }
 
 async function boundedFetch(
