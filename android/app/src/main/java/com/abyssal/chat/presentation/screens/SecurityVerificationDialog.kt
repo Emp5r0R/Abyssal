@@ -28,6 +28,13 @@ fun SecurityVerificationDialog(
         title = title,
         onDismiss = {},
         accent = SelfDestructAmber,
+        icon = {
+            AbyssalMarkLoader(
+                size = AbyssalMarkLoaderSize.Medium,
+                description = title,
+                animated = isChecking
+            )
+        },
         modifier = Modifier.widthIn(max = 440.dp)
     ) {
         Text(

@@ -1,12 +1,14 @@
-import { Eye, EyeOff, KeyRound, LoaderCircle, RadioTower } from "lucide-react";
+import { Eye, EyeOff, KeyRound, RadioTower } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { AccountSession } from "../domain/types";
-import { Brand, Field, IconButton, Toggle } from "./Ui";
+import { AbyssalMarkLoader, Brand, Field, IconButton, Toggle } from "./Ui";
 
 export function Entrance({
   onLogin,
+  onPreflight,
 }: {
   onLogin: (input: { nodeUrl: string; code: string; password: Uint8Array; retainWhenHidden: boolean }) => Promise<AccountSession>;
+  onPreflight: () => Promise<boolean | void>;
 }) {
   const [nodeUrl, setNodeUrl] = useState(() => (window.location.port === "4020" ? window.location.origin : ""));
   const [code, setCode] = useState("");
@@ -21,16 +23,21 @@ export function Entrance({
     if (busy) return;
     setBusy(true);
     setError(false);
-    const passwordBytes = new TextEncoder().encode(password);
+    const submittedPassword = password;
     setPassword("");
     setShowPassword(false);
+    let passwordBytes: Uint8Array | undefined;
     try {
+      if ((await onPreflight()) === false) {
+        throw new Error("Release verification rejected");
+      }
+      passwordBytes = new TextEncoder().encode(submittedPassword);
       await onLogin({ nodeUrl, code, password: passwordBytes, retainWhenHidden });
       setCode("");
     } catch {
       setError(true);
     } finally {
-      passwordBytes.fill(0);
+      passwordBytes?.fill(0);
       setBusy(false);
     }
   };
@@ -39,9 +46,7 @@ export function Entrance({
     <main className="entrance-page">
       <section className="entrance-brand-band" aria-label="Abyssal">
         <Brand />
-        <div className="entrance-signal" aria-hidden="true">
-          <span /><span /><span /><span />
-        </div>
+        <AbyssalMarkLoader className="entrance-signal" size="large" />
         <div className="entrance-node-line">
           <RadioTower size={16} />
           <span>NODE-DEFINED SESSION</span>
@@ -105,7 +110,7 @@ export function Entrance({
           </div>
 
           <button className="primary-button entrance-submit" type="submit" disabled={busy || !nodeUrl || !code || password.length < 8}>
-            {busy ? <LoaderCircle className="spin" size={18} /> : <KeyRound size={18} />}
+            {busy ? <AbyssalMarkLoader size="compact" /> : <KeyRound size={18} />}
             {busy ? "ENTERING" : "ENTER"}
           </button>
         </form>

@@ -10,6 +10,15 @@ The web client and Android client share the same Abyssal visual language: dark r
 
 Android uses `FLAG_SECURE`, so production device screenshots are intentionally blocked instead of being used as README media.
 
+Both clients provide a reusable Abyssal mark loader for entry and verification
+states; Android also uses it for update, dashboard, and chat loading states.
+Web verification is inline and fail-closed: the signed origin audit blocks
+account entry and the workspace,
+while each account submission performs a fresh lightweight preflight. The web
+mark respects `prefers-reduced-motion`; its surrounding status remains
+accessible through live status text. Android uses the same mark with fixed
+sizes, TalkBack loading semantics, and `MotionDurationScale`-aware animation.
+
 ## Monorepo Layout
 
 ```text
@@ -277,7 +286,28 @@ The file must already exist and be readable. The helpers require
 fail closed when the host is absent or changes. Do not use an unauthenticated
 `ssh-keyscan` result or an `accept-new` policy to trust a first connection.
 
-Sync the committed source plus its matching signed web release archive, then
+With no artifact overrides (and no complete local release set),
+`deploy-server.sh` resolves the one canonical `vMAJOR.MINOR.PATCH` tag at the
+clean committed `HEAD`, then downloads the public manifest, detached signature,
+and matching web archive from the configured canonical GitHub repository into
+mode-700 private temporary storage:
+
+```bash
+./deploy/deploy-server.sh
+```
+
+The download path strips GitHub credential environment variables, disables
+netrc lookup, allows only HTTPS redirects, and bounds redirects, connection
+time, total time, and each asset size. It verifies the signed manifest,
+revocation state, archive name/size/digest, and exact source commit before any
+rsync transfer; it verifies the staged archive again, then removes temporary
+files on exit. A dirty tree, missing/untagged or ambiguous canonical tag,
+partial artifact set, or other invalid input fails before rsync. GitHub is a
+public availability source here; the offline release key is never downloaded
+or needed by the deploy helper.
+
+To use explicitly selected, already-produced artifacts instead, sync the
+committed source plus their matching signed web release archive and
 rebuild/restart Docker on the server:
 
 ```bash
@@ -325,6 +355,11 @@ Run only the Docker rebuild/restart:
 ```bash
 ./deploy/restart-docker.sh
 ```
+
+`restart-docker.sh` performs no release download and does not need the signing
+key. It recreates the remote container from the archive already staged by a
+verified sync, and the relay restart intentionally wipes its RAM-only accounts,
+sessions, rooms, pending frames, and attachments.
 
 Check container status and the built-in health probe without persistent logs:
 

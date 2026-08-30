@@ -67,6 +67,14 @@ fun UpdateAvailableDialog(
             modifier = Modifier.padding(top = 22.dp)
         )
 
+        if (isPreparing) {
+            AbyssalMarkLoader(
+                size = AbyssalMarkLoaderSize.Small,
+                description = "Verifying update package",
+                modifier = Modifier.padding(top = 18.dp)
+            )
+        }
+
         MiragePrimaryButton(
             text = if (isPreparing) "VERIFYING..." else "UPDATE",
             onClick = onUpdate,

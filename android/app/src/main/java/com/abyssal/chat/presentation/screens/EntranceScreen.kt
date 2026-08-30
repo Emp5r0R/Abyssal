@@ -18,7 +18,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -306,10 +305,9 @@ private fun EntranceContent(
                                 .padding(top = 18.dp)
                         ) {
                             if (isVerifying) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(21.dp),
-                                    color = DeepBlack,
-                                    strokeWidth = 2.dp
+                                AbyssalMarkLoader(
+                                    size = AbyssalMarkLoaderSize.Inline,
+                                    description = "Verifying node access"
                                 )
                             } else {
                                 Text(

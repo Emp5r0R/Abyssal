@@ -13,7 +13,23 @@ export function PinSetup({
   const [confirm, setConfirm] = useState("");
   const [duress, setDuress] = useState("");
   const [busy, setBusy] = useState(false);
-  const valid = /^\d{6,12}$/.test(pin) && pin === confirm && (!duress || (/^\d{6,12}$/.test(duress) && duress !== pin));
+  const [error, setError] = useState(false);
+  const validCover = /^\d{6,12}$/u.test(pin);
+  const validConfirm = validCover && pin === confirm;
+  const validDuress = !duress || (/^\d{6,12}$/u.test(duress) && duress !== pin);
+  const valid = validCover && validConfirm && validDuress;
+
+  const guidance = !validCover
+    ? "Use 6-12 digits for the cover PIN."
+    : !confirm
+    ? "Re-enter the cover PIN to continue."
+    : !validConfirm
+    ? "PINs do not match."
+    : !validDuress && duress === pin
+    ? "Duress PIN must differ from the cover PIN."
+    : !validDuress
+    ? "Duress PIN must be 6-12 digits or left blank."
+    : "Ready to enable privacy cover.";
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -24,10 +40,12 @@ export function PinSetup({
     setConfirm("");
     setDuress("");
     setBusy(true);
+    setError(false);
     try {
       await onComplete(coverPin, duressPin);
     } catch {
       // Keep the same non-specific failure surface as account entry.
+      setError(true);
     } finally {
       setBusy(false);
     }
@@ -44,9 +62,57 @@ export function PinSetup({
       }
     >
       <form id="pin-setup-form" className="stack-form" onSubmit={submit}>
-        <Field label="Cover PIN" type="password" inputMode="numeric" autoComplete="off" minLength={6} maxLength={12} value={pin} onChange={(event) => setPin(digits(event.target.value))} />
-        <Field label="Confirm PIN" type="password" inputMode="numeric" autoComplete="off" minLength={6} maxLength={12} value={confirm} onChange={(event) => setConfirm(digits(event.target.value))} />
-        <Field label="Duress PIN (optional)" type="password" inputMode="numeric" autoComplete="off" minLength={6} maxLength={12} value={duress} onChange={(event) => setDuress(digits(event.target.value))} />
+        <Field
+          label="Cover PIN"
+          name="privacy-cover-pin"
+          type="password"
+          inputMode="numeric"
+          autoComplete="new-password"
+          autoCorrect="off"
+          spellCheck={false}
+          pattern="[0-9]*"
+          minLength={6}
+          maxLength={12}
+          value={pin}
+          aria-invalid={pin.length > 0 && !validCover}
+          aria-describedby="pin-setup-guidance"
+          onChange={(event) => { setError(false); setPin(digits(event.target.value)); }}
+        />
+        <Field
+          label="Confirm PIN"
+          name="privacy-cover-pin-confirm"
+          type="password"
+          inputMode="numeric"
+          autoComplete="new-password"
+          autoCorrect="off"
+          spellCheck={false}
+          pattern="[0-9]*"
+          minLength={6}
+          maxLength={12}
+          value={confirm}
+          aria-invalid={confirm.length > 0 && !validConfirm}
+          aria-describedby="pin-setup-guidance"
+          onChange={(event) => { setError(false); setConfirm(digits(event.target.value)); }}
+        />
+        <Field
+          label="Duress PIN (optional)"
+          name="privacy-duress-pin"
+          type="password"
+          inputMode="numeric"
+          autoComplete="new-password"
+          autoCorrect="off"
+          spellCheck={false}
+          pattern="[0-9]*"
+          minLength={6}
+          maxLength={12}
+          value={duress}
+          aria-invalid={duress.length > 0 && !validDuress}
+          aria-describedby="pin-setup-guidance"
+          onChange={(event) => { setError(false); setDuress(digits(event.target.value)); }}
+        />
+        <p id="pin-setup-guidance" className="field-hint pin-setup-guidance" role="status" aria-live="polite">
+          {error ? "Could not enable privacy cover." : guidance}
+        </p>
       </form>
     </Dialog>
   );

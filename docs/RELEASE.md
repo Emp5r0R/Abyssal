@@ -84,6 +84,27 @@ The web builder bakes the signed build identity into JavaScript and `/build-id.j
 
 ## Deploy relay
 
+From a clean checkout whose `HEAD` has exactly one canonical
+`vMAJOR.MINOR.PATCH` tag, the default deployment path needs no local artifact
+paths:
+
+```bash
+./deploy/deploy-server.sh
+```
+
+With no artifact overrides (and no complete local release set),
+`sync-server.sh` downloads the public `release-manifest-v1.json`, detached
+signature, and tag-matching web archive from the configured canonical GitHub
+repository into private mode-700 temporary storage. It removes GitHub
+credential variables and netrc access, requires HTTPS-only redirects, bounds
+redirects/time/size, verifies the signed archive/source-commit contract before
+rsync, verifies the staged copy, and cleans temporary files. Dirty, untagged,
+multiply tagged, partial, or otherwise ambiguous inputs fail before rsync. The
+release signing key is not downloaded or required on the deployment host.
+
+Explicit artifact overrides remain supported when all required paths are
+provided and match the committed source:
+
 ```bash
 ABYSSAL_RELEASE_OUTPUT_DIR=/secure/release-output \
 ABYSSAL_WEB_RELEASE_MANIFEST=/secure/release-output/release-manifest-v1.json \
@@ -105,3 +126,9 @@ local signing credentials even if future ignore rules change. If the relay
 environment is missing on a first deployment, the restart helper installs the
 tracked template with mode `600`; review that file before distributing its
 generated invite codes.
+
+`restart-docker.sh` is a separate remote rebuild/restart operation. It never
+downloads release assets and has no signing-key dependency; it recreates the
+container from the already staged verified archive. Restarting the relay
+intentionally destroys its RAM-only accounts, sessions, rooms, pending frames,
+attachments, and invite-code set.

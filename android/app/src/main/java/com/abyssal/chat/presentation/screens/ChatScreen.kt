@@ -2042,12 +2042,21 @@ private fun RamVideoPreview(bytes: ByteArray) {
         )
 
         if (!prepared && !playbackFailed) {
-            Text(
-                text = "Loading video",
-                color = SteelMuted,
-                fontSize = 12.sp,
-                modifier = Modifier.align(Alignment.Center)
-            )
+            Column(
+                modifier = Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                AbyssalMarkLoader(
+                    size = AbyssalMarkLoaderSize.Small,
+                    description = "Loading video"
+                )
+                Text(
+                    text = "Loading video",
+                    color = SteelMuted,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
         }
 
         if (playbackFailed) {

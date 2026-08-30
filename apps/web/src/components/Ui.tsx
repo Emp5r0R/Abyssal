@@ -52,6 +52,28 @@ export function Toggle({
   );
 }
 
+export function AbyssalMarkLoader({
+  animated = true,
+  className = "",
+  size = "medium",
+}: {
+  animated?: boolean;
+  className?: string;
+  size?: "compact" | "medium" | "large";
+}) {
+  return (
+    <span
+      className={`abyssal-mark-loader abyssal-mark-loader-${size} ${animated ? "" : "is-static"} ${className}`.trim()}
+      aria-hidden="true"
+    >
+      <span />
+      <span />
+      <span />
+      <span />
+    </span>
+  );
+}
+
 export function Dialog({
   title,
   description,
@@ -92,4 +114,3 @@ export function Brand({ compact = false }: { compact?: boolean }) {
     </div>
   );
 }
-

@@ -16,7 +16,7 @@ export interface OriginAttestationResult {
   status: Exclude<OriginAttestationStatus, "CHECKING" | "ATTESTATION_REJECTED">;
 }
 
-interface AttestationContext {
+export interface OriginAttestationOverrides {
   fetch: typeof globalThis.fetch;
   origin: string;
   nowMs: number;
@@ -59,15 +59,69 @@ const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
 class MismatchError extends Error {}
 class StaleError extends Error {}
 
+let startupVerificationFlight: {
+  key: string;
+  promise: Promise<OriginAttestationResult>;
+} | null = null;
+
 export async function verifyOriginAttestation(
-  overrides: Partial<AttestationContext> = {},
+  overrides: Partial<OriginAttestationOverrides> = {},
 ): Promise<OriginAttestationResult> {
-  const context: AttestationContext = {
+  const context = createContext(overrides);
+  const key = startupVerificationKey(context, overrides);
+  if (key && startupVerificationFlight?.key === key) return startupVerificationFlight.promise;
+  const promise = verifyAttestation(context, true);
+  if (key) {
+    startupVerificationFlight = { key, promise };
+    void promise.then(
+      () => { if (startupVerificationFlight?.promise === promise) startupVerificationFlight = null; },
+      () => { if (startupVerificationFlight?.promise === promise) startupVerificationFlight = null; },
+    );
+  }
+  return promise;
+}
+
+/**
+ * Verify release approval immediately before account entry. This intentionally
+ * omits the expensive served-asset audit, which remains mandatory at startup.
+ */
+export function verifyOriginPreflight(
+  overrides: Partial<OriginAttestationOverrides> = {},
+): Promise<OriginAttestationResult> {
+  return verifyAttestation(createContext(overrides), false);
+}
+
+function createContext(
+  overrides: Partial<OriginAttestationOverrides>,
+): OriginAttestationOverrides {
+  return {
     fetch: overrides.fetch ?? globalThis.fetch.bind(globalThis),
     origin: overrides.origin ?? window.location.origin,
     nowMs: overrides.nowMs ?? Date.now(),
     identity: overrides.identity ?? RELEASE_BUILD_IDENTITY,
   };
+}
+
+function startupVerificationKey(
+  context: OriginAttestationOverrides,
+  overrides: Partial<OriginAttestationOverrides>,
+): string | null {
+  // Calls with injected dependencies are tests or explicit callers. Only
+  // deduplicate the two StrictMode-triggered default startup calls.
+  if (Object.keys(overrides).length !== 0) return null;
+  return [
+    context.origin,
+    context.identity.buildId,
+    context.identity.sourceCommit,
+    context.identity.buildSignatureB64,
+    String(context.identity.configured),
+  ].join("\0");
+}
+
+async function verifyAttestation(
+  context: OriginAttestationOverrides,
+  verifyAssets: boolean,
+): Promise<OriginAttestationResult> {
   try {
     if (!context.identity.configured || !releaseTrustAnchorConfigured()) throw new MismatchError();
     const manifestUrl = sameOriginUrl(context.origin, RELEASE_MANIFEST_ENDPOINT);
@@ -109,7 +163,7 @@ export async function verifyOriginAttestation(
     }
 
     await verifyOriginBuildIdentity(context, webBuild);
-    await verifyServedAssets(context, webBuild);
+    if (verifyAssets) await verifyServedAssets(context, webBuild);
     return { status: "OK" };
   } catch (error) {
     if (error instanceof StaleError) return { status: "STALE" };
@@ -119,7 +173,7 @@ export async function verifyOriginAttestation(
 }
 
 async function verifyOriginBuildIdentity(
-  context: AttestationContext,
+  context: OriginAttestationOverrides,
   build: ManifestBuild,
 ): Promise<void> {
   const url = new URL("/build-id.json", context.origin);
@@ -137,7 +191,7 @@ async function verifyOriginBuildIdentity(
   }
 }
 
-async function verifyServedAssets(context: AttestationContext, build: ManifestBuild): Promise<void> {
+async function verifyServedAssets(context: OriginAttestationOverrides, build: ManifestBuild): Promise<void> {
   const version = build.build_id.slice("web@".length);
   const archiveName = `abyssal-web-${version}.tar.gz`;
   const servedAssets = build.assets.filter((asset) => asset.name !== archiveName);
@@ -181,7 +235,7 @@ async function verifyServedAssets(context: AttestationContext, build: ManifestBu
 }
 
 async function verifyServedAsset(
-  context: AttestationContext,
+  context: OriginAttestationOverrides,
   candidate: { asset: ManifestAsset; expectedSize: number; url: URL },
 ): Promise<void> {
   const { asset, expectedSize, url } = candidate;

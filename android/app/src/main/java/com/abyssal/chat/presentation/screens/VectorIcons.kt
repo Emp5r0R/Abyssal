@@ -28,49 +28,74 @@ import com.abyssal.chat.theme.DeepBlack
 import com.abyssal.chat.theme.SteelMuted
 
 @Composable
-fun MirageLogo(modifier: Modifier = Modifier) {
-    val infiniteTransition = rememberInfiniteTransition(label = "mirageLogoTransition")
+fun MirageLogo(
+    modifier: Modifier = Modifier,
+    animated: Boolean = true
+) {
+    if (animated) {
+        val infiniteTransition = rememberInfiniteTransition(label = "mirageLogoTransition")
+        val rotationOuter by infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 15000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "rotationOuter"
+        )
+        val rotationInner by infiniteTransition.animateFloat(
+            initialValue = 360f,
+            targetValue = 0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 10000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "rotationInner"
+        )
+        val pulseScale by infiniteTransition.animateFloat(
+            initialValue = 0.95f,
+            targetValue = 1.05f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 2000, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "pulseScale"
+        )
+        val wormholeProgress by infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 4000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "wormholeProgress"
+        )
+        MirageLogoCanvas(
+            modifier = modifier,
+            rotationOuter = rotationOuter,
+            rotationInner = rotationInner,
+            pulseScale = pulseScale,
+            wormholeProgress = wormholeProgress
+        )
+    } else {
+        MirageLogoCanvas(
+            modifier = modifier,
+            rotationOuter = 0f,
+            rotationInner = 0f,
+            pulseScale = 1f,
+            wormholeProgress = 0f
+        )
+    }
+}
 
-    val rotationOuter by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 15000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "rotationOuter"
-    )
-
-    val rotationInner by infiniteTransition.animateFloat(
-        initialValue = 360f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 10000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "rotationInner"
-    )
-
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.95f,
-        targetValue = 1.05f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 2000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulseScale"
-    )
-
-    val wormholeProgress by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 4000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "wormholeProgress"
-    )
-
+@Composable
+private fun MirageLogoCanvas(
+    modifier: Modifier,
+    rotationOuter: Float,
+    rotationInner: Float,
+    pulseScale: Float,
+    wormholeProgress: Float
+) {
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height

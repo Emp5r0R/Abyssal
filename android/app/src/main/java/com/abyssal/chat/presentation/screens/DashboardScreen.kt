@@ -247,7 +247,36 @@ private fun DashboardContent(
                     .padding(horizontal = 16.dp, vertical = 10.dp)
             )
 
-            if (filteredSessions.isEmpty()) {
+            if (status.state == "CONNECTING" && sessions.isEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    AbyssalMarkLoader(
+                        size = AbyssalMarkLoaderSize.Large,
+                        description = "Connecting to node"
+                    )
+                    Text(
+                        text = "Connecting to node",
+                        color = PureWhite,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 18.dp)
+                    )
+                    Text(
+                        text = "Loading active rooms and conversations.",
+                        color = SteelMuted,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+            } else if (filteredSessions.isEmpty()) {
                 EmptyState(
                     title = if (selectedTab == 0) "No active rooms" else "No direct messages",
                     detail = if (selectedTab == 0) {

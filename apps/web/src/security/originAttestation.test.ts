@@ -5,7 +5,16 @@ vi.mock("../generated/abyssal_core/abyssal_core", () => ({
   releaseTrustAnchorConfigured: () => true,
 }));
 
-import { verifyOriginAttestation } from "./originAttestation";
+vi.mock("../buildIdentity", () => ({
+  RELEASE_BUILD_IDENTITY: Object.freeze({
+    buildId: "web@2.1.0",
+    buildSignatureB64: "A".repeat(86),
+    sourceCommit: "1".repeat(40),
+    configured: true,
+  }),
+}));
+
+import { verifyOriginAttestation, verifyOriginPreflight } from "./originAttestation";
 
 const ORIGIN = "https://abyssal.example";
 const MANIFEST_URL = `${ORIGIN}/.well-known/abyssal-release-manifest-v1.json`;
@@ -50,6 +59,78 @@ describe("origin release attestation", () => {
       });
       expect(init.signal).toBeInstanceOf(AbortSignal);
     }
+  });
+
+  it("performs a fresh lightweight preflight without replacing the full startup audit", async () => {
+    const fixture = await releaseFixture();
+    const result = await verifyOriginPreflight({
+      fetch: fixture.fetcher,
+      origin: ORIGIN,
+      nowMs: 1_500,
+      identity: IDENTITY,
+    });
+    expect(result).toEqual({ status: "OK" });
+    expect(fixture.requested).toEqual([
+      MANIFEST_URL,
+      SIGNATURE_URL,
+      `${ORIGIN}/build-id.json`,
+    ]);
+  });
+
+  it("does not reuse a completed preflight for a later account submit", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_500);
+    const origin = window.location.origin;
+    const fixture = await releaseFixture({ origin });
+    vi.stubGlobal("fetch", fixture.fetcher);
+    try {
+      await expect(verifyOriginPreflight()).resolves.toEqual({ status: "OK" });
+      await expect(verifyOriginPreflight()).resolves.toEqual({ status: "OK" });
+      expect(fixture.requested).toEqual([
+        `${origin}/.well-known/abyssal-release-manifest-v1.json`,
+        `${origin}/.well-known/abyssal-release-manifest-v1.sig`,
+        `${origin}/build-id.json`,
+        `${origin}/.well-known/abyssal-release-manifest-v1.json`,
+        `${origin}/.well-known/abyssal-release-manifest-v1.sig`,
+        `${origin}/build-id.json`,
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("shares concurrent default startup audits but starts a later audit fresh", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_500);
+    const origin = window.location.origin;
+    const firstFixture = await releaseFixture({ origin });
+    vi.stubGlobal("fetch", firstFixture.fetcher);
+    try {
+      const first = verifyOriginAttestation();
+      const concurrent = verifyOriginAttestation();
+      await expect(Promise.all([first, concurrent])).resolves.toEqual([
+        { status: "OK" },
+        { status: "OK" },
+      ]);
+      expect(firstFixture.requested).toHaveLength(7);
+
+      const laterFixture = await releaseFixture({ origin });
+      vi.stubGlobal("fetch", laterFixture.fetcher);
+      await expect(verifyOriginAttestation()).resolves.toEqual({ status: "OK" });
+      expect(laterFixture.requested).toHaveLength(7);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("fails the lightweight preflight for a revoked build", async () => {
+    const fixture = await releaseFixture({ revokedBuildIds: [IDENTITY.buildId] });
+    const result = await verifyOriginPreflight({
+      fetch: fixture.fetcher,
+      origin: ORIGIN,
+      nowMs: 1_500,
+      identity: IDENTITY,
+    });
+    expect(result).toEqual({ status: "MISMATCH" });
+    expect(fixture.requested).toEqual([MANIFEST_URL, SIGNATURE_URL]);
   });
 
   it("fails closed for a changed asset, stale approval, and network failure", async () => {
@@ -149,6 +230,7 @@ async function releaseFixture(options: {
   extraAssets?: number;
   assetDelayMs?: number;
   transientFailures?: Readonly<Record<string, number>>;
+  revokedBuildIds?: string[];
 } = {}): Promise<{
   fetcher: typeof fetch;
   requested: string[];
@@ -188,7 +270,7 @@ async function releaseFixture(options: {
       build_signature_b64: IDENTITY.buildSignatureB64,
       assets,
     }],
-    revoked_build_ids: [],
+    revoked_build_ids: options.revokedBuildIds ?? [],
   }));
   const requested: string[] = [];
   const requests: Array<{ url: string; init: RequestInit }> = [];

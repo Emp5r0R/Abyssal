@@ -1,5 +1,119 @@
 # Project Progress
 
+## Active Deployment: v2.3.0 Signed Release and Production Rollout
+
+The original release-provenance key, Android keystore, and strict Android
+credential file were recovered from the established owner-only external release
+directory. This package publishes the completed relay modularization, inline
+web admission, unified loading UX, and verified deployment recovery without
+changing the existing trust roots.
+
+### Bounded Plan
+
+1. Verify the recovered Ed25519 key against the committed public fingerprint
+   and the Android keystore against the existing release signer; advance all
+   canonical version surfaces to `2.3.0` with the next Android version code.
+2. Run the complete final-tree test and security gate, stage only intended
+   project changes, commit, and push `main` while preserving unrelated local
+   files.
+3. Require CI and CodeQL success for the exact commit, create and push the
+   annotated `v2.3.0` tag, and build signed Android/web artifacts plus the
+   canonical manifest from a clean isolated worktree using the established
+   external keys.
+4. Verify artifact digests, signatures, manifest binding, and signer continuity;
+   publish one stable GitHub release with complete notes and exact assets.
+5. Deploy the exact published release through `deploy-server.sh`, verify relay
+   and public health plus web admission, and record only observed results.
+
+### Acceptance Gates
+
+- No replacement release root or Android signer is generated.
+- All applicable tests, security gates, CI, and CodeQL pass for the exact
+  released commit.
+- The APK/AAB, web archive, manifest, and detached signature bind the same
+  version, source commit, and established signing identities.
+- Production runs the exact published web archive and reports healthy after
+  the intentional RAM-only restart.
+
+## Completed Deployment: Verified Deploy Recovery and Unified Loading UX
+
+### Delivered
+
+- `deploy-server.sh` can acquire the exact published manifest, detached
+  signature, and web archive when no local artifact inputs exist. It accepts
+  only one canonical release tag at committed `HEAD`, uses bounded HTTPS-only
+  downloads in a private temporary directory, verifies every artifact before
+  transfer, and rejects dirty, untagged, ambiguous, partial, oversized, or
+  tampered inputs before `rsync`.
+- `restart-docker.sh` remains an explicit restart of the remotely staged,
+  verified archive. It performs no release download and needs no offline
+  signing key.
+- Web startup verification is a fail-closed inline page state rather than a
+  dialog. Account entry is absent until verification succeeds, authenticated
+  attestation rejection hides the workspace, and every login submission runs
+  a fresh bounded signed-manifest preflight before OPAQUE authentication.
+- The web client reuses the login page's four-ring Abyssal mark for startup,
+  runtime, and entry loading. Android now has a reusable Compose loader backed
+  by its canonical `MirageLogo` drawing for entrance verification, connection,
+  build/update verification, and video preparation. Fixed sizing,
+  reduced-motion rendering, and loading-versus-terminal semantics are covered
+  by deterministic tests; quantitative attachment progress remains unchanged.
+
+### Verification
+
+- Independent deployment tests passed release acquisition, explicit overrides,
+  clean-source enforcement, artifact validation, and pre-transfer rejection.
+- Independent web verification passed 34 files and 374 tests, lint, TypeScript,
+  and the production build. Component tests cover the inline admission and
+  loader states; the local Playwright attempt could not cross the signed
+  attestation test boundary and is not counted as passed evidence.
+- Independent Android verification passed focused loader-policy tests and
+  debug Kotlin compilation, including static reduced-motion loading semantics.
+- Final `./scripts/test-all.sh all` passed repository and shell checks, web
+  tests/build, 321 Rust tests, Android unit/lint/release compilation, live
+  OPAQUE/v9/v10 relay integration, and dependency advisory checks. A second
+  final-tree run is required after this progress reconciliation.
+
+### Operational Boundary
+
+- No commit, push, tag, release, or production deployment was performed. The
+  worktree is intentionally rejected by deployment while it contains
+  uncommitted changes, and the matching offline release key, Android keystore,
+  and release environment are not available in this checkout. Production
+  packaging must use the original material matching the compiled release trust
+  root and existing Android signer; generating replacements would break that
+  trust chain.
+
+## Completed Deployment: Web Admission UX and Relay Modularization
+
+### Delivered
+
+- Privacy-cover setup now exposes exact 6-12 digit validation state, matching
+  confirmation, optional distinct duress-PIN validation, accessible guidance,
+  and a generic enable-failure surface.
+- The full signed startup origin/asset audit remains mandatory. Concurrent
+  default startup calls share only their active flight, while every account
+  submission performs a fresh lightweight manifest, revocation, and exact
+  build-identity preflight before password encoding or OPAQUE authentication.
+- The relay entrypoint delegates attachment, authentication/session,
+  configuration, HTTP, transport, protocol-v9 message, and MLS responsibilities
+  to dedicated modules. `RoomAuthority` remains the stable facade over focused
+  model, policy, validation, membership, application, delivery, and snapshot
+  modules.
+- Protocol schemas, transactional delivery behavior, resource limits,
+  zeroization, and RAM-only lifecycle remain unchanged.
+
+### Verification
+
+- Independent focused verification passed 368 web tests and 321 Rust tests,
+  web lint/build, Rust formatting, and strict Clippy.
+- Final `./scripts/test-all.sh all` passed repository and shell checks, 368 web
+  tests plus production build, 321 Rust tests, Android unit/lint compilation,
+  live OPAQUE/v9/v10 relay integration, and dependency advisory checks.
+- The advisory scan reported zero vulnerabilities and one explicitly allowed
+  yanked-crate warning for `chacha20 0.10.1`.
+- No release was created for this package.
+
 ## Active Deployment: Attested Release Recovery
 
 Production v2.2.0 serves the exact signed web archive, but browser account entry

@@ -35,7 +35,8 @@ const mocks = vi.hoisted(() => {
   };
 
   const controller = {
-    session,
+    session: session as AccountSession | null,
+    securityWarning: null as "ATTESTATION_REJECTED" | null,
     connection: "connected" as const,
     rooms: [],
     directs: [],
@@ -67,14 +68,19 @@ const mocks = vi.hoisted(() => {
     wipeRelay: vi.fn(),
     clearNotice: vi.fn(),
   };
+  const preflight = vi.fn(async (): Promise<{ status: "OK" | "MISMATCH" }> => ({ status: "OK" }));
 
   return {
     FakePinGate,
     controller,
+    preflight,
     gates: [] as FakePinGate[],
     reset: () => {
+      controller.session = session;
+      controller.securityWarning = null;
       controller.retainWhenHiddenRef.current = true;
       mocks.gates.length = 0;
+      preflight.mockResolvedValue({ status: "OK" });
     },
   };
 });
@@ -89,10 +95,21 @@ vi.mock("./security/privacyPin", () => ({
 
 vi.mock("./security/originAttestation", () => ({
   verifyOriginAttestation: vi.fn().mockResolvedValue({ status: "OK" }),
+  verifyOriginPreflight: mocks.preflight,
 }));
 
 vi.mock("./components/Entrance", () => ({
-  Entrance: () => <div data-testid="entrance" />,
+  Entrance: ({ onLogin, onPreflight }: {
+    onLogin: (...args: unknown[]) => unknown;
+    onPreflight: () => Promise<boolean | void>;
+  }) => (
+    <div data-testid="entrance">
+      <button type="button" onClick={async () => {
+        if ((await onPreflight()) === false) return;
+        await onLogin();
+      }}>Enter</button>
+    </div>
+  ),
 }));
 
 vi.mock("./components/AppShell", () => ({
@@ -187,5 +204,33 @@ describe("App privacy lifecycle policy", () => {
 
     expect(gate.destroyed).toBe(true);
     expect(mocks.controller.clearPrivateView).toHaveBeenCalledOnce();
+  });
+
+  it("blocks account entry when the fresh preflight rejects", async () => {
+    mocks.controller.session = null;
+    mocks.preflight.mockResolvedValue({ status: "MISMATCH" });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Enter" }));
+    await waitFor(() => expect(mocks.preflight).toHaveBeenCalledOnce());
+    expect(mocks.controller.login).not.toHaveBeenCalled();
+  });
+
+  it("passes account entry to login only after a fresh preflight succeeds", async () => {
+    mocks.controller.session = null;
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Enter" }));
+    await waitFor(() => expect(mocks.controller.login).toHaveBeenCalledOnce());
+    expect(mocks.preflight).toHaveBeenCalledOnce();
+  });
+
+  it("does not expose the workspace after an authenticated node rejects the build", async () => {
+    mocks.controller.securityWarning = "ATTESTATION_REJECTED";
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Build rejected by node" })).toBeInTheDocument();
+    expect(screen.queryByTestId("workspace")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "END SESSION" })).toBeInTheDocument();
   });
 });

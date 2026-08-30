@@ -6,7 +6,7 @@ import { ChatView } from "./components/ChatView";
 import { CreateRoomDialog } from "./components/CreateRoomDialog";
 import { Entrance } from "./components/Entrance";
 import { MediaViewer } from "./components/MediaViewer";
-import { SecurityVerificationDialog } from "./components/SecurityVerificationDialog";
+import { SecurityVerificationGate } from "./components/SecurityVerificationGate";
 import { CalculatorCover, PinSetup } from "./components/Privacy";
 import type { ReactionAsset } from "./domain/reactions";
 import type { ChatMessage } from "./domain/types";
@@ -14,6 +14,7 @@ import { useAbyssalSession } from "./hooks/useAbyssalSession";
 import { PrivacyPinGate } from "./security/privacyPin";
 import {
   verifyOriginAttestation,
+  verifyOriginPreflight,
   type OriginAttestationStatus,
 } from "./security/originAttestation";
 
@@ -37,6 +38,12 @@ export default function App() {
     void verifyOriginAttestation().then((result) => {
       if (attestationGenerationRef.current === generation) setOriginStatus(result.status);
     });
+  }, []);
+
+  const preflightOrigin = useCallback(async () => {
+    const result = await verifyOriginPreflight();
+    if (result.status !== "OK") setOriginStatus(result.status);
+    return result.status === "OK";
   }, []);
 
   useEffect(() => {
@@ -109,15 +116,21 @@ export default function App() {
   };
 
   if (originStatus !== "OK") {
+    return <SecurityVerificationGate status={originStatus} onRetry={checkOrigin} />;
+  }
+
+  if (abyssal.securityWarning === "ATTESTATION_REJECTED") {
     return (
-      <div className="secure-root verification-root">
-        <SecurityVerificationDialog status={originStatus} onRetry={checkOrigin} />
-      </div>
+      <SecurityVerificationGate
+        status="ATTESTATION_REJECTED"
+        onRetry={() => window.location.reload()}
+        onEndSession={() => { void abyssal.logout(); }}
+      />
     );
   }
 
   if (!abyssal.session) {
-    return <Entrance onLogin={abyssal.login} />;
+    return <Entrance onLogin={abyssal.login} onPreflight={preflightOrigin} />;
   }
 
   if (!pinGate || pinGate.destroyed) {
@@ -170,13 +183,6 @@ export default function App() {
       ) : null}
       {abyssal.media ? <MediaViewer media={abyssal.media} onClose={abyssal.clearMedia} /> : null}
       {abyssal.notice ? <button type="button" className="notice" onClick={abyssal.clearNotice}>{abyssal.notice}</button> : null}
-      {abyssal.securityWarning === "ATTESTATION_REJECTED" ? (
-        <SecurityVerificationDialog
-          status="ATTESTATION_REJECTED"
-          onRetry={() => window.location.reload()}
-          onEndSession={() => { void abyssal.logout(); }}
-        />
-      ) : null}
     </div>
   );
 }

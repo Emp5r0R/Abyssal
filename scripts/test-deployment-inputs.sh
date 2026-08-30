@@ -66,6 +66,57 @@ EOF
 
 chmod 0755 "$FAKE_BIN/ssh" "$FAKE_BIN/rsync" "$FAKE_BIN/docker"
 
+cat > "$FAKE_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" >> "$FAKE_CURL_LOG"
+[[ "${FAKE_CURL_FAIL:-0}" != 1 ]] || exit 22
+destination=''
+for ((index = 1; index <= $#; index++)); do
+  if [[ "${!index}" == --output ]]; then
+    next=$((index + 1))
+    destination="${!next}"
+  fi
+done
+url="${!#}"
+[[ "$url" == https://github.com/*/releases/download/v*/* ]] || exit 1
+[[ -n "$destination" ]] || exit 1
+mkdir -p "$(dirname -- "$destination")"
+if [[ "$url" == */release-manifest-v1.json ]]; then
+  if [[ "${FAKE_CURL_OVERSIZE:-0}" == manifest ]]; then
+    head -c 262145 /dev/zero > "$destination"
+  else
+    cp -- "$EXPECTED_MANIFEST_SOURCE" "$destination"
+  fi
+elif [[ "$url" == */release-manifest-v1.sig ]]; then
+  cp -- "$EXPECTED_SIGNATURE_SOURCE" "$destination"
+elif [[ "$url" == */abyssal-web-*.tar.gz ]]; then
+  if [[ "${FAKE_CURL_TAMPER:-0}" == 1 ]]; then
+    printf '%s' 'tampered downloaded archive' > "$destination"
+  else
+    cp -- "$EXPECTED_ARCHIVE_SOURCE" "$destination"
+  fi
+else
+  exit 1
+fi
+EOF
+
+cat > "$FAKE_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -C && "${3:-}" == diff ]]; then
+  [[ "${FAKE_GIT_DIRTY:-0}" != 1 ]] || exit 1
+  exit 0
+fi
+if [[ "${1:-}" == -C && "${3:-}" == tag ]]; then
+  printf '%s\n' "${FAKE_GIT_TAGS-v2.2.5}"
+  exit 0
+fi
+exec /usr/bin/git "$@"
+EOF
+
+chmod 0755 "$FAKE_BIN/curl" "$FAKE_BIN/git"
+
 RELEASE_OUTPUT_DIR="$TEMP_DIR/releases"
 RELEASE_MANIFEST="$RELEASE_OUTPUT_DIR/release-manifest-v1.json"
 RELEASE_SIGNATURE="$RELEASE_OUTPUT_DIR/release-manifest-v1.sig"
@@ -253,6 +304,136 @@ for helper in restart-docker.sh stop-docker.sh logs-docker.sh sync-server.sh dep
   run_fake_helper "$helper"
 done
 
+AUTO_RELEASE_OUTPUT_DIR="$TEMP_DIR/auto-releases"
+FAKE_CURL_LOG="$TEMP_DIR/fake-curl.log"
+EXPECTED_MANIFEST_SOURCE="$RELEASE_MANIFEST"
+EXPECTED_SIGNATURE_SOURCE="$RELEASE_SIGNATURE"
+EXPECTED_ARCHIVE_SOURCE="$WEB_ARCHIVE"
+run_fake_auto_sync() {
+  PATH="$FAKE_BIN:$PATH" \
+    FAKE_LOG="$FAKE_LOG" \
+    FAKE_CURL_LOG="$FAKE_CURL_LOG" \
+    EXPECTED_MANIFEST_SOURCE="$EXPECTED_MANIFEST_SOURCE" \
+    EXPECTED_SIGNATURE_SOURCE="$EXPECTED_SIGNATURE_SOURCE" \
+    EXPECTED_ARCHIVE_SOURCE="$EXPECTED_ARCHIVE_SOURCE" \
+    FAKE_GIT_TAGS="v2.2.0" \
+    ABYSSAL_DEPLOY_ENV="$TEMP_DIR/missing.env" \
+    ABYSSAL_SSH_HOST=ubuntu@example.invalid \
+    ABYSSAL_SSH_KEY="$KEY_FILE" \
+    ABYSSAL_SSH_KNOWN_HOSTS="$KNOWN_HOSTS" \
+    ABYSSAL_REMOTE_DIR=/home/ubuntu/abyssal \
+    ABYSSAL_RELEASE_OUTPUT_DIR="$AUTO_RELEASE_OUTPUT_DIR" \
+    ABYSSAL_RELEASE_REPOSITORY=fixture/Abyssal \
+    ABYSSAL_RELEASE_TOOL="$FAKE_BIN/abyssal-release-tool" \
+    EXPECTED_ARCHIVE_SHA="$EXPECTED_ARCHIVE_SHA" \
+    EXPECTED_ARCHIVE_NAME="$EXPECTED_ARCHIVE_NAME" \
+    EXPECTED_ARCHIVE_SIZE="$EXPECTED_ARCHIVE_SIZE" \
+    EXPECTED_MANIFEST_SHA="$EXPECTED_MANIFEST_SHA" \
+    EXPECTED_SIGNATURE_SHA="$EXPECTED_SIGNATURE_SHA" \
+    EXPECTED_SOURCE_COMMIT="$EXPECTED_SOURCE_COMMIT" \
+    bash "$ROOT_DIR/deploy/sync-server.sh"
+}
+
+run_fake_auto_case() {
+  env \
+    PATH="$FAKE_BIN:$PATH" \
+    FAKE_LOG="$FAKE_LOG" \
+    FAKE_CURL_LOG="$FAKE_CURL_LOG" \
+    EXPECTED_MANIFEST_SOURCE="$EXPECTED_MANIFEST_SOURCE" \
+    EXPECTED_SIGNATURE_SOURCE="$EXPECTED_SIGNATURE_SOURCE" \
+    EXPECTED_ARCHIVE_SOURCE="$EXPECTED_ARCHIVE_SOURCE" \
+    EXPECTED_ARCHIVE_SHA="$EXPECTED_ARCHIVE_SHA" \
+    EXPECTED_ARCHIVE_NAME="$EXPECTED_ARCHIVE_NAME" \
+    EXPECTED_ARCHIVE_SIZE="$EXPECTED_ARCHIVE_SIZE" \
+    EXPECTED_MANIFEST_SHA="$EXPECTED_MANIFEST_SHA" \
+    EXPECTED_SIGNATURE_SHA="$EXPECTED_SIGNATURE_SHA" \
+    EXPECTED_SOURCE_COMMIT="$EXPECTED_SOURCE_COMMIT" \
+    ABYSSAL_DEPLOY_ENV="$TEMP_DIR/missing.env" \
+    ABYSSAL_SSH_HOST=ubuntu@example.invalid \
+    ABYSSAL_SSH_KEY="$KEY_FILE" \
+    ABYSSAL_SSH_KNOWN_HOSTS="$KNOWN_HOSTS" \
+    ABYSSAL_REMOTE_DIR=/home/ubuntu/abyssal \
+    ABYSSAL_RELEASE_TOOL="$FAKE_BIN/abyssal-release-tool" \
+    "$@" \
+    bash "$ROOT_DIR/deploy/sync-server.sh"
+}
+
+expect_auto_failure() {
+  local before after
+  before="$(grep -c '^rsync$' "$FAKE_LOG" || true)"
+  if run_fake_auto_case "$@" >/dev/null 2>&1; then
+    echo 'Expected automatic release resolution to reject its input.' >&2
+    exit 1
+  fi
+  after="$(grep -c '^rsync$' "$FAKE_LOG" || true)"
+  [[ "$before" == "$after" ]] || {
+    echo 'Automatic release resolution invoked rsync after rejecting input.' >&2
+    exit 1
+  }
+}
+
+before_auto_rsync="$(grep -c '^rsync$' "$FAKE_LOG" || true)"
+run_fake_auto_sync
+after_auto_rsync="$(grep -c '^rsync$' "$FAKE_LOG" || true)"
+[[ "$after_auto_rsync" -eq $((before_auto_rsync + 1)) ]] || {
+  echo 'Automatic release download did not reach the existing verified rsync path.' >&2
+  exit 1
+}
+grep -Fq -- 'https://github.com/fixture/Abyssal/releases/download/v2.2.0/release-manifest-v1.json' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not use the canonical HTTPS manifest URL.' >&2
+  exit 1
+}
+grep -Fq -- 'https://github.com/fixture/Abyssal/releases/download/v2.2.0/release-manifest-v1.sig' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not use the canonical HTTPS signature URL.' >&2
+  exit 1
+}
+grep -Fq -- 'https://github.com/fixture/Abyssal/releases/download/v2.2.0/abyssal-web-2.2.0.tar.gz' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not use the tag-matched archive URL.' >&2
+  exit 1
+}
+grep -Fq -- '--max-filesize' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not bound response sizes.' >&2
+  exit 1
+}
+grep -Fq -- '--max-time' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not bound response time.' >&2
+  exit 1
+}
+grep -Fq -- '--max-redirs' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not bound redirects.' >&2
+  exit 1
+}
+grep -Fq -- '--proto-redir' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not restrict redirects to HTTPS.' >&2
+  exit 1
+}
+grep -Fq -- '--netrc-file' "$FAKE_CURL_LOG" || {
+  echo 'Automatic release download did not disable credential forwarding.' >&2
+  exit 1
+}
+
+expect_auto_failure \
+  FAKE_GIT_DIRTY=1 \
+  ABYSSAL_RELEASE_OUTPUT_DIR="$TEMP_DIR/dirty-releases"
+expect_auto_failure \
+  FAKE_GIT_TAGS= \
+  ABYSSAL_RELEASE_OUTPUT_DIR="$TEMP_DIR/untagged-releases"
+expect_auto_failure \
+  FAKE_GIT_TAGS=$'v2.2.0\nv2.2.1' \
+  ABYSSAL_RELEASE_OUTPUT_DIR="$TEMP_DIR/ambiguous-releases"
+expect_auto_failure \
+  FAKE_CURL_FAIL=1 \
+  FAKE_GIT_TAGS=v2.2.0 \
+  ABYSSAL_RELEASE_OUTPUT_DIR="$TEMP_DIR/failed-download-releases"
+expect_auto_failure \
+  FAKE_CURL_OVERSIZE=manifest \
+  FAKE_GIT_TAGS=v2.2.0 \
+  ABYSSAL_RELEASE_OUTPUT_DIR="$TEMP_DIR/oversize-releases"
+expect_auto_failure \
+  FAKE_CURL_TAMPER=1 \
+  FAKE_GIT_TAGS=v2.2.0 \
+  ABYSSAL_RELEASE_OUTPUT_DIR="$TEMP_DIR/tampered-releases"
+
 run_fake_sync() {
   local archive="${1-}"
   local manifest="${2:-$RELEASE_MANIFEST}"
@@ -261,6 +442,7 @@ run_fake_sync() {
   local expected_archive_size="${5:-$EXPECTED_ARCHIVE_SIZE}"
   PATH="$FAKE_BIN:$PATH" \
     FAKE_LOG="$FAKE_LOG" \
+    FAKE_GIT_DIRTY="${FAKE_GIT_DIRTY:-0}" \
     ABYSSAL_DEPLOY_ENV="$TEMP_DIR/missing.env" \
     ABYSSAL_SSH_HOST=ubuntu@example.invalid \
     ABYSSAL_SSH_KEY="$KEY_FILE" \
@@ -289,6 +471,12 @@ expect_no_rsync() {
     exit 1
   }
 }
+
+run_fake_dirty_sync() {
+  FAKE_GIT_DIRTY=1 run_fake_sync "$@"
+}
+
+expect_no_rsync run_fake_dirty_sync "$WEB_ARCHIVE"
 
 expect_no_rsync run_fake_sync "$TEMP_DIR/missing-archive.tar.gz"
 ln -s "$WEB_ARCHIVE" "$TEMP_DIR/archive-link.tar.gz"

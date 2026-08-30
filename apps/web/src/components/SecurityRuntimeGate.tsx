@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { initializeSecurityRuntime } from "../security/runtime";
-import { SecurityVerificationDialog } from "./SecurityVerificationDialog";
+import { SecurityVerificationGate } from "./SecurityVerificationGate";
 
 type RuntimeStatus = "CHECKING" | "READY" | "UNAVAILABLE";
 
@@ -39,7 +39,7 @@ export function SecurityRuntimeGate({
 
   if (status === "READY") return children;
   return (
-    <SecurityVerificationDialog
+    <SecurityVerificationGate
       status={status}
       onRetry={retry}
     />

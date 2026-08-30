@@ -1,5 +1,40 @@
 # Project Diary
 
+## 2026-08-30 - Web admission checks and relay ownership boundaries
+
+The web startup path retains a full signed origin audit, including the served
+asset set. Concurrent default startup calls share one in-flight audit and clear
+that flight when it settles; a later call starts a new audit. Before every
+account submission, the entrance runs a fresh lightweight signed-release
+preflight for manifest validity, revocation, and build identity without
+replacing the startup asset audit. Privacy-cover setup now validates a 6-12
+digit cover PIN, matching confirmation, and an optional distinct 6-12 digit
+duress PIN. Invalid state has accessible live guidance, while enable failures
+use a generic message.
+
+The relay entrypoint is now an orchestrator and frame-dispatch boundary. Its
+attachment, authentication/session, configuration, HTTP, transport,
+protocol-v9 message, and MLS responsibilities are delegated to dedicated
+modules. `RoomAuthority` remains the MLS facade, with model, policy,
+validation, membership, application, delivery, and snapshot implementations
+behind it.
+
+Remote deployment now has a published-release fallback. From a clean tracked
+source commit with exactly one canonical version tag, the default sync fetches
+the public manifest, signature, and matching web archive into private bounded
+temporary storage, strips credential/netrc access, verifies the signed
+archive/source-commit contract before transfer, and cleans the temporary files.
+Explicit artifact paths remain available, while dirty, untagged, ambiguous, or
+partial inputs stop before rsync. Docker restart is intentionally separate: it
+does not download or use signing keys and recreates the remote container from
+the already staged archive, so the relay restart still wipes RAM state.
+
+The web and Android clients now share a reusable animated Abyssal mark loader.
+Web release admission is an inline fail-closed surface before login/workspace
+rendering, with a fresh lightweight preflight before account submission. Web
+`prefers-reduced-motion` and Android `MotionDurationScale` disable motion while
+keeping the corresponding accessible status/loading semantics.
+
 ## 2026-08-23 - Offline release provenance and strict build admission
 
 Abyssal now has a separate Ed25519 release-provenance root shared through Rust core, WASM, JNI, relay, Android, and web. Canonical manifests bind exact Android/web build IDs to the same version/source commit, bounded asset digests, validity, sequence, and revocations. The relay mirrors only signed GitHub manifests into a monotonic RAM last-known-good store and checks exact build identity before bearer-session lookup or WebSocket ticket issuance. Web blocks account entry until its compiled identity, origin `build-id.json`, and all served bundle assets match the signed manifest. Android blocks account access until its baked identity matches, and user-approved updates are streamed to private cache with exact size/SHA-256 verification before a `FileProvider` installer handoff. Release tooling refuses unconfigured roots, dirty tracked trees, weak key files, or existing outputs. The integration key is fixed, debug/loopback-only, and forbidden at release compilation.
