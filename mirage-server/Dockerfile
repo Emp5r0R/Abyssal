@@ -14,7 +14,7 @@ RUN --mount=type=cache,id=abyssal-cargo-registry,target=/usr/local/cargo/registr
     && mkdir -p /out \
     && cp /repo/target/release/mirage-server /out/mirage-server
 
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS web-runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS web-runtime
 
 ADD .web-release/abyssal-web-*.tar.gz /opt/abyssal/web/
 RUN set -eux; \
@@ -24,7 +24,7 @@ RUN set -eux; \
     test ! -L /opt/abyssal/web/build-id.json; \
     test -z "$(find /opt/abyssal/web -type l -print -quit)"
 
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin mirage
 
