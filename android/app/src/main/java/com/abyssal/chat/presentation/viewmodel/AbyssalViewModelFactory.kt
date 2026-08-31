@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.abyssal.chat.BuildConfig
 import com.abyssal.chat.data.network.EncryptedAttachmentService
+import com.abyssal.chat.data.network.AndroidBuildAttestationProvider
 import com.abyssal.chat.data.network.GitHubReleaseUpdateService
 import com.abyssal.chat.data.network.InMemoryNodeConfigService
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
@@ -59,6 +60,7 @@ class AbyssalViewModelFactory(
         val chatTransport = RealChatTransport(nodeConfigService, nodeWebSocketClient)
         val attachmentService = EncryptedAttachmentService(appContext, attachmentHttpClient)
         val disguiseManager = AndroidDisguiseManager(appContext)
+        val localBuildAttestation = AndroidBuildAttestationProvider.current()
         val appUpdateService = GitHubReleaseUpdateService(
             client = OkHttpClient.Builder()
                 .dns(Dns.SYSTEM)
@@ -73,7 +75,8 @@ class AbyssalViewModelFactory(
                 .cache(null)
                 .build(),
             currentVersionName = BuildConfig.VERSION_NAME,
-            apiUrl = BuildConfig.UPDATE_API_URL
+            apiUrl = BuildConfig.UPDATE_API_URL,
+            currentBuildAttestation = localBuildAttestation
         )
 
         @Suppress("UNCHECKED_CAST")
@@ -86,6 +89,9 @@ class AbyssalViewModelFactory(
             attachmentService = attachmentService,
             disguiseManager = disguiseManager,
             appUpdateService = appUpdateService,
+            initialReleaseVerificationStatus = initialReleaseVerificationStatus(
+                localBuildAttestation != null
+            ),
             payloadCipher = payloadCipher
         ) as T
     }

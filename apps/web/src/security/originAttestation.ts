@@ -21,6 +21,15 @@ export interface OriginAttestationOverrides {
   origin: string;
   nowMs: number;
   identity: Readonly<ReleaseBuildIdentity>;
+  timeoutMs?: number;
+}
+
+interface ResolvedAttestationContext extends Omit<OriginAttestationOverrides, "timeoutMs"> {
+  timeoutMs: number;
+}
+
+interface VerificationContext extends ResolvedAttestationContext {
+  signal: AbortSignal;
 }
 
 interface ManifestAsset {
@@ -48,10 +57,11 @@ const RELEASE_SIGNATURE_ENDPOINT = "/.well-known/abyssal-release-manifest-v1.sig
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const SIGNATURE_BYTES = 64;
 const MAX_WEB_ASSET_BYTES = 64 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 12_000;
+const ATTESTATION_TIMEOUT_MS = 30_000;
 const REQUEST_RETRY_DELAYS_MS = [250, 750] as const;
 const REQUEST_ATTEMPTS = REQUEST_RETRY_DELAYS_MS.length + 1;
-const ASSET_VERIFICATION_CONCURRENCY = 2;
+const ASSET_VERIFICATION_CONCURRENCY = 4;
 const SAFE_ASSET_NAME = /^(?!\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9._/-]{1,192}$/u;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
@@ -93,12 +103,13 @@ export function verifyOriginPreflight(
 
 function createContext(
   overrides: Partial<OriginAttestationOverrides>,
-): OriginAttestationOverrides {
+): ResolvedAttestationContext {
   return {
     fetch: overrides.fetch ?? globalThis.fetch.bind(globalThis),
     origin: overrides.origin ?? window.location.origin,
     nowMs: overrides.nowMs ?? Date.now(),
     identity: overrides.identity ?? RELEASE_BUILD_IDENTITY,
+    timeoutMs: overrides.timeoutMs ?? ATTESTATION_TIMEOUT_MS,
   };
 }
 
@@ -119,23 +130,33 @@ function startupVerificationKey(
 }
 
 async function verifyAttestation(
-  context: OriginAttestationOverrides,
+  context: ResolvedAttestationContext,
   verifyAssets: boolean,
 ): Promise<OriginAttestationResult> {
+  if (!Number.isFinite(context.timeoutMs) || context.timeoutMs <= 0) {
+    return { status: "UNAVAILABLE" };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), context.timeoutMs);
+  const runContext: VerificationContext = { ...context, signal: controller.signal };
   try {
     if (!context.identity.configured || !releaseTrustAnchorConfigured()) throw new MismatchError();
     const manifestUrl = sameOriginUrl(context.origin, RELEASE_MANIFEST_ENDPOINT);
     const manifestResponse = await boundedFetchWithRetry(
-      context.fetch,
+      runContext.fetch,
       manifestUrl,
       MAX_MANIFEST_BYTES,
+      {},
+      runContext.signal,
     );
     requireSameOriginResponse(manifestResponse.url, context.origin, RELEASE_MANIFEST_ENDPOINT);
     const signatureUrl = sameOriginUrl(context.origin, RELEASE_SIGNATURE_ENDPOINT);
     const signatureResponse = await boundedFetchWithRetry(
-      context.fetch,
+      runContext.fetch,
       signatureUrl,
       SIGNATURE_BYTES,
+      {},
+      runContext.signal,
     );
     requireSameOriginResponse(signatureResponse.url, context.origin, RELEASE_SIGNATURE_ENDPOINT);
     let canonical: string;
@@ -162,23 +183,32 @@ async function verifyAttestation(
       throw new MismatchError();
     }
 
-    await verifyOriginBuildIdentity(context, webBuild);
-    if (verifyAssets) await verifyServedAssets(context, webBuild);
+    await verifyOriginBuildIdentity(runContext, webBuild);
+    if (verifyAssets) await verifyServedAssets(runContext, webBuild);
     return { status: "OK" };
   } catch (error) {
     if (error instanceof StaleError) return { status: "STALE" };
     if (error instanceof MismatchError) return { status: "MISMATCH" };
     return { status: "UNAVAILABLE" };
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
   }
 }
 
 async function verifyOriginBuildIdentity(
-  context: OriginAttestationOverrides,
+  context: VerificationContext,
   build: ManifestBuild,
 ): Promise<void> {
   const url = new URL("/build-id.json", context.origin);
   if (url.origin !== context.origin) throw new MismatchError();
-  const response = await boundedFetchWithRetry(context.fetch, url.toString(), 1024);
+  const response = await boundedFetchWithRetry(
+    context.fetch,
+    url.toString(),
+    1024,
+    {},
+    context.signal,
+  );
   requireSameOriginResponse(response.url, context.origin, "/build-id.json");
   const identity = parseObjectJson(response.bytes);
   if (Object.keys(identity).sort().join("\0") !==
@@ -191,7 +221,7 @@ async function verifyOriginBuildIdentity(
   }
 }
 
-async function verifyServedAssets(context: OriginAttestationOverrides, build: ManifestBuild): Promise<void> {
+async function verifyServedAssets(context: VerificationContext, build: ManifestBuild): Promise<void> {
   const version = build.build_id.slice("web@".length);
   const archiveName = `abyssal-web-${version}.tar.gz`;
   const servedAssets = build.assets.filter((asset) => asset.name !== archiveName);
@@ -235,11 +265,17 @@ async function verifyServedAssets(context: OriginAttestationOverrides, build: Ma
 }
 
 async function verifyServedAsset(
-  context: OriginAttestationOverrides,
+  context: VerificationContext,
   candidate: { asset: ManifestAsset; expectedSize: number; url: URL },
 ): Promise<void> {
   const { asset, expectedSize, url } = candidate;
-  const response = await boundedFetchWithRetry(context.fetch, url.toString(), expectedSize);
+  const response = await boundedFetchWithRetry(
+    context.fetch,
+    url.toString(),
+    expectedSize,
+    {},
+    context.signal,
+  );
   let actual: string;
   try {
     requireSameOriginResponse(response.url, context.origin, url.pathname);
@@ -264,47 +300,56 @@ async function boundedFetch(
   url: string,
   maximum: number,
   init: RequestInit = {},
+  parentSignal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; url: string }> {
   if (!Number.isSafeInteger(maximum) || maximum < 0 || maximum > MAX_WEB_ASSET_BYTES) {
     throw new MismatchError();
   }
-  const response = await fetcher(url, {
-    ...init,
-    method: "GET",
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error("unavailable");
-  const declared = response.headers.get("Content-Length");
-  if (declared !== null && (!DECIMAL.test(declared) || Number(declared) > maximum)) {
-    throw new MismatchError();
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("unavailable");
-  const chunks: Uint8Array[] = [];
-  let total = 0;
+  const request = createRequestSignal(parentSignal);
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > maximum) throw new MismatchError();
-      chunks.push(value);
+    const response = await awaitAbortable(
+      Promise.resolve().then(() => fetcher(url, {
+        ...init,
+        method: "GET",
+        cache: "no-store",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        redirect: "error",
+        signal: request.signal,
+      })),
+      request.signal,
+    );
+    if (!response.ok) throw new Error("unavailable");
+    const declared = response.headers.get("Content-Length");
+    if (declared !== null && (!DECIMAL.test(declared) || Number(declared) > maximum)) {
+      throw new MismatchError();
     }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-      chunk.fill(0);
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("unavailable");
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await awaitAbortable(reader.read(), request.signal);
+        if (done) break;
+        total += value.byteLength;
+        if (total > maximum) throw new MismatchError();
+        chunks.push(value);
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+        chunk.fill(0);
+      }
+      return { bytes, url: response.url || url };
+    } finally {
+      chunks.forEach((chunk) => chunk.fill(0));
+      reader.releaseLock();
     }
-    return { bytes, url: response.url || url };
   } finally {
-    chunks.forEach((chunk) => chunk.fill(0));
-    reader.releaseLock();
+    request.dispose();
   }
 }
 
@@ -313,21 +358,88 @@ async function boundedFetchWithRetry(
   url: string,
   maximum: number,
   init: RequestInit = {},
+  signal?: AbortSignal,
 ): Promise<{ bytes: Uint8Array; url: string }> {
   let lastAvailabilityError: unknown;
   for (let attempt = 0; attempt < REQUEST_ATTEMPTS; attempt += 1) {
     try {
-      return await boundedFetch(fetcher, url, maximum, init);
+      return await boundedFetch(fetcher, url, maximum, init, signal);
     } catch (error) {
       if (error instanceof MismatchError) throw error;
       lastAvailabilityError = error;
+      if (signal?.aborted) throw error;
       const retryDelay = REQUEST_RETRY_DELAYS_MS[attempt];
       if (retryDelay !== undefined) {
-        await new Promise((resolve) => setTimeout(resolve, retryDelay));
+        await abortableDelay(retryDelay, signal);
       }
     }
   }
   throw lastAvailabilityError;
+}
+
+function createRequestSignal(parentSignal?: AbortSignal): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const abort = () => controller.abort();
+  parentSignal?.addEventListener("abort", abort, { once: true });
+  if (parentSignal?.aborted) controller.abort();
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", abort);
+    },
+  };
+}
+
+function awaitAbortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const abort = () => {
+      if (settled) return;
+      settled = true;
+      reject(abortError());
+    };
+    if (signal.aborted) {
+      void operation.catch(() => undefined);
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const operation = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, milliseconds);
+  });
+  return awaitAbortable(operation, signal ?? new AbortController().signal).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+function abortError(): Error {
+  const error = new Error("Origin attestation timed out or was aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 function sameOriginUrl(origin: string, path: string): string {

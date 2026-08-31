@@ -5,6 +5,7 @@ import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -12,6 +13,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.TimeUnit
 
 class GitHubReleaseUpdateServiceTest {
     @Test
@@ -40,7 +42,13 @@ class GitHubReleaseUpdateServiceTest {
                         expectation.apkName
                     )
                     VerifiedAndroidRelease("a".repeat(64), 16L * 1024L * 1024L, "1".repeat(40))
-                }
+                },
+                currentBuildAttestation = BuildAttestation(
+                    "android",
+                    "1.8.0",
+                    "A".repeat(86),
+                    "1".repeat(40)
+                )
             )
 
             val result = service.checkCurrentRelease()
@@ -74,6 +82,30 @@ class GitHubReleaseUpdateServiceTest {
         assertNull(service.parseReleaseCandidate(releaseJson("v1.8.1").put("draft", true)))
         assertNull(service.parseReleaseCandidate(releaseJson("v1.8.1").put("prerelease", true)))
         assertNull(service.parseReleaseCandidate(releaseJson("v1.8.1-beta.1")))
+    }
+
+    @Test
+    fun rejectsRemoteReleaseDiscoveryWhenLocalAdmissionIsMissing() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody(releaseJson("v1.8.1").toString()))
+        server.start()
+        try {
+            val service = GitHubReleaseUpdateService(
+                client = OkHttpClient.Builder().followRedirects(false).build(),
+                currentVersionName = "1.8.0",
+                apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
+                expectedApiHost = server.hostName,
+                allowInsecureApiForTests = true
+            )
+
+            assertEquals(
+                ReleaseVerificationStatus.REJECTED,
+                service.checkCurrentRelease().verificationStatus
+            )
+            assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+        } finally {
+            server.shutdown()
+        }
     }
 
     @Test
@@ -129,10 +161,14 @@ class GitHubReleaseUpdateServiceTest {
                 currentVersionName = "1.8.0",
                 apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
                 expectedApiHost = server.hostName,
-                allowInsecureApiForTests = true
+                allowInsecureApiForTests = true,
+                currentBuildAttestation = validLocalAttestation()
             )
 
-            assertTrue(runCatching { service.checkCurrentRelease() }.isFailure)
+            assertEquals(
+                ReleaseVerificationStatus.REJECTED,
+                service.checkCurrentRelease().verificationStatus
+            )
         } finally {
             server.shutdown()
         }
@@ -150,6 +186,7 @@ class GitHubReleaseUpdateServiceTest {
                 apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
                 expectedApiHost = server.hostName,
                 allowInsecureApiForTests = true,
+                currentBuildAttestation = validLocalAttestation(),
                 assetLoader = ReleaseAssetLoader { url, _ ->
                     if (url.encodedPath.endsWith(".sig")) ByteArray(64) else byteArrayOf(1)
                 },
@@ -201,6 +238,37 @@ class GitHubReleaseUpdateServiceTest {
         }
     }
 
+    @Test
+    fun keepsValidLocalAdmissionWhenGitHubIsUnavailable() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        server.start()
+        try {
+            val service = GitHubReleaseUpdateService(
+                client = OkHttpClient.Builder()
+                    .callTimeout(100, TimeUnit.MILLISECONDS)
+                    .build(),
+                currentVersionName = "1.8.0",
+                apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
+                expectedApiHost = server.hostName,
+                allowInsecureApiForTests = true,
+                currentBuildAttestation = BuildAttestation(
+                    "android",
+                    "1.8.0",
+                    "A".repeat(86),
+                    "1".repeat(40)
+                )
+            )
+
+            val result = service.checkCurrentRelease()
+
+            assertEquals(ReleaseVerificationStatus.VERIFIED, result.verificationStatus)
+            assertNull(result.update)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     private fun parserService(currentVersion: String): GitHubReleaseUpdateService {
         return GitHubReleaseUpdateService(
             client = OkHttpClient(),
@@ -208,6 +276,13 @@ class GitHubReleaseUpdateServiceTest {
             apiUrl = "https://api.github.com/repos/Emp5r0R/Abyssal/releases/latest"
         )
     }
+
+    private fun validLocalAttestation() = BuildAttestation(
+        "android",
+        "1.8.0",
+        "A".repeat(86),
+        "1".repeat(40)
+    )
 
     private fun releaseJson(tag: String): JSONObject {
         val version = tag.removePrefix("v")

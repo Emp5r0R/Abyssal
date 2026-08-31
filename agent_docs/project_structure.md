@@ -6,8 +6,17 @@
   origin audit at startup. `Entrance` performs a fresh lightweight signed-release
   preflight immediately before each account submission.
 - `apps/web/src/security/originAttestation.ts` contains the signed manifest,
-  build-identity, and served-asset checks. Default concurrent startup calls are
-  deduplicated only while the same audit is in flight.
+  build-identity, and served-asset checks. The startup audit is bounded to a
+  30-second aggregate, caps each request at 12 seconds, and checks assets with
+  at most four workers. `apps/web/src/security/runtime.ts` loads the WASM core
+  same-origin with `no-store` and aborts initialization at 30 seconds. Default
+  concurrent startup calls are deduplicated only while the same audit is in
+  flight.
+- `android/.../BuildAttestationProvider.kt` performs local baked build ID,
+  source-commit, and signature admission through the compiled native Ed25519
+  root. `GitHubReleaseUpdateService.kt` performs bounded advisory update
+  discovery after that local decision; `ChatViewModel.kt` preserves a verified
+  local status when discovery is unavailable.
 - `apps/web/src/components/Privacy.tsx` owns privacy-cover PIN setup and the
   calculator cover. Setup validates the cover PIN, confirmation, and optional
   distinct duress PIN, with accessible live feedback and a vague enable failure.
@@ -23,6 +32,9 @@
   Its focused implementations are in `rooms/model.rs`, `policy.rs`,
   `validation.rs`, `membership.rs`, `application.rs`, `delivery.rs`, and
   `snapshot.rs`.
+- `mirage-server/src/release_admission.rs` owns the signed-manifest mirror and
+  exact-current platform/version/signature admission used before bearer-session
+  lookup and WebSocket ticket issuance.
 
 ## Deployment and Shared Loading UI
 

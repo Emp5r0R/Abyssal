@@ -2,9 +2,20 @@
 
 Abyssal's web client performs a full signed release-origin audit during startup.
 The audit verifies the same-origin manifest, signature, build identity, and
-served assets. Concurrent default startup calls share one in-flight audit; a
-completed audit is not reused for account entry. Each account submission runs a
-fresh lightweight signed-release preflight before invoking authentication.
+every served JS/CSS/WASM/HTML asset. It has a 30-second aggregate deadline, a
+12-second cap per request, and at most four concurrent asset checks. Concurrent
+default startup calls share one in-flight audit; a completed audit is not reused
+for account entry. Each account submission runs a fresh lightweight signed-
+release preflight before invoking authentication. The WASM core is loaded with
+a same-origin `no-store` request and its initialization aborts after 30 seconds.
+
+Android account access uses a separate local admission path: the baked build ID,
+source commit, and signature are checked through the compiled offline Ed25519
+root before account entry. Bounded GitHub signed-manifest update discovery is
+advisory after this check, so update-service availability cannot demote a valid
+local admission. The relay remains authoritative for messaging: it requires the
+exact current signed-manifest platform, version, and signature before parsing a
+bearer token or issuing a WebSocket ticket.
 
 The web privacy-cover setup requires a 6-12 digit cover PIN, matching
 confirmation, and an optional 6-12 digit duress PIN that differs from the cover

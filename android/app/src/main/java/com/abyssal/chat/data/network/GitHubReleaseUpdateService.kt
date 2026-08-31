@@ -4,7 +4,9 @@ import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.AppUpdateCheckResult
 import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import com.abyssal.chat.domain.repository.IAppUpdateService
+import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.CacheControl
@@ -49,6 +51,7 @@ class GitHubReleaseUpdateService internal constructor(
         ?: throw IllegalArgumentException("Invalid update endpoint")
 
     override suspend fun checkCurrentRelease(): AppUpdateCheckResult = withContext(Dispatchers.IO) {
+        if (!hasValidLocalAdmission()) return@withContext rejected()
         val request = Request.Builder()
             .url(apiEndpoint)
             .cacheControl(CacheControl.FORCE_NETWORK)
@@ -58,17 +61,31 @@ class GitHubReleaseUpdateService internal constructor(
             .get()
             .build()
 
-        val candidate = awaitHttpResponse(client.newCall(request)) { response ->
-            check(response.request.url == apiEndpoint && response.isSuccessful)
-            val body = requireNotNull(response.body)
-            val reportedLength = body.contentLength()
-            check(reportedLength < 0L || reportedLength <= MAX_RESPONSE_BYTES)
-            val raw = readBounded(body, MAX_RESPONSE_BYTES)
-            try {
-                parseReleaseDescriptor(JSONObject(String(raw, StandardCharsets.UTF_8)))
-            } finally {
-                raw.fill(0)
+        val candidate = try {
+            awaitHttpResponse(client.newCall(request)) { response ->
+                check(response.request.url == apiEndpoint)
+                if (!response.isSuccessful) {
+                    if (response.code == 408 || response.code == 429 || response.code >= 500) {
+                        throw IOException("GitHub release service unavailable")
+                    }
+                    error("GitHub release metadata rejected")
+                }
+                val body = requireNotNull(response.body)
+                val reportedLength = body.contentLength()
+                check(reportedLength < 0L || reportedLength <= MAX_RESPONSE_BYTES)
+                val raw = readBounded(body, MAX_RESPONSE_BYTES)
+                try {
+                    parseReleaseDescriptor(JSONObject(String(raw, StandardCharsets.UTF_8)))
+                } finally {
+                    raw.fill(0)
+                }
             }
+        } catch (_: IOException) {
+            return@withContext networkUnavailable()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            return@withContext rejected()
         } ?: return@withContext rejected()
         if (candidate.version < currentVersion) return@withContext rejected()
 
@@ -80,21 +97,45 @@ class GitHubReleaseUpdateService internal constructor(
             null
         }
 
-        val manifestBytes = loadAsset(candidate.manifestUrl, MAX_MANIFEST_BYTES)
-        val signatureBytes = loadAsset(candidate.signatureUrl, SIGNATURE_BYTES)
+        val manifestBytes = try {
+            loadAsset(candidate.manifestUrl, MAX_MANIFEST_BYTES)
+        } catch (_: IOException) {
+            return@withContext networkUnavailable()
+        } catch (error: IllegalStateException) {
+            if (error.message == "Release asset unavailable") {
+                return@withContext networkUnavailable()
+            }
+            throw error
+        }
+        val signatureBytes = try {
+            loadAsset(candidate.signatureUrl, SIGNATURE_BYTES)
+        } catch (_: IOException) {
+            manifestBytes.fill(0)
+            return@withContext networkUnavailable()
+        } catch (error: IllegalStateException) {
+            manifestBytes.fill(0)
+            if (error.message == "Release asset unavailable") {
+                return@withContext networkUnavailable()
+            }
+            throw error
+        }
         try {
             if (signatureBytes.size != SIGNATURE_BYTES.toInt()) return@withContext rejected()
-            val verified = manifestInspector.inspect(
-                manifestBytes,
-                signatureBytes,
-                System.currentTimeMillis(),
-                AndroidReleaseExpectation(
-                    version = candidate.version.display,
-                    apkName = candidate.apkName,
-                    buildSignatureBase64Url = currentIdentity?.signatureBase64Url,
-                    sourceCommit = currentIdentity?.sourceCommit
+            val verified = try {
+                manifestInspector.inspect(
+                    manifestBytes,
+                    signatureBytes,
+                    System.currentTimeMillis(),
+                    AndroidReleaseExpectation(
+                        version = candidate.version.display,
+                        apkName = candidate.apkName,
+                        buildSignatureBase64Url = currentIdentity?.signatureBase64Url,
+                        sourceCommit = currentIdentity?.sourceCommit
+                    )
                 )
-            ) ?: return@withContext rejected()
+            } catch (_: Exception) {
+                null
+            } ?: return@withContext rejected()
             if (verified.apkSizeBytes != candidate.apkSizeBytes) return@withContext rejected()
             val update = if (candidate.version > currentVersion) {
                 AvailableAppUpdate(
@@ -116,6 +157,21 @@ class GitHubReleaseUpdateService internal constructor(
     }
 
     private fun rejected() = AppUpdateCheckResult(ReleaseVerificationStatus.REJECTED)
+
+    private fun networkUnavailable(): AppUpdateCheckResult {
+        return if (hasValidLocalAdmission()) {
+            AppUpdateCheckResult(ReleaseVerificationStatus.VERIFIED)
+        } else {
+            AppUpdateCheckResult(ReleaseVerificationStatus.UNAVAILABLE)
+        }
+    }
+
+    private fun hasValidLocalAdmission(): Boolean {
+        val attestation = currentBuildAttestation ?: return false
+        return attestation.platform == "android" && attestation.version == currentVersion.display &&
+            BUILD_SIGNATURE_PATTERN.matches(attestation.signatureBase64Url) &&
+            SOURCE_COMMIT_PATTERN.matches(attestation.sourceCommit)
+    }
 
     internal fun parseReleaseCandidate(release: JSONObject): ReleaseCandidate? {
         return parseReleaseDescriptor(release)?.takeIf { it.version > currentVersion }
@@ -234,5 +290,7 @@ class GitHubReleaseUpdateService internal constructor(
         const val MIN_APK_BYTES = 1024L * 1024L
         const val MAX_APK_BYTES = 256L * 1024L * 1024L
         const val MAX_RELEASE_ASSETS = 128
+        val BUILD_SIGNATURE_PATTERN = Regex("^[A-Za-z0-9_-]{86}$")
+        val SOURCE_COMMIT_PATTERN = Regex("^[0-9a-f]{40}$")
     }
 }

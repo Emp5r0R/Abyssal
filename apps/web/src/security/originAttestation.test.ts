@@ -146,6 +146,54 @@ describe("origin release attestation", () => {
     expect(unavailable).toHaveBeenCalledTimes(3);
   });
 
+  it("aborts a never-resolving request at the total deadline and retries fresh", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetcher = vi.fn<typeof fetch>(() => new Promise<Response>(() => undefined));
+      const overrides = {
+        fetch: fetcher,
+        origin: ORIGIN,
+        nowMs: 1_500,
+        identity: IDENTITY,
+        timeoutMs: 10,
+      };
+
+      const first = verifyOriginAttestation(overrides);
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(first).resolves.toEqual({ status: "UNAVAILABLE" });
+      expect(fetcher.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+      expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+
+      const second = verifyOriginAttestation(overrides);
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(second).resolves.toEqual({ status: "UNAVAILABLE" });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a never-resolving asset request at the total audit deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await releaseFixture({ hang: `${ORIGIN}/assets/core.wasm` });
+      const verification = verifyOriginAttestation({
+        fetch: fixture.fetcher,
+        origin: ORIGIN,
+        nowMs: 1_500,
+        identity: IDENTITY,
+        timeoutMs: 10,
+      });
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expect(verification).resolves.toEqual({ status: "UNAVAILABLE" });
+      expect(fixture.requested).toContain(`${ORIGIN}/assets/core.wasm`);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers from bounded transient body availability failures", async () => {
     const assetUrl = `${ORIGIN}/assets/app.js`;
     const fixture = await releaseFixture({
@@ -205,7 +253,7 @@ describe("origin release attestation", () => {
     expect(result).toEqual({ status: "OK" });
     expect(fixture.requested.filter((url) => url.includes("/assets/parallel-"))).toHaveLength(12);
     expect(fixture.maxActiveAssetRequests()).toBeGreaterThan(1);
-    expect(fixture.maxActiveAssetRequests()).toBeLessThanOrEqual(2);
+    expect(fixture.maxActiveAssetRequests()).toBeLessThanOrEqual(4);
   });
 });
 
@@ -229,6 +277,7 @@ async function releaseFixture(options: {
   origin?: string;
   extraAssets?: number;
   assetDelayMs?: number;
+  hang?: string;
   transientFailures?: Readonly<Record<string, number>>;
   revokedBuildIds?: string[];
 } = {}): Promise<{
@@ -286,6 +335,7 @@ async function releaseFixture(options: {
       transientFailures.set(url, failuresRemaining - 1);
       throw new TypeError("transient body failure");
     }
+    if (url === options.hang) return new Promise<Response>(() => undefined);
     if (url === manifestUrl) return response(manifest, options.manifestFinalUrl ?? manifestUrl);
     if (url === signatureUrl) return response(new Uint8Array(64), signatureUrl);
     const expected = content.get(url);

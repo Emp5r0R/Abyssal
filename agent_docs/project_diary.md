@@ -1,5 +1,28 @@
 # Project Diary
 
+## 2026-08-31 - Attestation liveness boundaries
+
+Android account access now makes its initial release decision locally. The
+baked build ID, source commit, and build signature are checked through the
+compiled offline Ed25519 root before account entry, without a GitHub dependency.
+GitHub latest-release discovery remains a separate bounded update workflow; after
+local admission, an availability failure preserves the verified status rather
+than locking the valid build out of the app. A successfully discovered update
+still requires its signed manifest and exact bounded artifact checks.
+
+The relay retains the stronger online boundary for messaging: its RAM
+last-known-good manifest must be current, and the exact platform/version/signature
+must pass before bearer-session lookup or WebSocket ticket issuance. The web
+startup audit still verifies the same-origin manifest, build identity, and every
+served asset with a 30-second aggregate deadline, 12-second request cap, and four
+asset workers. WASM initialization uses same-origin `no-store` loading and a
+30-second abort deadline.
+
+This is software provenance and liveness handling, not hardware or TEE
+attestation. A patched client, malicious web origin, malicious relay, missing
+GitHub/manifest, or runtime/device compromise remains outside the guarantee;
+availability failures still fail closed where the relevant admission is required.
+
 ## 2026-08-30 - Web admission checks and relay ownership boundaries
 
 The web startup path retains a full signed origin audit, including the served

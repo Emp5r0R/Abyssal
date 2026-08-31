@@ -111,6 +111,30 @@ internal fun isLocalOnlyForum(
 
 internal fun canStartAccountEntry(activeJob: Job?): Boolean = activeJob?.isActive != true
 
+internal fun initialReleaseVerificationStatus(localBuildVerified: Boolean): ReleaseVerificationStatus =
+    if (localBuildVerified) ReleaseVerificationStatus.VERIFIED else ReleaseVerificationStatus.REJECTED
+
+internal fun releaseVerificationStatusAfterDiscovery(
+    current: ReleaseVerificationStatus,
+    discovered: ReleaseVerificationStatus
+): ReleaseVerificationStatus =
+    when {
+        // A failed local admission cannot be repaired by remote metadata.
+        current == ReleaseVerificationStatus.REJECTED -> ReleaseVerificationStatus.REJECTED
+        current == ReleaseVerificationStatus.VERIFIED &&
+            discovered == ReleaseVerificationStatus.UNAVAILABLE -> ReleaseVerificationStatus.VERIFIED
+        else -> discovered
+    }
+
+internal fun releaseVerificationStatusAfterFailure(
+    current: ReleaseVerificationStatus
+): ReleaseVerificationStatus =
+    when (current) {
+        ReleaseVerificationStatus.VERIFIED,
+        ReleaseVerificationStatus.REJECTED -> current
+        else -> ReleaseVerificationStatus.UNAVAILABLE
+    }
+
 internal fun canInstallAccountEntryResult(
     coroutineIsActive: Boolean,
     result: IdentityValidationResult
@@ -376,6 +400,7 @@ class ChatViewModel(
     private val attachmentService: IEncryptedAttachmentService,
     private val disguiseManager: IDisguiseManager,
     private val appUpdateService: IAppUpdateService,
+    initialReleaseVerificationStatus: ReleaseVerificationStatus = ReleaseVerificationStatus.CHECKING,
     private val payloadCipher: InMemoryPayloadCipher = InMemoryPayloadCipher(),
     private val mlsTransport: IMlsTransport? = chatTransport as? IMlsTransport
 ) : ViewModel() {
@@ -445,7 +470,7 @@ class ChatViewModel(
 
     private val _availableUpdate = MutableStateFlow<AvailableAppUpdate?>(null)
     val availableUpdate: StateFlow<AvailableAppUpdate?> = _availableUpdate.asStateFlow()
-    private val _releaseVerificationStatus = MutableStateFlow(ReleaseVerificationStatus.CHECKING)
+    private val _releaseVerificationStatus = MutableStateFlow(initialReleaseVerificationStatus)
     val releaseVerificationStatus: StateFlow<ReleaseVerificationStatus> =
         _releaseVerificationStatus.asStateFlow()
     private val updatePromptPolicy = UpdatePromptPolicy()
@@ -935,15 +960,24 @@ class ChatViewModel(
                 val result = runCatching { appUpdateService.checkCurrentRelease() }
                 val completedAt = elapsedRealtimeMs()
                 result.onSuccess { check ->
-                    _releaseVerificationStatus.value = check.verificationStatus
-                    if (check.verificationStatus == ReleaseVerificationStatus.VERIFIED) {
+                    // Discovery is advisory once the baked native admission has
+                    // passed. A GitHub outage must not lock an otherwise valid
+                    // local build out of the app.
+                    val status = releaseVerificationStatusAfterDiscovery(
+                        _releaseVerificationStatus.value,
+                        check.verificationStatus
+                    )
+                    _releaseVerificationStatus.value = status
+                    if (status == ReleaseVerificationStatus.VERIFIED) {
                         updatePromptPolicy.markChecked(completedAt)
                         _availableUpdate.value = check.update
                     } else {
                         updatePromptPolicy.markFailed(completedAt)
                     }
                 }.onFailure {
-                    _releaseVerificationStatus.value = ReleaseVerificationStatus.UNAVAILABLE
+                    _releaseVerificationStatus.value = releaseVerificationStatusAfterFailure(
+                        _releaseVerificationStatus.value
+                    )
                     updatePromptPolicy.markFailed(completedAt)
                 }
             } finally {
@@ -953,7 +987,9 @@ class ChatViewModel(
     }
 
     fun retryReleaseVerification() {
-        _releaseVerificationStatus.value = ReleaseVerificationStatus.CHECKING
+        if (_releaseVerificationStatus.value != ReleaseVerificationStatus.REJECTED) {
+            _releaseVerificationStatus.value = ReleaseVerificationStatus.CHECKING
+        }
         checkForAppUpdate(force = true)
     }
 

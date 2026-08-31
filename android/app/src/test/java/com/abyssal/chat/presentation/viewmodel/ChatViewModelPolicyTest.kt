@@ -19,6 +19,7 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.SenderClient
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
+import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import com.abyssal.chat.domain.repository.IAppUpdateService
 import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
@@ -121,6 +122,99 @@ class ChatViewModelPolicyTest {
         assertFalse(isLocalOnlyForum("forum_general", listOf(recipient("Bob"))))
         assertFalse(isLocalOnlyForum("dm_bob", emptyList()))
         assertFalse(isLocalOnlyForum("forum_general", null))
+    }
+
+    @Test
+    fun verifiedLocalAdmissionSurvivesUnavailableDiscoveryAndIoFailure() {
+        assertEquals(
+            ReleaseVerificationStatus.VERIFIED,
+            releaseVerificationStatusAfterDiscovery(
+                ReleaseVerificationStatus.VERIFIED,
+                ReleaseVerificationStatus.UNAVAILABLE
+            )
+        )
+        assertEquals(
+            ReleaseVerificationStatus.VERIFIED,
+            releaseVerificationStatusAfterFailure(ReleaseVerificationStatus.VERIFIED)
+        )
+    }
+
+    @Test
+    fun missingLocalAdmissionStartsAndRemainsBlocked() {
+        assertEquals(
+            ReleaseVerificationStatus.REJECTED,
+            initialReleaseVerificationStatus(localBuildVerified = false)
+        )
+        assertEquals(
+            ReleaseVerificationStatus.REJECTED,
+            releaseVerificationStatusAfterDiscovery(
+                ReleaseVerificationStatus.REJECTED,
+                ReleaseVerificationStatus.REJECTED
+            )
+        )
+        assertEquals(
+            ReleaseVerificationStatus.REJECTED,
+            releaseVerificationStatusAfterFailure(ReleaseVerificationStatus.REJECTED)
+        )
+    }
+
+    @Test
+    fun verifiedViewModelAdmissionSurvivesUpdateServiceExceptionAndUnavailableResult() = runBlocking {
+        val updateServiceCalled = CompletableDeferred<Unit>()
+        val viewModel = verificationViewModel(
+            initialStatus = ReleaseVerificationStatus.VERIFIED,
+            updateResult = Result.failure(IllegalStateException("network unavailable")),
+            updateServiceCalled = updateServiceCalled
+        )
+        try {
+            viewModel.checkForAppUpdate(force = true)
+            updateServiceCalled.await()
+            delay(100)
+            assertEquals(ReleaseVerificationStatus.VERIFIED, viewModel.releaseVerificationStatus.value)
+
+            val unavailableViewModel = verificationViewModel(
+                initialStatus = ReleaseVerificationStatus.VERIFIED,
+                updateResult = Result.success(
+                    com.abyssal.chat.domain.model.AppUpdateCheckResult(
+                        ReleaseVerificationStatus.UNAVAILABLE
+                    )
+                )
+            )
+            try {
+                unavailableViewModel.checkForAppUpdate(force = true)
+                delay(100)
+                assertEquals(
+                    ReleaseVerificationStatus.VERIFIED,
+                    unavailableViewModel.releaseVerificationStatus.value
+                )
+            } finally {
+                unavailableViewModel.clear()
+            }
+        } finally {
+            viewModel.clear()
+        }
+    }
+
+    @Test
+    fun invalidInitialAdmissionRemainsBlockedAcrossUpdateAndRetry() = runBlocking {
+        val updateServiceCalled = CompletableDeferred<Unit>()
+        val viewModel = verificationViewModel(
+            initialStatus = ReleaseVerificationStatus.REJECTED,
+            updateResult = Result.success(
+                com.abyssal.chat.domain.model.AppUpdateCheckResult(
+                    ReleaseVerificationStatus.VERIFIED
+                )
+            ),
+            updateServiceCalled = updateServiceCalled
+        )
+        try {
+            viewModel.retryReleaseVerification()
+            updateServiceCalled.await()
+            delay(100)
+            assertEquals(ReleaseVerificationStatus.REJECTED, viewModel.releaseVerificationStatus.value)
+        } finally {
+            viewModel.clear()
+        }
     }
 
     @Test
@@ -1130,7 +1224,12 @@ class ChatViewModelPolicyTest {
         messages: Map<String, List<Message>> = emptyMap(),
         attachmentCalls: AtomicLong? = null,
         markReadCalls: AtomicLong? = null,
-        activeSession: NodeSession? = null
+        activeSession: NodeSession? = null,
+        initialStatus: ReleaseVerificationStatus = ReleaseVerificationStatus.CHECKING,
+        updateResult: Result<com.abyssal.chat.domain.model.AppUpdateCheckResult> = Result.success(
+            com.abyssal.chat.domain.model.AppUpdateCheckResult(ReleaseVerificationStatus.VERIFIED)
+        ),
+        updateServiceCalled: CompletableDeferred<Unit>? = null
     ): ChatViewModel {
         val identityService = proxy(IIdentityService::class.java) { method ->
             when (method.name) {
@@ -1179,9 +1278,8 @@ class ChatViewModelPolicyTest {
             }
         }
         val updateService = proxy(IAppUpdateService::class.java) {
-            com.abyssal.chat.domain.model.AppUpdateCheckResult(
-                com.abyssal.chat.domain.model.ReleaseVerificationStatus.VERIFIED
-            )
+            updateServiceCalled?.complete(Unit)
+            updateResult.getOrThrow()
         }
         val viewModel = ChatViewModel(
             identityService = identityService,
@@ -1192,12 +1290,35 @@ class ChatViewModelPolicyTest {
             attachmentService = attachmentService,
             disguiseManager = disguiseManager,
             appUpdateService = updateService,
+            initialReleaseVerificationStatus = initialStatus,
             payloadCipher = payloadCipher
         )
         setCurrentUser(viewModel, user)
         setSessionGeneration(viewModel, 1L)
         setActiveSessionPolicy(viewModel)
         return viewModel
+    }
+
+    private fun verificationViewModel(
+        initialStatus: ReleaseVerificationStatus,
+        updateResult: Result<com.abyssal.chat.domain.model.AppUpdateCheckResult>,
+        updateServiceCalled: CompletableDeferred<Unit>? = null
+    ): ChatViewModel {
+        val payloadCipher = InMemoryPayloadCipher()
+        val user = User("Alice", ByteArray(32) { 1 }, "prekey")
+        val probe = TransactionTransportProbe(
+            cipher = payloadCipher,
+            leases = emptyList(),
+            sendResult = OutboundSendResult.ACCEPTED
+        )
+        return transactionViewModel(
+            payloadCipher = payloadCipher,
+            user = user,
+            probe = probe,
+            initialStatus = initialStatus,
+            updateResult = updateResult,
+            updateServiceCalled = updateServiceCalled
+        )
     }
 
     @Suppress("UNCHECKED_CAST")
