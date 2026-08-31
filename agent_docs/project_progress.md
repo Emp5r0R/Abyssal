@@ -1,39 +1,52 @@
 # Project Progress
 
-## Active Deployment: v2.3.0 Signed Release and Production Rollout
+## Completed Deployment: v2.3.1 Release-Verification Liveness Hotfix
 
-The original release-provenance key, Android keystore, and strict Android
-credential file were recovered from the established owner-only external release
-directory. This package publishes the completed relay modularization, inline
-web admission, unified loading UX, and verified deployment recovery without
-changing the existing trust roots.
+### Delivered
 
-### Bounded Plan
+- Android release admission now verifies the baked build ID, source commit,
+  and Ed25519 signature locally against the compiled offline trust root. A
+  transient GitHub update-discovery failure no longer demotes an otherwise
+  valid installed build, while malformed or untrusted local identities still
+  fail closed.
+- Web startup verification retains the complete signed asset audit with a
+  30-second aggregate deadline, 12-second request bounds, four workers, real
+  cancellation of fetch/body reads, and a same-origin no-store WASM load.
+- Android and web version `2.3.1` bind to source commit
+  `08a99a16e7f3015a75fb28f28dc50a15ab7eb1af` through signed manifest sequence
+  `9`. The established release-root fingerprint and Android signer were
+  preserved.
+- Stable GitHub release `v2.3.1` publishes the exact signed APK, AAB,
+  checksums, deterministic web archive, manifest, and detached signature.
+  Production consumes that exact web archive and manifest.
 
-1. Verify the recovered Ed25519 key against the committed public fingerprint
-   and the Android keystore against the existing release signer; advance all
-   canonical version surfaces to `2.3.0` with the next Android version code.
-2. Run the complete final-tree test and security gate, stage only intended
-   project changes, commit, and push `main` while preserving unrelated local
-   files.
-3. Require CI and CodeQL success for the exact commit, create and push the
-   annotated `v2.3.0` tag, and build signed Android/web artifacts plus the
-   canonical manifest from a clean isolated worktree using the established
-   external keys.
-4. Verify artifact digests, signatures, manifest binding, and signer continuity;
-   publish one stable GitHub release with complete notes and exact assets.
-5. Deploy the exact published release through `deploy-server.sh`, verify relay
-   and public health plus web admission, and record only observed results.
+### Verification
 
-### Acceptance Gates
+- Final `./scripts/test-all.sh all` passed 379 web tests, 68 Rust-core tests,
+  20 release-tool tests, 233 relay tests, 253 Android JVM tests, Android release
+  lint/compilation, live OPAQUE/v9/v10 integration, generated-artifact checks,
+  deployment checks, and dependency audits.
+- GitHub CI and both CodeQL analyses passed for the exact release commit; open
+  CodeQL and Dependabot alert counts were zero at release time.
+- Independent artifact verification covered the Ed25519 manifest/build
+  signatures, every recorded asset, safe web archive structure, Android
+  version code `25`, APK signature schemes v2/v3, AAB signature, signer
+  continuity, all four packaged ABIs, checksums, and owner-only output modes.
+- Public production health, build identity, manifest, and signature match the
+  released bytes. A real Chromium session reached account entry after the
+  complete origin audit without page exceptions. The container is healthy,
+  read-only, loopback-bound on port `4020`, configured with no automatic
+  restart, and uses Docker's `none` log driver.
 
-- No replacement release root or Android signer is generated.
-- All applicable tests, security gates, CI, and CodeQL pass for the exact
-  released commit.
-- The APK/AAB, web archive, manifest, and detached signature bind the same
-  version, source commit, and established signing identities.
-- Production runs the exact published web archive and reports healthy after
-  the intentional RAM-only restart.
+### Operational Boundary
+
+- The production restart intentionally destroyed the previous RAM-only state
+  and generated a new one-time invite-code set visible only in the attached
+  deployment output.
+- The previously paired Android device was no longer discoverable over ADB at
+  final installation time. APK signature, package metadata, and static/runtime
+  release admission tests passed, but installation and UI confirmation on that
+  physical device remain unclaimed until it reconnects.
 
 ## Completed Deployment: Verified Deploy Recovery and Unified Loading UX
 
