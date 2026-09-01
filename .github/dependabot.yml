@@ -4,28 +4,48 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 1
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 1
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: gradle
     directory: "/android"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 1
+    groups:
+      android-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 1
+    groups:
+      workflow-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: docker
     directory: "/mirage-server"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 1
+    groups:
+      relay-image-dependencies:
+        patterns:
+          - "*"
