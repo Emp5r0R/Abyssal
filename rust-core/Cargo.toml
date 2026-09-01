@@ -21,8 +21,8 @@ required-features = ["bindgen-cli"]
 zeroize = { version = "1.7", features = ["derive"] }
 
 # Cryptography
-chacha20poly1305 = "0.10"
-rand = "0.8"
+chacha20poly1305 = "0.11"
+rand = "0.10"
 opaque-ke = { version = "4.0.1", features = ["argon2", "ristretto255"] }
 sha2 = "0.11"
 # opaque-ke 4.0.1 still exposes its OPAQUE hash boundary through digest 0.10.
@@ -33,13 +33,13 @@ base64 = "=0.23.1"
 hkdf = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 vodozemac = { version = "0.10.0", features = ["experimental-session-config"] }
 
 # MLS room protocol v10.  Keep the provider deliberately scoped to the
 # ChaCha ciphersuite and disable provider defaults so no storage backend is
 # pulled into the client.
-mls-rs = { version = "=0.55.4", default-features = false, features = [
+mls-rs = { version = "=0.56.0", default-features = false, features = [
     "std",
     "rfc_compliant",
     "private_message",
