@@ -1,5 +1,64 @@
 # Project Progress
 
+## Active Deployment: Unified Invite Capsule V1 - Source Complete
+
+### Goal
+
+Replace normal `node URL + invite code + password` bootstrap with a signed,
+self-contained `Invite Capsule + password` flow without changing OPAQUE,
+direct protocol v9, MLS protocol v10, or RAM-only account/message semantics.
+
+### Bounded Plan
+
+1. Add a standalone, networking-free invite crate with strict canonical CBOR,
+   Ed25519 node signatures, 256-bit account-bootstrap capabilities, typed
+   HTTPS/development-loopback locators, bounded URI/manual codecs, checksums,
+   expiry validation, transport selection, and stable conformance vectors.
+2. Add a separately provisioned persistent node signing identity, signed node
+   descriptor endpoint, advertised-locator configuration, startup capsule
+   issuance, HMAC-derived capability lookup, expiry enforcement, exact
+   one-time registration consumption, and race tests. Preserve explicit typed
+   loopback development locators without retaining a manual URL/code bypass.
+3. Expose shared invite parsing and descriptor verification through the
+   existing UniFFI/WASM core. Update web and Android bootstrap services and UI
+   to accept Invite + Password, verify the connected node before OPAQUE, reject
+   unsafe locators/redirects, and keep all bootstrap material in RAM.
+4. Update integration/deployment scripts, generated crypto artifacts, public
+   documentation, protocol specification, environment templates, and focused
+   fuzzing where it remains reproducible and bounded.
+5. Run focused protocol/client/integration checks followed by the complete
+   repository test and security gate. Commit/push only from a fully green final
+   tree; release and deploy only after the complete plan is verified.
+
+### Acceptance
+
+- Canonical codec, signature, tamper, size, checksum, expiry, locator/SSRF,
+  descriptor identity, and stable-vector tests pass.
+- Registration, login, WebSocket admission, concurrent invite consumption,
+  restart semantics, and existing OPAQUE/v9/v10 integration remain green.
+- Web and Android normal account entry contain no node URL field; both use the
+  shared Rust parser and verify the signed node descriptor before authentication.
+- Node private keys and capability secrets are never persisted by clients or
+  logged outside explicit one-time operator invite output.
+- Final `./scripts/test-all.sh all` and every applicable generated-artifact,
+  dependency, lint, and security gate pass after the last implementation edit.
+
+### Verified Source Status
+
+- Invite Capsule V1 is implemented across the standalone Rust codec, relay,
+  shared UniFFI/WASM core, web, Android, deployment helpers, and documentation.
+- Final `./scripts/test-all.sh all` passed repository/deployment checks, 386 web
+  tests plus lint and production build, 70 Rust-core tests, 14 invite tests,
+  236 relay tests, strict Clippy/rustfmt, Android JVM tests and release lint,
+  live OPAQUE/v9/v10 relay integration, and npm/RustSec advisory checks.
+- The npm gate initially found the `browserslist <=4.28.6` advisories. The root
+  override and lockfile now require `4.28.8`; the repeated gate reports zero npm
+  vulnerabilities. RustSec reports no vulnerability and one allowed yanked
+  transitive warning for `chacha20 0.10.1`.
+- Packaging, tagging, release publication, and production deployment remain
+  pending. They must use one final breaking release after the source checkpoint,
+  hosted CI/CodeQL success, and release-artifact verification.
+
 ## Completed Deployment: v2.3.1 Release-Verification Liveness Hotfix
 
 ### Delivered

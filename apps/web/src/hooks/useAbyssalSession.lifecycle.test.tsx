@@ -477,6 +477,22 @@ vi.mock("../security/crypto", async () => {
   };
 });
 
+vi.mock("../security/invite", () => ({
+  parseInvite: vi.fn(() => ({
+    nodeId: "node-one",
+    nodePublicKey: new Uint8Array(32).fill(9),
+    endpoint: mocks.nodeEndpoint,
+    capability: new Uint8Array(32).fill(4),
+    accountContext: new Uint8Array(32).fill(5),
+  })),
+  verifyConnectedInviteNode: vi.fn(async () => undefined),
+  wipeParsedInvite: vi.fn((invite: { capability: Uint8Array; accountContext: Uint8Array; nodePublicKey: Uint8Array } | null) => {
+    invite?.capability.fill(0);
+    invite?.accountContext.fill(0);
+    invite?.nodePublicKey.fill(0);
+  }),
+}));
+
 vi.mock("../transport/nodeClient", async () => {
   const actual = await vi.importActual<typeof import("../transport/nodeClient")>("../transport/nodeClient");
   return {
@@ -608,8 +624,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -661,8 +676,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -685,8 +699,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -707,8 +720,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -725,8 +737,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -768,8 +779,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -818,8 +828,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     try {
       await act(async () => {
         await result.current.login({
-          nodeUrl: "https://node.example.test",
-          code: "ABCD-1234",
+          invite: "fixture-invite",
           password: new TextEncoder().encode("password"),
           retainWhenHidden: true,
         });
@@ -832,8 +841,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await act(async () => {
         await result.current.logout();
         await result.current.login({
-          nodeUrl: "https://node.example.test",
-          code: "ABCD-1234",
+          invite: "fixture-invite",
           password: new TextEncoder().encode("password"),
           retainWhenHidden: true,
         });
@@ -855,8 +863,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -904,8 +911,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -949,8 +955,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1015,8 +1020,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1060,8 +1064,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1129,8 +1132,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1187,8 +1189,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1246,8 +1247,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1305,8 +1305,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1352,8 +1351,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1390,8 +1388,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1436,8 +1433,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1491,8 +1487,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1556,8 +1551,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1586,8 +1580,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1662,8 +1655,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1720,8 +1712,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1761,8 +1752,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1788,8 +1778,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1822,8 +1811,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1889,8 +1877,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     });
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -1911,7 +1898,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
-  it("rejects a finish response from a different node and revokes its candidate session", async () => {
+  it("rejects a start response from a different node before creating a candidate session", async () => {
     mocks.startOpaqueAccount.mockResolvedValueOnce({
       accepted: true,
       mode: "registration",
@@ -1924,15 +1911,14 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
     await act(async () => {
       await expect(result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
-      })).rejects.toThrow("Wrong information");
+      })).rejects.toThrow("Node identity mismatch");
     });
 
     expect(result.current.session).toBeNull();
-    expect(mocks.revokeSession).toHaveBeenCalledOnce();
+    expect(mocks.revokeSession).not.toHaveBeenCalled();
     expect(mocks.getLastRelay()).toBeNull();
     unmount();
   });
@@ -1947,8 +1933,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
     await act(async () => {
       await expect(result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       })).rejects.toThrow("Wrong information");
@@ -1964,8 +1949,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -2004,8 +1988,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -2032,8 +2015,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -2124,8 +2106,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -2162,8 +2143,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -2197,8 +2177,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
-        nodeUrl: "https://node.example.test",
-        code: "ABCD-1234",
+        invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
         retainWhenHidden: true,
       });
@@ -2242,7 +2221,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("routes protocol-v10 room sends through MLS and fails closed on ambiguous admission", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
@@ -2265,7 +2244,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("replays an accepted MLS snapshot transaction without decrypting or republishing the message", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0];
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     const incoming = {
@@ -2285,7 +2264,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("accepts generic protocol-safe room ids and retains join rejection state when send fails", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     expect(result.current.joinRoom("general-room_1")).toBe(true);
     expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_discover_room", room_id: "general-room_1" });
@@ -2307,7 +2286,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("accepts only an exact rejection for this client's pending join", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({
       type: "mls_room_discovered", protocol_version: 10, room_id: "general-room", group_id_b64: "AA", owner_username: "Bob",
@@ -2321,7 +2300,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
 
     const second = renderHook(() => useAbyssalSession());
-    await act(async () => { await second.result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await second.result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const secondRelay = mocks.getLastRelay();
     await act(async () => secondRelay?.emit({
       type: "mls_room_discovered", protocol_version: 10, room_id: "other-room", group_id_b64: "AA", owner_username: "Bob",
@@ -2335,7 +2314,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("routes owner leave approval and retains the request when rejection send fails", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     const request = { type: "mls_leave_requested", protocol_version: 10, room_id: "forum_mls", request_id: "leave-request", username: "Bob", stable_identity_b64: "AA" } as unknown as IncomingFrame;
@@ -2359,7 +2338,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("fails closed when a member leave acknowledgement is not bound to its pending request", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     act(() => result.current.leaveRoom("forum_mls"));
@@ -2373,7 +2352,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("removes MLS room state and plaintext messages after the relay confirms the member left", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ nodeUrl: "https://node.example.test", code: "ABCD-1234", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     act(() => result.current.openRoom("forum_mls"));

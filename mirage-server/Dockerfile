@@ -4,6 +4,7 @@ FROM rust:1.97.1-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7
 
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock ./
+COPY abyssal-invite ./abyssal-invite
 COPY mirage-server ./mirage-server
 COPY rust-core ./rust-core
 COPY tools/release-tool ./tools/release-tool

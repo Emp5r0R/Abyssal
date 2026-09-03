@@ -17,6 +17,7 @@ path = "src/bin/uniffi-bindgen.rs"
 required-features = ["bindgen-cli"]
 
 [dependencies]
+abyssal-invite = { path = "../abyssal-invite" }
 # Secure memory wiping on drop
 zeroize = { version = "1.7", features = ["derive"] }
 
@@ -56,6 +57,7 @@ uniffi = { version = "0.32", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+js-sys = "=0.3.103"
 wasm-bindgen = "=0.2.126"
 
 [build-dependencies]

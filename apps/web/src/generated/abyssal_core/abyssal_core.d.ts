@@ -137,11 +137,15 @@ export function opaqueClientFinishRegistration(password: Uint8Array, registratio
 
 export function opaqueClientStart(password: Uint8Array): string;
 
+export function parseInviteCapsule(invite_text: string, now_unix_seconds: bigint, allow_development_loopback: boolean): any;
+
 export function parseReleaseBuildId(build_id: string): string;
 
 export function releaseSha256(data: Uint8Array): Uint8Array;
 
 export function releaseTrustAnchorConfigured(): boolean;
+
+export function verifyInviteNodeDescriptor(descriptor: Uint8Array, expected_node_public_key: Uint8Array, expected_node_url: string): void;
 
 export function verifyReleaseBuildSignature(build_id: string, source_commit: string, signature: Uint8Array): void;
 
@@ -198,6 +202,7 @@ export interface InitOutput {
     readonly opaqueClientFinishLogin: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly opaqueClientFinishRegistration: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly opaqueClientStart: (a: number, b: number) => [number, number, number, number];
+    readonly parseInviteCapsule: (a: number, b: number, c: bigint, d: number) => [number, number, number];
     readonly parseReleaseBuildId: (a: number, b: number) => [number, number, number, number];
     readonly releaseSha256: (a: number, b: number) => [number, number];
     readonly releaseTrustAnchorConfigured: () => number;
@@ -215,9 +220,11 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_checksum_func_opaque_client_finish_login: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_finish_registration: () => number;
     readonly uniffi_abyssal_core_checksum_func_opaque_client_start: () => number;
+    readonly uniffi_abyssal_core_checksum_func_parse_invite_capsule: () => number;
     readonly uniffi_abyssal_core_checksum_func_parse_release_build_id: () => number;
     readonly uniffi_abyssal_core_checksum_func_release_sha256: () => number;
     readonly uniffi_abyssal_core_checksum_func_release_trust_anchor_configured: () => number;
+    readonly uniffi_abyssal_core_checksum_func_verify_invite_node_descriptor: () => number;
     readonly uniffi_abyssal_core_checksum_func_verify_release_build_signature: () => number;
     readonly uniffi_abyssal_core_checksum_func_verify_release_manifest: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound: () => number;
@@ -270,9 +277,11 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_func_opaque_client_finish_login: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_finish_registration: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_func_opaque_client_start: (a: number, b: number, c: number) => void;
+    readonly uniffi_abyssal_core_fn_func_parse_invite_capsule: (a: number, b: number, c: bigint, d: number, e: number) => void;
     readonly uniffi_abyssal_core_fn_func_parse_release_build_id: (a: number, b: number, c: number) => void;
     readonly uniffi_abyssal_core_fn_func_release_sha256: (a: number, b: number, c: number) => void;
     readonly uniffi_abyssal_core_fn_func_release_trust_anchor_configured: (a: number) => number;
+    readonly uniffi_abyssal_core_fn_func_verify_invite_node_descriptor: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_verify_release_build_signature: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_verify_release_manifest: (a: number, b: number, c: number, d: bigint, e: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_commit_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
@@ -307,6 +316,7 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_method_mlsroom_rollback_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
     readonly uniffi_abyssal_core_fn_method_mlsroom_room_info: (a: number, b: bigint, c: number) => void;
     readonly uniffi_abyssal_core_fn_method_mlsroom_seal_state: (a: number, b: bigint, c: number) => void;
+    readonly verifyInviteNodeDescriptor: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly verifyReleaseBuildSignature: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly verifyReleaseManifest: (a: number, b: number, c: number, d: number, e: bigint) => [number, number, number, number];
     readonly wasme2eesession_commitOutbound: (a: number, b: number, c: number, d: bigint) => [number, number];

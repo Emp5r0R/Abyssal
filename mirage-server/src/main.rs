@@ -2,8 +2,7 @@ use std::{
     borrow::Borrow,
     collections::{HashMap, HashSet},
     convert::Infallible,
-    env,
-    io::{self, Write},
+    env, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{
@@ -23,6 +22,7 @@ use abyssal_core::secure_protocol::{
 };
 #[cfg(test)]
 use abyssal_core::secure_protocol::{ATTACHMENT_BLOB_VERSION, ATTACHMENT_CHUNK_RECORD_BYTES};
+use abyssal_invite::account_context_v1;
 use axum::{
     body::{Body, Bytes},
     extract::Request,
@@ -62,6 +62,7 @@ mod auth;
 mod client_platform;
 mod config;
 mod http;
+mod invite_bootstrap;
 mod messages;
 mod mls;
 mod mls_wire;
@@ -77,9 +78,10 @@ use client_platform::{ClientPlatform, InteropPolicy};
 use config::*;
 #[cfg(test)]
 use http::{
-    release_manifest_endpoint, release_signature_endpoint, CACHE_CONTROL_POLICY,
-    CONTENT_SECURITY_POLICY,
+    node_descriptor_endpoint, release_manifest_endpoint, release_signature_endpoint,
+    CACHE_CONTROL_POLICY, CONTENT_SECURITY_POLICY,
 };
+use invite_bootstrap::{write_boot_invites, BootstrapMaterials, IssuedInvite};
 use messages::*;
 use mls::*;
 use release_admission::{
@@ -155,7 +157,6 @@ const MAX_NODE_ID_BYTES: usize = 128;
 // revision saturates; a changed digest at that point is rejected by peers.
 const MAX_DIRECTORY_REVISION: u64 = 65_536;
 const DIRECTORY_DIGEST_BYTES: usize = 32;
-const MAX_CODE_BYTES: usize = 128;
 const LOGIN_RATE_WINDOW_MS: u64 = 60_000;
 const LOGIN_MAX_ATTEMPTS_PER_WINDOW: usize = 6;
 const MAX_LOGIN_LIMIT_ENTRIES: usize = 4_096;
@@ -219,7 +220,7 @@ const ATTACHMENT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACHMENT_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ATTACHMENT_DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACHMENT_CLAIM_HEADER: &str = "x-abyssal-attachment-claim";
-const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_INVITE_CODE_ID_V1";
+const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_CAPABILITY_ID_V1";
 
 type CodeId = [u8; 32];
 type WsTicketDigest = [u8; WS_TICKET_BYTES];
@@ -228,6 +229,8 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone)]
 struct AppState {
     node_id: String,
+    node_public_key: [u8; 32],
+    node_descriptor: Arc<Vec<u8>>,
     release_admission: Arc<ReleaseAdmissionStore>,
     attachment_ram_limit_bytes: usize,
     attachment_account_limit_bytes: usize,
@@ -250,8 +253,9 @@ struct AppState {
     opaque_setup: Arc<Zeroizing<Vec<u8>>>,
     opaque_handshakes: Arc<Mutex<HashMap<Uuid, OpaqueHandshake>>>,
     invite_code_pepper: Arc<Zeroizing<CodeId>>,
-    boot_codes: Arc<Mutex<Option<Vec<String>>>>,
+    boot_invites: Arc<Mutex<Option<Vec<IssuedInvite>>>>,
     available_codes: Arc<Mutex<HashSet<CodeId>>>,
+    capability_expiries: Arc<Mutex<HashMap<CodeId, u64>>>,
     accounts: Arc<Mutex<HashMap<CodeId, Account>>>,
     sessions: Arc<Mutex<HashMap<SessionToken, AuthSession>>>,
     ws_tickets: Arc<Mutex<HashMap<WsTicketDigest, WsTicket>>>,
@@ -322,16 +326,6 @@ struct ClientResult {
 enum ClientControl {
     GlobalWipe,
     Close,
-}
-
-struct BootCodes(Vec<String>);
-
-impl Drop for BootCodes {
-    fn drop(&mut self) {
-        for code in &mut self.0 {
-            code.zeroize();
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -507,14 +501,14 @@ struct RoomRecord {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OpaqueAccountStartRequest {
-    code: String,
+    capability_b64: String,
     registration_request_b64: String,
     credential_request_b64: String,
 }
 
 impl Drop for OpaqueAccountStartRequest {
     fn drop(&mut self) {
-        self.code.zeroize();
+        self.capability_b64.zeroize();
         self.registration_request_b64.zeroize();
         self.credential_request_b64.zeroize();
     }
@@ -1374,34 +1368,26 @@ async fn main() {
         .expect("failed to bind ABYSSAL_BIND_ADDR");
 
     info!("abyssal relay listening on {bind_addr}");
-    let code_print_delay_ms = read_usize_env("ABYSSAL_CODE_PRINT_DELAY_MS", 0).min(30_000) as u64;
-    if code_print_delay_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(code_print_delay_ms)).await;
+    let invite_print_delay_ms = std::env::var("ABYSSAL_INVITE_PRINT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| read_usize_env("ABYSSAL_CODE_PRINT_DELAY_MS", 0))
+        .min(30_000) as u64;
+    if invite_print_delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(invite_print_delay_ms)).await;
     }
-    state.print_boot_codes().await;
+    state.print_boot_invites().await;
     axum::serve(listener, app).await.expect("server failed");
 }
 
 impl AppState {
     fn from_env() -> Self {
         let (purge_epoch, _) = watch::channel(0_u64);
-        let node_id = match env::var("ABYSSAL_NODE_ID").or_else(|_| env::var("MIRAGE_NODE_ID")) {
-            Ok(value) if valid_node_id(&value) => value,
-            Ok(_) => panic!("ABYSSAL_NODE_ID must be 1-128 ASCII identifier characters"),
-            Err(_) => format!("abyssal-{}", Uuid::new_v4().simple()),
-        };
-
-        let min_len = read_usize_env("ABYSSAL_CODE_MIN_LEN", 12).clamp(12, MAX_CODE_BYTES);
-        let max_distinct_lengths = MAX_CODE_BYTES - min_len + 1;
-        let user_count = read_usize_env("ABYSSAL_CODE_COUNT", 5).min(max_distinct_lengths);
-        let required_max_len = min_len.saturating_add(user_count.saturating_sub(1));
-        let requested_max_len =
-            read_usize_env("ABYSSAL_CODE_MAX_LEN", required_max_len).clamp(min_len, MAX_CODE_BYTES);
-        let max_len = requested_max_len.max(required_max_len);
-        let mut boot_code_set = HashSet::new();
-        let mut generated_lengths = HashSet::new();
         let mut invite_code_pepper = [0_u8; 32];
         OsRng.fill_bytes(&mut invite_code_pepper);
+        let bootstrap = BootstrapMaterials::from_env(now_ms() / 1_000).unwrap_or_else(|error| {
+            panic!("Abyssal node bootstrap configuration rejected: {error}")
+        });
         let attachment_ram_limit_bytes = read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512)
             .saturating_mul(1024 * 1024)
             .min(Semaphore::MAX_PERMITS);
@@ -1449,21 +1435,40 @@ impl AppState {
             .filter(|limit| *limit > 0)
             .map(|limit| limit as u64);
 
-        generate_codes(
-            &mut boot_code_set,
-            &mut generated_lengths,
-            user_count,
-            min_len,
-            max_len,
-        );
-        let boot_codes = boot_code_set.into_iter().collect::<Vec<_>>();
-        let available_codes = boot_codes
+        let available_codes = bootstrap
+            .issued_invites
             .iter()
-            .map(|code| derive_code_id(&invite_code_pepper, code))
+            .map(|invite| derive_code_id(&invite_code_pepper, invite.capability.as_slice()))
             .collect::<HashSet<_>>();
+        if available_codes.len() != bootstrap.issued_invites.len() {
+            panic!("CSPRNG generated a duplicate bootstrap capability");
+        }
+        let capability_expiries = bootstrap
+            .issued_invites
+            .iter()
+            .filter_map(|invite| {
+                invite.expires_at.map(|expiry| {
+                    (
+                        derive_code_id(&invite_code_pepper, invite.capability.as_slice()),
+                        expiry,
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        info!("ABYSSAL_NODE_IDENTITY node_id={}", bootstrap.node_id);
+        info!(
+            "ABYSSAL_NODE_FINGERPRINT fingerprint={}",
+            bootstrap.fingerprint
+        );
+        info!(
+            "ABYSSAL_PUBLIC_LOCATOR locator={}",
+            bootstrap.locator.api_base_url()
+        );
 
         Self {
-            node_id,
+            node_id: bootstrap.node_id,
+            node_public_key: bootstrap.node_public_key,
+            node_descriptor: Arc::new(bootstrap.descriptor_binary),
             release_admission: Arc::new(ReleaseAdmissionStore::new()),
             attachment_ram_limit_bytes,
             attachment_account_limit_bytes,
@@ -1483,8 +1488,9 @@ impl AppState {
             opaque_setup: Arc::new(Zeroizing::new(opaque_server_setup())),
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
             invite_code_pepper: Arc::new(Zeroizing::new(invite_code_pepper)),
-            boot_codes: Arc::new(Mutex::new(Some(boot_codes))),
+            boot_invites: Arc::new(Mutex::new(Some(bootstrap.issued_invites))),
             available_codes: Arc::new(Mutex::new(available_codes)),
+            capability_expiries: Arc::new(Mutex::new(capability_expiries)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ws_tickets: Arc::new(Mutex::new(HashMap::new())),
@@ -1518,21 +1524,19 @@ impl AppState {
         }
     }
 
-    async fn print_boot_codes(&self) {
-        let Some(codes) = self.boot_codes.lock().await.take() else {
+    async fn print_boot_invites(&self) {
+        let Some(invites) = self.boot_invites.lock().await.take() else {
             return;
         };
-        let codes = BootCodes(codes);
         let print_result = {
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            write_boot_codes(&mut output, &codes.0)
+            write_boot_invites(&mut output, &invites)
         };
         if let Err(error) = print_result {
-            drop(codes);
-            panic!("failed to print Abyssal startup codes: {error}");
+            panic!("failed to print Abyssal startup invites: {error}");
         }
-        drop(codes);
+        drop(invites);
         info!(
             "ABYSSAL_ATTACHMENT_RAM_LIMIT bytes={}",
             self.attachment_ram_limit_bytes
@@ -1587,17 +1591,6 @@ impl AppState {
     }
 }
 
-fn write_boot_codes<W: Write>(output: &mut W, codes: &[String]) -> io::Result<()> {
-    writeln!(
-        output,
-        "ABYSSAL RAM-ONLY ACCESS CODES - copy these now; they are not written to disk"
-    )?;
-    for code in codes {
-        writeln!(output, "ABYSSAL_CODE code={code}")?;
-    }
-    output.flush()
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1605,10 +1598,10 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn derive_code_id(pepper: &[u8], code: &str) -> CodeId {
+fn derive_code_id(pepper: &[u8], capability: impl AsRef<[u8]>) -> CodeId {
     let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC accepts any key length");
     mac.update(CODE_ID_DOMAIN);
-    mac.update(code.as_bytes());
+    mac.update(capability.as_ref());
     mac.finalize().into_bytes().into()
 }
 
@@ -1630,87 +1623,6 @@ fn remove_code_id_map_entry<V>(map: &mut HashMap<CodeId, V>, code_id: &CodeId) {
         removed_code_id.zeroize();
         drop(value);
     }
-}
-
-fn generate_codes(
-    codes: &mut HashSet<String>,
-    generated_lengths: &mut HashSet<usize>,
-    count: usize,
-    min_len: usize,
-    max_len: usize,
-) {
-    let mut rng = OsRng;
-    for _ in 0..count {
-        loop {
-            let len = next_unique_length(&mut rng, generated_lengths, min_len, max_len);
-            let code = generate_code(&mut rng, len);
-            if codes.insert(code) {
-                break;
-            }
-        }
-    }
-}
-
-fn next_unique_length(
-    rng: &mut OsRng,
-    generated_lengths: &mut HashSet<usize>,
-    min_len: usize,
-    max_len: usize,
-) -> usize {
-    let available = (min_len..=max_len)
-        .filter(|len| !generated_lengths.contains(len))
-        .collect::<Vec<_>>();
-    let len = if available.is_empty() {
-        max_len + generated_lengths.len() + 1
-    } else {
-        available[rng.gen_range(0..available.len())]
-    };
-    generated_lengths.insert(len);
-    len
-}
-
-fn generate_code(rng: &mut OsRng, len: usize) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let dash_count = if len >= 16 { 2 } else { 1 };
-    let char_count = len - dash_count;
-    let mut raw = String::with_capacity(char_count);
-    for _ in 0..char_count {
-        let idx = rng.gen_range(0..ALPHABET.len());
-        raw.push(ALPHABET[idx] as char);
-    }
-
-    let first_dash = char_count / 3;
-    let second_dash = (char_count * 2) / 3;
-    let mut out = String::with_capacity(len);
-    for (idx, ch) in raw.chars().enumerate() {
-        if idx == first_dash || (dash_count == 2 && idx == second_dash) {
-            out.push('-');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn normalize_code(code: &str) -> Result<String, String> {
-    let normalized = code.trim().to_ascii_uppercase();
-    if !valid_code_shape(&normalized) {
-        return Err(
-            "Code must be at least 12 characters and contain only letters, numbers, and dashes."
-                .to_string(),
-        );
-    }
-    Ok(normalized)
-}
-
-fn valid_code_shape(code: &str) -> bool {
-    code.len() >= 12
-        && code.len() <= MAX_CODE_BYTES
-        && !code.starts_with('-')
-        && !code.ends_with('-')
-        && code.chars().any(|ch| ch.is_ascii_alphanumeric())
-        && code
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 fn record_rate_attempt(state: &mut RateState, now: u64, window_ms: u64, limit: usize) -> bool {
@@ -1763,7 +1675,25 @@ async fn known_code_id(state: &AppState, code_id: &CodeId) -> bool {
     if state.accounts.lock().await.contains_key(code_id) {
         return true;
     }
-    state.available_codes.lock().await.contains(code_id)
+    available_capability_is_live(state, code_id).await
+}
+
+async fn available_capability_is_live(state: &AppState, code_id: &CodeId) -> bool {
+    let mut available = state.available_codes.lock().await;
+    if !available.contains(code_id) {
+        return false;
+    }
+    let expiry = state.capability_expiries.lock().await.get(code_id).copied();
+    if expiry.is_some_and(|expires_at| expires_at <= now_ms() / 1_000) {
+        if let Some(mut expired) = available.take(code_id) {
+            expired.zeroize();
+        }
+        drop(available);
+        let mut expiries = state.capability_expiries.lock().await;
+        remove_code_id_map_entry(&mut expiries, code_id);
+        return false;
+    }
+    true
 }
 
 fn random_username() -> String {
@@ -2679,11 +2609,10 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     let mut available_codes = state.available_codes.lock().await;
     zeroize_code_id_set(&mut available_codes);
     drop(available_codes);
-    if let Some(mut boot_codes) = state.boot_codes.lock().await.take() {
-        for code in &mut boot_codes {
-            code.zeroize();
-        }
-    }
+    let mut capability_expiries = state.capability_expiries.lock().await;
+    zeroize_code_id_map(&mut capability_expiries);
+    drop(capability_expiries);
+    drop(state.boot_invites.lock().await.take());
     state.frame_limits.lock().await.clear();
     state.replay_ids.lock().await.clear();
     state.transaction_receipts.lock().await.clear();

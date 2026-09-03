@@ -97,8 +97,12 @@ class NetworkIdentityServiceTest {
             val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
 
             val password = "correct horse battery staple".toByteArray()
+            val capability = ByteArray(32) { 4 }
+            val accountContext = ByteArray(32) { 5 }
             val result = service.enterAccount(
-                code = "ABYS-INVITE-1234",
+                capability = capability,
+                accountContext = accountContext,
+                expectedNodeId = "node-1",
                 password = password,
                 endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
             )
@@ -111,7 +115,10 @@ class NetworkIdentityServiceTest {
             assertTrue(body.contains("credential_request_b64"))
             assertFalse(body.contains("correct horse battery staple"))
             assertFalse(body.contains("password"))
+            assertTrue(body.contains("capability_b64"))
             assertTrue(password.all { it == 0.toByte() })
+            assertTrue(capability.all { it == 0.toByte() })
+            assertTrue(accountContext.all { it == 0.toByte() })
         } finally {
             server.shutdown()
         }
@@ -129,14 +136,20 @@ class NetworkIdentityServiceTest {
             val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
 
             val password = "correct horse battery staple".toByteArray()
+            val capability = ByteArray(32) { 4 }
+            val accountContext = ByteArray(32) { 5 }
             val result = service.enterAccount(
-                code = "ABYS-INVITE-1234",
+                capability = capability,
+                accountContext = accountContext,
+                expectedNodeId = "node-1",
                 password = password,
                 endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
             )
 
             assertFalse(result.accepted)
             assertTrue(password.all { it == 0.toByte() })
+            assertTrue(capability.all { it == 0.toByte() })
+            assertTrue(accountContext.all { it == 0.toByte() })
         } finally {
             server.shutdown()
         }
@@ -157,7 +170,13 @@ class NetworkIdentityServiceTest {
             displayHost = "test"
         )
         val job = launch(Dispatchers.Default) {
-            service.enterAccount("ABYS-INVITE-1234", "correct horse battery staple".toByteArray(), endpoint)
+            service.enterAccount(
+                ByteArray(32) { 4 },
+                ByteArray(32) { 5 },
+                "node-1",
+                "correct horse battery staple".toByteArray(),
+                endpoint
+            )
         }
 
         assertTrue(factory.call.enqueued.await(2, TimeUnit.SECONDS))

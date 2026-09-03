@@ -21,6 +21,7 @@ import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -33,6 +34,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -54,13 +56,12 @@ import com.abyssal.chat.theme.PureWhite
 import com.abyssal.chat.theme.SelfDestructAmber
 import com.abyssal.chat.theme.SteelMuted
 import java.nio.charset.StandardCharsets
-import java.util.Locale
 
 @Composable
 fun EntranceScreen(viewModel: ChatViewModel) {
     EntranceContent(
-        isVerifying = viewModel.isVerifyingCode.value,
-        error = viewModel.inviteCodeError.value,
+        isVerifying = viewModel.isVerifyingInvite.value,
+        error = viewModel.inviteError.value,
         onInputChanged = viewModel::clearAccountError,
         onSubmit = viewModel::submitAccount
     )
@@ -71,19 +72,17 @@ private fun EntranceContent(
     isVerifying: Boolean,
     error: String?,
     onInputChanged: () -> Unit,
-    onSubmit: (String, String, ByteArray, Boolean) -> Unit
+    onSubmit: (String, ByteArray, Boolean) -> Unit
 ) {
-    var nodeUrl by remember { mutableStateOf("") }
-    var inviteCode by remember { mutableStateOf("") }
+    var invite by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
     var rememberSession by remember { mutableStateOf(true) }
-    val codeFocusRequester = remember { FocusRequester() }
     val passwordFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
-    val canSubmit = inviteCode.length >= 12 &&
-        nodeUrl.isNotBlank() &&
-        password.length >= 8 &&
+    val clipboard = LocalClipboardManager.current
+    val canSubmit = invite.isNotBlank() &&
+        password.length in MIN_PASSWORD_CHARS..MAX_PASSWORD_CHARS &&
         !isVerifying
 
     fun submit() {
@@ -92,7 +91,7 @@ private fun EntranceContent(
         val passwordBytes = password.toByteArray(StandardCharsets.UTF_8)
         password = ""
         passwordVisible = false
-        onSubmit(inviteCode, nodeUrl, passwordBytes, rememberSession)
+        onSubmit(invite, passwordBytes, rememberSession)
     }
 
     MirageBackground {
@@ -138,7 +137,7 @@ private fun EntranceContent(
                 }
 
                 Text(
-                    text = "Enter node",
+                    text = "Enter Abyssal",
                     color = PureWhite,
                     fontSize = 22.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -153,58 +152,48 @@ private fun EntranceContent(
                 ) {
                     Column(modifier = Modifier.padding(18.dp)) {
                         OutlinedTextField(
-                            value = nodeUrl,
+                            value = invite,
                             onValueChange = {
-                                nodeUrl = it.trim()
+                                invite = it.take(MAX_INVITE_TEXT_CHARS)
                                 onInputChanged()
                             },
-                            label = { Text("Node URL") },
-                            placeholder = { Text("https://node.example.com") },
+                            label = { Text("Abyssal invite") },
+                            placeholder = { Text("ABY1-... or abyssal:invite:...") },
                             colors = entranceTextFieldColors(),
                             enabled = !isVerifying,
-                            singleLine = true,
+                            minLines = 3,
+                            maxLines = 5,
                             isError = error != null,
                             keyboardOptions = KeyboardOptions(
                                 capitalization = KeyboardCapitalization.None,
-                                keyboardType = KeyboardType.Uri,
-                                imeAction = ImeAction.Next
-                            ),
-                            keyboardActions = KeyboardActions(
-                                onNext = { codeFocusRequester.requestFocus() }
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        OutlinedTextField(
-                            value = inviteCode,
-                            onValueChange = {
-                                inviteCode = formatInviteCode(it)
-                                onInputChanged()
-                            },
-                            label = { Text("Invite code") },
-                            placeholder = { Text("ABY7-KQ29-X4PZ") },
-                            colors = entranceTextFieldColors(accent = NeonCyan),
-                            enabled = !isVerifying,
-                            singleLine = true,
-                            isError = error != null,
-                            keyboardOptions = KeyboardOptions(
-                                capitalization = KeyboardCapitalization.Characters,
                                 keyboardType = KeyboardType.Ascii,
                                 imeAction = ImeAction.Next
                             ),
                             keyboardActions = KeyboardActions(
                                 onNext = { passwordFocusRequester.requestFocus() }
                             ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 12.dp)
-                                .focusRequester(codeFocusRequester)
+                            modifier = Modifier.fillMaxWidth()
                         )
+
+                        TextButton(
+                            onClick = {
+                                invite = clipboard.getText()?.text
+                                    ?.take(MAX_INVITE_TEXT_CHARS)
+                                    .orEmpty()
+                                onInputChanged()
+                            },
+                            enabled = !isVerifying,
+                            modifier = Modifier
+                                .align(Alignment.End)
+                                .padding(top = 4.dp)
+                        ) {
+                            Text("Paste invite")
+                        }
 
                         OutlinedTextField(
                             value = password,
                             onValueChange = {
-                                password = it
+                                password = it.take(MAX_PASSWORD_CHARS)
                                 onInputChanged()
                             },
                             label = { Text("Password") },
@@ -355,12 +344,9 @@ private fun entranceTextFieldColors(accent: Color = NeonCyan) = OutlinedTextFiel
     unfocusedPlaceholderColor = SteelMuted.copy(alpha = 0.45f)
 )
 
-private fun formatInviteCode(input: String): String {
-    return input
-        .filter { it.isLetterOrDigit() || it == '-' }
-        .take(64)
-        .uppercase(Locale.ROOT)
-}
+private const val MAX_INVITE_TEXT_CHARS = 2_048
+private const val MIN_PASSWORD_CHARS = 8
+private const val MAX_PASSWORD_CHARS = 128
 
 @Preview(showBackground = true)
 @Composable
@@ -369,6 +355,6 @@ private fun EntranceContentPreview() {
         isVerifying = false,
         error = null,
         onInputChanged = {},
-        onSubmit = { _, _, _, _ -> }
+        onSubmit = { _, _, _ -> }
     )
 }

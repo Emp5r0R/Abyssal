@@ -675,6 +675,10 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
+    external fun uniffi_abyssal_core_checksum_func_parse_invite_capsule(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_func_verify_invite_node_descriptor(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_inspect_release_manifest(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_parse_release_build_id(
@@ -875,6 +879,10 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_sign_registration_identity_proof(`ptr`: Long,`nodeId`: RustBuffer.ByValue,`handshakeId`: RustBuffer.ByValue,`challenge`: RustBuffer.ByValue,`registrationUpload`: RustBuffer.ByValue,`identityPublic`: RustBuffer.ByValue,`prekeyId`: RustBuffer.ByValue,`identityEnvelope`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_parse_invite_capsule(`inviteText`: RustBuffer.ByValue,`nowUnixSeconds`: Long,`allowDevelopmentLoopback`: Byte,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_verify_invite_node_descriptor(`descriptor`: RustBuffer.ByValue,`expectedNodePublicKey`: RustBuffer.ByValue,`expectedNodeUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
     external fun uniffi_abyssal_core_fn_func_inspect_release_manifest(`manifestJson`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_parse_release_build_id(`buildId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1028,6 +1036,12 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_abyssal_core_checksum_func_parse_invite_capsule() != 1378) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_verify_invite_node_descriptor() != 40877) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_func_inspect_release_manifest() != 45504) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3545,6 +3559,64 @@ public object FfiConverterTypeOpaqueRegistrationFinish: FfiConverterRustBuffer<O
 
 
 
+data class ParsedInvite (
+    var `nodeId`: kotlin.String
+    ,
+    var `nodePublicKey`: kotlin.ByteArray
+    ,
+    var `nodeUrl`: kotlin.String
+    ,
+    var `capability`: kotlin.ByteArray
+    ,
+    var `accountContext`: kotlin.ByteArray
+    ,
+    var `expiresAt`: kotlin.ULong?
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeParsedInvite: FfiConverterRustBuffer<ParsedInvite> {
+    override fun read(buf: ByteBuffer): ParsedInvite {
+        return ParsedInvite(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterOptionalULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ParsedInvite) = (
+            FfiConverterString.allocationSize(value.`nodeId`) +
+            FfiConverterByteArray.allocationSize(value.`nodePublicKey`) +
+            FfiConverterString.allocationSize(value.`nodeUrl`) +
+            FfiConverterByteArray.allocationSize(value.`capability`) +
+            FfiConverterByteArray.allocationSize(value.`accountContext`) +
+            FfiConverterOptionalULong.allocationSize(value.`expiresAt`)
+    )
+
+    override fun write(value: ParsedInvite, buf: ByteBuffer) {
+            FfiConverterString.write(value.`nodeId`, buf)
+            FfiConverterByteArray.write(value.`nodePublicKey`, buf)
+            FfiConverterString.write(value.`nodeUrl`, buf)
+            FfiConverterByteArray.write(value.`capability`, buf)
+            FfiConverterByteArray.write(value.`accountContext`, buf)
+            FfiConverterOptionalULong.write(value.`expiresAt`, buf)
+    }
+}
+
+
+
 data class RecipientEnvelope (
     var `username`: kotlin.String
     ,
@@ -3745,6 +3817,38 @@ public object FfiConverterTypeAbyssalError : FfiConverterRustBuffer<AbyssalExcep
 /**
  * @suppress
  */
+public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
+    override fun read(buf: ByteBuffer): kotlin.ULong? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterULong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ULong?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterULong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.ULong?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterULong.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeMlsRosterMember: FfiConverterRustBuffer<List<MlsRosterMember>> {
     override fun read(buf: ByteBuffer): List<MlsRosterMember> {
         val len = buf.getInt()
@@ -3822,6 +3926,33 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
         }
     }
 }
+    @Throws(AbyssalException::class) fun `parseInviteCapsule`(`inviteText`: kotlin.String, `nowUnixSeconds`: kotlin.ULong, `allowDevelopmentLoopback`: kotlin.Boolean): ParsedInvite {
+            return FfiConverterTypeParsedInvite.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_parse_invite_capsule(
+
+
+        FfiConverterString.lower(`inviteText`),
+        FfiConverterULong.lower(`nowUnixSeconds`),
+        FfiConverterBoolean.lower(`allowDevelopmentLoopback`),_status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `verifyInviteNodeDescriptor`(`descriptor`: kotlin.ByteArray, `expectedNodePublicKey`: kotlin.ByteArray, `expectedNodeUrl`: kotlin.String)
+        =
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_verify_invite_node_descriptor(
+
+
+        FfiConverterByteArray.lower(`descriptor`),
+        FfiConverterByteArray.lower(`expectedNodePublicKey`),
+        FfiConverterString.lower(`expectedNodeUrl`),_status)
+}
+
+
+
         /**
          * Verifies signature, canonical encoding, build signatures, and manifest
          * policy without accepting it for use at any wall-clock time. Callers must

@@ -117,6 +117,20 @@ data class NodeEndpoint(
     val displayHost: String
 )
 
+data class VerifiedInvite(
+    val nodeId: String,
+    val nodePublicKey: ByteArray,
+    val endpoint: NodeEndpoint,
+    val capability: ByteArray,
+    val accountContext: ByteArray
+) {
+    fun destroy() {
+        nodePublicKey.fill(0)
+        capability.fill(0)
+        accountContext.fill(0)
+    }
+}
+
 data class NodeSession(
     val endpoint: NodeEndpoint,
     val token: String,

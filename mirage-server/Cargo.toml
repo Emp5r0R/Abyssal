@@ -8,9 +8,12 @@ license = "MPL-2.0"
 integration-release-root = ["abyssal-core/integration-release-root"]
 
 [dependencies]
+abyssal-invite = { path = "../abyssal-invite" }
 axum = { version = "0.7", features = ["ws"] }
+ed25519-dalek = "2.2"
 futures-util = "=0.3.34"
 hmac = "0.13"
+libc = "0.2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -26,4 +29,4 @@ abyssal-core = { path = "../rust-core" }
 base64 = "=0.23.1"
 
 [dev-dependencies]
-ed25519-dalek = "2.2"
+tempfile = "3"

@@ -604,6 +604,58 @@ if grep -Eq '(^|[[:space:]])(FROM node|npm (ci|run)|COPY apps/web)' "$DOCKERFILE
   exit 1
 fi
 
+NODE_TEST_ROOT="$TEMP_DIR/node-runtime"
+mkdir -p "$NODE_TEST_ROOT/deploy" "$NODE_TEST_ROOT/mirage-server"
+cp -- "$ROOT_DIR/deploy/generate-node-key.sh" "$NODE_TEST_ROOT/deploy/"
+cp -- "$ROOT_DIR/deploy/prepare-runtime-env.sh" "$NODE_TEST_ROOT/deploy/"
+cp -- "$ROOT_DIR/mirage-server/.env.example" "$NODE_TEST_ROOT/mirage-server/"
+bash "$NODE_TEST_ROOT/deploy/generate-node-key.sh" >/dev/null
+NODE_TEST_KEY="$NODE_TEST_ROOT/.secrets/node-signing.key"
+[[ -f "$NODE_TEST_KEY" && ! -L "$NODE_TEST_KEY" ]] || {
+  echo 'Node key generator did not create a regular key file.' >&2
+  exit 1
+}
+[[ "$(stat -c '%s:%a' -- "$NODE_TEST_KEY")" == '32:600' ]] || {
+  echo 'Node key generator produced an invalid size or mode.' >&2
+  exit 1
+}
+node_key_digest="$(sha256sum "$NODE_TEST_KEY")"
+expect_failure bash "$NODE_TEST_ROOT/deploy/generate-node-key.sh"
+[[ "$(sha256sum "$NODE_TEST_KEY")" == "$node_key_digest" ]] || {
+  echo 'Node key generator rotated an existing identity.' >&2
+  exit 1
+}
+expect_failure bash "$NODE_TEST_ROOT/deploy/prepare-runtime-env.sh"
+sed -i 's|^ABYSSAL_PUBLIC_URL=$|ABYSSAL_PUBLIC_URL=https://node.example.com|' \
+  "$NODE_TEST_ROOT/mirage-server/.env"
+bash "$NODE_TEST_ROOT/deploy/prepare-runtime-env.sh"
+mv "$NODE_TEST_ROOT/mirage-server/.env" "$NODE_TEST_ROOT/mirage-server/.env.real"
+ln -s .env.real "$NODE_TEST_ROOT/mirage-server/.env"
+expect_failure bash "$NODE_TEST_ROOT/deploy/prepare-runtime-env.sh"
+rm "$NODE_TEST_ROOT/mirage-server/.env"
+mv "$NODE_TEST_ROOT/mirage-server/.env.real" "$NODE_TEST_ROOT/mirage-server/.env"
+chmod 0755 "$NODE_TEST_ROOT/.secrets"
+expect_failure bash "$NODE_TEST_ROOT/deploy/prepare-runtime-env.sh"
+chmod 0700 "$NODE_TEST_ROOT/.secrets"
+mv "$NODE_TEST_ROOT/.secrets" "$NODE_TEST_ROOT/.secrets.real"
+ln -s .secrets.real "$NODE_TEST_ROOT/.secrets"
+expect_failure bash "$NODE_TEST_ROOT/deploy/prepare-runtime-env.sh"
+rm "$NODE_TEST_ROOT/.secrets"
+mv "$NODE_TEST_ROOT/.secrets.real" "$NODE_TEST_ROOT/.secrets"
+chmod 0644 "$NODE_TEST_KEY"
+expect_failure bash "$NODE_TEST_ROOT/deploy/prepare-runtime-env.sh"
+chmod 0600 "$NODE_TEST_KEY"
+
+COMPOSE_FILE="$ROOT_DIR/deploy/docker-compose.yml"
+grep -Fq '../.secrets/node-signing.key:/run/secrets/abyssal-node-signing-key:ro' "$COMPOSE_FILE" || {
+  echo 'Compose does not mount the stable node identity read-only.' >&2
+  exit 1
+}
+grep -Fq 'driver: none' "$COMPOSE_FILE" || {
+  echo 'Compose no longer disables persistent invite logging.' >&2
+  exit 1
+}
+
 [[ ! -e "$SENTINEL" ]] || {
   echo 'Hostile helper override executed shell input.' >&2
   exit 1

@@ -1,6 +1,6 @@
 # Abyssal Chat
 
-Abyssal is an ephemeral chat monorepo containing a native Android client, a browser client, a Rust relay, and a native crypto crate. Neither client hardcodes a node URL: account entry takes a node URL, access code, and password every time a process starts.
+Abyssal is an ephemeral chat monorepo containing native Android and browser clients, a Rust relay, a shared crypto crate, and a standalone Invite Capsule protocol crate. Normal account entry takes one signed Abyssal invite plus a password; the authenticated node locator is carried inside the invite rather than typed separately.
 
 ## UI Preview
 
@@ -24,6 +24,7 @@ sizes, TalkBack loading semantics, and `MotionDurationScale`-aware animation.
 ```text
 apps/web/        React + TypeScript browser client
 android/         Kotlin + Jetpack Compose Android client
+abyssal-invite/  Shared deterministic Invite Capsule codec and signatures
 mirage-server/   Rust Axum relay (legacy directory name)
 rust-core/       Native Rust crypto crate
 deploy/          Docker, rsync, and service scripts
@@ -33,14 +34,14 @@ Root `package.json` owns the npm workspace. Root `Cargo.toml` and `Cargo.lock` o
 
 ## Storage Policy
 
-- Android keeps account sessions, node URLs, chat sessions, message buffers, camouflage secrets, passwords, and encryption material out of app-owned persistent storage. Authenticated state lives only in the application process.
+- Android keeps decoded invites and locators, account sessions, chat sessions, message buffers, camouflage secrets, passwords, and encryption material out of app-owned persistent storage. Authenticated state lives only in the application process.
 - Android and web cap decrypted message history at 500 messages or an estimated 8 MiB per chat, and 5,000 messages or an estimated 32 MiB globally, whichever limit is reached first. Eviction is deterministic and removes the oldest entries first. Eviction, expiry, and clearing wipe mutable attachment-key byte arrays and best-effort drop plaintext references. The estimates are deliberately conservative accounting bounds, not physical-memory measurements: immutable JVM/JavaScript strings and the OS/runtime may retain copies that application code cannot reliably zeroize.
 - `Remember this session` keeps that RAM-only session alive across activity pause, stop, and activity recreation while the Android process remains alive. With calculator camouflage enabled, leaving the app shows the calculator cover without logging out. When unchecked, leaving the foreground ends the session.
 - Every authenticated session has a strict node-provided inactivity deadline. User interaction refreshes it; background time and time spent behind the calculator cover do not. Expiry clears local RAM state, disconnects transport, and requires account entry again. Process death, explicit logout, wipe, or relay restart also clears session state.
 - Explicit logout and client-side expiry also make a best-effort relay call to revoke the bearer token immediately. The relay independently rejects expired tokens and closes idle WebSockets, so client enforcement is not the only boundary.
 - The calculator cover supports a normal unlock PIN and an optional duress PIN. The duress PIN silently purges local memory and attempts a relay wipe, but the operation is stamped to the captured account so a stale evaluation cannot wipe a replacement login.
 - Camouflage has no default PIN and is never recoverable from disk. Android resets the stale calculator launcher alias and the RAM-only PIN after process death; configure a new camouflage PIN after signing in to a fresh process.
-- The relay stores generated codes, OPAQUE password records, encrypted identity envelopes, sessions, rooms, clients, presence, and pending recipient-specific ciphertext in RAM only. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Pending frames expire after a bounded configurable lifetime (default 24 hours, accepted range 1-168 hours; `0` is clamped, never unbounded), and expiration also releases any matching prekey lease. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
+- The relay stores capability identifiers, OPAQUE password records, encrypted identity envelopes, sessions, rooms, clients, presence, and pending recipient-specific ciphertext in RAM only. The node signing key is the one intentional infrastructure-identity exception: it is a separately provisioned, read-only key file so signed invites survive relay restarts. Pending frames are keyed by conversation and intended username so one participant cannot consume another participant's offline queue. Pending frames expire after a bounded configurable lifetime (default 24 hours, accepted range 1-168 hours; `0` is clamped, never unbounded), and expiration also releases any matching prekey lease. Restarting the relay, an authenticated user wipe, or the dead-man switch clears all relay account and chat state.
 - Files, images, and videos may only be written to disk through an explicit user save flow. Android and web authenticate and decrypt attachments in memory, then save the original bytes under a sanitized original filename. One-time attachments remain view-only and expose no save control.
 - Android software updates are a second explicit disk-write flow. After the user selects Update, Abyssal downloads the signed release APK into private cache, enforces the manifest size, verifies its SHA-256 digest, and grants Android's package installer temporary read access. Failed or stale update files are deleted; account, message, password, token, and key material never enter that cache.
 - Attachment plaintext limits are 20 MiB for images, 100 MiB for videos, and 200 MiB for other files. Cipher v2 splits bulk data into independently authenticated 256 KiB plaintext chunks. Each fixed 262,201-byte XChaCha20-Poly1305 record authenticates its version, index, count, exact total plaintext length, message context, and per-record nonce; the final chunk receives random padding before encryption. Clients encrypt and decrypt one record at a time, wipe mutable working buffers, and never retain a complete plaintext and ciphertext copy together. The bulk key is delivered inside encrypted message metadata; the relay stores and streams only opaque fixed records. The record count still reveals a 256 KiB size bucket. A default 320 MiB encrypted-RAM quota applies per account in addition to the global RAM limit, with bounded upload and download concurrency. Android applies a heap-aware limit before allocating the final decrypted output.
@@ -79,14 +80,19 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 The install command expects `adb` on `PATH`. Otherwise invoke `platform-tools/adb` from your Android SDK.
 
-At the entrance screen enter:
+At the entrance screen paste the relay's `abyssal:invite:...` deep link or
+`ABY1-...` manual form, then enter a password. The shared Rust parser validates
+the canonical capsule, signature, application, protocol range, expiry, and
+locator before any bootstrap request. The client then fetches the signed
+`/v1/node` descriptor and requires the connected node identity to match the
+invite. Account creation consumes the capability once; later login uses the
+same invite and password while the relay account remains alive. A second login
+is rejected while that account has an unexpired session.
 
-- Node URL, for example `https://chat.example.com`. Plain HTTP is accepted only for loopback development addresses such as `127.0.0.1` and the Android emulator host `10.0.2.2`.
-- Code printed by the relay process at startup.
-- Password. Creating an account consumes the code; later logins use the same code and password while the relay process is still alive. A second login is rejected while that code still has an unexpired session.
-- `Remember this session` is optional and never stores the code, password, URL, or token on disk. It only changes lifecycle behavior for the current process.
-
-For an Android emulator talking to a server on the development machine, use `http://10.0.2.2:4020`.
+`Remember this session` is optional and never stores the invite, capability,
+password, locator, or token on disk. It only changes lifecycle behavior for the
+current process. Development relays issue a typed loopback invite for
+`http://10.0.2.2:4020`; normal users never enter that address manually.
 
 ### Chat behavior
 
@@ -128,17 +134,34 @@ npm ci
 npm run web:dev
 ```
 
-For local cross-origin development, start the relay from the repository root with the exact Vite origin:
+For local cross-origin development, create a disposable 32-byte node seed and
+start the relay from the repository root with the exact Vite origin and an
+explicit loopback locator:
 
 ```bash
-ABYSSAL_WEB_ORIGINS=http://localhost:4173 cargo run --package mirage-server
+node_key="$(mktemp)"
+chmod 600 "$node_key"
+openssl rand -out "$node_key" 32
+ABYSSAL_NODE_SIGNING_KEY_FILE="$node_key" \
+ABYSSAL_PUBLIC_URL=http://127.0.0.1:4020 \
+ABYSSAL_WEB_ORIGINS=http://localhost:4173 \
+  cargo run --package mirage-server
 ```
 
-Open `http://localhost:4173`, then enter `http://127.0.0.1:4020` as the node URL. Production Docker serves the exact signed web release archive from the relay root, so a URL such as `https://chat.example.com/` and the API use one origin. The relay mirrors its already verified release manifest and detached signature through fixed same-origin well-known endpoints; the browser verifies those bytes and every served asset before account entry. All relay responses combine `no-store` with `no-transform`, preventing a compliant CDN or reverse proxy from injecting analytics, challenge scripts, or other bytes into signed HTML. Leave `ABYSSAL_WEB_ORIGINS` empty for that deployment.
+Open `http://localhost:4173` and paste one emitted invite. Remove the disposable
+key after stopping the development relay. Production Docker serves the exact
+signed web release archive from the relay root, so a URL such as
+`https://chat.example.com/` and the API use one origin. The relay mirrors its
+already verified release manifest and detached signature through fixed
+same-origin well-known endpoints; the browser verifies those bytes and every
+served asset before account entry. All relay responses combine `no-store` with
+`no-transform`, preventing a compliant CDN or reverse proxy from injecting
+analytics, challenge scripts, or other bytes into signed HTML. Leave
+`ABYSSAL_WEB_ORIGINS` empty for that deployment.
 
 Web client behavior:
 
-- Account entry automatically creates an account for an unused code or logs into its existing RAM account. Each account request body is capped at 16 KiB; OPAQUE handshakes expire after 60 seconds and code attempts are rate-limited to six per minute.
+- Account entry automatically creates an account for an unused Invite Capsule capability or logs into its existing RAM account. Each account request body is capped at 16 KiB; OPAQUE handshakes expire after 60 seconds and capability attempts are rate-limited to six per minute.
 - Rooms, owner quotas, room media policy, live presence, encrypted messages, replies, read expiry, absolute expiry, GIFs, upload progress, images, videos, and explicit attachment downloads use the existing relay protocol. Dashboard room and DM entries never render message plaintext.
 - Web room names, usernames, message bubbles, reply previews, GIFs, attachment summaries, and decrypted media are visually blurred until pointer hover or keyboard focus. This is a shoulder-surfing control, not encryption or a browser screenshot defense.
 - Existing DMs are listed in the sidebar. Select any other account in `DIRECT` or the live presence rail to create/open the canonical pairwise conversation. The relay sends DM frames only to its two participants and rejects unauthorized joins and attachment requests.
@@ -172,13 +195,16 @@ Security-sensitive build inputs are pinned and checked: Rust `1.97.1`, Gradle `8
 
 ## Rust Server
 
-Run locally:
+Run locally from the repository root. Node identity is persistent
+infrastructure state; generate it once and do not rotate it during ordinary
+restart:
 
 ```bash
-cd mirage-server
+./deploy/generate-node-key.sh
 ABYSSAL_BIND_ADDR=0.0.0.0:4020 \
-ABYSSAL_NODE_ID=abyssal-node-1 \
-ABYSSAL_CODE_COUNT=8 \
+ABYSSAL_NODE_SIGNING_KEY_FILE=.secrets/node-signing.key \
+ABYSSAL_PUBLIC_URL=http://127.0.0.1:4020 \
+ABYSSAL_INVITE_COUNT=8 \
 ABYSSAL_ATTACHMENT_RAM_LIMIT_MB=512 \
 ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB=320 \
 ABYSSAL_ATTACHMENT_RECORD_LIMIT=16384 \
@@ -192,7 +218,7 @@ ABYSSAL_SESSION_INACTIVITY_MINUTES=15 \
 ABYSSAL_INACTIVITY_LIMIT_HOURS=0 \
 ABYSSAL_ALLOW_ANDROID_TO_WEB=false \
 ABYSSAL_ALLOW_WEB_TO_ANDROID=true \
-cargo run --release
+cargo run --release --package mirage-server
 ```
 
 Health check:
@@ -201,14 +227,32 @@ Health check:
 curl http://127.0.0.1:4020/health
 ```
 
-The server prints generated access codes once to attached stdout during boot. Each code has a random variable length of at least 12 characters including dashes, can create exactly one RAM-only account, and is never written to a relay file or Docker log. After printing, plaintext code buffers are zeroized and the relay retains only per-process HMAC identifiers; account, session, client, rate-limit, and room-owner maps never retain plaintext codes. Fixed invite codes cannot be supplied through environment variables. There are no administrator roles or privileged codes. Only one unexpired bearer session may exist for a code at a time. If the operator loses terminal output, codes are deliberately unrecoverable through supported interfaces; restarting the relay destroys all RAM state and creates a new set.
+The server prints each signed Invite Capsule once in `ABY1-...` and
+`abyssal:invite:...` form. Both encode the same 256-bit account-bootstrap
+capability, authenticated node identity, typed locator, protocol range, flags,
+and optional expiry. The relay never writes capsules to a file or Docker log;
+after printing, plaintext capability buffers are zeroized and only
+per-process HMAC identifiers remain in account state. A capability creates
+exactly one RAM-only account and can later log into that account while the
+relay remains alive. Only one unexpired bearer session may exist per account.
+Lost invites are deliberately unrecoverable; restarting destroys all RAM state
+and emits fresh capabilities while the separately backed-up node key preserves
+the node identity. There are no administrator roles or privileged invites.
+
+Read [Invite Capsule V1](docs/INVITE_CAPSULE_V1.md) for the interoperable wire,
+signature, text encoding, size-limit, locator, and failure specification.
 
 Every authenticated user can create rooms and trigger a relay RAM wipe. Rooms are owned by their creator: only that account can update or delete them. `ABYSSAL_MAX_ROOMS_PER_USER` limits each account's active rooms, and deleting an owned room releases one slot.
 
-This is an intentional availability tradeoff: a compromised account can wipe the relay and force destructive restart/code rotation. Keep active account sessions and the wipe confirmation protected.
+This is an intentional availability tradeoff: a compromised account can wipe the relay and force destructive restart/capability rotation. Keep active account sessions and the wipe confirmation protected.
 
 Security-related relay knobs:
 
+- `ABYSSAL_NODE_SIGNING_KEY_FILE`: required path to an exact 32-byte raw Ed25519 seed owned by the relay user with mode `0600`. This infrastructure identity is never printed.
+- `ABYSSAL_PUBLIC_URL`: required advertised locator embedded in signed capsules and the signed node descriptor. Production accepts HTTPS DNS hosts; HTTP is limited to typed loopback development hosts.
+- `ABYSSAL_INVITE_COUNT`: number of fresh account-bootstrap capsules emitted once at startup. Default: `5`; accepted range: `0` to `256` (the tracked production template uses `8`).
+- `ABYSSAL_INVITE_EXPIRY_HOURS`: optional registration deadline. `0` disables wall-clock expiry; values up to `8760` hours are enforced by both clients and relay.
+- `ABYSSAL_INVITE_PRINT_DELAY_MS`: brief attached-terminal delay before one-shot output. It is not a persistence or retrieval window.
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
 - `ABYSSAL_ATTACHMENT_ACCOUNT_LIMIT_MB`: per-account in-memory encrypted attachment quota, capped by the global RAM limit. Default: `320`.
 - `ABYSSAL_ATTACHMENT_RECORD_LIMIT`: global encrypted attachment-record quota. Default: `16384`; accepted range: `1` to `65536`.
@@ -230,7 +274,7 @@ The relay accepts transport-padded WebSocket dummy controls whose stripped domai
 
 Relay `ack_result` acceptance requires exactly one matching pending recipient frame and, for a leased first-contact frame, its matching lease, with the signed recipient state mutation and frame removal completed before the result is emitted.
 
-Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Registration also proves possession of the generated Ed25519 identity key over a fresh server challenge and the exact identity upload before the one-time code is consumed. Direct protocol v9 uses ChaCha20-Poly1305, recipient-specific authenticated Olm Double Ratchet envelopes, Ed25519 envelope/state signatures, bounded revision replay protection, and recipient-bound one-time-prekey leases. The relay receives ciphertext and signed public/state metadata, never message or attachment plaintext or ratchet secrets.
+Android and web use the same Rust core. Account creation/login uses OPAQUE, so the password is not sent as relay application data. Registration also proves possession of the generated Ed25519 identity key over a fresh server challenge and the exact identity upload before the one-time capability is consumed. Direct protocol v9 uses ChaCha20-Poly1305, recipient-specific authenticated Olm Double Ratchet envelopes, Ed25519 envelope/state signatures, bounded revision replay protection, and recipient-bound one-time-prekey leases. The relay receives ciphertext and signed public/state metadata, never message or attachment plaintext or ratchet secrets.
 
 Direct sender and recipient state is transactional. The relay atomically admits complete fanout, applies authenticated acknowledgement state, and finalizes a bounded RAM-only exact-frame receipt before attempting result delivery. Android and web retry only the identical serialized encrypted transaction for at most 30 seconds across a same-account reconnect. An exact duplicate replays the original terminal result without repeating fanout or mutation; changed bytes under the same account, operation, conversation, and message identity invalidate the connection. Capacity or recovery-deadline exhaustion fails closed. First-contact lease requests are not treated as recoverable mutations, and clients release only leases definitely known to be unused. `message_result`, `ack_result`, `mls_room_result`, and `mls_snapshot_result` prove relay delivery/state durability, not that a human read a message.
 
@@ -242,15 +286,27 @@ This room protocol is not a Signal-grade claim. The selected RustCrypto MLS prov
 
 ## Docker
 
-The relay can run cleanly in Docker. The production build compiles the Rust relay and extracts the already verified signed web archive; it never rebuilds browser source. The minimal runtime image contains those exact static bytes and the compiled relay; the relay binary performs its own loopback health check without `curl` or a package-manager install. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, disabled core dumps, and no database volume. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, which already accounts for stored blobs and in-flight upload/download references, plus runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host. Attachment uploads have a 30-second idle deadline and a 10-minute total deadline, while stalled download producers release their buffers and permits after 30 seconds. Automatic restart is deliberately disabled: a crash must remain visible, because restarting creates a new invite-code set that is only recoverable from the operator's attached stdout.
+The relay can run cleanly in Docker. The production build compiles the Rust relay and extracts the already verified signed web archive; it never rebuilds browser source. The minimal runtime image contains those exact static bytes and the compiled relay; the relay binary performs its own loopback health check without `curl` or a package-manager install. It runs as a non-root user with a read-only filesystem, bounded memory/PIDs, disabled Docker log persistence, disabled core dumps, and no database volume. The only mounted state is the read-only node signing key, which is persistent infrastructure identity rather than account/chat state. Compose binds `4020` to loopback so a local Cloudflare tunnel or reverse proxy can reach it without exposing plaintext HTTP publicly. The Compose memory default is `2g` to leave headroom for the 512 MiB global attachment pool, which already accounts for stored blobs and in-flight upload/download references, plus runtime overhead; set `ABYSSAL_CONTAINER_MEMORY_LIMIT` before `docker compose` when sizing a different host. Attachment uploads have a 30-second idle deadline and a 10-minute total deadline, while stalled download producers release their buffers and permits after 30 seconds. Automatic restart is deliberately disabled: a crash must remain visible, because restarting creates fresh one-shot capabilities that exist only in the attached stdout.
 
-Docker is the supported launcher. A systemd unit is intentionally not shipped: journald would persist one-time startup codes and relay metadata, while a hidden restart could generate an unrecoverable fresh code set. Keep Docker's `none` log driver and disabled automatic restart unchanged.
+Docker is the supported launcher. A systemd unit is intentionally not shipped: journald would persist one-time startup invites and relay metadata, while a hidden restart could generate an unrecoverable fresh capability set. Keep Docker's `none` log driver and disabled automatic restart unchanged.
 
 ```bash
+./deploy/generate-node-key.sh
 cp mirage-server/.env.example mirage-server/.env
 $EDITOR mirage-server/.env
 ./deploy/server-start.sh
 curl http://127.0.0.1:4020/health
+```
+
+Set `ABYSSAL_PUBLIC_URL` to the exact public HTTPS origin before start. Back up
+`.secrets/node-signing.key` separately with owner-only access; losing it changes
+the node identity and invalidates every previously shared invite. The key
+generator refuses to overwrite or rotate an existing key. To render a copied
+manual/deep-link invite as a terminal QR without placing it in the process
+argument list:
+
+```bash
+printf '%s\n' "$INVITE" | ./deploy/render-invite-qr.sh
 ```
 
 The public health response contains only liveness, node identity, and the RAM-only storage label; invite and account counts are not exposed.
@@ -261,7 +317,7 @@ Stop it:
 docker compose -f deploy/docker-compose.yml down
 ```
 
-Do not put production codes in the Dockerfile. Configure only counts and node settings in `.env` or your server secret manager. The process prints codes once to attached stdout. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs. Terminal scrollback is the operator's only copy and must be protected or cleared after distribution.
+Do not put production capsules, capabilities, or the private node key in the Dockerfile or `.env`. Configure only issuance policy, the public locator, and the mounted key path. The process prints capsules once to attached stdout. The supplied Compose file uses Docker's `none` log driver, so startup credentials are not retained in host container logs. Terminal scrollback is the operator's only copy and must be protected or cleared after distribution.
 
 ## Remote Docker Deploy
 
@@ -323,8 +379,12 @@ manifest validity and revocation state, exact committed `HEAD`, and the archive'
 name, size, and SHA-256 digest. It then stages only that verified archive inside
 the clean committed snapshot. Docker extracts it without rebuilding the browser
 bundle. The first deploy creates `mirage-server/.env` from the tracked template
-with mode `600`. Later syncs preserve that file and its node-specific settings.
-Review it on the server before issuing production invite codes.
+with mode `600`. The template deliberately leaves `ABYSSAL_PUBLIC_URL` empty,
+so startup fails until the operator configures the real HTTPS origin. The
+remote `.secrets/` directory is excluded from rsync and must be initialized
+once on the server with `./deploy/generate-node-key.sh`; later syncs preserve
+both the key and `.env`. Back up only the key through a separate secure channel.
+Review the configuration before issuing production Invite Capsules.
 
 Run that command from your local machine, not from inside the server shell. It uses SSH and rsync to reach the configured remote host.
 
@@ -340,7 +400,7 @@ If you are already SSH'd into the server at `/home/ubuntu/abyssal`, use the serv
 `server-logs.sh` is a compatibility alias for the status/health check. The
 Compose service uses Docker's `none` log driver, so there are no persistent
 container logs to retrieve. Keep the startup terminal attached when rotating
-invite codes.
+account-bootstrap capabilities.
 
 Run only the sync:
 
@@ -370,15 +430,15 @@ Check container status and the built-in health probe without persistent logs:
 Despite its historical name, `logs-docker.sh` reports `docker compose ps` and
 the container/health state through `server-status.sh`; it never attempts to
 read Docker logs. A failing status means the operator must inspect the
-attached startup terminal, not recover codes from a log store.
+attached startup terminal, not recover invites from a log store.
 
-Invite codes cannot be retrieved after startup. This command explains the destructive recovery path and exits:
+Invite Capsules cannot be retrieved after startup. This command explains the destructive recovery path and exits:
 
 ```bash
 ./deploy/invite-codes.sh
 ```
 
-To generate new codes, restart the relay. This destroys all accounts, rooms, pending messages, attachments, and sessions:
+To generate new capabilities, restart the relay. This destroys all accounts, rooms, pending messages, attachments, and sessions but retains node identity through the configured key:
 
 ```bash
 ./deploy/restart-docker.sh
@@ -419,8 +479,9 @@ before any network connection.
 On Ubuntu ARM64, including Oracle Ampere instances, install Docker Engine with
 the Compose plugin and use the signed-archive deployment flow above. Do not
 rebuild the browser bundle manually on the relay. Put Cloudflare Tunnel, Caddy,
-or Nginx in front of private port `4020` with HTTPS/WSS. The Android app derives
-`wss://.../v1/ws` from the user-entered `https://...` node URL.
+or Nginx in front of private port `4020` with HTTPS/WSS. Android and web select
+the authenticated HTTPS locator from the Invite Capsule and derive the API and
+WebSocket endpoints without a user-entered node URL.
 
 ## License
 

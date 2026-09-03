@@ -59,59 +59,15 @@ fn attachment_limits_budget_fixed_authenticated_chunks() {
 }
 
 #[test]
-fn generated_codes_are_at_least_minimum_length() {
-    let mut rng = OsRng;
-    for len in 12..=20 {
-        let code = generate_code(&mut rng, len);
-        assert_eq!(len, code.len());
-        assert!(valid_code_shape(&code));
-    }
-}
-
-#[test]
-fn generated_code_lengths_are_unique() {
-    let mut codes = HashSet::new();
-    let mut lengths = HashSet::new();
-    generate_codes(&mut codes, &mut lengths, 11, 12, 24);
-
-    let unique_lengths = codes.iter().map(|code| code.len()).collect::<HashSet<_>>();
-    assert_eq!(codes.len(), unique_lengths.len());
-}
-
-#[test]
-fn boot_code_writer_flushes_only_the_one_time_startup_output() {
-    let codes = vec!["ABCD-12345678".to_string(), "XYZ-123456789".to_string()];
-    let mut output = Vec::new();
-    write_boot_codes(&mut output, &codes).expect("startup output writes");
-    let output = String::from_utf8(output).expect("startup output is utf8");
-    assert!(output.starts_with("ABYSSAL RAM-ONLY ACCESS CODES"));
-    assert!(output.contains("ABYSSAL_CODE code=ABCD-12345678"));
-    assert!(output.contains("ABYSSAL_CODE code=XYZ-123456789"));
-}
-
-#[test]
 fn invite_code_ids_are_keyed_and_do_not_embed_plaintext() {
-    let code = "ABYS-PRIVATE-0001";
-    let first = derive_code_id(&[1_u8; 32], code);
-    let repeated = derive_code_id(&[1_u8; 32], code);
-    let different_process = derive_code_id(&[2_u8; 32], code);
+    let capability = [3_u8; 32];
+    let first = derive_code_id(&[1_u8; 32], capability);
+    let repeated = derive_code_id(&[1_u8; 32], capability);
+    let different_process = derive_code_id(&[2_u8; 32], capability);
 
     assert_eq!(first, repeated);
     assert_ne!(first, different_process);
-    assert!(!first
-        .windows(code.len())
-        .any(|window| window == code.as_bytes()));
-}
-
-#[test]
-fn code_parser_accepts_variable_lengths() {
-    assert!(valid_code_shape("ABCD-1234-WXYZ"));
-    assert!(valid_code_shape("ABC-12345678"));
-    assert!(!valid_code_shape("SHORT-1"));
-    assert!(!valid_code_shape("-ABCD12345678"));
-    assert!(!valid_code_shape("ABCD12345678-"));
-    assert!(!valid_code_shape("ABCD_12345678"));
-    assert!(!valid_code_shape(&"A".repeat(MAX_CODE_BYTES + 1)));
+    assert_ne!(first, capability);
 }
 
 #[test]
@@ -196,6 +152,27 @@ async fn unknown_code_flood_cannot_consume_known_code_limiter_capacity() {
 }
 
 #[tokio::test]
+async fn expired_capability_is_removed_before_account_bootstrap() {
+    let state = test_state();
+    let capability = [0x31_u8; 32];
+    let code_id = derive_code_id(&state.invite_code_pepper[..], capability);
+    state.available_codes.lock().await.insert(code_id);
+    state
+        .capability_expiries
+        .lock()
+        .await
+        .insert(code_id, (now_ms() / 1_000).saturating_sub(1));
+
+    assert!(!known_code_id(&state, &code_id).await);
+    assert!(!state.available_codes.lock().await.contains(&code_id));
+    assert!(!state
+        .capability_expiries
+        .lock()
+        .await
+        .contains_key(&code_id));
+}
+
+#[tokio::test]
 async fn opaque_handshakes_are_bounded_in_ram() {
     let state = test_state();
     let first_id = Uuid::new_v4();
@@ -236,13 +213,13 @@ async fn opaque_handshakes_are_bounded_in_ram() {
 #[tokio::test]
 async fn global_wipe_serializes_with_opaque_start_and_clears_new_handshake() {
     let state = test_state();
-    let code = "ABCD-12345678";
-    let code_id = derive_code_id(&state.invite_code_pepper[..], code);
+    let capability = [4_u8; 32];
+    let code_id = derive_code_id(&state.invite_code_pepper[..], capability);
     state.available_codes.lock().await.insert(code_id);
     let opaque = abyssal_core::secure_protocol::opaque_client_start(b"correct-password".to_vec())
         .expect("opaque start");
     let request = OpaqueAccountStartRequest {
-        code: code.to_string(),
+        capability_b64: URL_SAFE_NO_PAD.encode(capability),
         registration_request_b64: URL_SAFE_NO_PAD.encode(opaque.registration_request),
         credential_request_b64: URL_SAFE_NO_PAD.encode(opaque.credential_request),
     };
@@ -280,15 +257,15 @@ async fn global_wipe_serializes_with_opaque_start_and_clears_new_handshake() {
 #[tokio::test]
 async fn global_wipe_serializes_with_opaque_finish_and_clears_new_account() {
     let state = test_state();
-    let code = "ABCD-12345678";
-    let code_id = derive_code_id(&state.invite_code_pepper[..], code);
+    let capability = [4_u8; 32];
+    let code_id = derive_code_id(&state.invite_code_pepper[..], capability);
     state.available_codes.lock().await.insert(code_id);
     let opaque = abyssal_core::secure_protocol::opaque_client_start(b"correct-password".to_vec())
         .expect("opaque start");
     let registration_response = opaque_server_registration_response(
         &state.opaque_setup,
         &opaque.registration_request,
-        code.as_bytes(),
+        &account_context_v1(&state.node_public_key, &capability),
     )
     .expect("registration response");
     let registration = abyssal_core::secure_protocol::opaque_client_finish_registration(
@@ -2258,7 +2235,7 @@ async fn invalid_account_handshakes_do_not_refresh_dead_man_activity() {
     let _ = start_opaque_account(
         State(state.clone()),
         Json(OpaqueAccountStartRequest {
-            code: "not-a-code".to_string(),
+            capability_b64: "not-a-capability".to_string(),
             registration_request_b64: String::new(),
             credential_request_b64: String::new(),
         }),
@@ -3134,6 +3111,30 @@ async fn release_material_endpoints_are_absent_until_install_and_serve_exact_byt
         .await
         .expect("signature response body");
     assert_eq!(body.as_ref(), &[3; 64]);
+}
+
+#[tokio::test]
+async fn node_descriptor_endpoint_serves_exact_non_cacheable_cbor() {
+    let state = test_state();
+    let expected = state.node_descriptor.as_ref().clone();
+    let response = node_descriptor_endpoint(State(state)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/cbor"))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    assert_eq!(
+        response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+        Some(&HeaderValue::from_static("nosniff"))
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("node descriptor response body");
+    assert_eq!(body.as_ref(), expected.as_slice());
 }
 
 #[tokio::test]
@@ -5066,6 +5067,106 @@ async fn registration_identity_proof_accepts_once_and_replay_fails() {
     .await
     .into_response();
     assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn concurrent_registration_finishes_consume_capability_exactly_once() {
+    let state = test_state();
+    let capability = [0x42_u8; 32];
+    let code_id = derive_code_id(&state.invite_code_pepper[..], capability);
+    state.available_codes.lock().await.insert(code_id);
+    let password = b"correct horse battery staple".to_vec();
+    let opaque = abyssal_core::secure_protocol::opaque_client_start(password.clone())
+        .expect("OPAQUE client start");
+    let response = opaque_server_registration_response(
+        &state.opaque_setup,
+        &opaque.registration_request,
+        &account_context_v1(&state.node_public_key, &capability),
+    )
+    .expect("OPAQUE server response");
+    let finish = abyssal_core::secure_protocol::opaque_client_finish_registration(
+        password,
+        opaque.registration_state,
+        response,
+    )
+    .expect("OPAQUE client finish");
+    let identity =
+        abyssal_core::secure_protocol::E2eeSession::create(vec![74; 64]).expect("identity");
+    let public = identity.public_key();
+    let prekey_id = identity.prekey_id();
+    let envelope = identity
+        .seal_identity(vec![74; 64], b"registration-context".to_vec())
+        .expect("identity envelope");
+
+    let make_request = |handshake_id: Uuid, challenge: Vec<u8>| {
+        let proof = identity
+            .sign_registration_identity_proof(
+                state.node_id.clone(),
+                handshake_id.to_string(),
+                challenge,
+                finish.registration_upload.clone(),
+                public.clone(),
+                prekey_id.clone(),
+                envelope.clone(),
+            )
+            .expect("identity proof");
+        OpaqueAccountFinishRequest {
+            handshake_id,
+            registration_upload_b64: Some(URL_SAFE_NO_PAD.encode(&finish.registration_upload)),
+            credential_finalization_b64: None,
+            identity_public_b64: Some(URL_SAFE_NO_PAD.encode(&public)),
+            identity_prekey_id: Some(prekey_id.clone()),
+            identity_envelope_b64: Some(URL_SAFE_NO_PAD.encode(&envelope)),
+            identity_proof_b64: Some(URL_SAFE_NO_PAD.encode(proof)),
+        }
+    };
+
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let first_challenge = vec![19; REGISTRATION_CHALLENGE_BYTES_V9];
+    let second_challenge = vec![20; REGISTRATION_CHALLENGE_BYTES_V9];
+    state.opaque_handshakes.lock().await.extend([
+        (
+            first_id,
+            OpaqueHandshake::Registration {
+                code_id,
+                challenge: Zeroizing::new(first_challenge.clone()),
+                created_at_ms: now_ms(),
+            },
+        ),
+        (
+            second_id,
+            OpaqueHandshake::Registration {
+                code_id,
+                challenge: Zeroizing::new(second_challenge.clone()),
+                created_at_ms: now_ms(),
+            },
+        ),
+    ]);
+    let first = make_request(first_id, first_challenge);
+    let second = make_request(second_id, second_challenge);
+
+    let (first_response, second_response) = tokio::join!(
+        finish_opaque_account(State(state.clone()), Json(first)),
+        finish_opaque_account(State(state.clone()), Json(second)),
+    );
+    let statuses = [
+        first_response.into_response().status(),
+        second_response.into_response().status(),
+    ];
+    assert_eq!(
+        statuses.iter().filter(|status| status.is_success()).count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+    assert_eq!(state.accounts.lock().await.len(), 1);
+    assert!(!state.available_codes.lock().await.contains(&code_id));
 }
 
 #[tokio::test]
@@ -8566,6 +8667,8 @@ async fn pending_android_ciphertext_is_not_delivered_to_a_web_connection() {
 fn test_state() -> AppState {
     AppState {
         node_id: "test-node".to_string(),
+        node_public_key: [6_u8; 32],
+        node_descriptor: Arc::new(vec![1]),
         release_admission: Arc::new(ReleaseAdmissionStore::ready_for_tests()),
         attachment_ram_limit_bytes: 8 * 1024 * 1024,
         attachment_account_limit_bytes: 4 * 1024 * 1024,
@@ -8585,8 +8688,9 @@ fn test_state() -> AppState {
         opaque_setup: Arc::new(Zeroizing::new(opaque_server_setup())),
         opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
         invite_code_pepper: Arc::new(Zeroizing::new([7_u8; 32])),
-        boot_codes: Arc::new(Mutex::new(None)),
+        boot_invites: Arc::new(Mutex::new(None)),
         available_codes: Arc::new(Mutex::new(HashSet::new())),
+        capability_expiries: Arc::new(Mutex::new(HashMap::new())),
         accounts: Arc::new(Mutex::new(HashMap::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         ws_tickets: Arc::new(Mutex::new(HashMap::new())),

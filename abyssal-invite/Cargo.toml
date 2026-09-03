@@ -1,0 +1,17 @@
+[package]
+name = "abyssal-invite"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+base64 = "=0.23.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["rand_core", "std", "zeroize"] }
+rand = "0.8"
+sha2 = "0.11"
+thiserror = "1"
+url = "2"
+zeroize = { version = "1.7", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

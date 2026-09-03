@@ -7,6 +7,8 @@ import {
   initSync,
   opaqueClientFinishRegistration,
   opaqueClientStart,
+  parseInviteCapsule,
+  verifyInviteNodeDescriptor,
   WasmE2eeSession,
 } from "../apps/web/src/generated/abyssal_core/abyssal_core.js";
 
@@ -18,12 +20,12 @@ initSync({
 });
 
 const baseUrl = process.env.ABYSSAL_TEST_BASE_URL;
-const aliceCode = process.env.ABYSSAL_TEST_CODE_A;
-const bobCode = process.env.ABYSSAL_TEST_CODE_B;
+const aliceInvite = process.env.ABYSSAL_TEST_INVITE_A;
+const bobInvite = process.env.ABYSSAL_TEST_INVITE_B;
 const buildSignatureB64 = process.env.ABYSSAL_TEST_BUILD_SIGNATURE_B64;
 assert.ok(baseUrl, "ABYSSAL_TEST_BASE_URL is required");
-assert.ok(aliceCode, "ABYSSAL_TEST_CODE_A is required");
-assert.ok(bobCode, "ABYSSAL_TEST_CODE_B is required");
+assert.ok(aliceInvite, "ABYSSAL_TEST_INVITE_A is required");
+assert.ok(bobInvite, "ABYSSAL_TEST_INVITE_B is required");
 assert.match(buildSignatureB64 ?? "", /^[A-Za-z0-9_-]{86}$/);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -676,8 +678,41 @@ function waitForFrame(socket, predicate) {
   });
 }
 
-async function register(code, password) {
+function parseIntegrationInvite(invite) {
+  const parsed = parseInviteCapsule(
+    invite,
+    BigInt(Math.floor(Date.now() / 1000)),
+    true,
+  );
+  assert.equal(parsed.node_url, baseUrl);
+  assert.equal(parsed.capability.length, 32);
+  assert.equal(parsed.account_context.length, 32);
+  assert.equal(parsed.node_public_key.length, 32);
+  return parsed;
+}
+
+async function verifyIntegrationNode(parsed) {
+  const response = await fetch(`${parsed.node_url}/v1/node`, {
+    method: "GET",
+    cache: "no-store",
+    credentials: "omit",
+    redirect: "error",
+    headers: { accept: "application/cbor" },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/cbor");
+  const descriptor = new Uint8Array(await response.arrayBuffer());
+  try {
+    assert.ok(descriptor.byteLength > 0 && descriptor.byteLength <= 1024);
+    verifyInviteNodeDescriptor(descriptor, new Uint8Array(parsed.node_public_key), parsed.node_url);
+  } finally {
+    descriptor.fill(0);
+  }
+}
+
+async function register(invite, password) {
   const passwordBytes = encoder.encode(password);
+  const parsed = parseIntegrationInvite(invite);
   let opaque;
   let identity;
   let context = new Uint8Array(0);
@@ -694,7 +729,7 @@ async function register(code, password) {
   try {
     opaque = JSON.parse(opaqueClientStart(passwordBytes));
     const startRequest = {
-      code,
+      capability_b64: encode(parsed.capability),
       registration_request_b64: encode(opaque.registration_request),
       credential_request_b64: encode(opaque.credential_request),
     };
@@ -725,7 +760,8 @@ async function register(code, password) {
     exportKey = new Uint8Array(finished.export_key);
     registrationUpload = new Uint8Array(finished.registration_upload);
     identity = WasmE2eeSession.create(exportKey);
-    context = encoder.encode(`ABYSSAL_IDENTITY_V2:${start.node_id}:${code.toUpperCase()}`);
+    assert.equal(start.node_id, parsed.node_id);
+    context = new Uint8Array(parsed.account_context);
     identityPublic = identity.publicKey();
     assert.equal(identityPublic.byteLength, IDENTITY_PUBLIC_BYTES_V9);
     const identityPrekeyId = identity.prekeyId();
@@ -785,10 +821,14 @@ async function register(code, password) {
       opaque.login_state.fill(0);
       opaque.credential_request.fill(0);
     }
+    parsed.capability.fill(0);
+    parsed.account_context.fill(0);
+    parsed.node_public_key.fill(0);
   }
 }
 
-async function opaqueStartStatus(code, password) {
+async function opaqueStartStatus(invite, password) {
+  const parsed = parseIntegrationInvite(invite);
   const passwordBytes = encoder.encode(password);
   const opaque = JSON.parse(opaqueClientStart(passwordBytes));
   passwordBytes.fill(0);
@@ -797,7 +837,7 @@ async function opaqueStartStatus(code, password) {
     cache: "no-store",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      code,
+      capability_b64: encode(parsed.capability),
       registration_request_b64: encode(opaque.registration_request),
       credential_request_b64: encode(opaque.credential_request),
     }),
@@ -806,6 +846,9 @@ async function opaqueStartStatus(code, password) {
   opaque.registration_request.fill(0);
   opaque.login_state.fill(0);
   opaque.credential_request.fill(0);
+  parsed.capability.fill(0);
+  parsed.account_context.fill(0);
+  parsed.node_public_key.fill(0);
   return response.status;
 }
 
@@ -2069,10 +2112,15 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
   }
 }
 
-const alice = await register(aliceCode, "alice-password");
-const bob = await register(bobCode, "bob-password");
-assert.equal(await opaqueStartStatus(aliceCode, "alice-password"), 409);
-assert.equal(await opaqueStartStatus(aliceCode, "other-password"), 409);
+const aliceParsed = parseIntegrationInvite(aliceInvite);
+await verifyIntegrationNode(aliceParsed);
+aliceParsed.capability.fill(0);
+aliceParsed.account_context.fill(0);
+aliceParsed.node_public_key.fill(0);
+const alice = await register(aliceInvite, "alice-password");
+const bob = await register(bobInvite, "bob-password");
+assert.equal(await opaqueStartStatus(aliceInvite, "alice-password"), 409);
+assert.equal(await opaqueStartStatus(aliceInvite, "other-password"), 409);
 
 await expectBuildAdmissionRejected(alice);
 const aliceTicket = await requestWsTicket(alice);

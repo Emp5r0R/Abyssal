@@ -84,6 +84,22 @@ The web builder bakes the signed build identity into JavaScript and `/build-id.j
 
 ## Deploy relay
 
+Provision the relay's stable node identity once on the deployment host, then
+set its advertised HTTPS locator. This key is separate from release provenance
+and Android signing keys; it remains on the relay host and must be backed up
+through a separate secure path:
+
+```bash
+cd /home/ubuntu/abyssal
+./deploy/generate-node-key.sh
+cp mirage-server/.env.example mirage-server/.env
+$EDITOR mirage-server/.env  # set ABYSSAL_PUBLIC_URL=https://exact-origin
+chmod 600 mirage-server/.env .secrets/node-signing.key
+```
+
+The generator refuses to replace an existing key. Source synchronization
+excludes and preserves both `.secrets/` and `mirage-server/.env`.
+
 From a clean checkout whose `HEAD` has exactly one canonical
 `vMAJOR.MINOR.PATCH` tag, the default deployment path needs no local artifact
 paths:
@@ -114,7 +130,7 @@ ABYSSAL_WEB_RELEASE_ARCHIVE=/secure/release-output/abyssal-web-VERSION.tar.gz \
 curl --fail https://chat.example.com/health
 ```
 
-Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh startup codes appeared once in the attached deployment terminal. Codes must not exist in Docker logs, relay files, or environment configuration. Confirm public responses preserve both `no-store` and `no-transform`; CDN analytics or challenge injection changes signed HTML and must remain disabled. The public health response exposes only liveness, node identity, and the RAM-only storage label; there is deliberately no code-retrieval workflow. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments. Docker automatic restart must remain disabled because an unattended restart rotates the unrecoverable one-time code set.
+Confirm the container is healthy, the public endpoint is HTTPS, port `4020` is not publicly exposed, and fresh signed Invite Capsules appeared once in the attached deployment terminal. Capsules and capabilities must not exist in Docker logs, relay files, or environment configuration. Fetch `/v1/node` and confirm that its node ID/fingerprint matches the expected persistent node identity. Confirm public responses preserve both `no-store` and `no-transform`; CDN analytics or challenge injection changes signed HTML and must remain disabled. The public health response exposes only liveness, node identity, and the RAM-only storage label; there is deliberately no capsule-retrieval workflow. A restart intentionally destroys all prior accounts, sessions, rooms, pending frames, and attachments while the separately mounted key preserves node identity. Docker automatic restart must remain disabled because an unattended restart rotates the unrecoverable one-time capability set.
 
 Before any rsync, the sync helper verifies the offline-root signature, canonical
 manifest validity window, current web build and revocation state, exact
@@ -124,11 +140,12 @@ build extracts those exact web bytes and never rebuilds the browser bundle from
 source. The helper explicitly protects the remote relay `.env` and excludes
 local signing credentials even if future ignore rules change. If the relay
 environment is missing on a first deployment, the restart helper installs the
-tracked template with mode `600`; review that file before distributing its
-generated invite codes.
+tracked template with mode `600`; startup deliberately fails until a real
+`ABYSSAL_PUBLIC_URL` and the owner-only node key exist. Review both before
+distributing generated Invite Capsules.
 
 `restart-docker.sh` is a separate remote rebuild/restart operation. It never
 downloads release assets and has no signing-key dependency; it recreates the
 container from the already staged verified archive. Restarting the relay
 intentionally destroys its RAM-only accounts, sessions, rooms, pending frames,
-attachments, and invite-code set.
+attachments, and capability set while retaining the configured node identity.

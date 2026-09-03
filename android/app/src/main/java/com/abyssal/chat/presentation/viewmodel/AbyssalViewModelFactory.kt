@@ -8,8 +8,10 @@ import com.abyssal.chat.data.network.EncryptedAttachmentService
 import com.abyssal.chat.data.network.AndroidBuildAttestationProvider
 import com.abyssal.chat.data.network.GitHubReleaseUpdateService
 import com.abyssal.chat.data.network.InMemoryNodeConfigService
+import com.abyssal.chat.data.network.InviteBootstrapService
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.data.network.NetworkIdentityService
+import com.abyssal.chat.data.network.PublicNodeDns
 import com.abyssal.chat.data.network.RealChatTransport
 import com.abyssal.chat.data.repository.AndroidDisguiseManager
 import com.abyssal.chat.data.repository.InMemoryMessageRepository
@@ -26,8 +28,9 @@ class AbyssalViewModelFactory(
             error("Unsupported ViewModel: ${modelClass.name}")
         }
 
+        val nodeDns = PublicNodeDns(allowDevelopmentLoopback = BuildConfig.DEBUG, delegate = Dns.SYSTEM)
         val nodeHttpClient = OkHttpClient.Builder()
-            .dns(Dns.SYSTEM)
+            .dns(nodeDns)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
@@ -38,7 +41,7 @@ class AbyssalViewModelFactory(
             .cache(null)
             .build()
         val nodeWebSocketClient = OkHttpClient.Builder()
-            .dns(Dns.SYSTEM)
+            .dns(nodeDns)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
@@ -54,6 +57,11 @@ class AbyssalViewModelFactory(
             .callTimeout(11, TimeUnit.MINUTES)
             .build()
         val nodeConfigService = InMemoryNodeConfigService()
+        val inviteBootstrapService = InviteBootstrapService(
+            client = nodeHttpClient,
+            nodeConfigService = nodeConfigService,
+            allowDevelopmentLoopback = BuildConfig.DEBUG
+        )
         val payloadCipher = InMemoryPayloadCipher()
         val identityService = NetworkIdentityService(nodeHttpClient, payloadCipher)
         val messageRepository = InMemoryMessageRepository()
@@ -83,6 +91,7 @@ class AbyssalViewModelFactory(
         return ChatViewModel(
             identityService = identityService,
             nodeConfigService = nodeConfigService,
+            inviteBootstrapService = inviteBootstrapService,
             messageRepository = messageRepository,
             messageSender = messageRepository,
             chatTransport = chatTransport,

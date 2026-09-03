@@ -240,7 +240,7 @@ export function AppShell({
             </>
           }
         >
-          <div className="destructive-summary"><ShieldAlert size={26} /><span>Relay restart or new access codes required after wipe.</span></div>
+          <div className="destructive-summary"><ShieldAlert size={26} /><span>Relay restart and new invite capsules are required after wipe.</span></div>
         </Dialog>
       ) : null}
     </main>

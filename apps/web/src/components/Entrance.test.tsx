@@ -20,11 +20,10 @@ describe("account entrance secret lifetime", () => {
     const signal = document.querySelector(".entrance-signal");
     expect(signal).toHaveClass("abyssal-mark-loader", "abyssal-mark-loader-large");
     expect(signal?.querySelectorAll(":scope > span")).toHaveLength(4);
-    fireEvent.change(screen.getByLabelText("Node URL"), {
-      target: { value: "https://node.example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Invite code"), {
-      target: { value: "ABYS-INVITE-1234" },
+    expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("maxlength", "2048");
+    expect(screen.getByLabelText("Password")).toHaveAttribute("maxlength", "128");
+    fireEvent.change(screen.getByLabelText("Abyssal invite"), {
+      target: { value: "fixture-invite" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },
@@ -49,11 +48,8 @@ describe("account entrance secret lifetime", () => {
     const onLogin = vi.fn(async () => ({}) as never);
 
     render(<Entrance onLogin={onLogin} onPreflight={onPreflight} />);
-    fireEvent.change(screen.getByLabelText("Node URL"), {
-      target: { value: "https://node.example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Invite code"), {
-      target: { value: "ABYS-INVITE-1234" },
+    fireEvent.change(screen.getByLabelText("Abyssal invite"), {
+      target: { value: "fixture-invite" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },
@@ -70,11 +66,8 @@ describe("account entrance secret lifetime", () => {
     const onLogin = vi.fn(async () => ({}) as never);
 
     render(<Entrance onLogin={onLogin} onPreflight={onPreflight} />);
-    fireEvent.change(screen.getByLabelText("Node URL"), {
-      target: { value: "https://node.example.test" },
-    });
-    fireEvent.change(screen.getByLabelText("Invite code"), {
-      target: { value: "ABYS-INVITE-1234" },
+    fireEvent.change(screen.getByLabelText("Abyssal invite"), {
+      target: { value: "fixture-invite" },
     });
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },

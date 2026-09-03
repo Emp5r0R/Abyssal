@@ -4,8 +4,9 @@ services:
       context: ..
       dockerfile: mirage-server/Dockerfile
     image: mirage-server:latest
+    user: "${ABYSSAL_CONTAINER_UID:-10001}:${ABYSSAL_CONTAINER_GID:-10001}"
     # A crash must stay visible to the operator. Automatic restart would
-    # generate a fresh invite-code set while the none log driver discards it.
+    # generate a fresh capability set while the none log driver discards it.
     restart: "no"
     init: true
     stop_grace_period: 10s
@@ -21,7 +22,8 @@ services:
         required: false
     environment:
       ABYSSAL_BIND_ADDR: 0.0.0.0:4020
-      ABYSSAL_CODE_PRINT_DELAY_MS: 4000
+    volumes:
+      - ../.secrets/node-signing.key:/run/secrets/abyssal-node-signing-key:ro
     ports:
       - "127.0.0.1:4020:4020"
     read_only: true

@@ -6,11 +6,13 @@ version = 4
 name = "abyssal-core"
 version = "0.1.0"
 dependencies = [
+ "abyssal-invite",
  "base64 0.23.1",
  "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hkdf 0.13.0",
+ "js-sys",
  "mls-rs",
  "mls-rs-core",
  "mls-rs-crypto-rustcrypto",
@@ -24,6 +26,20 @@ dependencies = [
  "uniffi",
  "vodozemac",
  "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
+name = "abyssal-invite"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "rand 0.8.7",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 1.0.69",
+ "url",
  "zeroize",
 ]
 
@@ -1475,16 +1491,19 @@ name = "mirage-server"
 version = "0.1.0"
 dependencies = [
  "abyssal-core",
+ "abyssal-invite",
  "axum",
  "base64 0.23.1",
  "ed25519-dalek",
  "futures-util",
  "hmac 0.13.0",
+ "libc",
  "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tower-http 0.5.2",
  "tracing",

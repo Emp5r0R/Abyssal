@@ -28,6 +28,7 @@ pub(super) fn router(state: AppState) -> Router {
     let web_origins = state.web_origins.clone();
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/v1/node", get(node_descriptor_endpoint))
         .route(
             release_admission::RELEASE_MANIFEST_ENDPOINT,
             get(release_manifest_endpoint),
@@ -72,6 +73,19 @@ pub(super) fn router(state: AppState) -> Router {
         );
     }
     app.layer(middleware::from_fn(security_headers))
+}
+
+pub(super) async fn node_descriptor_endpoint(State(state): State<AppState>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/cbor"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Body::from(state.node_descriptor.as_ref().clone()),
+    )
+        .into_response()
 }
 
 pub(super) async fn api_not_found() -> StatusCode {

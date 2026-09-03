@@ -130,11 +130,18 @@ pub(super) async fn start_opaque_account(
 ) -> impl IntoResponse {
     let _account_guard = state.account_ops.lock().await;
     prune_opaque_handshakes(&state).await;
-    let code = match normalize_code(&request.code) {
-        Ok(code) => Zeroizing::new(code),
+    let capability = match decode_exact(&request.capability_b64, 32) {
+        Ok(value) => Zeroizing::new(value),
         Err(_) => return opaque_start_error(StatusCode::BAD_REQUEST, &state),
     };
-    let code_id = derive_code_id(&state.invite_code_pepper[..], &code);
+    let code_id = derive_code_id(&state.invite_code_pepper[..], capability.as_slice());
+    let mut capability_array = [0_u8; 32];
+    capability_array.copy_from_slice(&capability);
+    let account_context = Zeroizing::new(account_context_v1(
+        &state.node_public_key,
+        &capability_array,
+    ));
+    capability_array.zeroize();
     // Unknown HMAC IDs must not allocate limiter entries. Otherwise an
     // attacker can fill the bounded map with random codes and deny real
     // invite holders even though every request is rejected.
@@ -159,7 +166,7 @@ pub(super) async fn start_opaque_account(
             &state.opaque_setup,
             &account.password_file,
             request_bytes.as_slice(),
-            code.as_bytes(),
+            account_context.as_slice(),
         ) {
             Ok(result) => result,
             Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
@@ -205,7 +212,7 @@ pub(super) async fn start_opaque_account(
     let response = match opaque_server_registration_response(
         &state.opaque_setup,
         request_bytes.as_slice(),
-        code.as_bytes(),
+        account_context.as_slice(),
     ) {
         Ok(response) => response,
         Err(_) => return opaque_start_error(StatusCode::UNAUTHORIZED, &state),
@@ -267,7 +274,7 @@ pub(super) async fn finish_opaque_account(
                 return account_error(StatusCode::BAD_REQUEST, &state, String::new()).await;
             }
             if state.accounts.lock().await.contains_key(code_id)
-                || !state.available_codes.lock().await.contains(code_id)
+                || !available_capability_is_live(&state, code_id).await
             {
                 return account_error(StatusCode::CONFLICT, &state, String::new()).await;
             }
@@ -361,6 +368,8 @@ pub(super) async fn finish_opaque_account(
                 {
                     removed_code_id.zeroize();
                 }
+                let mut expiries = state.capability_expiries.lock().await;
+                remove_code_id_map_entry(&mut expiries, code_id);
                 let mut accounts = state.accounts.lock().await;
                 let username = random_unique_username(&accounts);
                 accounts.insert(

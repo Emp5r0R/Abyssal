@@ -21,18 +21,28 @@ import com.abyssal.chat.domain.model.RoomChange
 import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
+import com.abyssal.chat.domain.model.VerifiedInvite
 import kotlinx.coroutines.flow.Flow
 import java.io.InputStream
 
 interface IIdentityService {
-    /** Consumes and zeroes [password] before returning or throwing. */
-    suspend fun enterAccount(code: String, password: ByteArray, endpoint: NodeEndpoint): IdentityValidationResult
-    suspend fun createAccount(code: String, password: ByteArray, endpoint: NodeEndpoint): IdentityValidationResult
-    suspend fun login(code: String, password: ByteArray, endpoint: NodeEndpoint): IdentityValidationResult
+    /** Consumes and zeroes every mutable secret argument before returning or throwing. */
+    suspend fun enterAccount(
+        capability: ByteArray,
+        accountContext: ByteArray,
+        expectedNodeId: String,
+        password: ByteArray,
+        endpoint: NodeEndpoint
+    ): IdentityValidationResult
     fun setCurrentUser(user: User)
     fun getCurrentUser(): User?
     suspend fun revokeSession(session: NodeSession): Boolean
     fun logout()
+}
+
+interface IInviteBootstrapService {
+    /** Parses and verifies the capsule and connected node without persisting either. */
+    suspend fun verify(invite: String): Result<VerifiedInvite>
 }
 
 interface INodeConfigService {

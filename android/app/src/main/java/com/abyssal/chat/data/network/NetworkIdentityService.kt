@@ -7,7 +7,6 @@ import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.repository.IIdentityService
 import java.nio.charset.StandardCharsets
 import java.util.Base64
-import java.util.Locale
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -142,7 +141,9 @@ class NetworkIdentityService(
     private var currentUser: User? = null
 
     override suspend fun enterAccount(
-        code: String,
+        capability: ByteArray,
+        accountContext: ByteArray,
+        expectedNodeId: String,
         password: ByteArray,
         endpoint: NodeEndpoint
     ): IdentityValidationResult = withContext(Dispatchers.IO) {
@@ -151,7 +152,8 @@ class NetworkIdentityService(
         var context: ByteArray? = null
         try {
             if (
-                code.trim().length !in 1..MAX_CODE_CHARS ||
+                capability.size != CAPABILITY_BYTES ||
+                accountContext.size != ACCOUNT_CONTEXT_BYTES ||
                 password.size !in MIN_PASSWORD_CHARS..MAX_PASSWORD_CHARS
             ) return@withContext rejected()
             opaque = opaqueClientStart(password)
@@ -159,7 +161,7 @@ class NetworkIdentityService(
                 endpoint,
                 "/v2/account/start",
                 JSONObject()
-                    .put("code", code)
+                    .put("capability_b64", encode(capability))
                     .put("registration_request_b64", encode(opaque.registrationRequest))
                     .put("credential_request_b64", encode(opaque.credentialRequest))
             ) ?: return@withContext rejected()
@@ -167,8 +169,9 @@ class NetworkIdentityService(
             val handshakeId = validatedStart.handshakeId
             val mode = validatedStart.mode
             val nodeId = validatedStart.nodeId
+            if (nodeId != expectedNodeId) return@withContext rejectedAndClear()
             responseBytes = decodeIdentityBase64(validatedStart.responseB64)
-            context = identityContext(nodeId, code)
+            context = accountContext.copyOf()
 
             val finishBody = JSONObject().put("handshake_id", handshakeId)
             when (mode) {
@@ -287,6 +290,8 @@ class NetworkIdentityService(
             rejectedAndClear()
         } finally {
             password.fill(0)
+            capability.fill(0)
+            accountContext.fill(0)
             responseBytes?.fill(0)
             context?.fill(0)
             opaque?.registrationState?.fill(0)
@@ -295,18 +300,6 @@ class NetworkIdentityService(
             opaque?.credentialRequest?.fill(0)
         }
     }
-
-    override suspend fun createAccount(
-        code: String,
-        password: ByteArray,
-        endpoint: NodeEndpoint
-    ): IdentityValidationResult = enterAccount(code, password, endpoint)
-
-    override suspend fun login(
-        code: String,
-        password: ByteArray,
-        endpoint: NodeEndpoint
-    ): IdentityValidationResult = enterAccount(code, password, endpoint)
 
     override fun setCurrentUser(user: User) {
         currentUser = user
@@ -384,21 +377,11 @@ class NetworkIdentityService(
         return rejected()
     }
 
-    private fun identityContext(nodeId: String, code: String): ByteArray {
-        val node = nodeId.trim()
-        val credential = code.trim().uppercase(Locale.ROOT)
-        require(node.isNotEmpty() && node.length <= 128)
-        require(credential.isNotEmpty() && credential.length <= 128)
-        // The identity context is shared by Android and web clients.  The
-        // sealed envelope's protocol domain is versioned natively; retaining
-        // this account context keeps cross-client login/recovery compatible.
-        return "ABYSSAL_IDENTITY_V2:$node:$credential".toByteArray(StandardCharsets.UTF_8)
-    }
-
     private companion object {
         const val MIN_PASSWORD_CHARS = 8
         const val MAX_PASSWORD_CHARS = 512
-        const val MAX_CODE_CHARS = 128
+        const val CAPABILITY_BYTES = 32
+        const val ACCOUNT_CONTEXT_BYTES = 32
         const val MAX_ACCOUNT_RESPONSE_BYTES = 1 * 1024 * 1024L
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 

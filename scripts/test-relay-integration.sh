@@ -17,6 +17,7 @@ trap cleanup EXIT INT TERM
 
 RELEASE_TOOL="$ROOT_DIR/target/debug/abyssal-release-tool"
 RELEASE_KEY="$TMP_DIR/integration-release.key"
+NODE_KEY="$TMP_DIR/integration-node.key"
 ANDROID_SIGNATURE="$TMP_DIR/android-build-signature.b64"
 WEB_SIGNATURE="$TMP_DIR/web-build-signature.b64"
 ANDROID_ASSET="$TMP_DIR/integration.apk"
@@ -33,12 +34,13 @@ EXPIRES_AT_MS="$((NOW_MS + 10 * 60 * 1000))"
 cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --package abyssal-release-tool
 node -e '
   const fs = require("node:fs");
-  const [key, android, web, revocations] = process.argv.slice(1);
+  const [key, nodeKey, android, web, revocations] = process.argv.slice(1);
   fs.writeFileSync(key, Buffer.alloc(32, 7), { flag: "wx", mode: 0o600 });
+  fs.writeFileSync(nodeKey, Buffer.alloc(32, 11), { flag: "wx", mode: 0o600 });
   fs.writeFileSync(android, "integration android asset\n", { flag: "wx" });
   fs.writeFileSync(web, "integration web asset\n", { flag: "wx" });
   fs.writeFileSync(revocations, "", { flag: "wx" });
-' "$RELEASE_KEY" "$ANDROID_ASSET" "$WEB_ASSET" "$REVOCATIONS"
+' "$RELEASE_KEY" "$NODE_KEY" "$ANDROID_ASSET" "$WEB_ASSET" "$REVOCATIONS"
 
 "$RELEASE_TOOL" sign-build \
   --private-key "$RELEASE_KEY" \
@@ -85,10 +87,9 @@ coproc RELAY_PROCESS {
   ABYSSAL_INTEGRATION_TEST=1 \
   ABYSSAL_INTEGRATION_RELEASE_MANIFEST="$MANIFEST" \
   ABYSSAL_INTEGRATION_RELEASE_SIGNATURE="$MANIFEST_SIGNATURE" \
-  ABYSSAL_NODE_ID="abyssal-integration-node" \
-  ABYSSAL_CODE_COUNT=2 \
-  ABYSSAL_CODE_MIN_LEN=16 \
-  ABYSSAL_CODE_MAX_LEN=17 \
+  ABYSSAL_NODE_SIGNING_KEY_FILE="$NODE_KEY" \
+  ABYSSAL_PUBLIC_URL="http://127.0.0.1:$PORT" \
+  ABYSSAL_INVITE_COUNT=2 \
   ABYSSAL_SESSION_INACTIVITY_MINUTES=5 \
   ABYSSAL_WEB_ROOT="$TMP_DIR/no-web" \
   RUST_LOG="${RUST_LOG:-mirage_server=warn}" \
@@ -97,23 +98,23 @@ coproc RELAY_PROCESS {
 RELAY_PID="$RELAY_PROCESS_PID"
 RELAY_FD="${RELAY_PROCESS[0]}"
 
-codes=()
+invites=()
 for _ in {1..20}; do
   if read -r -t 0.5 -u "$RELAY_FD" line; then
-    if [[ "$line" == "ABYSSAL_CODE code="* ]]; then
-      codes+=("${line#ABYSSAL_CODE code=}")
-      if [[ ${#codes[@]} -eq 2 ]]; then
+    if [[ "$line" == "ABYSSAL_INVITE_DEEP_LINK invite="* ]]; then
+      invites+=("${line#ABYSSAL_INVITE_DEEP_LINK invite=}")
+      if [[ ${#invites[@]} -eq 2 ]]; then
         break
       fi
     fi
   elif ! kill -0 "$RELAY_PID" 2>/dev/null; then
-    echo "Relay exited before printing test invite codes." >&2
+    echo "Relay exited before printing test invite capsules." >&2
     exit 1
   fi
 done
 
-if [[ ${#codes[@]} -ne 2 ]]; then
-  echo "Relay did not print two one-time test invite codes." >&2
+if [[ ${#invites[@]} -ne 2 ]]; then
+  echo "Relay did not print two one-time test invite capsules." >&2
   exit 1
 fi
 
@@ -122,7 +123,7 @@ fi
 exec 3<&"$RELAY_FD"
 {
   while IFS= read -r -u 3 line; do
-    if [[ "$line" != "ABYSSAL_CODE code="* ]]; then
+    if [[ "$line" != "ABYSSAL_INVITE invite="* && "$line" != "ABYSSAL_INVITE_DEEP_LINK invite="* ]]; then
       printf '%s\n' "$line" >&2
     fi
   done
@@ -141,7 +142,7 @@ done
 
 curl --fail --silent --show-error "http://127.0.0.1:$PORT/health" >/dev/null
 ABYSSAL_TEST_BASE_URL="http://127.0.0.1:$PORT" \
-ABYSSAL_TEST_CODE_A="${codes[0]}" \
-ABYSSAL_TEST_CODE_B="${codes[1]}" \
+ABYSSAL_TEST_INVITE_A="${invites[0]}" \
+ABYSSAL_TEST_INVITE_B="${invites[1]}" \
 ABYSSAL_TEST_BUILD_SIGNATURE_B64="$WEB_BUILD_SIGNATURE_B64" \
   node --trace-uncaught "$ROOT_DIR/scripts/relay-integration.mjs"

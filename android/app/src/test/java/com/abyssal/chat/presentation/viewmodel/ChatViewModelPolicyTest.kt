@@ -25,6 +25,7 @@ import com.abyssal.chat.domain.repository.IChatTransport
 import com.abyssal.chat.domain.repository.IDisguiseManager
 import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
 import com.abyssal.chat.domain.repository.IIdentityService
+import com.abyssal.chat.domain.repository.IInviteBootstrapService
 import com.abyssal.chat.domain.repository.IMessageRepository
 import com.abyssal.chat.domain.repository.IMessageSender
 import com.abyssal.chat.domain.repository.INodeConfigService
@@ -1284,6 +1285,9 @@ class ChatViewModelPolicyTest {
         val viewModel = ChatViewModel(
             identityService = identityService,
             nodeConfigService = nodeConfig,
+            inviteBootstrapService = proxy(IInviteBootstrapService::class.java) {
+                error("invite bootstrap must not run")
+            },
             messageRepository = repository,
             messageSender = sender,
             chatTransport = probe.transport,

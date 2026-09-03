@@ -32,6 +32,7 @@ const endpoint: NodeEndpoint = {
   wsBaseUrl: "wss://node.example",
   displayHost: "node.example",
 };
+const CAPABILITY = new Uint8Array(32).fill(4);
 const SESSION_TOKEN = "87fced9a-30b1-42f4-9f9d-b75381e03af7";
 
 const session: AccountSession = {
@@ -188,7 +189,7 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      " CODE-1234567 ",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).resolves.toMatchObject({
@@ -201,7 +202,7 @@ describe("account transport", () => {
       credentials: "omit",
       referrerPolicy: "no-referrer",
       body: JSON.stringify({
-        code: "CODE-1234567",
+        capability_b64: bytesToBase64(CAPABILITY),
         registration_request_b64: "AQ",
         credential_request_b64: "Ag",
       }),
@@ -213,7 +214,7 @@ describe("account transport", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not-json", { status: 401 }));
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).rejects.toThrow("Wrong information");
@@ -240,13 +241,13 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).rejects.toThrow("Wrong information");
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).rejects.toThrow("Wrong information");
@@ -309,7 +310,7 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).rejects.toThrow("Wrong information");
@@ -325,7 +326,7 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).rejects.toThrow("Wrong information");
@@ -351,7 +352,7 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).resolves.toMatchObject({ mode: "registration", node_id: "node-1" });
@@ -377,9 +378,9 @@ describe("account transport", () => {
         headers: { "Content-Length": String(768 * 1024 + 1) },
       }));
 
-    await expect(startOpaqueAccount(endpoint, "CODE-1234567", new Uint8Array([1]), new Uint8Array([2])))
+    await expect(startOpaqueAccount(endpoint, CAPABILITY, new Uint8Array([1]), new Uint8Array([2])))
       .rejects.toThrow("Wrong information");
-    await expect(startOpaqueAccount(endpoint, "CODE-1234567", new Uint8Array([1]), new Uint8Array([2])))
+    await expect(startOpaqueAccount(endpoint, CAPABILITY, new Uint8Array([1]), new Uint8Array([2])))
       .rejects.toThrow("Wrong information");
     expect(cancellations).toBe(2);
   });
@@ -400,7 +401,7 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
       abort.signal,
@@ -435,7 +436,7 @@ describe("account transport", () => {
 
     await expect(startOpaqueAccount(
       endpoint,
-      "CODE-1234567",
+      CAPABILITY,
       new Uint8Array([1]),
       new Uint8Array([2]),
     )).rejects.toThrow("Wrong information");

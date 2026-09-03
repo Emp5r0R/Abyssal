@@ -60,6 +60,7 @@ import com.abyssal.chat.domain.repository.IIdentityService
 import com.abyssal.chat.domain.repository.IMessageRepository
 import com.abyssal.chat.domain.repository.IMessageSender
 import com.abyssal.chat.domain.repository.INodeConfigService
+import com.abyssal.chat.domain.repository.IInviteBootstrapService
 import com.abyssal.chat.domain.repository.OutboundSendResult
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -394,6 +395,7 @@ private fun encodeAttachmentKey(value: ByteArray): String =
 class ChatViewModel(
     private val identityService: IIdentityService,
     private val nodeConfigService: INodeConfigService,
+    private val inviteBootstrapService: IInviteBootstrapService,
     private val messageRepository: IMessageRepository,
     private val messageSender: IMessageSender,
     private val chatTransport: IChatTransport,
@@ -441,11 +443,11 @@ class ChatViewModel(
     val presence: StateFlow<List<UserPresence>> = chatTransport.getPresence()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    private val _inviteCodeError = mutableStateOf<String?>(null)
-    val inviteCodeError: State<String?> = _inviteCodeError
+    private val _inviteError = mutableStateOf<String?>(null)
+    val inviteError: State<String?> = _inviteError
 
-    private val _isVerifyingCode = mutableStateOf(false)
-    val isVerifyingCode: State<Boolean> = _isVerifyingCode
+    private val _isVerifyingInvite = mutableStateOf(false)
+    val isVerifyingInvite: State<Boolean> = _isVerifyingInvite
 
     private val _showCamouflagePinPrompt = mutableStateOf(false)
     val showCamouflagePinPrompt: State<Boolean> = _showCamouflagePinPrompt
@@ -1009,12 +1011,11 @@ class ChatViewModel(
     }
 
     fun clearAccountError() {
-        _inviteCodeError.value = null
+        _inviteError.value = null
     }
 
     fun submitAccount(
-        code: String,
-        nodeUrl: String,
+        invite: String,
         password: ByteArray,
         rememberSession: Boolean
     ) {
@@ -1024,39 +1025,53 @@ class ChatViewModel(
         }
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             var validation: IdentityValidationResult? = null
+            var verifiedInvite: com.abyssal.chat.domain.model.VerifiedInvite? = null
             var installedSession = false
             try {
-                _isVerifyingCode.value = true
-                _inviteCodeError.value = null
+                _isVerifyingInvite.value = true
+                _inviteError.value = null
 
-                val endpoint = nodeConfigService.normalizeNodeUrl(nodeUrl).getOrElse {
-                    _inviteCodeError.value = "Wrong information."
+                val verified = inviteBootstrapService.verify(invite).getOrElse { error ->
+                    _inviteError.value = safeInviteError(error.message)
                     return@launch
                 }
+                verifiedInvite = verified
+                val endpoint = verified.endpoint
 
                 ensureActive()
                 // Every MlsRoom must be closed before NetworkIdentityService replaces
                 // the account E2eeSession owned by payloadCipher.
                 mlsManager?.close()
                 mlsManager = null
-                validation = identityService.enterAccount(code, password, endpoint)
+                validation = identityService.enterAccount(
+                    capability = verified.capability,
+                    accountContext = verified.accountContext,
+                    expectedNodeId = verified.nodeId,
+                    password = password,
+                    endpoint = endpoint
+                )
                 // Do not install an identity returned by a request that was canceled while
                 // its response was being delivered.
                 ensureActive()
                 val result = requireNotNull(validation)
                 if (canInstallAccountEntryResult(currentCoroutineContext().isActive, result)) {
                     val publicKey = result.publicKey ?: run {
-                        _inviteCodeError.value = "Wrong information."
+                        _inviteError.value = "Wrong information."
                         payloadCipher.clear()
                         return@launch
                     }
                     val prekeyId = result.prekeyId ?: run {
                         publicKey.fill(0)
-                        _inviteCodeError.value = "Wrong information."
+                        _inviteError.value = "Wrong information."
                         payloadCipher.clear()
                         return@launch
                     }
-                    val nodeId = result.nodeId ?: endpoint.displayHost
+                    val nodeId = result.nodeId?.takeIf { it == verified.nodeId } ?: run {
+                        publicKey.fill(0)
+                        _inviteError.value = "Node identity mismatch"
+                        payloadCipher.clear()
+                        return@launch
+                    }
                     val token = requireNotNull(result.token)
                     val identity = User(
                         username = result.username ?: "AbyssalUser",
@@ -1094,7 +1109,7 @@ class ChatViewModel(
                 } else {
                     result.publicKey?.fill(0)
                     payloadCipher.clear()
-                    _inviteCodeError.value = "Wrong information."
+                    _inviteError.value = "Wrong information."
                 }
             } catch (error: CancellationException) {
                 // The logout path cancels account entry before redacting local state. If
@@ -1117,11 +1132,12 @@ class ChatViewModel(
                     validation?.publicKey?.fill(0)
                     payloadCipher.clear()
                 }
-                _inviteCodeError.value = "Wrong information."
+                _inviteError.value = "Wrong information."
             } finally {
+                verifiedInvite?.destroy()
                 password.fill(0)
                 if (!installedSession) validation?.publicKey?.fill(0)
-                _isVerifyingCode.value = false
+                _isVerifyingInvite.value = false
                 if (accountEntryJob === currentCoroutineContext()[Job]) {
                     accountEntryJob = null
                 }
@@ -1129,6 +1145,21 @@ class ChatViewModel(
         }
         accountEntryJob = job
         job.start()
+    }
+
+    private fun safeInviteError(message: String?): String = when (message) {
+        "Invalid invite",
+        "Unsupported invite version",
+        "Invite belongs to another application",
+        "Invite signature invalid",
+        "Invite expired",
+        "Unsupported invite protocol",
+        "Unsupported invite transport",
+        "Invite checksum invalid",
+        "Unable to reach node",
+        "Unable to verify node",
+        "Node identity mismatch" -> message
+        else -> "Wrong information."
     }
 
     fun sendMessage(content: String, selfDestructSec: Int, replyToMessageId: String? = null) {

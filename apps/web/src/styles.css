@@ -228,6 +228,7 @@ button:disabled {
 }
 
 .field input,
+.field textarea,
 .gif-picker input {
   width: 100%;
   height: 46px;
@@ -240,14 +241,35 @@ button:disabled {
   caret-color: var(--cyan);
 }
 
-.field input:hover:not(:disabled) {
+.field textarea {
+  min-height: 108px;
+  padding: 12px 13px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.field input:hover:not(:disabled),
+.field textarea:hover:not(:disabled) {
   border-color: var(--line-strong);
 }
 
-.field input:focus {
+.field input:focus,
+.field textarea:focus {
   border-color: var(--cyan);
   box-shadow: 0 0 0 3px var(--cyan-soft);
   outline: 0;
+}
+
+.invite-field {
+  position: relative;
+}
+
+.invite-paste {
+  justify-self: end;
+  min-height: 34px;
+  padding: 0 12px;
 }
 
 .field input:disabled {

@@ -1,5 +1,48 @@
 # Latest Session Work
 
+## 2026-09-03 - Unified Invite Capsule V1 source complete
+
+Replaced the normal node-URL and access-code bootstrap with a signed,
+self-contained Invite Capsule plus password flow. No package, tag, release, or
+production deployment was performed in this source phase.
+
+### Implemented
+
+- Added the standalone `abyssal-invite` crate with canonical bounded CBOR,
+  Ed25519 node identity/signatures, typed HTTPS and explicit loopback locators,
+  a 256-bit account-bootstrap capability, expiry enforcement, deterministic
+  URI/manual encodings, checksum validation, and stable vectors.
+- Added separately provisioned relay node identity, signed `/v1/node`
+  descriptors, one-time invite output, HMAC capability identifiers, exact
+  one-winner registration, and node/capability-bound OPAQUE context.
+- Web and Android now accept Invite + Password, parse through the shared Rust
+  core, verify the connected node before authentication, reject redirects and
+  unsafe locators, and keep decoded bootstrap material in process memory only.
+- Added strict Android public-DNS policy, browser same-origin production policy,
+  node-key and QR operator helpers, deployment preflight checks, protocol and
+  security documentation, and cross-layer regression/integration coverage.
+- Pinned `browserslist 4.28.8` after the full gate detected high-severity
+  advisories affecting `4.28.6`.
+
+### Verification
+
+- `./scripts/test-all.sh crypto`: passed; checked-in WASM, UniFFI, and all four
+  Android ABI libraries were regenerated and verified.
+- Final `./scripts/test-all.sh all`: passed repository/deployment checks, web
+  lint, 386 web tests and production build, 70 Rust-core tests, 14 invite tests,
+  236 relay tests, rustfmt and warning-denied Clippy, Android JVM tests and
+  release lint, live OPAQUE/v9/v10 relay integration, and dependency audits.
+- npm audit reported zero vulnerabilities. RustSec reported no vulnerability
+  and the existing allowed yanked transitive warning for `chacha20 0.10.1`.
+
+### Next
+
+- Create and push the fully verified source checkpoint without staging the
+  user-owned `.gitignore` edit or local cache/helper files.
+- Prepare one breaking release, require hosted CI/CodeQL success, verify every
+  signed Android/web artifact and signer, then deploy that exact release with a
+  persistent production node signing key and advertised HTTPS locator.
+
 ## 2026-08-25 - Release v2.2.0 published and production deployed
 
 Released the first attested-distribution stable build and deployed it to

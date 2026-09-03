@@ -41,7 +41,6 @@ import {
   finishOpaqueLogin,
   finishOpaqueRegistration,
   FatalCipherError,
-  identityContext,
   IDENTITY_PUBLIC_KEY_BYTES,
   InMemoryPayloadCipher,
   payloadToFrame,
@@ -68,7 +67,12 @@ import {
   type DirectTrustContext,
   type DirectTrustStatus,
 } from "../security/directTrust";
-import { normalizeNodeUrl } from "../security/nodeUrl";
+import {
+  parseInvite,
+  verifyConnectedInviteNode,
+  wipeParsedInvite,
+  type ParsedInvite,
+} from "../security/invite";
 import {
   decryptAndCompleteAttachment,
   deleteUploadedAttachment,
@@ -119,8 +123,7 @@ const DIRECT_KEYS = new Set(["id", "peer_username"]);
 const DOWNLOAD_URL_CLEANUP_DELAY_MS = 60_000;
 
 interface LoginInput {
-  nodeUrl: string;
-  code: string;
+  invite: string;
   password: Uint8Array;
   retainWhenHidden: boolean;
 }
@@ -1064,25 +1067,32 @@ export function useAbyssalSession() {
       await revokeSession(candidate).catch(() => undefined);
     };
     let nextSession: AccountSession | null = null;
+    let parsedInvite: ParsedInvite | null = null;
     setNotice(null);
     setSecurityWarning(null);
     try {
-      const endpoint = normalizeNodeUrl(input.nodeUrl);
+      parsedInvite = await parseInvite(input.invite);
+      await verifyConnectedInviteNode(parsedInvite, loginAbort.signal);
+      ensureLoginActive();
+      const endpoint = parsedInvite.endpoint;
       const opaque = await startOpaque(input.password);
       try {
         ensureLoginActive();
         const start = await startOpaqueAccount(
           endpoint,
-          input.code,
+          parsedInvite.capability,
           opaque.registrationRequest,
           opaque.credentialRequest,
           loginAbort.signal,
         );
         ensureLoginActive();
+        if (start.node_id !== parsedInvite.nodeId) {
+          throw new Error("Node identity mismatch");
+        }
         let context: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
         let response: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
         try {
-          context = identityContext(start.node_id, input.code);
+          context = parsedInvite.accountContext.slice();
           response = base64ToBytes(start.response_b64!);
           if (start.mode === "registration") {
             const result = await finishOpaqueRegistration(input.password, opaque, response);
@@ -1164,9 +1174,11 @@ export function useAbyssalSession() {
       cipherRef.current.clear();
       await revokeDiscardedSession(nextSession);
       if (loginAbortRef.current === loginAbort) loginAbortRef.current = null;
+      wipeParsedInvite(parsedInvite);
       wipeBytes(input.password);
       throw error;
     }
+    wipeParsedInvite(parsedInvite);
     let candidateRelay: RelaySocket | null = null;
     try {
       ensureLoginActive();

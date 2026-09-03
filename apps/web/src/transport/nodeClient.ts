@@ -170,7 +170,7 @@ interface PrekeyLeaseFrame {
 
 export async function startOpaqueAccount(
   endpoint: NodeEndpoint,
-  code: string,
+  capability: Uint8Array,
   registrationRequest: Uint8Array,
   credentialRequest: Uint8Array,
   signal?: AbortSignal,
@@ -179,10 +179,11 @@ export async function startOpaqueAccount(
     method: "POST",
     cache: "no-store",
     credentials: "omit",
+    redirect: "error",
     referrerPolicy: "no-referrer",
     headers: JSON_HEADERS,
     body: JSON.stringify({
-      code: code.trim(),
+      capability_b64: bytesToBase64(capability),
       registration_request_b64: bytesToBase64(registrationRequest),
       credential_request_b64: bytesToBase64(credentialRequest),
     }),
@@ -214,6 +215,7 @@ export async function finishOpaqueAccount(
     method: "POST",
     cache: "no-store",
     credentials: "omit",
+    redirect: "error",
     referrerPolicy: "no-referrer",
     headers: JSON_HEADERS,
     body: JSON.stringify({
