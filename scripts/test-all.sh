@@ -41,6 +41,7 @@ run_shell() {
   "$ROOT_DIR/scripts/verify-gradle-wrapper.sh"
   "$ROOT_DIR/scripts/verify-gradle-dependencies.sh"
   "$ROOT_DIR/scripts/verify-crypto-artifacts.sh"
+  bash "$ROOT_DIR/scripts/test-crypto-source-digest.sh"
   "$ROOT_DIR/scripts/test-release-env-parser.sh"
   "$ROOT_DIR/scripts/test-deployment-inputs.sh"
 

@@ -36,7 +36,14 @@ This creates an ignored keystore under `.secrets/` and an ignored `deploy/releas
 ./check.sh all
 ```
 
-The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without invoking Android packaging, and a live disposable-relay integration test. Android packaging remains an explicit release-only step. The 2026-08-28 integrated local gate ran 352 web tests across 31 files, 68 Rust-core tests, 20 release-tool tests, 232 relay tests, and 241 Android JVM tests; the forbidden integration-root release compile check, release lint, debug/release compilation, protocol-v9 direct/protocol-v10 MLS integration with strict build admission, deterministic generated-artifact/deployment checks, and npm/RustSec audits also passed. All applicable tests had zero skips, failures, or errors; no Android packaging task was invoked. CodeQL must pass remotely after push.
+The command checks shell syntax and repository whitespace, then runs web lint/tests/build, Rust formatting/tests/clippy, Android JVM tests/lint/Kotlin compilation without invoking Android packaging, and a live disposable-relay integration test. It also enforces the forbidden integration-root release compile check, generated-artifact and deployment checks, and current npm/RustSec audits. Android packaging remains an explicit release-only step. CI and CodeQL must pass remotely for the exact source commit before publication.
+
+Crypto freshness covers both `rust-core` and its local `abyssal-invite`
+dependency, their manifests, the workspace lockfile, the pinned toolchain, and
+the generation scripts. Run `./scripts/test-all.sh crypto` after changing any
+of these inputs. The digest regression test checks additions, renames, and
+mutations; hosted CI separately rebuilds all native/WASM artifacts and requires
+byte-for-byte equality with the committed outputs.
 
 ## Signed Android artifacts
 
