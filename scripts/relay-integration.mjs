@@ -701,6 +701,10 @@ async function verifyIntegrationNode(parsed) {
   });
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "application/cbor");
+  assert.match(response.headers.get("permissions-policy"), /(?:^|, )camera=\(self\)(?:,|$)/);
+  assert.match(response.headers.get("permissions-policy"), /(?:^|, )microphone=\(\)(?:,|$)/);
+  assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+  assert.match(response.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   const descriptor = new Uint8Array(await response.arrayBuffer());
   try {
     assert.ok(descriptor.byteLength > 0 && descriptor.byteLength <= 1024);

@@ -67,14 +67,16 @@ parsing and prefers supported HTTPS before explicit development loopback.
 ```text
 Https = [1, lowercase_ascii_dns_host, port]
 LoopbackDevelopment = [2, host_tag, port]
+OnionV3 = [3, bstr32(service_identity), port]
+I2pB32 = [4, bstr32(destination_hash), port]
 ```
 
 Development host tags are `1 = localhost`, `2 = 127.0.0.1`, `3 = ::1`, and
 `4 = Android emulator host 10.0.2.2`. Ports are 1-65535.
 
-Remote V1 locators require HTTPS and a canonical lowercase ASCII DNS name. IP
+Remote clearnet locators require HTTPS and a canonical lowercase ASCII DNS name. IP
 literals, credentials, paths, queries, fragments, trailing dots, non-ASCII
-input, `.local`, `.localhost`, `.internal`, `.onion`, `.home.arpa`, reserved
+input, `.local`, `.localhost`, `.internal`, `.onion`, `.i2p`, `.home.arpa`, reserved
 testing TLDs, invalid DNS labels, and every other URI scheme fail.
 Android resolves remote DNS through a public-address policy and rejects any
 mixed or private/reserved result. Browser JavaScript cannot safely pin DNS
@@ -83,9 +85,33 @@ to equal the page's own origin; explicit loopback development accepts only the
 four typed development hosts. Security-sensitive bootstrap requests do not
 follow redirects.
 
-A future `OnionV3` locator can receive a new locator tag and typed service
-identity. It does not require a new capability, account, text, or signature
-model. Onion networking is not implemented by V1.
+Tags 3 and 4 are server-side advertised locators, not permission for a client
+to use ordinary HTTP or DNS. Current production and development client
+transport policies select neither type. An overlay-only capsule returns
+`Unsupported transport` before bootstrap; a mixed capsule may select HTTPS
+(or explicit development loopback). Older parsers without these tags reject
+the entire capsule, including a mixed one, rather than ignoring unknown data.
+
+For Onion v3, `service_identity` is a valid non-weak Ed25519 public key. The
+canonical host is lowercase unpadded RFC 4648 Base32 of
+`public_key || checksum || 0x03`, followed by `.onion`. `checksum` is the first
+two bytes of `SHA3-256(".onion checksum" || public_key || 0x03)`. Host import
+checks the length, alphabet, version, key and checksum. This is the
+[Tor v3 address encoding](https://spec.torproject.org/rend-spec/encoding-onion-addresses.html),
+not the separate Abyssal node signing identity.
+
+For traditional I2P B32, `destination_hash` is a nonzero 32-byte SHA-256 hash
+of the serialized I2P destination. Its canonical host is the 52-character
+lowercase unpadded RFC 4648 Base32 representation plus `.b32.i2p`; unused tail
+bits must be zero. Address-book aliases, subdomains and extended/encrypted
+LeaseSet B32 names are not supported. See the
+[I2P naming specification](https://www.i2p.net/en/docs/overview/naming/).
+
+Operator URL import accepts only `http://<canonical-overlay-host>[:port]` for
+these types. HTTPS overlay wrappers, credentials, queries, fragments and
+non-root paths reject. The `http` label describes the local HTTP service
+carried inside an independently configured overlay, never public plaintext
+transport. No client Tor, Arti, SOCKS, I2P or proxy implementation is present.
 
 ## Node Identity and Descriptor
 
@@ -120,7 +146,7 @@ requires a valid descriptor signed by the invite key and containing the exact
 selected locator. TLS hostname validation alone is insufficient.
 
 The node signing seed is separate from account, release, OPAQUE, direct-chat,
-MLS, and any future Onion keys. It is persistent infrastructure identity while
+MLS, Onion service and I2P destination keys. It is persistent infrastructure identity while
 accounts and conversations remain RAM-only.
 
 Generate it once with `deploy/generate-node-key.sh`, keep the resulting raw
@@ -173,6 +199,34 @@ authoritative.
 - Unknown versions, capabilities, locator tags, or nonzero flags fail closed.
 - Expiry is covered by the signature. Clients reject it early; the relay is
   authoritative and removes an expired unused capability before registration.
+
+## Camera and Local QR Images
+
+Both account-entry clients offer an explicit camera scanner and local image
+picker. They decode QR text as data and pass it through the same bounded
+Rust invite verifier before filling the input. Successful scanning does not
+submit credentials or open any locator. Camera sessions expire after 60
+seconds and stop on cancellation, backgrounding or teardown.
+
+Image inputs are PNG/JPEG only, at most 8 MiB, 4,194,304 pixels and 4,096
+pixels on either side. A shared Rust raster decoder checks magic bytes against
+the declared MIME type (an absent MIME type is permitted), dimensions and
+8-bit channel layout, sets a best-effort 32 MiB decoder allocation limit, and
+creates an explicitly bounded grayscale buffer with a 960-pixel longest side.
+SVG/XML/HTML, URL text masquerading as an image, mismatched MIME and malformed
+rasters reject. File names, EXIF/comments and embedded URLs never become paths,
+HTML or network requests. QR text remains subject to the 2,048-byte capsule
+limit and signature checks regardless of image metadata.
+
+Browser input is a user-selected local Blob. Android input is an ephemeral
+`content://` grant read through the content resolver, not a converted filesystem
+path; neither client uploads QR images or retains file permission. Reads have
+size/deadline/cancellation checks and mutable buffers are wiped where owned.
+An Android document provider may itself be cloud-backed. OS/browser/provider
+copies, camera internals and native decoder execution are not a physical
+zeroization or hard real-time guarantee.
+
+## Capability Consumption
 
 The relay derives its RAM lookup key as:
 

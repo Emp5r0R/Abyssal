@@ -49,7 +49,11 @@ key_owner="$(stat -c '%u' -- "$NODE_KEY")"
 
 public_url_count="$(grep -c '^ABYSSAL_PUBLIC_URL=' "$ENV_FILE" || true)"
 public_url="$(sed -n 's/^ABYSSAL_PUBLIC_URL=//p' "$ENV_FILE")"
-if [[ "$public_url_count" != 1 || -z "$public_url" || "$public_url" == "https://chat.example.com" ]]; then
-  printf 'Set exactly one real ABYSSAL_PUBLIC_URL in %s before startup.\n' "$ENV_FILE" >&2
+locators_count="$(grep -c '^ABYSSAL_PUBLIC_LOCATORS=' "$ENV_FILE" || true)"
+locators="$(sed -n 's/^ABYSSAL_PUBLIC_LOCATORS=//p' "$ENV_FILE")"
+if [[ "$public_url_count" -gt 1 || "$locators_count" -gt 1 ||
+      ( -z "$public_url" && -z "$locators" ) ||
+      ( -n "$public_url" && -n "$locators" ) || "$public_url" == "https://chat.example.com" ]]; then
+  printf 'Set only one real ABYSSAL_PUBLIC_URL or ABYSSAL_PUBLIC_LOCATORS in %s before startup.\n' "$ENV_FILE" >&2
   exit 1
 fi

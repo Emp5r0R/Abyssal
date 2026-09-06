@@ -1,0 +1,13 @@
+# Dedicated server-only Tor instance. Never load this into a user's Tor client.
+# /run must be tmpfs. Only the hidden-service identity below is persistent.
+DataDirectory /run/abyssal-tor/router
+SocksPort 0
+ControlPort 0
+ClientOnly 1
+SafeLogging 1
+Log err file /dev/null
+HiddenServiceDir /var/lib/tor/abyssal-onion
+HiddenServiceVersion 3
+HiddenServicePort 80 127.0.0.1:4020
+HiddenServiceMaxStreams 64
+HiddenServiceMaxStreamsCloseCircuit 1

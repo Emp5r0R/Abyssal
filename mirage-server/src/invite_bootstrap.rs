@@ -1,10 +1,9 @@
 //! Node infrastructure identity and one-shot bootstrap invitation issuance.
 
 use abyssal_invite::{
-    derive_node_id, encode_deep_link, encode_manual, generate_capability, locator_from_public_url,
-    node_key_fingerprint, node_signing_key_from_seed, InviteCapsuleV1, NodeDescriptorV1,
-    NodeLocator, SignedInviteCapsule, SignedNodeDescriptor, DIRECT_PROTOCOL_VERSION,
-    ROOM_PROTOCOL_VERSION,
+    derive_node_id, encode_deep_link, encode_manual, generate_capability, node_key_fingerprint,
+    node_signing_key_from_seed, InviteCapsuleV1, NodeDescriptorV1, NodeLocator,
+    SignedInviteCapsule, SignedNodeDescriptor, DIRECT_PROTOCOL_VERSION, ROOM_PROTOCOL_VERSION,
 };
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -33,7 +32,7 @@ pub(super) struct BootstrapMaterials {
     pub(super) node_public_key: [u8; 32],
     pub(super) descriptor_binary: Vec<u8>,
     pub(super) issued_invites: Vec<IssuedInvite>,
-    pub(super) locator: NodeLocator,
+    pub(super) locators: Vec<NodeLocator>,
     pub(super) fingerprint: String,
 }
 
@@ -41,15 +40,11 @@ impl BootstrapMaterials {
     pub(super) fn from_env(now_unix_seconds: u64) -> Result<Self, String> {
         let key_path = env::var("ABYSSAL_NODE_SIGNING_KEY_FILE")
             .map_err(|_| "ABYSSAL_NODE_SIGNING_KEY_FILE is required".to_owned())?;
-        let public_url = env::var("ABYSSAL_PUBLIC_URL")
-            .map_err(|_| "ABYSSAL_PUBLIC_URL is required".to_owned())?;
+        let locators = super::advertised_locators::from_env()?;
         let signing_key = load_node_signing_key(Path::new(&key_path))?;
         let node_public_key = signing_key.verifying_key().to_bytes();
         let node_id = derive_node_id(&node_public_key);
         let fingerprint = node_key_fingerprint(&node_public_key);
-        let locator = locator_from_public_url(&public_url)
-            .map_err(|_| "ABYSSAL_PUBLIC_URL is not an allowed V1 locator".to_owned())?;
-        let locators = vec![locator.clone()];
         let descriptor = NodeDescriptorV1::abyssal(node_public_key, locators.clone())
             .map_err(|_| "failed to create node descriptor".to_owned())?;
         let descriptor_binary = SignedNodeDescriptor::sign(descriptor, &signing_key)
@@ -109,7 +104,7 @@ impl BootstrapMaterials {
             node_public_key,
             descriptor_binary,
             issued_invites,
-            locator,
+            locators,
             fingerprint,
         })
     }
@@ -199,6 +194,7 @@ fn load_node_signing_key(path: &Path) -> Result<ed25519_dalek::SigningKey, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abyssal_invite::locator_from_public_url;
     use std::fs;
     use tempfile::tempdir;
 

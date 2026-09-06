@@ -136,6 +136,9 @@ dependencies {
     implementation(libs.okhttp)
     implementation("net.java.dev.jna:jna:5.18.1@aar")
     implementation("com.google.zxing:core:3.5.4")
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
 
     testImplementation(libs.junit)
     testImplementation("net.java.dev.jna:jna:5.18.1")

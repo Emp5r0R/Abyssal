@@ -1,0 +1,12 @@
+# Dedicated inbound server destination; no HTTP rewriting or X-I2P headers.
+# The I2P destination key is separate from the Abyssal node signing key.
+[abyssal]
+type = server
+host = 127.0.0.1
+port = 4020
+inport = 80
+# Relative to --datadir. Bind-mount the persistent identity directory here.
+keys = identity/abyssal-destination.dat
+signaturetype = 7
+enableuniquelocal = false
+gzip = false

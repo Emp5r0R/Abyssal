@@ -233,4 +233,43 @@ mod tests {
             verify_invite_node_descriptor(descriptor, vec![8_u8; 32], parsed.node_url,).is_err()
         );
     }
+
+    #[test]
+    fn shared_clients_never_select_a_private_network_transport() {
+        let key = node_signing_key_from_seed(&[7_u8; 32]);
+        for url in [
+            "http://pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+            "http://ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p",
+        ] {
+            let mut capsule = InviteCapsuleV1::abyssal(
+                key.verifying_key().to_bytes(),
+                vec![locator_from_public_url(url).unwrap()],
+                [9; 32],
+                9,
+                10,
+                None,
+            )
+            .unwrap();
+            let signed = SignedInviteCapsule::sign(capsule.clone(), &key).unwrap();
+            for development in [false, true] {
+                let error = parse_invite_capsule(
+                    encode_deep_link(&signed).unwrap(),
+                    1_900_000_000,
+                    development,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("Unsupported invite transport"));
+            }
+            capsule
+                .locators
+                .push(locator_from_public_url("https://node.example.com").unwrap());
+            let signed = SignedInviteCapsule::sign(capsule, &key).unwrap();
+            let mut parsed =
+                parse_invite_capsule(encode_deep_link(&signed).unwrap(), 1_900_000_000, false)
+                    .unwrap();
+            assert_eq!(parsed.node_url, "https://node.example.com");
+            parsed.capability.zeroize();
+            parsed.account_context.zeroize();
+        }
+    }
 }

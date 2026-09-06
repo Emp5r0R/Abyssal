@@ -119,6 +119,8 @@ export function conversationSafetyNumber(first_public_key: Uint8Array, second_pu
 
 export function conversationVerificationToken(node_id: string, chat_id: string, first_username: string, first_public_key: Uint8Array, second_username: string, second_public_key: Uint8Array): string;
 
+export function decodeQrImage(bytes: Uint8Array, mime: string): any;
+
 export function decryptAttachment(chat_id: string, message_id: string, sender_username: string, media_type: string, key: Uint8Array, blob: Uint8Array): Uint8Array;
 
 export function decryptAttachmentChunk(chat_id: string, message_id: string, sender_username: string, media_type: string, key: Uint8Array, expected_total_plaintext_bytes: bigint, expected_chunk_index: number, record: Uint8Array): Uint8Array;
@@ -164,6 +166,7 @@ export interface InitOutput {
     readonly attachmentEncryptedSize: (a: number, b: number, c: bigint) => [bigint, number, number];
     readonly conversationSafetyNumber: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly conversationVerificationToken: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
+    readonly decodeQrImage: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly decryptAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
     readonly decryptAttachmentChunk: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint, l: number, m: number, n: number) => [number, number, number, number];
     readonly encryptAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
@@ -211,6 +214,7 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_checksum_func_attachment_encrypted_size: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_safety_number: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_verification_token: () => number;
+    readonly uniffi_abyssal_core_checksum_func_decode_qr_image: () => number;
     readonly uniffi_abyssal_core_checksum_func_decrypt_attachment: () => number;
     readonly uniffi_abyssal_core_checksum_func_decrypt_attachment_chunk: () => number;
     readonly uniffi_abyssal_core_checksum_func_encrypt_attachment: () => number;
@@ -268,6 +272,7 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_func_attachment_encrypted_size: (a: number, b: bigint, c: number) => bigint;
     readonly uniffi_abyssal_core_fn_func_conversation_safety_number: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_conversation_verification_token: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly uniffi_abyssal_core_fn_func_decode_qr_image: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_decrypt_attachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly uniffi_abyssal_core_fn_func_decrypt_attachment_chunk: (a: number, b: number, c: number, d: number, e: number, f: number, g: bigint, h: number, i: number, j: number) => void;
     readonly uniffi_abyssal_core_fn_func_encrypt_attachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;

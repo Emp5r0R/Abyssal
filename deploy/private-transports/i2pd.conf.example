@@ -1,0 +1,31 @@
+# Dedicated server router; do not replace another application's router config.
+daemon = false
+log = stdout
+loglevel = none
+notransit = true
+[persist]
+profiles = false
+addressbook = false
+[addressbook]
+enabled = false
+[reseed]
+verify = true
+followredirect = false
+[http]
+enabled = false
+[httpproxy]
+enabled = false
+[socksproxy]
+enabled = false
+[sam]
+enabled = false
+[bob]
+enabled = false
+[i2cp]
+enabled = false
+[i2pcontrol]
+enabled = false
+[upnp]
+enabled = false
+[nettime]
+enabled = false

@@ -24,9 +24,11 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,6 +37,10 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -56,6 +62,14 @@ import com.abyssal.chat.theme.PureWhite
 import com.abyssal.chat.theme.SelfDestructAmber
 import com.abyssal.chat.theme.SteelMuted
 import java.nio.charset.StandardCharsets
+import com.abyssal.chat.BuildConfig
+import com.abyssal.chat.data.qr.InviteQrDecoder
+import com.abyssal.chat.data.qr.LocalQrImageReader
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 
 @Composable
 fun EntranceScreen(viewModel: ChatViewModel) {
@@ -78,12 +92,46 @@ private fun EntranceContent(
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
     var rememberSession by remember { mutableStateOf(true) }
+    var scanning by remember { mutableStateOf(false) }
+    var readingImage by remember { mutableStateOf(false) }
+    var imageError by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+    var imageJob by remember { mutableStateOf<Job?>(null) }
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) imageJob?.cancel()
+        }
+        lifecycle.lifecycle.addObserver(observer)
+        onDispose { lifecycle.lifecycle.removeObserver(observer); imageJob?.cancel() }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null && !readingImage && !isVerifying) {
+            readingImage = true
+            imageError = false
+            imageJob = scope.launch {
+                try {
+                    val value = LocalQrImageReader.read(context.contentResolver, uri)
+                    require(InviteQrDecoder.isVerifiedInvite(value, BuildConfig.DEBUG))
+                    invite = value
+                    onInputChanged()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    imageError = true
+                } finally {
+                    readingImage = false
+                }
+            }
+        }
+    }
     val passwordFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     val clipboard = LocalClipboardManager.current
     val canSubmit = invite.isNotBlank() &&
         password.length in MIN_PASSWORD_CHARS..MAX_PASSWORD_CHARS &&
-        !isVerifying
+        !isVerifying && !readingImage && !scanning
 
     fun submit() {
         if (!canSubmit) return
@@ -93,6 +141,11 @@ private fun EntranceContent(
         passwordVisible = false
         onSubmit(invite, passwordBytes, rememberSession)
     }
+
+    if (scanning) InviteQrScanner(
+        onScanned = { invite = it; scanning = false; onInputChanged() },
+        onDismiss = { scanning = false }
+    )
 
     MirageBackground {
         Column(
@@ -151,6 +204,14 @@ private fun EntranceContent(
                     borderColor = if (error == null) GlassBorder else SelfDestructAmber.copy(alpha = 0.55f)
                 ) {
                     Column(modifier = Modifier.padding(18.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            TextButton(onClick = { scanning = true }, enabled = !isVerifying && !readingImage) { Text("Scan invite") }
+                            TextButton(onClick = { imagePicker.launch("image/*") }, enabled = !isVerifying && !readingImage) {
+                                if (readingImage) AbyssalMarkLoader(size = AbyssalMarkLoaderSize.Inline)
+                                Text(if (readingImage) "Reading image" else "Open QR image")
+                            }
+                        }
+                        if (imageError) Text("QR image not accepted.", color = SelfDestructAmber)
                         OutlinedTextField(
                             value = invite,
                             onValueChange = {

@@ -1,7 +1,10 @@
-import { ClipboardPaste, Eye, EyeOff, KeyRound, RadioTower } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { Camera, ClipboardPaste, Eye, EyeOff, KeyRound, RadioTower } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { AccountSession } from "../domain/types";
 import { AbyssalMarkLoader, Brand, Field, IconButton, Toggle } from "./Ui";
+import { QrScanner } from "./QrScanner";
+import { parseInvite, wipeParsedInvite } from "../security/invite";
+import { QrImageInput } from "./QrImageInput";
 
 export function Entrance({
   onLogin,
@@ -16,10 +19,36 @@ export function Entrance({
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [scanning, setScanning] = useState(false);
+  const [readingImage, setReadingImage] = useState(false);
+  const scanGeneration = useRef(0);
+  const inviteInput = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => () => { scanGeneration.current++; }, []);
+  useEffect(() => {
+    if (!scanning && invite) inviteInput.current?.focus();
+  }, [invite, scanning]);
+  const stopScanning = useCallback(() => {
+    scanGeneration.current++;
+    setScanning(false);
+  }, []);
+  const acceptScannedInvite = useCallback(async (value: string, signal: AbortSignal) => {
+    const generation = scanGeneration.current;
+    let parsed;
+    try {
+      parsed = await parseInvite(value);
+      if (signal.aborted || scanGeneration.current !== generation) return false;
+      setInvite(value);
+      setError("");
+      stopScanning();
+      return true;
+    } catch { return false; }
+    finally { wipeParsedInvite(parsed); }
+  }, [stopScanning]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy) return;
+    if (busy || scanning || readingImage || !invite || password.length < 8 || password.length > 128) return;
+    scanGeneration.current++;
     setBusy(true);
     setError("");
     const submittedPassword = password;
@@ -61,9 +90,18 @@ export function Entrance({
             <p>One signed invite selects and verifies your Abyssal node.</p>
           </div>
 
-          <label className="field invite-field">
-            <span className="field-label">Abyssal invite</span>
+          {scanning ? <QrScanner onScanned={acceptScannedInvite} onClose={stopScanning} /> : (
+            <button className="secondary-button" type="button" disabled={busy || readingImage} onClick={() => {
+              scanGeneration.current++;
+              setScanning(true);
+            }}><Camera size={16} /> SCAN INVITE</button>
+          )}
+          <QrImageInput disabled={busy || scanning} onScanned={acceptScannedInvite} onBusyChange={setReadingImage} resetKey={invite} />
+          <div className="field invite-field">
+            <label className="field-label" htmlFor="abyssal-invite">Abyssal invite</label>
             <textarea
+              id="abyssal-invite"
+              ref={inviteInput}
               name="invite"
               autoComplete="off"
               spellCheck={false}
@@ -84,7 +122,7 @@ export function Entrance({
             >
               <ClipboardPaste size={16} /> PASTE INVITE
             </button>
-          </label>
+          </div>
           <div className="password-field-wrap">
             <Field
               label="Password"
@@ -113,7 +151,7 @@ export function Entrance({
             {error || "\u00a0"}
           </div>
 
-          <button className="primary-button entrance-submit" type="submit" disabled={busy || !invite || password.length < 8 || password.length > 128}>
+          <button className="primary-button entrance-submit" type="submit" disabled={busy || scanning || readingImage || !invite || password.length < 8 || password.length > 128}>
             {busy ? <AbyssalMarkLoader size="compact" /> : <KeyRound size={18} />}
             {busy ? "ENTERING" : "ENTER"}
           </button>

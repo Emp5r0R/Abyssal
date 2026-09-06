@@ -80,8 +80,13 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 The install command expects `adb` on `PATH`. Otherwise invoke `platform-tools/adb` from your Android SDK.
 
-At the entrance screen paste the relay's `abyssal:invite:...` deep link or
-`ABY1-...` manual form, then enter a password. The shared Rust parser validates
+At the entrance screen scan an invite with the camera, open a local QR image,
+or paste the relay's `abyssal:invite:...` deep link or `ABY1-...` manual form,
+then enter a password. Android and web support PNG/JPEG QR images up to 8 MiB,
+4 megapixels, and 4,096 pixels per side. Image decoding is local: no QR image
+is uploaded to the relay, and a scan never opens a URL or submits a login.
+Camera access is explicit and stops on completion, cancellation, timeout, or
+leaving the scanner. The shared Rust parser validates
 the canonical capsule, signature, application, protocol range, expiry, and
 locator before any bootstrap request. The client then fetches the signed
 `/v1/node` descriptor and requires the connected node identity to match the
@@ -241,6 +246,8 @@ the node identity. There are no administrator roles or privileged invites.
 
 Read [Invite Capsule V1](docs/INVITE_CAPSULE_V1.md) for the interoperable wire,
 signature, text encoding, size-limit, locator, and failure specification.
+The [acceptance checklist](docs/INVITE_CAPSULE_CHECKLIST.md) separates implemented
+boundaries from outstanding device, live-ingress and coordinated-release checks.
 
 Every authenticated user can create rooms and trigger a relay RAM wipe. Rooms are owned by their creator: only that account can update or delete them. `ABYSSAL_MAX_ROOMS_PER_USER` limits each account's active rooms, and deleting an owned room releases one slot.
 
@@ -298,7 +305,15 @@ $EDITOR mirage-server/.env
 curl http://127.0.0.1:4020/health
 ```
 
-Set `ABYSSAL_PUBLIC_URL` to the exact public HTTPS origin before start. Back up
+Set `ABYSSAL_PUBLIC_URL` to the exact public HTTPS origin before start. For
+multiple signed locators, leave it empty and use `ABYSSAL_PUBLIC_LOCATORS`, a
+JSON array of one to four unique addresses. Server-side Onion v3 and I2P B32
+locator issuance and inbound-service profiles are described in
+[Private Transports](docs/PRIVATE_TRANSPORTS.md). Current clients still connect
+only through HTTPS or explicit development loopback; private-only capsules
+fail closed rather than resolving overlay names through ordinary DNS.
+
+Back up
 `.secrets/node-signing.key` separately with owner-only access; losing it changes
 the node identity and invalidates every previously shared invite. The key
 generator refuses to overwrite or rotate an existing key. To render a copied
@@ -308,6 +323,15 @@ argument list:
 ```bash
 printf '%s\n' "$INVITE" | ./deploy/render-invite-qr.sh
 ```
+
+Install the operating system's `qrencode` package first. Enter the invite into
+the shell variable privately (for example, `read -rs INVITE`), do not paste a
+literal secret into shell history, and `unset INVITE` afterward. Terminal
+scrollback and screen capture can still retain a printed invite. The renderer
+does not authenticate input; both clients verify the signed decoded capsule.
+For an explicitly saved QR image, `./deploy/render-invite-qr.sh png` writes PNG
+bytes to stdout. Protect any destination with owner-only permissions: the
+image contains the full bearer invite, not a redacted preview.
 
 The public health response contains only liveness, node identity, and the RAM-only storage label; invite and account counts are not exposed.
 

@@ -1,3 +1,6 @@
+use crate::private_locator::{
+    i2p_host, onion_host, parse_i2p_host, parse_onion_host, validate_onion_key,
+};
 use crate::{codec, InviteError};
 use std::{collections::HashSet, net::IpAddr};
 use url::{Host, Url};
@@ -44,8 +47,22 @@ impl LoopbackHost {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum NodeLocator {
-    Https { host: String, port: u16 },
-    LoopbackDevelopment { host: LoopbackHost, port: u16 },
+    Https {
+        host: String,
+        port: u16,
+    },
+    LoopbackDevelopment {
+        host: LoopbackHost,
+        port: u16,
+    },
+    OnionV3 {
+        service_identity: [u8; 32],
+        port: u16,
+    },
+    I2pB32 {
+        destination_hash: [u8; 32],
+        port: u16,
+    },
 }
 
 impl NodeLocator {
@@ -55,6 +72,14 @@ impl NodeLocator {
             Self::LoopbackDevelopment { host, port } => {
                 authority_url("http", host.as_str(), *port, 80)
             }
+            Self::OnionV3 {
+                service_identity,
+                port,
+            } => authority_url("http", &onion_host(service_identity), *port, 80),
+            Self::I2pB32 {
+                destination_hash,
+                port,
+            } => authority_url("http", &i2p_host(destination_hash), *port, 80),
         }
     }
 
@@ -64,6 +89,14 @@ impl NodeLocator {
             Self::LoopbackDevelopment { host, port } => {
                 authority_url("ws", host.as_str(), *port, 80)
             }
+            Self::OnionV3 {
+                service_identity,
+                port,
+            } => authority_url("ws", &onion_host(service_identity), *port, 80),
+            Self::I2pB32 {
+                destination_hash,
+                port,
+            } => authority_url("ws", &i2p_host(destination_hash), *port, 80),
         }
     }
 
@@ -71,6 +104,14 @@ impl NodeLocator {
         match self {
             Self::Https { host, port } => authority(host, *port, 443),
             Self::LoopbackDevelopment { host, port } => authority(host.as_str(), *port, 80),
+            Self::OnionV3 {
+                service_identity,
+                port,
+            } => authority(&onion_host(service_identity), *port, 80),
+            Self::I2pB32 {
+                destination_hash,
+                port,
+            } => authority(&i2p_host(destination_hash), *port, 80),
         }
     }
 
@@ -85,6 +126,23 @@ impl NodeLocator {
                 return Err(InviteError::UnsafeLocator);
             }
             Self::LoopbackDevelopment { .. } => {}
+            Self::OnionV3 {
+                service_identity,
+                port,
+            } => {
+                if *port == 0 {
+                    return Err(InviteError::UnsafeLocator);
+                }
+                validate_onion_key(service_identity)?;
+            }
+            Self::I2pB32 {
+                destination_hash,
+                port,
+            } => {
+                if *port == 0 || *destination_hash == [0; 32] {
+                    return Err(InviteError::UnsafeLocator);
+                }
+            }
         }
         Ok(())
     }
@@ -102,6 +160,22 @@ impl NodeLocator {
                 codec::encode_uint(output, host.tag());
                 codec::encode_uint(output, u64::from(*port));
             }
+            Self::OnionV3 {
+                service_identity,
+                port,
+            } => {
+                codec::encode_uint(output, 3);
+                codec::encode_bytes(output, service_identity);
+                codec::encode_uint(output, u64::from(*port));
+            }
+            Self::I2pB32 {
+                destination_hash,
+                port,
+            } => {
+                codec::encode_uint(output, 4);
+                codec::encode_bytes(output, destination_hash);
+                codec::encode_uint(output, u64::from(*port));
+            }
         }
     }
 
@@ -115,6 +189,20 @@ impl NodeLocator {
             },
             2 => Self::LoopbackDevelopment {
                 host: LoopbackHost::from_tag(decoder.uint()?)?,
+                port: decode_port(decoder.uint()?)?,
+            },
+            3 => Self::OnionV3 {
+                service_identity: decoder
+                    .bytes(32)?
+                    .try_into()
+                    .map_err(|_| InviteError::Invalid)?,
+                port: decode_port(decoder.uint()?)?,
+            },
+            4 => Self::I2pB32 {
+                destination_hash: decoder
+                    .bytes(32)?
+                    .try_into()
+                    .map_err(|_| InviteError::Invalid)?,
                 port: decode_port(decoder.uint()?)?,
             },
             _ => return Err(InviteError::UnsupportedTransport),
@@ -194,6 +282,28 @@ pub fn locator_from_public_url(value: &str) -> Result<NodeLocator, InviteError> 
     let port = url
         .port_or_known_default()
         .ok_or(InviteError::UnsafeLocator)?;
+    if let Host::Domain(domain) = host {
+        let private = if domain.ends_with(".onion") {
+            Some(NodeLocator::OnionV3 {
+                service_identity: parse_onion_host(domain)?,
+                port,
+            })
+        } else if domain.ends_with(".i2p") {
+            Some(NodeLocator::I2pB32 {
+                destination_hash: parse_i2p_host(domain)?,
+                port,
+            })
+        } else {
+            None
+        };
+        if let Some(locator) = private {
+            if url.scheme() != "http" {
+                return Err(InviteError::UnsupportedTransport);
+            }
+            locator.validate()?;
+            return Ok(locator);
+        }
+    }
     match url.scheme() {
         "https" => {
             let host = canonical_remote_url_host(host)?;
@@ -253,6 +363,7 @@ fn valid_remote_host(host: &str) -> bool {
         || host.ends_with(".local")
         || host.ends_with(".internal")
         || host.ends_with(".onion")
+        || host.ends_with(".i2p")
         || host.ends_with(".home.arpa")
         || host.ends_with(".invalid")
         || host.ends_with(".test")

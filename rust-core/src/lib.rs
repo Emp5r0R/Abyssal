@@ -1,5 +1,6 @@
 pub mod invite_protocol;
 pub mod mls_protocol;
+pub mod qr_image;
 pub mod release_provenance;
 mod release_root;
 pub mod secure_protocol;

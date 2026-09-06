@@ -156,7 +156,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(
         header::HeaderName::from_static("permissions-policy"),
         HeaderValue::from_static(
-            "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), interest-cohort=()",
+            "camera=(self), microphone=(), geolocation=(), payment=(), usb=(), serial=(), interest-cohort=()",
         ),
     );
     headers.insert(

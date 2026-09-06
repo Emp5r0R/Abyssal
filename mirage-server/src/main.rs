@@ -57,6 +57,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod advertised_locators;
 mod attachments;
 mod auth;
 mod client_platform;
@@ -1460,10 +1461,7 @@ impl AppState {
             "ABYSSAL_NODE_FINGERPRINT fingerprint={}",
             bootstrap.fingerprint
         );
-        info!(
-            "ABYSSAL_PUBLIC_LOCATOR locator={}",
-            bootstrap.locator.api_base_url()
-        );
+        info!("ABYSSAL_PUBLIC_LOCATORS count={}", bootstrap.locators.len());
 
         Self {
             node_id: bootstrap.node_id,

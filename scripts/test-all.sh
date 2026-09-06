@@ -44,6 +44,9 @@ run_shell() {
   bash "$ROOT_DIR/scripts/test-crypto-source-digest.sh"
   "$ROOT_DIR/scripts/test-release-env-parser.sh"
   "$ROOT_DIR/scripts/test-deployment-inputs.sh"
+  "$ROOT_DIR/scripts/test-web-release-archive.sh"
+  "$ROOT_DIR/scripts/test-invite-qr-renderer.sh"
+  python3 "$ROOT_DIR/scripts/test-private-transport-profiles.py"
 
   for sensitive_context_path in \
     .git .gradle-local .rustup-local .secrets .npmrc \
@@ -107,7 +110,7 @@ run_audit() {
     exit 1
   }
   npm --prefix "$ROOT_DIR" audit --audit-level=moderate
-  cargo audit --file "$ROOT_DIR/Cargo.lock"
+  cargo audit --deny warnings --file "$ROOT_DIR/Cargo.lock"
 }
 
 run_web() {

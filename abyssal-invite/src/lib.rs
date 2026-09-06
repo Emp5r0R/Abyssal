@@ -10,6 +10,7 @@ mod codec;
 mod descriptor;
 mod error;
 mod locator;
+mod private_locator;
 mod signing;
 mod text;
 

@@ -80,6 +80,80 @@ fn every_signed_field_rejects_bit_tampering() {
 }
 
 #[test]
+fn private_locators_are_signed_canonical_data_not_enabled_client_transports() {
+    use abyssal_invite::{select_locator, RuntimeLocatorPolicy, SupportedTransports};
+    let (key, mut invite) = fixture();
+    let https = invite.capsule.locators[0].clone();
+    let onion = locator_from_public_url(
+        "http://pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+    )
+    .unwrap();
+    let i2p = locator_from_public_url(
+        "http://ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p:80",
+    )
+    .unwrap();
+    for locator in [&onion, &i2p] {
+        assert!(select_locator(
+            std::slice::from_ref(locator),
+            SupportedTransports::PRODUCTION,
+            RuntimeLocatorPolicy::Production
+        )
+        .is_err());
+        assert!(select_locator(
+            std::slice::from_ref(locator),
+            SupportedTransports::DEVELOPMENT,
+            RuntimeLocatorPolicy::ExplicitDevelopment
+        )
+        .is_err());
+        let mut duplicate = invite.capsule.clone();
+        duplicate.locators = vec![locator.clone(), locator.clone()];
+        assert!(SignedInviteCapsule::sign(duplicate, &key).is_err());
+    }
+    invite.capsule.locators = vec![onion, i2p, https.clone()];
+    let signed = SignedInviteCapsule::sign(invite.capsule.clone(), &key).unwrap();
+    let bytes = signed.canonical_binary().unwrap();
+    let decoded = SignedInviteCapsule::decode(&bytes, None).unwrap();
+    assert_eq!(decoded, signed);
+    assert_eq!(
+        decode_invite_text(&encode_manual(&signed).unwrap(), None).unwrap(),
+        signed
+    );
+    assert_eq!(
+        select_locator(
+            &decoded.capsule.locators,
+            SupportedTransports::PRODUCTION,
+            RuntimeLocatorPolicy::Production
+        )
+        .unwrap(),
+        https
+    );
+    let descriptor = SignedNodeDescriptor::sign(
+        NodeDescriptorV1::abyssal(
+            key.verifying_key().to_bytes(),
+            decoded.capsule.locators.clone(),
+        )
+        .unwrap(),
+        &key,
+    )
+    .unwrap()
+    .canonical_binary()
+    .unwrap();
+    for locator in &decoded.capsule.locators {
+        SignedNodeDescriptor::decode_for_invite(
+            &descriptor,
+            &decoded.capsule.node_public_key,
+            locator,
+        )
+        .unwrap();
+    }
+    for index in 0..bytes.len() {
+        let mut tampered = bytes.clone();
+        tampered[index] ^= 1;
+        assert!(SignedInviteCapsule::decode(&tampered, None).is_err());
+    }
+}
+
+#[test]
 fn truncated_and_noncanonical_cbor_fail_closed() {
     let (_, invite) = fixture();
     let binary = invite.canonical_binary().unwrap();

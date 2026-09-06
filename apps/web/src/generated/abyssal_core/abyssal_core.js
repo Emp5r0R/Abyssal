@@ -1165,6 +1165,23 @@ export function conversationVerificationToken(node_id, chat_id, first_username, 
 }
 
 /**
+ * @param {Uint8Array} bytes
+ * @param {string} mime
+ * @returns {any}
+ */
+export function decodeQrImage(bytes, mime) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(mime, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeQrImage(ptr0, len0, ptr1, len1);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+
+/**
  * @param {string} chat_id
  * @param {string} message_id
  * @param {string} sender_username

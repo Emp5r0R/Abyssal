@@ -18,6 +18,8 @@ required-features = ["bindgen-cli"]
 
 [dependencies]
 abyssal-invite = { path = "../abyssal-invite" }
+# Local QR import only; no other image formats or filesystem inputs are enabled.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 # Secure memory wiping on drop
 zeroize = { version = "1.7", features = ["derive"] }
 

@@ -86,12 +86,8 @@ BUILD_RECORD="$OUTPUT_DIR/abyssal-web-$VERSION-build-record.json"
 for output in "$ARCHIVE" "$BUILD_RECORD"; do
   [[ ! -e "$output" ]] || { printf 'Release output already exists: %s\n' "$output" >&2; exit 1; }
 done
-tar --sort=name \
-  --mtime="@$SOURCE_EPOCH" \
-  --owner=0 --group=0 --numeric-owner \
-  --pax-option=delete=atime,delete=ctime \
-  -C "$DIST_DIR" -cf - . | gzip -n -9 > "$ARCHIVE"
-gzip -t "$ARCHIVE"
+source "$ROOT_DIR/scripts/lib/web-release-archive.sh"
+create_web_release_archive "$DIST_DIR" "$ARCHIVE" "$SOURCE_EPOCH"
 
 RECORD_ARGUMENTS=(
   create-build-record
