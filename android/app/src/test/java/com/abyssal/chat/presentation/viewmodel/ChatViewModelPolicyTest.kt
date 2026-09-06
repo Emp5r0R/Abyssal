@@ -126,14 +126,16 @@ class ChatViewModelPolicyTest {
     }
 
     @Test
-    fun verifiedLocalAdmissionSurvivesUnavailableDiscoveryAndIoFailure() {
-        assertEquals(
-            ReleaseVerificationStatus.VERIFIED,
-            releaseVerificationStatusAfterDiscovery(
+    fun verifiedLocalAdmissionCannotBeDemotedByAdvisoryDiscoveryOrIoFailure() {
+        for (discovered in ReleaseVerificationStatus.entries) {
+            assertEquals(
                 ReleaseVerificationStatus.VERIFIED,
-                ReleaseVerificationStatus.UNAVAILABLE
+                releaseVerificationStatusAfterDiscovery(
+                    ReleaseVerificationStatus.VERIFIED,
+                    discovered
+                )
             )
-        )
+        }
         assertEquals(
             ReleaseVerificationStatus.VERIFIED,
             releaseVerificationStatusAfterFailure(ReleaseVerificationStatus.VERIFIED)

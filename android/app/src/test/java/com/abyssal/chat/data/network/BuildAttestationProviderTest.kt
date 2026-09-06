@@ -1,12 +1,27 @@
 package com.abyssal.chat.data.network
 
+import com.abyssal.chat.BuildConfig
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 
 class BuildAttestationProviderTest {
+    @Test
+    fun generatedBuildIdentityIsEitherAbsentOrNativeVerified() {
+        val attestation = AndroidBuildAttestationProvider.current()
+
+        if (BuildConfig.RELEASE_BUILD_CONFIGURED) {
+            assertNotNull(attestation)
+            assertEquals(BuildConfig.VERSION_NAME, attestation?.version)
+            assertEquals(BuildConfig.RELEASE_SOURCE_COMMIT, attestation?.sourceCommit)
+        } else {
+            assertNull(attestation)
+        }
+    }
+
     @Test
     fun acceptsOnlyNativeVerifiedBakedIdentity() {
         var verifiedBuildId: String? = null

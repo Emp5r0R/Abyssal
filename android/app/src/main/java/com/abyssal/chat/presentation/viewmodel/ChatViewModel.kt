@@ -122,8 +122,11 @@ internal fun releaseVerificationStatusAfterDiscovery(
     when {
         // A failed local admission cannot be repaired by remote metadata.
         current == ReleaseVerificationStatus.REJECTED -> ReleaseVerificationStatus.REJECTED
-        current == ReleaseVerificationStatus.VERIFIED &&
-            discovered == ReleaseVerificationStatus.UNAVAILABLE -> ReleaseVerificationStatus.VERIFIED
+        // Update discovery is advisory. Network responses, parsing failures,
+        // rate limits, or unavailable metadata cannot revoke an offline-root
+        // verified native build. The relay independently enforces its signed,
+        // current-only manifest before account or messaging admission.
+        current == ReleaseVerificationStatus.VERIFIED -> ReleaseVerificationStatus.VERIFIED
         else -> discovered
     }
 
