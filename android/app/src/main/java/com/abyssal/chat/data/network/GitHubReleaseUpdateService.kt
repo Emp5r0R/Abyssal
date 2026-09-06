@@ -87,7 +87,13 @@ class GitHubReleaseUpdateService internal constructor(
         } catch (_: Exception) {
             return@withContext rejected()
         } ?: return@withContext rejected()
-        if (candidate.version < currentVersion) return@withContext rejected()
+        // The baked offline-root signature is the local admission authority.
+        // GitHub can legitimately lag a newly built or gradually published
+        // version, so an older release is not evidence that this build is bad.
+        // Do not fetch or trust any assets from the older release.
+        if (candidate.version < currentVersion) {
+            return@withContext AppUpdateCheckResult(ReleaseVerificationStatus.VERIFIED)
+        }
 
         val currentIdentity = if (candidate.version == currentVersion) {
             currentBuildAttestation?.takeIf { attestation ->

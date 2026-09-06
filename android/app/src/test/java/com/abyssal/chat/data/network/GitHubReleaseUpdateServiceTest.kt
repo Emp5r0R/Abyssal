@@ -239,6 +239,40 @@ class GitHubReleaseUpdateServiceTest {
     }
 
     @Test
+    fun keepsSignedLocalAdmissionWhenPublishedReleaseIsOlder() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody(releaseJson("v1.7.9").toString()))
+        server.start()
+        try {
+            var assetLoadAttempted = false
+            val service = GitHubReleaseUpdateService(
+                client = OkHttpClient.Builder().followRedirects(false).build(),
+                currentVersionName = "1.8.0",
+                apiUrl = server.url("/repos/Emp5r0R/Abyssal/releases/latest").toString(),
+                expectedApiHost = server.hostName,
+                allowInsecureApiForTests = true,
+                assetLoader = ReleaseAssetLoader { _, _ ->
+                    assetLoadAttempted = true
+                    error("older release assets must not be loaded")
+                },
+                currentBuildAttestation = validLocalAttestation()
+            )
+
+            val result = service.checkCurrentRelease()
+
+            assertEquals(ReleaseVerificationStatus.VERIFIED, result.verificationStatus)
+            assertNull(result.update)
+            assertEquals(false, assetLoadAttempted)
+            assertEquals(
+                "/repos/Emp5r0R/Abyssal/releases/latest",
+                server.takeRequest().path
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun keepsValidLocalAdmissionWhenGitHubIsUnavailable() = runBlocking {
         val server = MockWebServer()
         server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
