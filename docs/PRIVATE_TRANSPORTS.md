@@ -90,6 +90,13 @@ to `127.0.0.1:4020`. See the
 
 ## I2P Server
 
+Use a daemon version that accepts the complete supplied profile. Native profile
+checks have passed with i2pd 2.59.0, and isolated Ubuntu ARM64 startup has passed
+with 2.61.0. Ubuntu 24.04's 2.49.0 package rejects `reseed.followredirect` and is
+not compatible with this profile. Do not remove that restriction to make an
+older daemon start. Run the native profile check against the actual executable
+before provisioning; successful startup alone does not prove ingress works.
+
 Use both `i2pd.conf.example` and `i2pd-tunnels.conf.example` from
 `deploy/private-transports/`. Create an empty, dedicated tunnels directory so
 the daemon does not auto-load unrelated `.conf` files. Supply the installed

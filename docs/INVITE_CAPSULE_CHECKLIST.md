@@ -53,12 +53,39 @@ isolates the entrance mount, not the QR parser; it is not a full release-origin
 attestation or physical camera test. The native renderer round-trip also uses
 the real shared WASM raster/parser and client QR decoder, not a mocked decoder.
 
+## Qualification Evidence
+
+On 2026-09-06, source `0f4e898f4d12b0c2c0dbca2345f96f5c98aa1758`
+passed hosted CI (run `34037354761`) and CodeQL (run `34037354781`).
+On the paired Android 16 device, the attested debug build reached account
+entry; camera denial/regrant and background teardown were checked. Canceling
+the system image picker returned to empty account entry. Importing the
+independent `invite-qrencode.png` fixture through the local media provider
+populated the expected invite, left the password empty and login disabled.
+These observations do not replace the remaining physical camera checks.
+
+An isolated Tor 0.4.9.11 service on the operator's ARM64 host forwarded to a
+disposable current-source relay through a loopback SSH tunnel. A separate Tor
+probe retrieved the signed descriptor and health response. The descriptor
+matched the locally verified node identity and advertised Onion locator.
+After restarting the service, its Onion identity was unchanged, descriptor
+retrieval passed again, and a ticket obtained through test OPAQUE registration
+was accepted with WebSocket HTTP status 101 through the Onion service. Initial
+requests during network startup timed out; success required established
+circuits. This qualifies the supplied Tor forwarding profile with test state,
+not a production overlay deployment or a claim of anonymity.
+
+The isolated I2P 2.61.0 instance loaded an owner-only destination key and
+populated its router database, but reported unavailable peers when attempting
+inbound tunnels. End-to-end I2P ingress remains unverified. All overlay test
+identities and account fixtures were separate from production.
+
 ## Release Checks Still Required
 
 - Physical Android camera scan, permission denial/regrant, backgrounding,
   rotation, repeated scans and local document-provider cancellation. Confirm
   secure screenshots and that no QR action submits credentials automatically.
-- Live operator-controlled Tor and I2P ingress qualification: descriptor
+- Live operator-controlled I2P ingress qualification: descriptor
   identity/signature, health, WebSocket upgrade and stable service identity
   after restart. Local native profile checks only prove startup/configuration
   and destination-key behavior, not routability or anonymity.
