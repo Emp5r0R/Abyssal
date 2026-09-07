@@ -1,3 +1,4 @@
+import { attachmentUploadEnvelope, decodeAttachmentUploadResponse, ATTACHMENT_UPLOAD_PREFIX_BYTES } from "./attachmentUploadEnvelope";
 import type {
   AccountResponse,
   AccountSession,
@@ -996,6 +997,7 @@ export function uploadEncryptedAttachment(
   signal?: AbortSignal,
 ): Promise<string> {
   if (!validUuid(messageId)) return Promise.reject(new Error("Upload rejected"));
+  if (signal?.aborted) return Promise.reject(new Error("Upload aborted"));
   const encryptedBytes = encrypted instanceof Blob ? encrypted.size : encrypted.byteLength;
   if (!Number.isSafeInteger(encryptedBytes) || encryptedBytes <= 0 ||
     encryptedBytes > maxSerializedAttachmentBytes(mediaType) ||
@@ -1003,14 +1005,14 @@ export function uploadEncryptedAttachment(
     return Promise.reject(new Error("Upload rejected"));
   }
   return new Promise((resolve, reject) => {
-    const query = new URLSearchParams({
+    const body = attachmentUploadEnvelope({
       chat_id: chatId,
       message_id: messageId,
       media_type: mediaType,
-      one_time: String(options.oneTime),
-      delete_after_download: String(options.deleteAfterDownload || options.oneTime),
-      ttl_sec: String(Math.max(0, options.ttlSec)),
-    });
+      one_time: options.oneTime,
+      delete_after_download: options.deleteAfterDownload || options.oneTime,
+      ttl_sec: Math.max(0, options.ttlSec),
+    }, encrypted);
     const request = new XMLHttpRequest();
     let settled = false;
     const finish = (callback: () => void) => {
@@ -1025,11 +1027,14 @@ export function uploadEncryptedAttachment(
       fail("Upload aborted");
       return;
     }
-    request.open("POST", `${session.endpoint.apiBaseUrl}/v1/attachment?${query}`);
+    request.open("POST", `${session.endpoint.apiBaseUrl}/v2/attachment`);
     request.responseType = "text";
     request.setRequestHeader("Authorization", `Bearer ${session.token}`);
     request.setRequestHeader("Content-Type", "application/octet-stream");
-    request.upload.onprogress = (event) => onProgress({ loaded: event.loaded, total: event.total || encryptedBytes });
+    request.upload.onprogress = (event) => onProgress({
+      loaded: Math.min(encryptedBytes, Math.max(0, event.loaded - ATTACHMENT_UPLOAD_PREFIX_BYTES)),
+      total: encryptedBytes,
+    });
     request.onprogress = (event) => {
       if (event.loaded > MAX_ATTACHMENT_UPLOAD_JSON_BYTES) {
         fail("Upload rejected");
@@ -1054,21 +1059,14 @@ export function uploadEncryptedAttachment(
       }
       try {
         const payload = JSON.parse(request.responseText) as unknown;
-        if (!plainObjectWithKeys(payload, ["attachment_id"]) ||
-          typeof payload.attachment_id !== "string") throw new Error("Upload rejected");
-        const id = validateAttachmentId(payload.attachment_id);
+        const id = decodeAttachmentUploadResponse(payload);
         finish(() => resolve(id));
       } catch {
         fail("Upload rejected");
       }
     };
     signal?.addEventListener("abort", abort, { once: true });
-    if (encrypted instanceof Blob) {
-      request.send(encrypted);
-    } else {
-      // Keep the encrypted view intact through the boundary instead of copying it.
-      request.send(encrypted as unknown as ArrayBuffer);
-    }
+    request.send(body);
   });
 }
 

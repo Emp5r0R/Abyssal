@@ -90,6 +90,10 @@ identities and account fixtures were separate from production.
   public bootstrap information and observable network timing/addresses. Do not
   publish a metadata-free claim or silently treat these limits as accepted.
   Local room labels remain client-only and are not shared encrypted titles.
+  Attachment upload metadata now travels in a bounded body envelope rather than
+  URL queries; this is access-log minimization, not an end-to-end metadata channel.
+  Coordinate relay/web/Android updates for the v2 upload endpoint; v1 uploads
+  are intentionally rejected without fallback.
 - Physical Android camera scan, permission denial/regrant, backgrounding,
   rotation, repeated scans and local document-provider cancellation. Confirm
   secure screenshots and that no QR action submits credentials automatically.

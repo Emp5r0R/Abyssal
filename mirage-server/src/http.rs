@@ -12,7 +12,12 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/v1/ws-ticket", post(issue_ws_ticket))
         .route("/v1/account/logout", post(logout_account))
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
-    let attachment_upload_routes = Router::new().route("/v1/attachment", post(upload_attachment));
+    let attachment_upload_routes = Router::new()
+        .route(
+            "/v2/attachment",
+            post(attachment_upload::upload_attachment_v2),
+        )
+        .route("/v1/attachment", post(|| async { StatusCode::GONE }));
     let attachment_download_routes = Router::new()
         .route(
             "/v1/attachment/:id",

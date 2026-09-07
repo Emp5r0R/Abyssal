@@ -155,6 +155,19 @@ dependency targets and their spans even with `RUST_LOG=trace`. This reduces
 accidental logging exposure, not the relay's in-memory knowledge, warning-event
 timing, upstream access logs or a malicious host administrator's access.
 
+Official clients send attachment uploads to the fixed `/v2/attachment` path.
+The bounded 1 KiB upload envelope moves chat/message IDs, media class and
+retention options out of URL queries and into the TLS-protected request body;
+it does **not** encrypt these fields from the relay or TLS terminator. No metadata
+is moved into custom HTTP headers. The relay rejects query-bearing v2 uploads
+and returns 410 for the legacy upload endpoint. Authentication, per-account and
+global concurrency admission precede envelope reads; parsing has a 10-second
+total deadline. Existing ciphertext quotas, staging, session revalidation and
+purge checks remain in force. Download/claim URLs still carry opaque attachment
+IDs, and authorization headers still carry bearer tokens. Intermediaries that
+log bodies or headers can still expose sensitive data. Browser Blob and HTTP
+implementation buffers cannot be guaranteed physically zeroized.
+
 Official clients generate new room IDs from full random UUIDs independently of
 the local label; Android no longer truncates them to 32 bits. Current MLS room
 creation has no title field and rejects additional plaintext title fields.

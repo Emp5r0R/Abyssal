@@ -1,6 +1,9 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 
+#[path = "attachment_upload_tests.rs"]
+mod attachment_upload_tests;
+
 #[test]
 fn healthcheck_accepts_only_a_successful_json_health_response() {
     assert!(healthcheck_response_is_healthy(

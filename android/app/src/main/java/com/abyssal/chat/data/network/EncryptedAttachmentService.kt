@@ -11,7 +11,6 @@ import com.abyssal.chat.domain.repository.IAttachmentPlaintextSource
 import com.abyssal.chat.domain.repository.IEncryptedAttachmentService
 import java.io.EOFException
 import java.io.IOException
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.util.Locale
@@ -227,6 +226,7 @@ class EncryptedAttachmentService(
     ): AttachmentUploadResult = withContext(Dispatchers.IO) {
         val normalizedMediaType = mediaType.uppercase(Locale.ROOT)
         var key: ByteArray? = null
+        var uploadPrefix: ByteArray? = null
         var keyTransferred = false
         try {
             val expectedWireBytes = expectedEncryptedAttachmentBytes(source.sizeBytes)
@@ -240,17 +240,11 @@ class EncryptedAttachmentService(
             if (key.size != AttachmentProtocol.KEY_BYTES) {
                 return@withContext AttachmentUploadResult(false)
             }
-            val query = listOf(
-                "chat_id" to chatId,
-                "message_id" to messageId,
-                "media_type" to normalizedMediaType,
-                "one_time" to oneTimeView.toString(),
-                "delete_after_download" to deleteAfterDownload.toString(),
-                "ttl_sec" to ttlSec.coerceAtLeast(0).toString()
-            ).joinToString("&") { (queryKey, value) ->
-                "${queryKey}=${URLEncoder.encode(value, StandardCharsets.UTF_8.name())}"
-            }
+            uploadPrefix = AttachmentUploadEnvelope.encode(
+                chatId, messageId, normalizedMediaType, oneTimeView, deleteAfterDownload, ttlSec
+            )
             val body = EncryptedChunkRequestBody(
+                uploadPrefix = uploadPrefix,
                 source = source,
                 chatId = chatId,
                 messageId = messageId,
@@ -260,7 +254,7 @@ class EncryptedAttachmentService(
                 onProgress = onProgress
             )
             val request = Request.Builder()
-                .url("${session.endpoint.apiBaseUrl}/v1/attachment?$query")
+                .url("${session.endpoint.apiBaseUrl}/v2/attachment")
                 .header("Authorization", "Bearer ${session.token}")
                 .post(body)
                 .build()
@@ -286,6 +280,7 @@ class EncryptedAttachmentService(
             AttachmentUploadResult(false)
         } finally {
             source.destroy()
+            uploadPrefix?.fill(0)
             if (!keyTransferred) key?.fill(0)
         }
     }
@@ -513,6 +508,7 @@ class EncryptedAttachmentService(
     }
 
     private class EncryptedChunkRequestBody(
+        private val uploadPrefix: ByteArray,
         private val source: IAttachmentPlaintextSource,
         private val chatId: String,
         private val messageId: String,
@@ -526,7 +522,7 @@ class EncryptedAttachmentService(
 
         override fun contentType(): MediaType = "application/octet-stream".toMediaType()
 
-        override fun contentLength(): Long = wireBytes
+        override fun contentLength(): Long = wireBytes + AttachmentUploadEnvelope.PREFIX_BYTES
 
         override fun isOneShot(): Boolean = true
 
@@ -536,6 +532,7 @@ class EncryptedAttachmentService(
             var chunkIndex = 0L
             onProgress(0L, source.sizeBytes)
             try {
+                sink.write(uploadPrefix)
                 source.openStream().use { input ->
                     while (plaintextRead < source.sizeBytes) {
                         val chunkBytes = minOf(

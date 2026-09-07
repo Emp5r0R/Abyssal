@@ -164,6 +164,15 @@ class EncryptedAttachmentServiceTest {
                 progress
             )
             val request = server.takeRequest()
+            assertEquals("/v2/attachment", request.path)
+            val prefix = request.body.readByteArray(AttachmentUploadEnvelope.PREFIX_BYTES.toLong())
+            assertEquals("ABYUP001", String(prefix, 0, 8, Charsets.US_ASCII))
+            val jsonLength = ((prefix[8].toInt() and 255) shl 8) or (prefix[9].toInt() and 255)
+            val metadata = org.json.JSONObject(String(prefix, 10, jsonLength, Charsets.UTF_8))
+            assertEquals(TEST_CHAT_ID, metadata.getString("chat_id"))
+            assertEquals(ATTACHMENT_ID, metadata.getString("message_id"))
+            assertEquals(60, metadata.getInt("ttl_sec"))
+            assertTrue(prefix.drop(10 + jsonLength).all { it == 0.toByte() })
             val encrypted = request.body.readByteArray()
             assertEquals(2L * ATTACHMENT_CHUNK_RECORD_BYTES, encrypted.size.toLong())
             assertEquals(AttachmentProtocol.CIPHER_VERSION, encrypted[0].toInt())
@@ -280,7 +289,7 @@ class EncryptedAttachmentServiceTest {
             assertTrue(upload.accepted)
             val uploadRequest = capturedServer.takeRequest()
             assertEquals("Bearer captured-token", uploadRequest.getHeader("Authorization"))
-            assertTrue(uploadRequest.path.orEmpty().contains("message_id=$ATTACHMENT_ID"))
+            assertEquals("/v2/attachment", uploadRequest.path)
 
             assertTrue(service.deleteUploadedAttachment(capturedSession, ATTACHMENT_ID))
             assertEquals(

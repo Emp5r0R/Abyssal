@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomFillSync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { attachmentUploadEnvelope, decodeAttachmentUploadResponse } from "../apps/web/src/transport/attachmentUploadEnvelope.ts";
 import {
   decryptAttachment,
   encryptAttachment,
@@ -28,6 +29,10 @@ assert.ok(aliceInvite, "ABYSSAL_TEST_INVITE_A is required");
 assert.ok(bobInvite, "ABYSSAL_TEST_INVITE_B is required");
 assert.match(buildSignatureB64 ?? "", /^[A-Za-z0-9_-]{86}$/);
 const encoder = new TextEncoder();
+const uploadEnvelope = (chatId, messageId, encrypted, oneTime = false) => attachmentUploadEnvelope({
+  chat_id: chatId, message_id: messageId, media_type: "FILE",
+  one_time: oneTime, delete_after_download: oneTime, ttl_sec: 0,
+}, encrypted);
 const decoder = new TextDecoder();
 const RESULT_TIMEOUT_MS = 5_000;
 const MAX_PENDING_RESULT_WAITERS = 256;
@@ -1977,11 +1982,12 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
     const attachmentBlob = new Uint8Array(encryptedAttachment.blob);
     try {
       const uploadResponse = await fetch(
-        `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(roomId)}&message_id=${encodeURIComponent(attachmentMessageId)}&media_type=FILE`,
-        { method: "POST", headers: { authorization: `Bearer ${alice.token}` }, body: attachmentBlob },
+        `${baseUrl}/v2/attachment`,
+        { method: "POST", headers: { authorization: `Bearer ${alice.token}` }, body: uploadEnvelope(roomId, attachmentMessageId, attachmentBlob) },
       );
       assert.equal(uploadResponse.status, 200);
       const upload = await uploadResponse.json();
+      assert.equal(decodeAttachmentUploadResponse(upload), upload.attachment_id);
       assert.equal(upload.accepted, true);
       const staged = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
       assert.equal(staged.status, 404, "staged MLS attachment must not be downloadable");
@@ -2236,17 +2242,28 @@ try {
   const attachmentBytes = new Uint8Array(encryptedAttachment.blob);
   assert.ok(attachmentBytes.byteLength > attachmentPlaintext.byteLength);
   const uploadResponse = await fetch(
-    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&message_id=${encodeURIComponent(attachmentMessageId)}&media_type=FILE`,
+    `${baseUrl}/v2/attachment`,
     {
       method: "POST",
       headers: { authorization: `Bearer ${alice.token}` },
-      body: attachmentBytes,
+      body: uploadEnvelope(aliceOpened.direct.id, attachmentMessageId, attachmentBytes),
     },
   );
   assert.equal(uploadResponse.status, 200);
   const upload = await uploadResponse.json();
+  assert.equal(decodeAttachmentUploadResponse(upload), upload.attachment_id);
   assert.equal(upload.accepted, true);
   assert.match(String(upload.attachment_id), /^[0-9a-f-]{36}$/);
+
+  const legacyUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=fixture`, {
+    method: "POST", headers: { authorization: `Bearer ${alice.token}` }, body: new Uint8Array([3]),
+  });
+  assert.equal(legacyUpload.status, 410, "legacy metadata-in-URL uploads must fail closed");
+  const queryUpload = await fetch(`${baseUrl}/v2/attachment?chat_id=fixture`, {
+    method: "POST", headers: { authorization: `Bearer ${alice.token}` },
+    body: uploadEnvelope(aliceOpened.direct.id, attachmentMessageId, attachmentBytes),
+  });
+  assert.equal(queryUpload.status, 400, "v2 uploads must not accept query metadata");
 
   const stagedOwnerDownload = await fetch(
     `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
@@ -2351,15 +2368,16 @@ try {
   const oneTimeAttachmentKey = new Uint8Array(oneTimeEncryptedAttachment.key);
   const oneTimeAttachmentBytes = new Uint8Array(oneTimeEncryptedAttachment.blob);
   const oneTimeUploadResponse = await fetch(
-    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&message_id=${encodeURIComponent(oneTimeMessageId)}&media_type=FILE&one_time=true&delete_after_download=true`,
+    `${baseUrl}/v2/attachment`,
     {
       method: "POST",
       headers: { authorization: `Bearer ${alice.token}` },
-      body: oneTimeAttachmentBytes,
+      body: uploadEnvelope(aliceOpened.direct.id, oneTimeMessageId, oneTimeAttachmentBytes, true),
     },
   );
   assert.equal(oneTimeUploadResponse.status, 200);
   const oneTimeUpload = await oneTimeUploadResponse.json();
+  assert.equal(decodeAttachmentUploadResponse(oneTimeUpload), oneTimeUpload.attachment_id);
   assert.equal(oneTimeUpload.accepted, true);
   await acceptAttachmentMetadata({
     messageId: oneTimeMessageId,
@@ -2441,15 +2459,16 @@ try {
   const releasableAttachmentKey = new Uint8Array(releasableEncryptedAttachment.key);
   const releasableAttachmentBytes = new Uint8Array(releasableEncryptedAttachment.blob);
   const releasableUploadResponse = await fetch(
-    `${baseUrl}/v1/attachment?chat_id=${encodeURIComponent(aliceOpened.direct.id)}&message_id=${encodeURIComponent(releasableMessageId)}&media_type=FILE&one_time=true&delete_after_download=true`,
+    `${baseUrl}/v2/attachment`,
     {
       method: "POST",
       headers: { authorization: `Bearer ${alice.token}` },
-      body: releasableAttachmentBytes,
+      body: uploadEnvelope(aliceOpened.direct.id, releasableMessageId, releasableAttachmentBytes, true),
     },
   );
   assert.equal(releasableUploadResponse.status, 200);
   const releasableUpload = await releasableUploadResponse.json();
+  assert.equal(decodeAttachmentUploadResponse(releasableUpload), releasableUpload.attachment_id);
   await acceptAttachmentMetadata({
     messageId: releasableMessageId,
     attachmentId: releasableUpload.attachment_id,
@@ -2666,11 +2685,11 @@ try {
 
   const unauthorizedUploadMessageId = randomUUID();
   const unauthorizedUpload = await fetch(
-    `${baseUrl}/v1/attachment?chat_id=dm_guessed&message_id=${encodeURIComponent(unauthorizedUploadMessageId)}&media_type=FILE`,
+    `${baseUrl}/v2/attachment`,
     {
       method: "POST",
       headers: { authorization: `Bearer ${alice.token}` },
-      body: new Uint8Array([1, 2, 3]),
+      body: uploadEnvelope("dm_guessed", unauthorizedUploadMessageId, new Uint8Array([1, 2, 3])),
     },
   );
   assert.equal(unauthorizedUpload.status, 403);

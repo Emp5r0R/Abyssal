@@ -852,15 +852,16 @@ describe("account transport", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("passes the encrypted upload view to XHR without making a full copy", async () => {
+  it("keeps upload metadata out of the URL and preserves the encrypted records", async () => {
     const original = globalThis.XMLHttpRequest;
     let sent: unknown;
     let openedUrl = "";
+    const progress: Array<{ loaded: number; total: number }> = [];
     class TestXmlHttpRequest {
       readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
       responseType = "";
       status = 201;
-      responseText = JSON.stringify({ attachment_id: ATTACHMENT_PRIMARY });
+      responseText = JSON.stringify({ accepted: true, attachment_id: ATTACHMENT_PRIMARY, storage: "ram-only" });
       onerror: (() => void) | null = null;
       onabort: (() => void) | null = null;
       onload: (() => void) | null = null;
@@ -875,6 +876,9 @@ describe("account transport", () => {
 
       send(body: unknown): void {
         sent = body;
+        for (const loaded of [100, 1026, 1024 + encrypted.length]) {
+          this.upload.onprogress?.({ loaded, total: 1024 + encrypted.length } as ProgressEvent);
+        }
         this.onload?.();
       }
     }
@@ -888,10 +892,23 @@ describe("account transport", () => {
         "FILE",
         encrypted,
         { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
-        () => undefined,
+        (event) => progress.push(event),
       )).resolves.toBe(ATTACHMENT_PRIMARY);
-      expect(sent).toBe(encrypted);
-      expect(openedUrl).toContain(`message_id=${ATTACHMENT_PRIMARY}`);
+      expect(sent).toBeInstanceOf(Blob);
+      const bytes = new Uint8Array(await (sent as Blob).arrayBuffer());
+      expect(new TextDecoder().decode(bytes.subarray(0, 8))).toBe("ABYUP001");
+      const length = new DataView(bytes.buffer).getUint16(8, false);
+      expect(JSON.parse(new TextDecoder().decode(bytes.subarray(10, 10 + length)))).toEqual({
+        chat_id: "dm_Alice_Bob", message_id: ATTACHMENT_PRIMARY, media_type: "FILE",
+        one_time: false, delete_after_download: false, ttl_sec: 60,
+      });
+      expect(bytes.subarray(10 + length, 1024).every((byte) => byte === 0)).toBe(true);
+      expect(bytes.subarray(1024)).toEqual(encrypted);
+      expect(openedUrl).toBe(`${session.endpoint.apiBaseUrl}/v2/attachment`);
+      expect(progress).toEqual([
+        { loaded: 0, total: encrypted.length }, { loaded: 2, total: encrypted.length },
+        { loaded: encrypted.length, total: encrypted.length },
+      ]);
     } finally {
       globalThis.XMLHttpRequest = original;
     }
@@ -1022,7 +1039,7 @@ describe("account transport", () => {
       });
       await expect(upload()).rejects.toThrow("Upload rejected");
 
-      TestXmlHttpRequest.responseText = JSON.stringify({ attachment_id: ATTACHMENT_PRIMARY });
+      TestXmlHttpRequest.responseText = JSON.stringify({ accepted: true, attachment_id: ATTACHMENT_PRIMARY, storage: "ram-only" });
       TestXmlHttpRequest.declaredLength = String(4 * 1024 + 1);
       await expect(upload()).rejects.toThrow("Upload rejected");
 

@@ -57,6 +57,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 mod advertised_locators;
+mod attachment_upload;
 mod attachments;
 mod auth;
 mod client_platform;
@@ -549,6 +550,14 @@ struct AttachmentQuery {
     one_time: Option<bool>,
     delete_after_download: Option<bool>,
     ttl_sec: Option<u64>,
+}
+
+impl Drop for AttachmentQuery {
+    fn drop(&mut self) {
+        self.chat_id.zeroize();
+        self.message_id.zeroize();
+        self.media_type.zeroize();
+    }
 }
 
 #[derive(Serialize)]
