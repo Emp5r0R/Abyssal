@@ -1,5 +1,6 @@
 //! Node infrastructure identity and one-shot bootstrap invitation issuance.
 
+use super::invite_output::{write_qr, InviteOutputMode};
 use abyssal_invite::{
     derive_node_id, encode_deep_link, encode_manual, generate_capability, node_key_fingerprint,
     node_signing_key_from_seed, InviteCapsuleV1, NodeDescriptorV1, NodeLocator,
@@ -34,10 +35,12 @@ pub(super) struct BootstrapMaterials {
     pub(super) issued_invites: Vec<IssuedInvite>,
     pub(super) locators: Vec<NodeLocator>,
     pub(super) fingerprint: String,
+    pub(super) output_mode: InviteOutputMode,
 }
 
 impl BootstrapMaterials {
     pub(super) fn from_env(now_unix_seconds: u64) -> Result<Self, String> {
+        let output_mode = InviteOutputMode::from_env()?;
         let key_path = env::var("ABYSSAL_NODE_SIGNING_KEY_FILE")
             .map_err(|_| "ABYSSAL_NODE_SIGNING_KEY_FILE is required".to_owned())?;
         let locators = super::advertised_locators::from_env()?;
@@ -106,6 +109,7 @@ impl BootstrapMaterials {
             issued_invites,
             locators,
             fingerprint,
+            output_mode,
         })
     }
 }
@@ -113,18 +117,27 @@ impl BootstrapMaterials {
 pub(super) fn write_boot_invites<W: Write>(
     output: &mut W,
     invites: &[IssuedInvite],
+    mode: InviteOutputMode,
 ) -> io::Result<()> {
     writeln!(
         output,
-        "ABYSSAL RAM-ONLY INVITES - copy these now; they cannot be recovered"
+        "ABYSSAL RAM-ONLY INVITES - keep these private; they cannot be recovered"
     )?;
-    for invite in invites {
-        writeln!(output, "ABYSSAL_INVITE invite={}", invite.manual.as_str())?;
-        writeln!(
-            output,
-            "ABYSSAL_INVITE_DEEP_LINK invite={}",
-            invite.deep_link.as_str()
-        )?;
+    for (index, invite) in invites.iter().enumerate() {
+        match mode {
+            InviteOutputMode::Qr => {
+                writeln!(output, "Invite {} of {} (QR)", index + 1, invites.len())?;
+                write_qr(output, invite.deep_link.as_str())?;
+            }
+            InviteOutputMode::Text => {
+                writeln!(output, "ABYSSAL_INVITE invite={}", invite.manual.as_str())?;
+                writeln!(
+                    output,
+                    "ABYSSAL_INVITE_DEEP_LINK invite={}",
+                    invite.deep_link.as_str()
+                )?;
+            }
+        }
     }
     output.flush()
 }
@@ -262,7 +275,7 @@ mod tests {
             manual: Zeroizing::new(encode_manual(&signed).unwrap()),
         };
         let mut output = Vec::new();
-        write_boot_invites(&mut output, &[invite]).unwrap();
+        write_boot_invites(&mut output, &[invite], InviteOutputMode::Text).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("ABYSSAL_INVITE invite=ABY1-"));
         assert!(text.contains("ABYSSAL_INVITE_DEEP_LINK invite=abyssal:invite:"));

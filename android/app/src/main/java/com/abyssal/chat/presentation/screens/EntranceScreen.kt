@@ -212,27 +212,16 @@ private fun EntranceContent(
                             }
                         }
                         if (imageError) Text("QR image not accepted.", color = SelfDestructAmber)
-                        OutlinedTextField(
+                        InviteEntryField(
                             value = invite,
                             onValueChange = {
                                 invite = it.take(MAX_INVITE_TEXT_CHARS)
                                 onInputChanged()
                             },
-                            label = { Text("Abyssal invite") },
-                            placeholder = { Text("ABY1-... or abyssal:invite:...") },
                             colors = entranceTextFieldColors(),
-                            enabled = !isVerifying,
-                            minLines = 3,
-                            maxLines = 5,
+                            enabled = !isVerifying && !readingImage && !scanning,
                             isError = error != null,
-                            keyboardOptions = KeyboardOptions(
-                                capitalization = KeyboardCapitalization.None,
-                                keyboardType = KeyboardType.Ascii,
-                                imeAction = ImeAction.Next
-                            ),
-                            keyboardActions = KeyboardActions(
-                                onNext = { passwordFocusRequester.requestFocus() }
-                            ),
+                            onNext = { passwordFocusRequester.requestFocus() },
                             modifier = Modifier.fillMaxWidth()
                         )
 
@@ -243,7 +232,7 @@ private fun EntranceContent(
                                     .orEmpty()
                                 onInputChanged()
                             },
-                            enabled = !isVerifying,
+                            enabled = !isVerifying && !readingImage && !scanning,
                             modifier = Modifier
                                 .align(Alignment.End)
                                 .padding(top = 4.dp)

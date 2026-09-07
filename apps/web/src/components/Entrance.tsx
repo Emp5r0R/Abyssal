@@ -22,7 +22,7 @@ export function Entrance({
   const [scanning, setScanning] = useState(false);
   const [readingImage, setReadingImage] = useState(false);
   const scanGeneration = useRef(0);
-  const inviteInput = useRef<HTMLTextAreaElement>(null);
+  const inviteInput = useRef<HTMLInputElement>(null);
   useEffect(() => () => { scanGeneration.current++; }, []);
   useEffect(() => {
     if (!scanning && invite) inviteInput.current?.focus();
@@ -99,25 +99,35 @@ export function Entrance({
           <QrImageInput disabled={busy || scanning} onScanned={acceptScannedInvite} onBusyChange={setReadingImage} resetKey={invite} />
           <div className="field invite-field">
             <label className="field-label" htmlFor="abyssal-invite">Abyssal invite</label>
-            <textarea
+            <input
               id="abyssal-invite"
               ref={inviteInput}
               name="invite"
+              type="password"
               autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
               spellCheck={false}
               placeholder="ABY1-... or abyssal:invite:..."
               value={invite}
               maxLength={2048}
-              onChange={(event) => setInvite(event.target.value)}
+              onChange={(event) => { scanGeneration.current++; setInvite(event.target.value); }}
+              disabled={busy || scanning || readingImage}
               required
             />
             <button
               className="secondary-button invite-paste"
               type="button"
+              disabled={busy || scanning || readingImage}
               onClick={() => {
+                const generation = ++scanGeneration.current;
                 void navigator.clipboard.readText()
-                  .then((value) => setInvite(value.slice(0, 2048)))
-                  .catch(() => setError("Unable to read invite."));
+                  .then((value) => {
+                    if (scanGeneration.current === generation) setInvite(value.slice(0, 2048));
+                  })
+                  .catch(() => {
+                    if (scanGeneration.current === generation) setError("Unable to read invite.");
+                  });
               }}
             >
               <ClipboardPaste size={16} /> PASTE INVITE

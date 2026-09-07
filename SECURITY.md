@@ -65,6 +65,12 @@ with this threat must compare the node fingerprint through a separate trusted
 path. The manual Base32 checksum catches transcription errors only and is not
 an authenticity proof.
 
+Web and Android mask invite entry, including camera and image-import results,
+and never echo decoded credentials in error messages. This reduces shoulder
+surfing, not access by a compromised browser, device, clipboard, or input method.
+QR images remain readable bearer credentials; masking does not encrypt their
+locator or other signed capsule fields.
+
 An Invite Capsule is a bearer credential. Anyone who obtains an unused capsule
 can attempt registration until it is consumed or expires, subject to relay rate
 limits. Node-key compromise permits creation of authentic-looking capsules and
@@ -137,7 +143,7 @@ Canonical WebSocket frame buckets reduce exact application-frame length leakage,
 1. Serve production web and API from one HTTPS origin. Leave `ABYSSAL_WEB_ORIGINS` empty unless a separate reviewed origin is required.
 2. Keep port `4020` private behind TLS tunnel or reverse proxy. Do not expose plaintext relay HTTP to internet.
 3. Use the supplied Docker read-only runtime, non-root UID, dropped capabilities, bounded memory/PIDs, and `no-new-privileges`. Keep the owner-only node seed as the sole read-only mounted state; do not mount account/chat storage.
-4. Invite Capsules appear once in attached process stdout. The supplied Compose deployment disables Docker log persistence and provides no retrieval file, API, fixed-capability environment setting, or plaintext-capability map. Lost capsules require a destructive restart. Do not replace this with a disk-backed log driver.
+4. Invite Capsules appear once as QR-only output in attached process stdout by default. Only explicit `ABYSSAL_INVITE_QR_ENABLED=false` enables text forms; invalid settings abort startup and QR errors do not fall back to text. The supplied Compose deployment disables Docker log persistence and provides no retrieval file, API, fixed-capability environment setting, or plaintext-capability map. Lost capsules require a destructive restart. A terminal QR still encodes the complete bearer credential, including its signed locators; terminal capture is credential disclosure. Owned output buffers are cleared best-effort, but QR-library internals, terminal scrollback and OS output copies cannot be guaranteed erased. Do not replace this with a disk-backed log driver.
 5. Restart wipes all relay state. Verify terminal capture, host tracing, crash dumps, and swap are not configured to capture process/container memory.
 6. Rebuild Android and web clients after protocol changes. Current source keeps protocol-v9 OPAQUE/Olm direct chats and requires protocol-v10 MLS room clients with matching generated native/WASM bindings and strict schemas. Older protocol-v9 room clients have no pairwise fallback and fail closed; protocol-v8 clients/checkpoints and older pre-v8 clients are also wire-incompatible. No Android APK/AAB is produced by the normal security gate.
 7. Keep the Android release keystore and node identity backup protected. Never commit `deploy/release.env`, `.secrets/`, APK signing credentials, node signing seeds, generated capsules, or capabilities.

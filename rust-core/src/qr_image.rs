@@ -187,6 +187,28 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_metadata_is_inert_and_cannot_replace_image_pixels() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .write_image(&[255; 12], 2, 2, ColorType::Rgb8.into())
+            .unwrap();
+        let expected = decode_qr_image(jpeg.clone(), "image/jpeg".into()).unwrap();
+        let metadata =
+            b"Exif\0\0file:///etc/passwd https://evil.example/lookup?invite=secret <script>";
+        let mut tagged = jpeg[..2].to_vec();
+        tagged.extend_from_slice(&[0xff, 0xe1]);
+        tagged.extend_from_slice(&((metadata.len() + 2) as u16).to_be_bytes());
+        tagged.extend_from_slice(metadata);
+        tagged.extend_from_slice(&jpeg[2..]);
+        let result = decode_qr_image(tagged, "image/jpeg".into()).unwrap();
+        assert_eq!(
+            (result.width, result.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(result.luminance, expected.luminance);
+    }
+
+    #[test]
     fn hostile_mutations_never_panic() {
         let valid = png();
         for index in 0..valid.len() {

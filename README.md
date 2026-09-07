@@ -232,8 +232,11 @@ Health check:
 curl http://127.0.0.1:4020/health
 ```
 
-The server prints each signed Invite Capsule once in `ABY1-...` and
-`abyssal:invite:...` form. Both encode the same 256-bit account-bootstrap
+The server prints each signed Invite Capsule once as a terminal QR by default,
+without an accompanying visible code. Scan it from a private, sufficiently wide
+ANSI/UTF-8 terminal. Set `ABYSSAL_INVITE_QR_ENABLED=false` explicitly to print
+the `ABY1-...` and `abyssal:invite:...` text forms instead. QR encoding errors
+never fall back to text. Both presentations encode the same 256-bit account-bootstrap
 capability, authenticated node identity, typed locator, protocol range, flags,
 and optional expiry. The relay never writes capsules to a file or Docker log;
 after printing, plaintext capability buffers are zeroized and only
@@ -243,6 +246,13 @@ relay remains alive. Only one unexpired bearer session may exist per account.
 Lost invites are deliberately unrecoverable; restarting destroys all RAM state
 and emits fresh capabilities while the separately backed-up node key preserves
 the node identity. There are no administrator roles or privileged invites.
+
+Both clients mask typed, pasted and scanned invites like passwords, including
+after an error. A successful scan fills the masked invite without submitting
+credentials. Invalid QR data produces a bounded error, never the decoded secret.
+QRs themselves are bearer credentials: terminal recording, screenshots or
+saved QR images can expose them just as plaintext output can. Masking is visual
+privacy, not protection against browser extensions or a compromised device.
 
 Read [Invite Capsule V1](docs/INVITE_CAPSULE_V1.md) for the interoperable wire,
 signature, text encoding, size-limit, locator, and failure specification.
@@ -258,6 +268,7 @@ Security-related relay knobs:
 - `ABYSSAL_NODE_SIGNING_KEY_FILE`: required path to an exact 32-byte raw Ed25519 seed owned by the relay user with mode `0600`. This infrastructure identity is never printed.
 - `ABYSSAL_PUBLIC_URL`: required advertised locator embedded in signed capsules and the signed node descriptor. Production accepts HTTPS DNS hosts; HTTP is limited to typed loopback development hosts.
 - `ABYSSAL_INVITE_COUNT`: number of fresh account-bootstrap capsules emitted once at startup. Default: `5`; accepted range: `0` to `256` (the tracked production template uses `8`).
+- `ABYSSAL_INVITE_QR_ENABLED`: `true` by default for QR-only terminal output; exact `false` enables one-shot text output. Other values abort startup. No extra executable or runtime package is required for server QR rendering.
 - `ABYSSAL_INVITE_EXPIRY_HOURS`: optional registration deadline. `0` disables wall-clock expiry; values up to `8760` hours are enforced by both clients and relay.
 - `ABYSSAL_INVITE_PRINT_DELAY_MS`: brief attached-terminal delay before one-shot output. It is not a persistence or retrieval window.
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.

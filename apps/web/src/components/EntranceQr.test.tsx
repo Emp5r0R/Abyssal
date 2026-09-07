@@ -29,6 +29,8 @@ describe("invite QR entry", () => {
     expect(onPreflight).not.toHaveBeenCalled();
     await act(async () => { expect(await camera.accept!(QR_TEST_INVITE, new AbortController().signal)).toBe(true); });
     expect(screen.getByLabelText("Abyssal invite")).toHaveValue(QR_TEST_INVITE);
+    expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
+    expect(document.body.textContent).not.toContain(QR_TEST_INVITE);
     expect(onLogin).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
     await waitFor(() => expect(onLogin).toHaveBeenCalledOnce());
@@ -74,7 +76,23 @@ describe("invite QR entry", () => {
     fireEvent.change(screen.getByLabelText("QR image"), { target: { files: [new File(["data"], "qr.png")] } });
     await waitFor(() => expect(screen.getByText("QR image not accepted.")).toBeVisible());
     expect(screen.getByLabelText("Abyssal invite")).toHaveValue("");
+    expect(document.body.textContent).not.toContain("intent://arbitrary");
     view.unmount();
     expect(image.read.mock.calls[0][1].aborted).toBe(false);
+  });
+
+  it("keeps a successful image invite masked, including after a login error", async () => {
+    image.read.mockResolvedValue(QR_TEST_INVITE);
+    const onLogin = vi.fn(async () => { throw new Error(QR_TEST_INVITE); });
+    render(<Entrance onLogin={onLogin} onPreflight={vi.fn(async () => true)} />);
+    fireEvent.change(screen.getByLabelText("QR image"), { target: { files: [new File(["data"], "qr.png")] } });
+    await waitFor(() => expect(screen.getByLabelText("Abyssal invite")).toHaveValue(QR_TEST_INVITE));
+    expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
+    expect(onLogin).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password123" } });
+    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+    await waitFor(() => expect(screen.getByText("Wrong information.")).toBeVisible());
+    expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
+    expect(document.body.textContent).not.toContain(QR_TEST_INVITE);
   });
 });

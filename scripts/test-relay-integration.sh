@@ -82,6 +82,16 @@ WEB_BUILD_SIGNATURE_B64="$(tr -d '\n' < "$WEB_SIGNATURE")"
 cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
   --package mirage-server --features integration-release-root
 
+ABYSSAL_BIND_ADDR="127.0.0.1:$PORT" \
+ABYSSAL_INTEGRATION_TEST=1 \
+ABYSSAL_INTEGRATION_RELEASE_MANIFEST="$MANIFEST" \
+ABYSSAL_INTEGRATION_RELEASE_SIGNATURE="$MANIFEST_SIGNATURE" \
+ABYSSAL_NODE_SIGNING_KEY_FILE="$NODE_KEY" \
+ABYSSAL_PUBLIC_URL= \
+ABYSSAL_PUBLIC_LOCATORS="[\"http://pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion\",\"http://ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p\",\"http://127.0.0.1:$PORT\"]" \
+ABYSSAL_WEB_ROOT="$TMP_DIR/no-web" \
+  node "$ROOT_DIR/scripts/test-startup-invite-qr.mjs"
+
 coproc RELAY_PROCESS {
   ABYSSAL_BIND_ADDR="127.0.0.1:$PORT" \
   ABYSSAL_INTEGRATION_TEST=1 \
@@ -91,6 +101,7 @@ coproc RELAY_PROCESS {
   ABYSSAL_PUBLIC_URL= \
   ABYSSAL_PUBLIC_LOCATORS="[\"http://pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion\",\"http://ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p\",\"http://127.0.0.1:$PORT\"]" \
   ABYSSAL_INVITE_COUNT=2 \
+  ABYSSAL_INVITE_QR_ENABLED=false \
   ABYSSAL_SESSION_INACTIVITY_MINUTES=5 \
   ABYSSAL_WEB_ROOT="$TMP_DIR/no-web" \
   RUST_LOG="${RUST_LOG:-mirage_server=warn}" \

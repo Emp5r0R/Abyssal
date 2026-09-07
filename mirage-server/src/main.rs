@@ -64,6 +64,7 @@ mod client_platform;
 mod config;
 mod http;
 mod invite_bootstrap;
+mod invite_output;
 mod messages;
 mod mls;
 mod mls_wire;
@@ -255,6 +256,7 @@ struct AppState {
     opaque_handshakes: Arc<Mutex<HashMap<Uuid, OpaqueHandshake>>>,
     invite_code_pepper: Arc<Zeroizing<CodeId>>,
     boot_invites: Arc<Mutex<Option<Vec<IssuedInvite>>>>,
+    boot_invite_output: invite_output::InviteOutputMode,
     available_codes: Arc<Mutex<HashSet<CodeId>>>,
     capability_expiries: Arc<Mutex<HashMap<CodeId, u64>>>,
     accounts: Arc<Mutex<HashMap<CodeId, Account>>>,
@@ -1487,6 +1489,7 @@ impl AppState {
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
             invite_code_pepper: Arc::new(Zeroizing::new(invite_code_pepper)),
             boot_invites: Arc::new(Mutex::new(Some(bootstrap.issued_invites))),
+            boot_invite_output: bootstrap.output_mode,
             available_codes: Arc::new(Mutex::new(available_codes)),
             capability_expiries: Arc::new(Mutex::new(capability_expiries)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
@@ -1529,7 +1532,7 @@ impl AppState {
         let print_result = {
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            write_boot_invites(&mut output, &invites)
+            write_boot_invites(&mut output, &invites, self.boot_invite_output)
         };
         if let Err(error) = print_result {
             panic!("failed to print Abyssal startup invites: {error}");

@@ -8689,6 +8689,7 @@ fn test_state() -> AppState {
         opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
         invite_code_pepper: Arc::new(Zeroizing::new([7_u8; 32])),
         boot_invites: Arc::new(Mutex::new(None)),
+        boot_invite_output: invite_output::InviteOutputMode::Qr,
         available_codes: Arc::new(Mutex::new(HashSet::new())),
         capability_expiries: Arc::new(Mutex::new(HashMap::new())),
         accounts: Arc::new(Mutex::new(HashMap::new())),

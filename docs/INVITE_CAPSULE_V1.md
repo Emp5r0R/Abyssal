@@ -204,7 +204,8 @@ authoritative.
 
 Both account-entry clients offer an explicit camera scanner and local image
 picker. They decode QR text as data and pass it through the same bounded
-Rust invite verifier before filling the input. Successful scanning does not
+Rust invite verifier before filling the masked invite input. Decoded credentials
+are not echoed in success or error messages. Successful scanning does not
 submit credentials or open any locator. Camera sessions expire after 60
 seconds and stop on cancellation, backgrounding or teardown.
 

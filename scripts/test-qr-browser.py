@@ -66,7 +66,9 @@ with sync_playwright() as p:
                     "mimeType": mime,
                     "buffer": (FIXTURES / filename).read_bytes(),
                 })
-                page.wait_for_function("document.querySelector('textarea').value.startsWith('abyssal:invite:')")
+                page.wait_for_function("document.getElementById('abyssal-invite').value.startsWith('abyssal:invite:')")
+                expect(page.get_by_label("Abyssal invite", exact=True)).to_have_attribute("type", "password")
+                assert "abyssal:invite:" not in page.locator("body").inner_text()
                 expect(page.get_by_role("button", name="OPEN QR IMAGE")).to_be_enabled()
                 assert page.evaluate("window.testLoginCalls") == 0
                 page.get_by_label("Abyssal invite", exact=True).fill("")
@@ -76,7 +78,9 @@ with sync_playwright() as p:
                 expect(page.get_by_label("Abyssal invite", exact=True)).to_have_value("")
                 expect(page.get_by_role("button", name="OPEN QR IMAGE")).to_be_enabled()
             page.get_by_role("button", name="SCAN INVITE", exact=True).click()
-            page.wait_for_function("document.querySelector('textarea').value.startsWith('abyssal:invite:')")
+            page.wait_for_function("document.getElementById('abyssal-invite').value.startsWith('abyssal:invite:')")
+            expect(page.get_by_label("Abyssal invite", exact=True)).to_have_attribute("type", "password")
+            assert "abyssal:invite:" not in page.locator("body").inner_text()
             expect(page.get_by_role("button", name="SCAN INVITE", exact=True)).to_be_visible()
             expect(page.get_by_label("Abyssal invite", exact=True)).to_be_focused()
             expect(page.get_by_label("Abyssal invite", exact=True)).to_be_in_viewport()
@@ -84,7 +88,11 @@ with sync_playwright() as p:
             assert page.evaluate("window.testLoginCalls") == 0
             expect(page.get_by_text("QR image not accepted.")).to_have_count(0)
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-            boxes = page.locator(".entrance-form button, .entrance-form textarea, .entrance-form input:not([hidden])").evaluate_all("els => els.filter(e => e.offsetWidth).map(e => ({w:e.clientWidth, s:e.scrollWidth}))")
+            for field in page.locator(".entrance-form input:not([type=hidden]):not([type=file])").all():
+                if field.is_visible():
+                    box = field.bounding_box()
+                    assert box and box["x"] >= 0 and box["x"] + box["width"] <= width
+            boxes = page.locator(".entrance-form button").evaluate_all("els => els.filter(e => e.offsetWidth).map(e => ({w:e.clientWidth, s:e.scrollWidth}))")
             assert all(box["s"] <= box["w"] + 1 for box in boxes), boxes
             assert all(urlparse(url).netloc == urlparse(BASE).netloc for url in requests), requests
             assert not any("/v1/" in url for url in requests), requests
