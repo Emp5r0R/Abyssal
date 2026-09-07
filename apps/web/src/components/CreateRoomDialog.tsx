@@ -49,7 +49,7 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
       }
     >
       <form id="create-room-form" className="room-form" onSubmit={submit}>
-        <Field label="Room name" autoFocus maxLength={36} value={room.name} onChange={(event) => setRoom((current) => ({ ...current, name: event.target.value }))} />
+        <Field label="Local room label" autoFocus maxLength={36} value={room.name} onChange={(event) => setRoom((current) => ({ ...current, name: event.target.value }))} />
 
         <PolicySection title="Text" enabled>
           <NumberPair

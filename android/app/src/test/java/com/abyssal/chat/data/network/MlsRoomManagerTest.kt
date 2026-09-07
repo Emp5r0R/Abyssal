@@ -13,6 +13,19 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class MlsRoomManagerTest {
+    @Test fun malformedLocalLabelsCannotCreateNativeRooms() {
+        val cipher = identity()
+        val key = cipher.publicKey()
+        val manager = MlsRoomManager(cipher, "Alice", "node-1", key)
+        key.fill(0)
+        try {
+            for (label in listOf(" ", "x".repeat(37), "secret\u0000title")) {
+                assertTrue(runCatching { manager.createRoom(room().copy(name = label)) }.isFailure)
+            }
+            assertEquals("0", manager.createRoom(room()).getString("epoch"))
+        } finally { manager.close(); cipher.clear() }
+    }
+
     @Test fun roomApplicationStagesAndExplicitRejectionRestoresUsableState() {
         val cipher = identity()
         val publicKey = cipher.publicKey()
@@ -71,8 +84,11 @@ class MlsRoomManagerTest {
         val stable = publicKey.copyOfRange(0, 64)
         publicKey.fill(0)
         try {
-            val session = room("room_custom")
+            val session = room("room_custom").copy(name = "Private incident response")
             val create = manager.createRoom(session)
+            assertFalse(create.toString().contains(session.name))
+            assertFalse(create.has("name"))
+            assertFalse(create.getJSONObject("policy").has("name"))
             val roster = listOf(MlsRosterMemberWire("Alice", MlsWireCodec.encode(stable)))
             val wire = MlsRoomWire(
                 roomId = "room_custom", ownerUsername = "Alice", groupIdB64 = create.getString("group_id_b64"),
@@ -84,8 +100,15 @@ class MlsRoomManagerTest {
                     stateEnvelopeB64 = create.getString("state_envelope_b64"), roster = roster
                 ), policy = policy(session), synchronized = true
             )
-            assertEquals(1, manager.recoverCatalog(listOf(wire)).size)
+            assertEquals(session.name, manager.confirmCreatedRoom(wire).name)
+            assertTrue(runCatching { manager.confirmCreatedRoom(wire.copy(groupIdB64 = MlsWireCodec.encode(ByteArray(32) { 9 }))) }.isFailure)
+            assertTrue(runCatching { manager.confirmCreatedRoom(wire.copy(ownerUsername = "Mallory")) }.isFailure)
+            repeat(2) { assertEquals(session.name, manager.recoverCatalog(listOf(wire)).single().name) }
             assertTrue(manager.isActiveRoom("room_custom"))
+
+            manager.removeRoom("room_custom")
+            assertTrue(runCatching { manager.confirmCreatedRoom(wire) }.isFailure)
+            assertFalse(manager.recoverCatalog(listOf(wire)).single().name == session.name)
 
             val spoofedOwner = wire.copy(ownerUsername = "Mallory")
             assertTrue(runCatching { manager.recoverCatalog(listOf(spoofedOwner)) }.isFailure)

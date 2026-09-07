@@ -54,7 +54,8 @@ internal class MlsRoomManager(
         var pendingJoinRequestId: String? = null,
         var pendingMessageId: String? = null,
         var pendingRevision: ULong? = null,
-        var pendingRoster: List<MlsRosterMemberWire>? = null
+        var pendingRoster: List<MlsRosterMemberWire>? = null,
+        val localLabel: String? = null
     )
     private data class PendingJoin(
         val roomId: String,
@@ -81,6 +82,8 @@ internal class MlsRoomManager(
     fun createRoom(room: ChatSession): JSONObject {
         checkOpen()
         require(ID.matches(room.id) && !rooms.containsKey(room.id) && rooms.size < MAX_ROOMS)
+        val localLabel = room.name.trim()
+        require(localLabel.length in 1..36 && localLabel.none(Char::isISOControl))
         require(room.ownerUsername == null || sameUsername(room.ownerUsername, username))
         val group = ByteArray(32).also(random::nextBytes)
         var handle: MlsRoom? = null
@@ -96,7 +99,7 @@ internal class MlsRoomManager(
                 infoGroup.contentEquals(group) && digest.size == 32)
             state = handle.sealState()
             val roster = listOf(MlsRosterMemberWire(username, MlsWireCodec.encode(stableIdentity)))
-            rooms[room.id] = RoomSlot(handle, group.clone(), username, roster, true, true)
+            rooms[room.id] = RoomSlot(handle, group.clone(), username, roster, true, true, localLabel = localLabel)
             handle = null
             JSONObject().put("type", "mls_create_room").put("protocol_version", MLS_PROTOCOL_VERSION)
                 .put("room_id", room.id).put("group_id_b64", MlsWireCodec.encode(group))
@@ -107,6 +110,18 @@ internal class MlsRoomManager(
         } catch (error: Throwable) {
             handle?.close(); removeRoom(room.id); throw error
         } finally { group.fill(0); infoGroup.fill(0); digest.fill(0); state.fill(0) }
+    }
+
+    @Synchronized
+    fun confirmCreatedRoom(wire: MlsRoomWire): ChatSession {
+        checkOpen()
+        validateRoomWire(wire)
+        val slot = requireNotNull(rooms[wire.roomId])
+        val label = requireNotNull(slot.localLabel)
+        require(sameUsername(wire.ownerUsername, username) && wire.active && wire.synchronized &&
+            wire.epoch == 0uL && wire.revision == 0uL && wire.roster.size == 1 &&
+            sameRoster(wire.roster, slot.roster) && exactExisting(slot, wire))
+        return MlsWireCodec.roomSession(wire).copy(name = label)
     }
 
     @Synchronized
@@ -124,9 +139,12 @@ internal class MlsRoomManager(
                     require(recovery.epoch == wire.epoch && recovery.revision == wire.revision &&
                         recovery.membershipDigestB64 == wire.membershipDigestB64 && sameRoster(recovery.roster, wire.roster))
                 }
-                if (wire.active) output += MlsWireCodec.roomSession(wire)
                 val existing = rooms[wire.roomId]
                 if (existing != null && exactExisting(existing, wire)) {
+                    if (wire.active) {
+                        val display = MlsWireCodec.roomSession(wire)
+                        output += display.copy(name = existing.localLabel ?: display.name)
+                    }
                     existing.active = recovery.active
                     existing.synchronized = wire.synchronized
                     if (wire.synchronized) {
@@ -150,6 +168,7 @@ internal class MlsRoomManager(
                             info.groupId.contentEquals(group) && info.membershipDigest.contentEquals(digest))
                     } finally { info.groupId.fill(0); info.membershipDigest.fill(0) }
                     rooms[wire.roomId] = RoomSlot(handle, group.clone(), wire.ownerUsername, recovery.roster.map { it.copy() }, recovery.active, wire.synchronized)
+                    if (wire.active) output += MlsWireCodec.roomSession(wire)
                     handle = null
                 } finally { handle?.close(); group.fill(0); envelope.fill(0); digest.fill(0) }
             }

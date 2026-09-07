@@ -6023,7 +6023,28 @@ fn mls_create_room_rejects_unknown_nested_policy_fields() {
         "policy": {"unexpected": true}
     });
 
-    assert!(serde_json::from_value::<InboundFrame>(frame).is_err());
+    assert!(serde_json::from_value::<InboundFrame>(frame.clone()).is_err());
+    let mut title_in_policy = frame.clone();
+    title_in_policy["policy"] = serde_json::json!({"name": "Private incident response"});
+    assert!(serde_json::from_value::<InboundFrame>(title_in_policy).is_err());
+    let mut title_on_frame = frame;
+    title_on_frame["policy"] = serde_json::json!({});
+    title_on_frame["name"] = "Private incident response".into();
+    assert!(serde_json::from_value::<InboundFrame>(title_on_frame).is_err());
+}
+
+#[tokio::test]
+async fn legacy_plaintext_room_creation_cannot_publish_a_title() {
+    let state = test_state();
+    add_test_account(&state, "private-room-owner", "Alice").await;
+    let (client_id, mut rx) = add_test_client(&state, "private-room-owner", "Alice").await;
+    let mut room = test_room("forum_private");
+    room.name = "Private incident response".into();
+    let frame = serde_json::json!({"type": "create_room", "room": room}).to_string();
+    assert!(handle_frame(&state, client_id, &frame).await.is_err());
+    assert!(state.room_catalog.lock().await.is_empty());
+    assert_eq!(state.mls_rooms.lock().await.room_count(), 0);
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

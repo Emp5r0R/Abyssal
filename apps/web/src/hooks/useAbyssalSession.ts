@@ -88,7 +88,6 @@ import {
   type PrekeyLease,
   PrekeyLeaseError,
 } from "../transport/nodeClient";
-import { roomFromMlsWire } from "../transport/mlsWire";
 
 const ACTIVITY_SIGNAL_INTERVAL_MS = 20_000;
 const MAX_MESSAGE_AGE_MS = 24 * 60 * 60 * 1000;
@@ -659,9 +658,12 @@ export function useAbyssalSession() {
       return;
     }
     if (frame.type === "mls_room_created") {
-      const nextRoom = roomFromMlsWire(frame.room);
-      roomsRef.current = [...roomsRef.current.filter((room) => room.id !== nextRoom.id), nextRoom];
-      setRooms(roomsRef.current);
+      try {
+        const nextRoom = mlsRef.current?.confirmCreatedRoom(frame.room);
+        if (!nextRoom) throw new Error("Room unavailable");
+        roomsRef.current = [...roomsRef.current.filter((room) => room.id !== nextRoom.id), nextRoom];
+        setRooms(roomsRef.current);
+      } catch { clearMemory(); }
       return;
     }
     if (frame.type === "mls_room_discovered") {

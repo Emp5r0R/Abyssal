@@ -20,6 +20,7 @@ import com.abyssal.chat.domain.model.AttachmentProtocol
 import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.AvailableAppUpdate
 import com.abyssal.chat.domain.model.ChatSession
+import com.abyssal.chat.domain.model.RoomIdentifiers
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
@@ -738,7 +739,9 @@ class ChatViewModel(
                         }
                     }
                     is MlsIncomingFrame.RoomCreated -> {
-                        val session = MlsWireCodec.roomSession(frame.room)
+                        val session = runCatching { manager.confirmCreatedRoom(frame.room) }.getOrElse {
+                            failClosedAfterAmbiguous(); return@withLock
+                        }
                         mutateRepositoryIfCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, session) }
                     }
                     is MlsIncomingFrame.RoomDiscovered -> if (requestedMlsRooms.remove(frame.roomId)) {
@@ -1839,7 +1842,7 @@ class ChatViewModel(
     ) {
         val connectionGeneration = chatTransport.currentConnectionGeneration()
         viewModelScope.launch {
-            val forumId = "forum_" + UUID.randomUUID().toString().take(8)
+            val forumId = RoomIdentifiers.newForumId()
             val session = ChatSession(
                 id = forumId,
                 name = name,

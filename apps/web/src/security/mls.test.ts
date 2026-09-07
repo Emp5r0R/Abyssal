@@ -80,6 +80,44 @@ function membershipFrame(fake: ReturnType<typeof sessionWith>, roster = [
 }
 
 describe("MlsRoomManager", () => {
+  it("keeps local labels out of the wire and discards them with the room handle", () => {
+    const fake = sessionWith();
+    const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
+    const label = "Private incident response";
+    const frame = manager.createRoom({ ...roomRecord, name: label });
+    expect(JSON.stringify(frame)).not.toContain(label);
+    expect(frame).not.toHaveProperty("name");
+    expect(frame.policy).not.toHaveProperty("name");
+    const roster = [{ username: "Alice", stable_identity_b64: encodeBase64Url(bytes(64, 7)) }];
+    const wire: MlsRoomWire = {
+      room_id: roomRecord.id, owner_username: "Alice", group_id_b64: String(frame.group_id_b64),
+      active: true, synchronized: true, epoch: "0", revision: "0",
+      membership_digest_b64: String(frame.membership_digest_b64), roster,
+      recovery_snapshot: {
+        active: true, epoch: "0", revision: "0", membership_digest_b64: String(frame.membership_digest_b64),
+        state_envelope_b64: String(frame.state_envelope_b64), roster,
+      }, policy: frame.policy as MlsRoomWire["policy"],
+    };
+    expect(manager.confirmCreatedRoom(wire).name).toBe(label);
+    expect(() => manager.confirmCreatedRoom({ ...wire, group_id_b64: encodeBase64Url(bytes(32, 9)) })).toThrow("Room unavailable");
+    expect(() => manager.confirmCreatedRoom({ ...wire, owner_username: "Mallory" })).toThrow("Room unavailable");
+    for (let update = 0; update < 2; update++) expect(manager.recoverCatalog([wire])[0].name).toBe(label);
+    manager.removeRoom(roomRecord.id);
+    expect(() => manager.confirmCreatedRoom(wire)).toThrow("Room unavailable");
+    expect(manager.recoverCatalog([wire])[0].name).not.toBe(label);
+    manager.close();
+  });
+
+  it("rejects oversized or control-bearing local labels before native room creation", () => {
+    const fake = sessionWith();
+    const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
+    for (const name of [" ", "x".repeat(37), "secret\u0000title"]) {
+      expect(() => manager.createRoom({ ...roomRecord, name })).toThrow("Room unavailable");
+    }
+    expect(fake.session.mlsCreateRoom).not.toHaveBeenCalled();
+    manager.close();
+  });
+
   it("derives rooms only through the account factory and emits canonical create state", () => {
     const fake = sessionWith(); const manager = new MlsRoomManager(fake.session, "Alice", "node-1", bytes(608, 7));
     const frame = manager.createRoom(roomRecord);

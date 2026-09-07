@@ -83,12 +83,13 @@ identities and account fixtures were separate from production.
 ## Release Checks Still Required
 
 - The expanded no-plaintext-metadata requirement remains unmet: the relay still
-  handles usernames, room catalog/titles, membership and policy metadata in
+  handles usernames, room IDs/catalog, membership and policy metadata in
   plaintext after TLS termination. Removing diagnostic leaks does not satisfy
   that requirement. Complete and cross-client test the relevant confidentiality
   migration before publication, with an explicit threat boundary for necessary
   public bootstrap information and observable network timing/addresses. Do not
   publish a metadata-free claim or silently treat these limits as accepted.
+  Local room labels remain client-only and are not shared encrypted titles.
 - Physical Android camera scan, permission denial/regrant, backgrounding,
   rotation, repeated scans and local document-provider cancellation. Confirm
   secure screenshots and that no QR action submits credentials automatically.

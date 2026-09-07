@@ -69,6 +69,7 @@ interface PendingMlsLeave extends PendingMlsLeaveSummary {
 }
 
 interface RoomSlot {
+  localLabel?: string;
   handle: WasmMlsRoom;
   groupId: Uint8Array;
   ownerUsername: string;
@@ -105,6 +106,8 @@ export class MlsRoomManager {
   createRoom(room: RoomRecord): Record<string, unknown> {
     this.assertOpen();
     if (!ID.test(room.id) || this.#rooms.has(room.id) || this.#rooms.size >= MAX_ROOMS) throw new Error("Room unavailable");
+    const localLabel = room.name.trim();
+    if (!localLabel || localLabel.length > 36 || /\p{Cc}/u.test(localLabel)) throw new Error("Room unavailable");
     const groupId = crypto.getRandomValues(new Uint8Array(32));
     let handle: WasmMlsRoom | null = null;
     let infoGroup: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -122,6 +125,7 @@ export class MlsRoomManager {
       stateEnvelope = handle.sealState();
       const roster = [{ username: this.#username, stable_identity_b64: encodeBase64Url(this.#stableIdentity) }];
       this.#rooms.set(room.id, {
+        localLabel,
         handle, groupId: groupId.slice(), ownerUsername: this.#username, roster, active: true, synchronized: true,
         pendingMessageId: null, pendingRevision: null, pendingRoster: null, ownJoinRequestId: null,
       });
@@ -143,6 +147,26 @@ export class MlsRoomManager {
     }
   }
 
+  confirmCreatedRoom(room: MlsRoomWire): RoomRecord {
+    this.assertOpen();
+    const slot = this.#rooms.get(room.room_id);
+    if (!slot?.localLabel || !validCatalogRoom(room, this.#username, this.#stableIdentity) ||
+      room.owner_username !== this.#username || !room.active || !room.synchronized ||
+      room.epoch !== "0" || room.revision !== "0" || !sameRoster(room.roster, slot.roster)) {
+      throw new Error("Room unavailable");
+    }
+    const info = readRoomInfo(slot.handle);
+    let group: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let digest: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    try {
+      group = decodeBase64Url(room.group_id_b64);
+      digest = decodeBase64Url(room.membership_digest_b64);
+      if (info.epoch !== 0n || info.revision !== 0n || info.memberCount !== 1 ||
+        !equal(group, info.groupId) || !equal(digest, info.membershipDigest)) throw new Error("Room unavailable");
+      return { ...roomFromMlsWire(room), name: slot.localLabel };
+    } finally { info.groupId.fill(0); info.membershipDigest.fill(0); group.fill(0); digest.fill(0); }
+  }
+
   recoverCatalog(rooms: MlsRoomWire[]): RoomRecord[] {
     this.assertOpen();
     if (rooms.length > MAX_ROOMS) throw new Error("Room unavailable");
@@ -152,7 +176,6 @@ export class MlsRoomManager {
       for (const room of rooms) {
         if (seen.has(room.room_id) || !validCatalogRoom(room, this.#username, this.#stableIdentity)) throw new Error("Room unavailable");
         seen.add(room.room_id);
-        if (room.active) output.push(roomFromMlsWire(room));
         const recovery = room.recovery_snapshot;
         if (!recovery) throw new Error("Room unavailable");
         const existing = this.#rooms.get(room.room_id);
@@ -172,6 +195,10 @@ export class MlsRoomManager {
             info.membershipDigest.fill(0); info.groupId.fill(0); digest.fill(0); group.fill(0);
           }
           if (exact) {
+            if (room.active) {
+              const display = roomFromMlsWire(room);
+              output.push({ ...display, name: existing.localLabel ?? display.name });
+            }
             existing.synchronized = room.synchronized;
             if (room.synchronized) existing.roster = cloneRoster(room.roster);
             continue;
@@ -205,6 +232,7 @@ export class MlsRoomManager {
             active: recovery.active, synchronized: room.synchronized,
             pendingMessageId: null, pendingRevision: null, pendingRoster: null, ownJoinRequestId: null,
           });
+          if (room.active) output.push(roomFromMlsWire(room));
           handle = null;
         } finally {
           handle?.free(); envelope.fill(0); digest.fill(0); groupId.fill(0);

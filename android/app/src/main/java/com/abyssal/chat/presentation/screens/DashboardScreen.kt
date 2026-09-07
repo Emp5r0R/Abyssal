@@ -844,7 +844,7 @@ private fun CreateForumDialog(
         OutlinedTextField(
             value = forumName,
             onValueChange = { forumName = it.take(36) },
-            label = { Text("Room name") },
+            label = { Text("Local room label") },
             colors = mirageTextFieldColors(),
             singleLine = true,
             modifier = Modifier.fillMaxWidth()

@@ -142,7 +142,8 @@ and preventing unsafe metadata interpretation are different properties:
 | Message text, replies, attachment filenames, MIME types, original byte counts and attachment keys | Inside authenticated E2EE payloads; intended recipients can read them. |
 | Uploaded file contents, including embedded EXIF/GPS, document properties and other file metadata | Encrypted as part of the original file. Not automatically stripped; recipients who decrypt the file can inspect its metadata. |
 | Imported QR image metadata | Local bounded raster decoding only. No metadata URLs are fetched and no metadata paths are opened. This is input safety, not encryption or metadata removal. |
-| Usernames, room catalog/titles, membership, presence, routing identifiers and relay-enforced retention policy | Visible to the relay in the current protocol; HTTPS protects transit only up to its TLS terminator. These fields are not all E2EE. |
+| Local room labels | Retained only in the creating client's bounded in-memory MLS room handle. They are not included in MLS creation requests, policy or sealed native snapshots, and are forgotten when that handle is discarded. Other clients and fresh processes use an ID-derived label; shared encrypted room titles are not implemented. |
+| Usernames, room IDs/catalog, membership, presence, routing identifiers and relay-enforced retention policy | Visible to the relay in the current protocol; HTTPS protects transit only up to its TLS terminator. These fields are not all E2EE. |
 | Invite locators, node public key and compatibility fields | Signed, not encrypted. Anyone holding the capsule can decode them and its bearer capability. |
 | Endpoint addresses, connection timing, packet counts and padded transfer lengths | Remain observable to the corresponding network/relay observers. Padding reduces precision, not visibility. |
 
@@ -153,6 +154,16 @@ byte counts. HTTP request tracing is removed; the diagnostic sink rejects
 dependency targets and their spans even with `RUST_LOG=trace`. This reduces
 accidental logging exposure, not the relay's in-memory knowledge, warning-event
 timing, upstream access logs or a malicious host administrator's access.
+
+Official clients generate new room IDs from full random UUIDs independently of
+the local label; Android no longer truncates them to 32 bits. Current MLS room
+creation has no title field and rejects additional plaintext title fields.
+The legacy plaintext-title creation route is rejected before catalog mutation
+or publication. This corrects the earlier description of current MLS room
+titles as relay-visible: the prior clients omitted the typed title and did not
+preserve it in the creating client's room display. No existing transmitted ID
+can be retroactively made secret, and arbitrary IDs in older or modified clients
+can still contain descriptive text.
 
 Relay and TLS endpoint observe IP addresses, timing, packet sizes, account sessions, usernames, room membership, presence, attachment sizes, and routing. Cloudflare terminates public TLS when used as the edge, so it can observe and modify application requests and responses at that boundary, including bootstrap capabilities, OPAQUE protocol messages, routing metadata, encrypted payloads, and the delivered web bundle. OPAQUE still prevents the plaintext password from appearing in those requests, and E2EE keeps message/attachment plaintext out of the relay and edge, but Cloudflare is part of the availability, account-enrollment, and web-code-delivery trust boundary. Use a directly controlled TLS origin when that trust is unacceptable.
 

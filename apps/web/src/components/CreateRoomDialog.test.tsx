@@ -8,7 +8,7 @@ describe("CreateRoomDialog routing identifier", () => {
     const onCreate = vi.fn((room: RoomRecord): boolean => room.id.length > 0);
     render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
 
-    fireEvent.change(screen.getByLabelText("Room name"), { target: { value: "Private Operations" } });
+    fireEvent.change(screen.getByLabelText("Local room label"), { target: { value: "Private Operations" } });
     fireEvent.click(screen.getByRole("button", { name: "CREATE" }));
 
     const room = onCreate.mock.calls[0]?.[0];
