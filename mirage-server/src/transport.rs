@@ -143,7 +143,6 @@ pub(super) async fn socket_loop(
     if let Some(account) = state.accounts.lock().await.get_mut(&auth.code_id) {
         account.connected = true;
     }
-    info!("client_connected id={client_id}");
     broadcast_presence(&state).await;
     send_mls_catalog(&state, client_id, &auth.code_id).await;
     send_mls_pending(&state, client_id, &auth.code_id).await;
@@ -277,34 +276,34 @@ pub(super) async fn socket_loop(
                         if active_session(&state, session_token.as_str(), false).await.is_none() {
                             break;
                         }
-                        if let Err(err) = validate_inbound_text_socket_admission(
+                        if validate_inbound_text_socket_admission(
                             text.as_str(),
                             check_ws_frame_allowed(&state, client_id, text.len()).await,
-                        ) {
-                            warn!("closing limited frame connection from {client_id}: {err}");
+                        ).is_err() {
+                            warn!("closing limited frame connection");
                             break;
                         }
                         let inner = match strip_inbound_control_transport(text.as_str()) {
                             Ok(inner) => inner,
-                            Err(err) => {
-                                warn!("closing invalid transport frame from {client_id}: {err}");
+                            Err(_) => {
+                                warn!("closing invalid transport frame");
                                 break;
                             }
                         };
-                        if let Err(err) = handle_frame(&state, client_id, inner.as_str()).await {
-                            warn!("dropping invalid frame from {client_id}: {err}");
+                        if handle_frame(&state, client_id, inner.as_str()).await.is_err() {
+                            warn!("dropping invalid frame");
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        if let Err(err) = check_ws_frame_allowed(&state, client_id, bytes.len()).await {
-                            warn!("closing limited binary connection from {client_id}: {err}");
+                        if check_ws_frame_allowed(&state, client_id, bytes.len()).await.is_err() {
+                            warn!("closing limited binary connection");
                             break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
-                    Some(Err(err)) => {
-                        warn!("websocket error from {client_id}: {err}");
+                    Some(Err(_)) => {
+                        warn!("websocket transport error");
                         break;
                     }
                 }

@@ -392,7 +392,6 @@ pub(super) async fn finish_opaque_account(
                 username
             };
             clear_login_limit(&state, code_id).await;
-            info!("opaque_account_created");
             let response = issue_session(&state, *code_id, username, true).await;
             if response.0.is_success() {
                 touch_activity(&state).await;
@@ -429,7 +428,6 @@ pub(super) async fn finish_opaque_account(
                 return account_error(StatusCode::CONFLICT, &state, String::new()).await;
             }
             clear_login_limit(&state, code_id).await;
-            info!("opaque_account_login");
             let response = issue_session(&state, *code_id, username.clone(), false).await;
             if response.0.is_success() {
                 touch_activity(&state).await;

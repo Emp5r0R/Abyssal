@@ -132,7 +132,27 @@ JavaScript cannot guarantee physical zeroization. Browser engines may copy immut
 
 Visual blur reduces casual shoulder surfing only. It does not remove plaintext from the DOM or decoded media from browser memory, and hover/focus intentionally reveals it. Web therefore provides no local forensic guarantee. Use hardened native Android for threat models requiring screenshot controls and stronger OS integration.
 
-### Metadata remains visible
+### Metadata encryption and remaining exposure
+
+The current application is **not metadata-free**. Encryption, metadata removal,
+and preventing unsafe metadata interpretation are different properties:
+
+| Data | Current protection and visibility |
+| --- | --- |
+| Message text, replies, attachment filenames, MIME types, original byte counts and attachment keys | Inside authenticated E2EE payloads; intended recipients can read them. |
+| Uploaded file contents, including embedded EXIF/GPS, document properties and other file metadata | Encrypted as part of the original file. Not automatically stripped; recipients who decrypt the file can inspect its metadata. |
+| Imported QR image metadata | Local bounded raster decoding only. No metadata URLs are fetched and no metadata paths are opened. This is input safety, not encryption or metadata removal. |
+| Usernames, room catalog/titles, membership, presence, routing identifiers and relay-enforced retention policy | Visible to the relay in the current protocol; HTTPS protects transit only up to its TLS terminator. These fields are not all E2EE. |
+| Invite locators, node public key and compatibility fields | Signed, not encrypted. Anyone holding the capsule can decode them and its bearer capability. |
+| Endpoint addresses, connection timing, packet counts and padded transfer lengths | Remain observable to the corresponding network/relay observers. Padding reduces precision, not visibility. |
+
+Routine account creation/login, connection and attachment-download events are
+not logged by the relay. Runtime rejection diagnostics contain fixed categories,
+not connection IDs, raw parser/transport errors, per-account counts or attachment
+byte counts. HTTP request tracing is removed; the diagnostic sink rejects
+dependency targets and their spans even with `RUST_LOG=trace`. This reduces
+accidental logging exposure, not the relay's in-memory knowledge, warning-event
+timing, upstream access logs or a malicious host administrator's access.
 
 Relay and TLS endpoint observe IP addresses, timing, packet sizes, account sessions, usernames, room membership, presence, attachment sizes, and routing. Cloudflare terminates public TLS when used as the edge, so it can observe and modify application requests and responses at that boundary, including bootstrap capabilities, OPAQUE protocol messages, routing metadata, encrypted payloads, and the delivered web bundle. OPAQUE still prevents the plaintext password from appearing in those requests, and E2EE keeps message/attachment plaintext out of the relay and edge, but Cloudflare is part of the availability, account-enrollment, and web-code-delivery trust boundary. Use a directly controlled TLS origin when that trust is unacceptable.
 

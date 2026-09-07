@@ -51,7 +51,6 @@ use tokio::{
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
-    trace::TraceLayer,
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -68,6 +67,7 @@ mod invite_output;
 mod messages;
 mod mls;
 mod mls_wire;
+mod privacy_logging;
 mod release_admission;
 mod rooms;
 mod transaction_receipts;
@@ -1289,7 +1289,7 @@ async fn refresh_release_manifest(store: &ReleaseAdmissionStore, mirror: &Releas
     match mirror.refresh(store, now_ms()).await {
         Ok(InstallOutcome::Installed) => info!("release_manifest_refresh result=installed"),
         Ok(InstallOutcome::Unchanged) => debug!("release_manifest_refresh result=unchanged"),
-        Err(error) => warn!("release_manifest_refresh result=rejected reason={error}"),
+        Err(_) => warn!("release_manifest_refresh result=rejected"),
     }
 }
 
@@ -1317,12 +1317,7 @@ async fn main() {
         let healthy = healthcheck(configured_bind_addr).await;
         std::process::exit(i32::from(!healthy));
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "mirage_server=info,tower_http=info".into()),
-        )
-        .init();
+    privacy_logging::init();
 
     let state = AppState::from_env();
     #[cfg(feature = "integration-release-root")]
@@ -1763,13 +1758,8 @@ async fn session_sweeper(state: AppState) {
         let _conversation_guard = state.conversation_ops.lock().await;
         let now = now_ms();
         let mut sessions = state.sessions.lock().await;
-        let before = sessions.len();
         sessions
             .retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
-        let removed = before.saturating_sub(sessions.len());
-        if removed > 0 {
-            info!("expired_sessions_removed count={removed}");
-        }
         drop(sessions);
         prune_ws_tickets(&state, now).await;
         prune_pending_queues(&state, now).await;
@@ -1789,7 +1779,7 @@ async fn prune_pending_queues(state: &AppState, now: u64) {
     let mut pending = state.pending.lock().await;
     let mut pending_bytes = state.pending_bytes.lock().await;
     let mut claims = state.prekey_leases.lock().await;
-    let removed = prune_pending_queues_locked(
+    prune_pending_queues_locked(
         &mut pending,
         &mut pending_bytes,
         &mut claims,
@@ -1799,9 +1789,6 @@ async fn prune_pending_queues(state: &AppState, now: u64) {
     drop(claims);
     drop(pending_bytes);
     drop(pending);
-    if removed > 0 {
-        info!("expired_pending_frames_removed count={removed}");
-    }
 }
 
 fn prune_pending_queues_locked(
@@ -1907,10 +1894,7 @@ async fn inactivity_watcher(state: AppState) {
         let last_activity = *state.last_activity_ms.lock().await;
         let idle_ms = now_ms().saturating_sub(last_activity);
         if idle_ms >= limit_ms {
-            warn!(
-                "dead_man_switch_triggered idle_ms={} limit_ms={}",
-                idle_ms, limit_ms
-            );
+            warn!("dead_man_switch_triggered");
             wipe_relay_state(&state, true).await;
             touch_activity(&state).await;
         }
@@ -3548,13 +3532,13 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
     if bytes > frame_limit
         || !reserve_outbound_bytes(&state.outbound_bytes, &queued_bytes, bytes, queue_limit)
     {
-        warn!("closing slow or over-budget client {client_id}");
+        warn!("closing slow or over-budget client");
         send_control_to_client(state, client_id, ClientControl::Close).await;
         return;
     }
     if tx.try_send(frame.clone()).is_err() {
         release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, frame);
-        warn!("closing slow or closed client {client_id}");
+        warn!("closing slow or closed client");
         send_control_to_client(state, client_id, ClientControl::Close).await;
     }
 }
@@ -3568,7 +3552,7 @@ async fn send_control_to_client(state: &AppState, client_id: Uuid, control: Clie
         .map(|client| client.control_tx.clone());
     if let Some(control_tx) = control_tx {
         if control_tx.try_send(control).is_err() {
-            warn!("dropping control frame for closed client {client_id}");
+            warn!("dropping control frame for closed client");
         }
     }
 }

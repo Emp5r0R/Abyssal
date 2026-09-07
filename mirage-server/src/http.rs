@@ -41,7 +41,6 @@ pub(super) fn router(state: AppState) -> Router {
         .merge(attachment_routes)
         .route("/v1/ws", get(ws_handler))
         .route("/v1/*path", any(api_not_found))
-        .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
     if let Some(web_root) = resolve_web_root() {

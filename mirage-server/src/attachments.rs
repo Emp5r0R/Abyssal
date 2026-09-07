@@ -138,7 +138,6 @@ pub(super) async fn prune_expired_attachments_locked(state: &AppState) {
     let mut bindings = state.attachment_bindings.lock().await;
     let mut attachments = state.attachments.lock().await;
     let mut usage = state.attachment_bytes_by_code.lock().await;
-    let before = attachments.len();
     attachments.retain(|attachment_id, record| {
         record
             .download_claims
@@ -189,10 +188,6 @@ pub(super) async fn prune_expired_attachments_locked(state: &AppState) {
             .get(attachment_id)
             .is_some_and(|record| key.matches_record(record))
     });
-    let removed = before.saturating_sub(attachments.len());
-    if removed > 0 {
-        info!("expired_attachments_removed count={removed}");
-    }
 }
 
 pub(super) async fn remove_chat_attachments(state: &AppState, chat_id: &str) {
@@ -1295,14 +1290,7 @@ pub(super) async fn upload_attachment(
         state.attachment_ram_limit_bytes,
         state.attachment_account_limit_bytes,
     ) {
-        warn!(
-            "attachment_upload_rejected reason=ram_limit used={} account_used={} incoming={} limit={} account_limit={}",
-            used_bytes,
-            account_used,
-            encrypted_len,
-            state.attachment_ram_limit_bytes,
-            state.attachment_account_limit_bytes,
-        );
+        warn!("attachment_upload_rejected reason=ram_limit");
         return StatusCode::from_u16(507)
             .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             .into_response();
@@ -1313,13 +1301,7 @@ pub(super) async fn upload_attachment(
         state.attachment_record_limit,
         state.attachment_account_record_limit,
     ) {
-        warn!(
-            "attachment_upload_rejected reason=record_limit used={} account_used={} limit={} account_limit={}",
-            used_records,
-            account_records,
-            state.attachment_record_limit,
-            state.attachment_account_record_limit,
-        );
+        warn!("attachment_upload_rejected reason=record_limit");
         return StatusCode::from_u16(507)
             .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             .into_response();
@@ -1406,10 +1388,6 @@ pub(super) async fn download_attachment(
         Ok(reservation) => reservation,
         Err(status) => return status.into_response(),
     };
-    info!(
-        "attachment_downloaded bytes={}",
-        reservation.blob.bytes.len()
-    );
     touch_activity(&state).await;
 
     attachment_download_response_with_epoch(
