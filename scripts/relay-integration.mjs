@@ -1858,11 +1858,18 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
     };
 
     const firstMessageId = randomUUID();
-    const firstPlaintext = encoder.encode(JSON.stringify({ kind: "text", content: "MLS application secret", id: firstMessageId }));
+    const privateRoomName = "Private incident response";
+    const firstPlaintext = encoder.encode(JSON.stringify({ kind: "text", content: "MLS application secret", id: firstMessageId,
+      room_profile: { version: 1, name: privateRoomName } }));
     let firstFrame;
     try {
       firstFrame = await sendAliceApplication(firstPlaintext, firstMessageId);
       assert.equal(JSON.stringify(firstFrame).includes("MLS application secret"), false);
+      assert.equal(JSON.stringify(firstFrame).includes(privateRoomName), false);
+      for (const field of ["authenticated_data_b64", "ciphertext_b64", "state_envelope_b64"]) {
+        const bytes = decode(firstFrame[field]);
+        try { assert.equal(Buffer.from(bytes).includes(Buffer.from(privateRoomName)), false); } finally { bytes.fill(0); }
+      }
       const noDuplicateDelivery = waitForNoMlsFrame(
         bobSocket,
         (candidate) => candidate.type === "mls_application" &&

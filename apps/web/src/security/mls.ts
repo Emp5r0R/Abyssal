@@ -1,5 +1,6 @@
 import type { WasmE2eeSession, WasmMlsProcessedControl, WasmMlsRoom, WasmMlsRoomInfo } from "../generated/abyssal_core/abyssal_core";
 import type { RoomRecord } from "../domain/types";
+import { readRoomProfile, roomProfile, type RoomProfile } from "../domain/roomProfile";
 import {
   decodeBase64Url,
   decimalU64,
@@ -107,7 +108,7 @@ export class MlsRoomManager {
     this.assertOpen();
     if (!ID.test(room.id) || this.#rooms.has(room.id) || this.#rooms.size >= MAX_ROOMS) throw new Error("Room unavailable");
     const localLabel = room.name.trim();
-    if (!localLabel || localLabel.length > 36 || /\p{Cc}/u.test(localLabel)) throw new Error("Room unavailable");
+    roomProfile(localLabel);
     const groupId = crypto.getRandomValues(new Uint8Array(32));
     let handle: WasmMlsRoom | null = null;
     let infoGroup: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -165,6 +166,27 @@ export class MlsRoomManager {
         !equal(group, info.groupId) || !equal(digest, info.membershipDigest)) throw new Error("Room unavailable");
       return { ...roomFromMlsWire(room), name: slot.localLabel };
     } finally { info.groupId.fill(0); info.membershipDigest.fill(0); group.fill(0); digest.fill(0); }
+  }
+
+  outgoingRoomProfile(roomId: string): RoomProfile | undefined {
+    const slot = this.activeSlot(roomId);
+    if (!sameUsername(slot.ownerUsername, this.#username) || !slot.localLabel) return undefined;
+    this.ownerSlot(roomId);
+    return roomProfile(slot.localLabel);
+  }
+
+  acceptRoomProfile(roomId: string, sender: string, value: unknown): string | undefined {
+    if (value === undefined) return undefined;
+    this.assertOpen();
+    const slot = this.#rooms.get(roomId);
+    // Publication is allowed only after the exact inbound snapshot has committed.
+    if (!slot?.active || slot.pendingMessageId || !sameUsername(sender, slot.ownerUsername)) {
+      throw new Error("Room unavailable");
+    }
+    const profile = readRoomProfile(value);
+    if (slot.localLabel !== undefined && slot.localLabel !== profile.name) throw new Error("Room unavailable");
+    slot.localLabel = profile.name;
+    return profile.name;
   }
 
   recoverCatalog(rooms: MlsRoomWire[]): RoomRecord[] {

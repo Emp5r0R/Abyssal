@@ -821,6 +821,13 @@ class ChatViewModel(
                             }
                             val senderKey = presence.value.firstOrNull { it.username == frame.senderUsername }?.publicKey ?: return@withLock
                             val message = parseIncomingMessage(frame.roomId, frame.messageId, json.toString(), frame.senderUsername, senderKey) ?: return@withLock
+                            val label = runCatching { manager.acceptRoomProfile(frame.roomId, frame.senderUsername, json.opt("room_profile")) }
+                                .getOrElse { wipeMessageSecrets(message); failClosedAfterAmbiguous(); return@withLock }
+                            if (label != null) {
+                                sessions.value.firstOrNull { it.id == frame.roomId }?.let { room ->
+                                    mutateRepositoryIfAccountCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, room.copy(name = label)) }
+                                }
+                            }
                             if (!mutateRepositoryIfAccountCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) wipeMessageSecrets(message)
                         } finally { decrypted.plaintext.fill(0); evidence.fill(0) }
                     }
@@ -2582,7 +2589,13 @@ class ChatViewModel(
             val transport = mlsTransport ?: return@withLock OutboundSendResult.NOT_SENT
             val manager = mlsManagerForChat
             val sender = currentUser.value?.username ?: return@withLock OutboundSendResult.NOT_SENT
-            val plain = stampedMetadata.toByteArray(StandardCharsets.UTF_8)
+            val plain = try {
+                JSONObject(stampedMetadata).apply {
+                    if (optString("kind") in setOf("text", "attachment")) {
+                        manager.outgoingRoomProfile(chatId)?.let { put("room_profile", it) }
+                    }
+                }.toString().toByteArray(StandardCharsets.UTF_8)
+            } catch (_: Exception) { return@withLock OutboundSendResult.NOT_SENT }
             val prepared = try {
                 manager.prepareApplication(chatId, messageId, sender, plain)
             } catch (_: Exception) {

@@ -745,6 +745,7 @@ export function useAbyssalSession() {
           return;
         }
         let plaintext: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+        let unpublishedMessage: ChatMessage | null = null;
         try {
           const decrypted = mlsRef.current?.receiveApplication(frame);
           if (!decrypted) throw new Error("Payload unavailable");
@@ -754,12 +755,23 @@ export function useAbyssalSession() {
           const message = plainRecord(decoded) && sessionRef.current
             ? parsePayload(frame.room_id, frame.message_id, decoded, room, sessionRef.current.username, frame.sender_username, undefined, ownMessageIdsRef.current)
             : null;
+          unpublishedMessage = message;
           if (!message || await sendMlsSnapshotRef.current(decrypted.snapshot) !== "ACCEPTED") throw new Error("Payload unavailable");
+          if (generation !== sessionGenerationRef.current || sessionRef.current?.token !== token) return;
+          const label = mlsRef.current?.acceptRoomProfile(frame.room_id, frame.sender_username, plainRecord(decoded) ? decoded.room_profile : undefined);
+          if (label !== undefined) {
+            roomsRef.current = roomsRef.current.map((candidate) => candidate.id === frame.room_id ? { ...candidate, name: label } : candidate);
+            setRooms(roomsRef.current);
+          }
           mlsSnapshotsRef.current.set(replay, { ...decrypted.snapshot, nativePending: false });
           while (mlsSnapshotsRef.current.size > 256) mlsSnapshotsRef.current.delete(mlsSnapshotsRef.current.keys().next().value!);
           updateMessages((current) => appendBoundedMessage(current, message));
+          unpublishedMessage = null;
         } catch { clearMemory(); }
-        finally { plaintext.fill(0); }
+        finally {
+          if (unpublishedMessage) wipeEvictedMessage(unpublishedMessage);
+          plaintext.fill(0);
+        }
       });
       return;
     }
@@ -1647,7 +1659,10 @@ export function useAbyssalSession() {
     if (isMlsRoom) {
       let plaintext = new Uint8Array(0);
       try {
-        plaintext = new TextEncoder().encode(JSON.stringify(messagePayload(message, directoryStampRef.current)));
+        plaintext = new TextEncoder().encode(JSON.stringify({
+          ...messagePayload(message, directoryStampRef.current),
+          room_profile: mlsRef.current?.outgoingRoomProfile(chatId),
+        }));
         const prepared = mlsRef.current?.prepareApplication(chatId, message.id, currentSession.username, plaintext);
         if (!prepared) return false;
         const outcome = await runMlsTransaction(currentSession, generation, connectionGeneration, prepared);
@@ -1802,7 +1817,10 @@ export function useAbyssalSession() {
           ),
         );
       } else {
-        const metadata = new TextEncoder().encode(JSON.stringify(messagePayload(outgoingMessage, directoryStampRef.current)));
+        const metadata = new TextEncoder().encode(JSON.stringify({
+          ...messagePayload(outgoingMessage, directoryStampRef.current),
+          room_profile: mlsRef.current?.outgoingRoomProfile(chatId),
+        }));
         try {
           const prepared = mlsRef.current?.prepareApplication(chatId, outgoingMessage.id, currentSession.username, metadata);
           outcome = prepared

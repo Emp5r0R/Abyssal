@@ -89,7 +89,8 @@ identities and account fixtures were separate from production.
   migration before publication, with an explicit threat boundary for necessary
   public bootstrap information and observable network timing/addresses. Do not
   publish a metadata-free claim or silently treat these limits as accepted.
-  Local room labels remain client-only and are not shared encrypted titles.
+  Room names now travel in owner-authenticated MLS text/attachment payloads;
+  clients learn them on owner-message delivery and keep them only in RAM.
   Attachment upload metadata now travels in a bounded body envelope rather than
   URL queries; this is access-log minimization, not an end-to-end metadata channel.
   Coordinate relay/web/Android updates for the v2 upload endpoint; v1 uploads

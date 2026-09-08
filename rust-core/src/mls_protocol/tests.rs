@@ -247,7 +247,11 @@ fn application_checkpoint_replay_and_tamper() {
         .join_welcome(add.welcome, add.roster, add.membership_digest)
         .unwrap();
     let app = alice_room
-        .encrypt_application("app-1".to_string(), b"hello".to_vec(), b"aad".to_vec())
+        .encrypt_application(
+            "app-1".to_string(),
+            b"hello".to_vec(),
+            application_context::encode("test-room", "app-1", "alice"),
+        )
         .unwrap();
     alice_room
         .commit_outbound(app.message_id.clone(), app.revision)
@@ -312,7 +316,7 @@ fn outbound_rollback_restores_exact_state_and_requires_exact_checkpoint() {
         .encrypt_application(
             "rollback-message".to_string(),
             b"hello".to_vec(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "rollback-message", "alice"),
         )
         .unwrap();
     assert!(room.seal_state().is_err());
@@ -332,13 +336,102 @@ fn outbound_rollback_restores_exact_state_and_requires_exact_checkpoint() {
         .encrypt_application(
             "rollback-message".to_string(),
             b"hello".to_vec(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "rollback-message", "alice"),
         )
         .unwrap();
     assert_eq!(retry.revision, before.revision + 1);
     room.commit_outbound(retry.message_id, retry.revision)
         .unwrap();
     assert!(room.seal_state().is_ok());
+}
+
+#[test]
+fn authenticated_member_cannot_claim_another_sender_and_rejection_restores_state() {
+    let (alice, export_a, sig_a) = identity(21, "alice");
+    let (bob, export_b, sig_b) = identity(22, "bob");
+    let alice_room = MlsRoom::create(
+        export_a,
+        "test-room".into(),
+        "alice".into(),
+        b"node=local".to_vec(),
+        alice.to_vec(),
+        vec![3; 32],
+        sig_a,
+    )
+    .unwrap();
+    let bob_room = MlsRoom::pending_join(
+        export_b,
+        "test-room".into(),
+        "bob".into(),
+        b"node=local".to_vec(),
+        bob.to_vec(),
+        vec![3; 32],
+        sig_b,
+    )
+    .unwrap();
+    let add = alice_room
+        .add_member(
+            bob_room.key_package().unwrap(),
+            "bob".into(),
+            bob.to_vec(),
+            "join".into(),
+        )
+        .unwrap();
+    alice_room
+        .commit_outbound(add.message_id.clone(), add.revision)
+        .unwrap();
+    bob_room
+        .join_welcome(add.welcome, add.roster, add.membership_digest)
+        .unwrap();
+    let forged_aad = application_context::encode("test-room", "forged", "alice");
+    let before_bob = bob_room.room_info().unwrap();
+    assert!(bob_room
+        .encrypt_application("forged".into(), b"spoof".to_vec(), forged_aad.clone())
+        .is_err());
+    assert_eq!(bob_room.room_info().unwrap(), before_bob);
+
+    // Model a modified member bypassing our outbound guard: genuine Bob MLS authentication, false Alice AAD.
+    let forged = bob_room
+        .lock_state_mut()
+        .unwrap()
+        .group
+        .as_mut()
+        .unwrap()
+        .encrypt_application_message(b"spoof", forged_aad.clone())
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    let before_alice = alice_room.room_info().unwrap();
+    let replay_before = alice_room.lock_state().unwrap().replay_ids.clone();
+    assert!(alice_room
+        .decrypt_application(forged, before_alice.epoch, "forged".into(), forged_aad)
+        .is_err());
+    assert_eq!(alice_room.room_info().unwrap(), before_alice);
+    assert_eq!(alice_room.lock_state().unwrap().replay_ids, replay_before);
+    assert!(alice_room.seal_state().is_ok());
+
+    let good = bob_room
+        .encrypt_application(
+            "good".into(),
+            b"actual Bob".to_vec(),
+            application_context::encode("test-room", "good", "Bob"),
+        )
+        .unwrap();
+    bob_room
+        .commit_outbound(good.message_id.clone(), good.revision)
+        .unwrap();
+    let received = alice_room
+        .decrypt_application(
+            good.ciphertext,
+            good.epoch,
+            good.message_id.clone(),
+            good.authenticated_data,
+        )
+        .unwrap();
+    assert_eq!(received.plaintext, b"actual Bob");
+    alice_room
+        .commit_outbound(good.message_id, received.revision)
+        .unwrap();
 }
 
 #[test]
@@ -538,7 +631,7 @@ fn every_public_mls_message_decoder_rejects_trailing_bytes() {
         .encrypt_application(
             "suffix-application".to_string(),
             b"hello".to_vec(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "suffix-application", "alice"),
         )
         .unwrap();
     alice_room
@@ -925,7 +1018,7 @@ fn replay_window_rolls_transactionally_at_capacity_and_survives_recovery() {
         .encrypt_application(
             "rolling-application".to_string(),
             b"latest".to_vec(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "rolling-application", "alice"),
         )
         .unwrap();
     alice_room
@@ -1039,7 +1132,7 @@ fn out_of_order_application_within_library_window_decrypts() {
         .encrypt_application(
             "out-of-order-1".to_string(),
             b"first".to_vec(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "out-of-order-1", "alice"),
         )
         .unwrap();
     alice_room
@@ -1049,7 +1142,7 @@ fn out_of_order_application_within_library_window_decrypts() {
         .encrypt_application(
             "out-of-order-2".to_string(),
             b"second".to_vec(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "out-of-order-2", "alice"),
         )
         .unwrap();
     alice_room
@@ -1161,13 +1254,22 @@ fn revoked_room_rejects_every_mls_operation() {
         ),
         (
             "encrypt_application",
-            room.encrypt_application("encrypt".to_string(), vec![1], vec![1])
-                .map(|_| ()),
+            room.encrypt_application(
+                "encrypt".to_string(),
+                vec![1],
+                application_context::encode("all-operations-room", "encrypt", "alice"),
+            )
+            .map(|_| ()),
         ),
         (
             "decrypt_application",
-            room.decrypt_application(vec![1], 0, "decrypt".to_string(), vec![1])
-                .map(|_| ()),
+            room.decrypt_application(
+                vec![1],
+                0,
+                "decrypt".to_string(),
+                application_context::encode("all-operations-room", "decrypt", "alice"),
+            )
+            .map(|_| ()),
         ),
         ("seal_state", room.seal_state().map(|_| ())),
     ];
@@ -1219,7 +1321,7 @@ fn application_plaintext_and_ciphertext_limits_fail_before_state_mutation() {
         .encrypt_application(
             "plaintext-too-large".to_string(),
             vec![0; MAX_APPLICATION_PLAINTEXT_BYTES + 1],
-            b"aad".to_vec(),
+            application_context::encode("test-room", "plaintext-too-large", "alice"),
         )
         .is_err());
     assert_eq!(room.room_info().unwrap(), before);
@@ -1228,7 +1330,7 @@ fn application_plaintext_and_ciphertext_limits_fail_before_state_mutation() {
         .encrypt_application(
             "plaintext-boundary".to_string(),
             vec![0; MAX_APPLICATION_PLAINTEXT_BYTES],
-            b"aad".to_vec(),
+            application_context::encode("test-room", "plaintext-boundary", "alice"),
         )
         .unwrap();
     assert!(boundary.ciphertext.len() <= MAX_APPLICATION_CIPHERTEXT_BYTES);
@@ -1241,7 +1343,7 @@ fn application_plaintext_and_ciphertext_limits_fail_before_state_mutation() {
             vec![0; MAX_APPLICATION_CIPHERTEXT_BYTES + 1],
             before.epoch,
             "ciphertext-too-large".to_string(),
-            b"aad".to_vec(),
+            application_context::encode("test-room", "ciphertext-too-large", "alice"),
         )
         .is_err());
     assert_eq!(room.room_info().unwrap(), before);

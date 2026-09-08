@@ -99,13 +99,21 @@ describe("MlsRoomManager", () => {
       }, policy: frame.policy as MlsRoomWire["policy"],
     };
     expect(manager.confirmCreatedRoom(wire).name).toBe(label);
+    expect(manager.outgoingRoomProfile(roomRecord.id)).toEqual({ version: 1, name: label });
+    expect(manager.acceptRoomProfile(roomRecord.id, "Alice", undefined)).toBeUndefined();
+    expect(() => manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: label })).toThrow();
+    expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: "Changed" })).toThrow();
     expect(() => manager.confirmCreatedRoom({ ...wire, group_id_b64: encodeBase64Url(bytes(32, 9)) })).toThrow("Room unavailable");
     expect(() => manager.confirmCreatedRoom({ ...wire, owner_username: "Mallory" })).toThrow("Room unavailable");
     for (let update = 0; update < 2; update++) expect(manager.recoverCatalog([wire])[0].name).toBe(label);
     manager.removeRoom(roomRecord.id);
     expect(() => manager.confirmCreatedRoom(wire)).toThrow("Room unavailable");
     expect(manager.recoverCatalog([wire])[0].name).not.toBe(label);
+    expect(manager.outgoingRoomProfile(roomRecord.id)).toBeUndefined();
+    expect(manager.acceptRoomProfile(roomRecord.id, "alice", { version: 1, name: label })).toBe(label);
+    expect(manager.recoverCatalog([wire])[0].name).toBe(label);
     manager.close();
+    expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: label })).toThrow();
   });
 
   it("rejects oversized or control-bearing local labels before native room creation", () => {
@@ -131,7 +139,9 @@ describe("MlsRoomManager", () => {
     const accepted = sessionWith(); const manager = new MlsRoomManager(accepted.session, "Alice", "node", bytes(608, 7));
     manager.createRoom(roomRecord);
     const first = manager.prepareApplication(roomRecord.id, "message-1", "Alice", bytes(3, 1));
+    expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: roomRecord.name })).toThrow();
     manager.finishTransaction(first, "ACCEPTED");
+    expect(manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: roomRecord.name })).toBe(roomRecord.name);
     expect(accepted.room.commitOutbound).toHaveBeenCalledWith("message-1", 2n);
     const second = manager.prepareApplication(roomRecord.id, "message-2", "Alice", bytes(3, 1));
     manager.finishTransaction(second, "REJECTED");
@@ -211,6 +221,10 @@ describe("MlsRoomManager", () => {
       policy: { self_destruct_timer_sec: "0", overall_expiry_sec: "60", allow_images: true, allow_videos: true, allow_files: true, enforce_text_absolute_expiry: true, image_read_timer_sec: "0", image_overall_expiry_sec: "60", enforce_image_absolute_expiry: true, video_read_timer_sec: "0", video_overall_expiry_sec: "60", enforce_video_absolute_expiry: true, file_read_timer_sec: "0", file_overall_expiry_sec: "60", enforce_file_absolute_expiry: true },
     }]);
     const request = { type: "mls_join_requested", protocol_version: 10, room_id: roomRecord.id, request_id: "request", username: "Carol", stable_identity_b64: encodeBase64Url(bytes(64, 5)), key_package_b64: encodeBase64Url(bytes(100, 8)) } as const;
+    expect(manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: "Private room" })).toBe("Private room");
+    expect(manager.outgoingRoomProfile(roomRecord.id)).toBeUndefined();
+    expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: "Private room" })).toThrow();
+    expect(() => manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: "Override" })).toThrow();
     expect(() => manager.rememberJoin(request)).toThrow("Room unavailable");
     const ownLeave = manager.beginLeave(roomRecord.id);
     manager.forgetLeave(roomRecord.id, ownLeave.request_id as string);

@@ -7,6 +7,7 @@ import com.abyssal.chat.domain.model.MlsRoomPolicyWire
 import com.abyssal.chat.domain.model.MlsRoomWire
 import com.abyssal.chat.domain.model.MlsRosterMemberWire
 import com.abyssal.chat.domain.repository.OutboundSendResult
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -186,14 +187,24 @@ class MlsRoomManagerTest {
             assertTrue(firstSnapshot.snapshot.nativePending)
             member.finishSnapshot(firstSnapshot.snapshot, OutboundSendResult.ACCEPTED)
 
-            val second = owner.prepareApplication("room_custom", "message-b", "Alice", byteArrayOf(2))
+            val profile = requireNotNull(owner.outgoingRoomProfile("room_custom"))
+            val plaintext = JSONObject().put("kind", "text").put("room_profile", profile).toString().toByteArray()
+            val second = try { owner.prepareApplication("room_custom", "message-b", "Alice", plaintext) } finally { plaintext.fill(0) }
+            assertFalse(second.frame.toString().contains(profile.getString("name")))
             val secondFrame = applicationFrame(second.frame, "Alice", 2uL)
             owner.finishTransaction(second, OutboundSendResult.ACCEPTED)
             val secondSnapshot = member.receiveApplication(secondFrame)
+            val receivedProfile = try { JSONObject(String(secondSnapshot.plaintext)).getJSONObject("room_profile") } finally { secondSnapshot.plaintext.fill(0) }
+            assertTrue(runCatching { member.acceptRoomProfile("room_custom", "Alice", receivedProfile) }.isFailure)
             member.finishSnapshot(secondSnapshot.snapshot, OutboundSendResult.ACCEPTED)
+            assertEquals(profile.getString("name"), member.acceptRoomProfile("room_custom", "Alice", receivedProfile))
+            assertTrue(runCatching { member.acceptRoomProfile("room_custom", "Bob", receivedProfile) }.isFailure)
+            assertTrue(runCatching { member.acceptRoomProfile("room_custom", "Alice", RoomProfileCodec.encode("Override")) }.isFailure)
 
             assertTrue(runCatching { member.receiveApplication(firstFrame) }.isFailure)
             assertTrue(runCatching { member.prepareApplication("room_custom", "message-c", "Bob", byteArrayOf(3)) }.isFailure)
+            member.removeRoom("room_custom")
+            assertTrue(runCatching { member.acceptRoomProfile("room_custom", "Alice", receivedProfile) }.isFailure)
         } finally {
             owner.close(); member.close(); ownerCipher.clear(); memberCipher.clear(); memberKey.fill(0)
         }

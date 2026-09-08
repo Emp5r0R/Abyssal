@@ -1,6 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as messageMemory from "../domain/messageMemoryPolicy";
 import type {
   AccountSession,
   DirectoryStamp,
@@ -22,6 +23,10 @@ const mocks = vi.hoisted(() => {
     finishOutcomes: string[] = [];
     snapshotOutcomes: string[] = [];
     receiveApplicationCount = 0;
+    profile: { version: 1; name: string } | undefined;
+    acceptedProfiles = 0;
+    lastApplication: unknown;
+    incomingAttachment = false;
     pendingJoinItems: Array<{ roomId: string; requestId: string; username: string }> = [];
     ownJoin: { roomId: string; requestId: string } | null = null;
     pendingLeaveItems: Array<{ roomId: string; requestId: string; username: string }> = [];
@@ -94,8 +99,16 @@ const mocks = vi.hoisted(() => {
     forgetLeave(roomId: string, requestId: string) {
       this.pendingLeaveItems = this.pendingLeaveItems.filter((leave) => leave.roomId !== roomId || leave.requestId !== requestId);
     }
-    prepareApplication(roomId: string, messageId: string) {
+    prepareApplication(roomId: string, messageId: string, _sender: string, plaintext: Uint8Array) {
+      this.lastApplication = JSON.parse(new TextDecoder().decode(plaintext));
       return { roomId, messageId, revision: 2n, frame: { type: "mls_application", room_id: roomId, message_id: messageId, revision: "2" } };
+    }
+    outgoingRoomProfile() { return this.profile; }
+    acceptRoomProfile(_room: string, _sender: string, profile: { version: 1; name: string } | undefined) {
+      if (!profile) return undefined;
+      if (this.snapshotOutcomes.at(-1) !== "ACCEPTED") throw new Error("Premature profile publication");
+      this.acceptedProfiles += 1;
+      return profile.name;
     }
     finishTransaction(prepared: { requestType?: string; requestId?: string; roomId?: string }, outcome: string) {
       this.finishOutcomes.push(outcome);
@@ -109,6 +122,12 @@ const mocks = vi.hoisted(() => {
         plaintext: new TextEncoder().encode(JSON.stringify({
           kind: "text", id: frame.message_id, sender: "Bob", content: "incoming MLS", timestamp_ms: Date.now(),
           sender_client: "android",
+          room_profile: this.profile,
+          ...(this.incomingAttachment ? {
+            kind: "attachment", attachment_id: "attachment-profile", attachment_cipher_version: 2,
+            attachment_key_b64: btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replaceAll("=", ""),
+            media_type: "FILE", name: "private.txt", mime_type: "text/plain", size_bytes: 4,
+          } : {}),
         })),
         snapshot: {
           roomId: frame.room_id, messageId: frame.message_id, revision: 3n, nativePending: true,
@@ -2231,8 +2250,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
     act(() => result.current.openRoom("forum_mls"));
 
+    const manager = mocks.FakeMlsManager.instances[0]!;
+    manager.profile = { version: 1, name: "Private incident response" };
     await act(async () => expect(result.current.sendText("MLS accepted")).resolves.toBe(true));
     expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_application", room_id: "forum_mls" });
+    expect(manager.lastApplication).toMatchObject({ room_profile: manager.profile, content: "MLS accepted" });
+    expect(JSON.stringify(relay?.sent.at(-1))).not.toContain(manager.profile.name);
     expect(mocks.FakeMlsManager.instances[0]?.finishOutcomes).toEqual(["ACCEPTED"]);
 
     mocks.FakeRelay.encryptedOutcome = "REJECTED";
@@ -2264,6 +2287,38 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(result.current.messages.forum_mls).toHaveLength(1);
     expect(relay?.sent.filter((frame) => (frame as { type?: string }).type === "mls_state_snapshot")).toHaveLength(2);
     unmount();
+  });
+
+  it.each(["ACCEPTED", "REJECTED", "AMBIGUOUS"] as const)("publishes encrypted room names only after accepted delivery: %s", async (outcome) => {
+    const wipe = vi.spyOn(messageMemory, "wipeEvictedMessage");
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    manager.profile = { version: 1, name: "Private incident response" };
+    manager.incomingAttachment = true;
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Bob", active: true }] } as unknown as IncomingFrame));
+    expect(result.current.rooms[0]?.name).toBe("MLS room");
+    mocks.FakeRelay.encryptedOutcome = outcome;
+    const incoming = { type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "profile-message",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x" } as unknown as IncomingFrame;
+    await act(async () => relay?.emit(incoming));
+    if (outcome === "ACCEPTED") {
+      await waitFor(() => expect(result.current.rooms[0]?.name).toBe(manager.profile?.name));
+      expect(manager.acceptedProfiles).toBe(1);
+      expect(result.current.messages.forum_mls).toHaveLength(1);
+      await act(async () => relay?.emit(incoming));
+      expect(manager.acceptedProfiles).toBe(1);
+    } else {
+      await waitFor(() => expect(result.current.session).toBeNull());
+      expect(manager.acceptedProfiles).toBe(0);
+      expect(result.current.rooms).toEqual([]);
+      expect(wipe).toHaveBeenCalled();
+      const discarded = wipe.mock.calls.find(([message]) => message.id === "profile-message")?.[0];
+      expect(discarded?.attachment?.encryptionKey).toEqual(new Uint8Array(32));
+      expect(discarded?.content).toBe("");
+    }
+    unmount();
+    wipe.mockRestore();
   });
 
   it("accepts generic protocol-safe room ids and retains join rejection state when send fails", async () => {

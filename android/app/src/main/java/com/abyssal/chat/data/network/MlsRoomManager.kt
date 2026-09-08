@@ -55,7 +55,7 @@ internal class MlsRoomManager(
         var pendingMessageId: String? = null,
         var pendingRevision: ULong? = null,
         var pendingRoster: List<MlsRosterMemberWire>? = null,
-        val localLabel: String? = null
+        var localLabel: String? = null
     )
     private data class PendingJoin(
         val roomId: String,
@@ -83,7 +83,7 @@ internal class MlsRoomManager(
         checkOpen()
         require(ID.matches(room.id) && !rooms.containsKey(room.id) && rooms.size < MAX_ROOMS)
         val localLabel = room.name.trim()
-        require(localLabel.length in 1..36 && localLabel.none(Char::isISOControl))
+        RoomProfileCodec.encode(localLabel)
         require(room.ownerUsername == null || sameUsername(room.ownerUsername, username))
         val group = ByteArray(32).also(random::nextBytes)
         var handle: MlsRoom? = null
@@ -122,6 +122,25 @@ internal class MlsRoomManager(
             wire.epoch == 0uL && wire.revision == 0uL && wire.roster.size == 1 &&
             sameRoster(wire.roster, slot.roster) && exactExisting(slot, wire))
         return MlsWireCodec.roomSession(wire).copy(name = label)
+    }
+
+    @Synchronized
+    fun outgoingRoomProfile(roomId: String): JSONObject? {
+        val slot = activeSlot(roomId)
+        if (!sameUsername(slot.ownerUsername, username)) return null
+        return slot.localLabel?.let(RoomProfileCodec::encode)
+    }
+
+    @Synchronized
+    fun acceptRoomProfile(roomId: String, sender: String, value: Any?): String? {
+        if (value == null) return null
+        checkOpen()
+        val slot = requireNotNull(rooms[roomId])
+        require(slot.active && slot.pendingMessageId == null && sameUsername(sender, slot.ownerUsername))
+        val name = RoomProfileCodec.decode(value)
+        require(slot.localLabel == null || slot.localLabel == name)
+        slot.localLabel = name
+        return name
     }
 
     @Synchronized

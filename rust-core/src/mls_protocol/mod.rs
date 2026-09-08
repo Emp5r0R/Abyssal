@@ -29,6 +29,7 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+mod application_context;
 mod identity;
 mod state;
 mod storage;
@@ -1114,6 +1115,12 @@ impl MlsRoom {
             "Payload unavailable",
         )?;
         let authenticated_data = bounded_bytes(authenticated_data, 4096, "Payload unavailable")?;
+        if application_context::sender(&authenticated_data, &self.room_id, &message_id)
+            .map_err(AbyssalError::from)?
+            != self.username
+        {
+            return Err("Payload unavailable".to_string().into());
+        }
         let mut state = self.lock_state_mut()?;
         if state.closed || state.pending.is_some() || state.group.is_none() {
             return Err("Payload unavailable".to_string().into());
@@ -1238,6 +1245,9 @@ impl MlsRoom {
         let replay_id = replay_digest_from_message_id(APPLICATION_REPLAY_DOMAIN, &message_id);
         let expected_authenticated_data =
             bounded_bytes(expected_authenticated_data, 4096, "Payload unavailable")?;
+        let expected_sender =
+            application_context::sender(&expected_authenticated_data, &self.room_id, &message_id)
+                .map_err(AbyssalError::from)?;
         let mut state = self.lock_state_mut()?;
         if state.closed
             || state.pending.is_some()
@@ -1286,7 +1296,16 @@ impl MlsRoom {
             return Err("Payload unavailable".to_string().into());
         };
         let sender_index = description.sender_index;
-        if description.authenticated_data != expected_authenticated_data {
+        let sender_matches = state
+            .group
+            .as_ref()
+            .expect("active checked")
+            .roster()
+            .members_iter()
+            .find(|member| member.index == sender_index)
+            .and_then(|member| parse_credential(&member.signing_identity).ok())
+            .is_some_and(|credential| credential.username == expected_sender);
+        if description.authenticated_data != expected_authenticated_data || !sender_matches {
             if state
                 .restore_sealed_snapshot(&self.group_id, snapshot.clone())
                 .is_err()
