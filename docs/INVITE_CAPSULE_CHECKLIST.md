@@ -55,6 +55,14 @@ the real shared WASM raster/parser and client QR decoder, not a mocked decoder.
 
 ## Qualification Evidence
 
+On 2026-09-09, the native terminal-QR round trip and real browser QR matrix
+passed at 1440x1000 and 390x844. The isolated native Tor/I2P profile test also
+passed startup and stable destination-key checks; this is not live I2P ingress
+evidence. Source checkpoint `9d512b6` passed hosted CI and CodeQL. Subsequent
+MLS lifecycle and audit-gate changes require their own integrated verification.
+The paired A059 device currently has no Abyssal package installed; earlier
+device observations below do not qualify a new build.
+
 On 2026-09-06, source `0f4e898f4d12b0c2c0dbca2345f96f5c98aa1758`
 passed hosted CI (run `34037354761`) and CodeQL (run `34037354781`).
 On the paired Android 16 device, the attested debug build reached account

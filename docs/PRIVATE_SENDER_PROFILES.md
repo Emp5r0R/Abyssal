@@ -41,7 +41,9 @@ verified account ID, public key, MLS credential or sender binding.
 - Incoming names publish only with an accepted authenticated message after the
   existing exact delivery/state acknowledgement. Invalid profiles are not
   displayed, but may already have been acknowledged; rejection does not promise
-  redelivery. Existing direct and MLS error handling remains in force.
+  redelivery. Web MLS drops malformed application profiles after exact native
+  snapshot acceptance without logging out the recipient. Cryptographic/state
+  failures and direct-message fail-closed handling are unchanged.
 - Incoming message headers display the name and its original account ID. Clicking
   an author mentions the account ID, never the display name. Safety numbers,
   direct targets, membership approval, ownership and mention matching still use

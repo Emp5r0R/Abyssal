@@ -1,5 +1,29 @@
 # Project Progress
 
+## Active Qualification: Production Release Readiness
+
+Source checkpoint `9d512b6` passed the full local gate and hosted CI/CodeQL.
+This is not release approval: `docs/INVITE_CAPSULE_CHECKLIST.md` remains the
+authoritative acceptance boundary, including Android physical-camera and live
+I2P ingress evidence and the unresolved metadata confidentiality requirement.
+
+### Bounded Work Package
+
+- RQ-audit: make incomplete dependency audits fail closed, including registry
+  errors that cargo-audit can report while returning success; add deterministic
+  regression tests and independent review.
+- RQ-review: independently inspect private-profile and QR/bootstrap trust
+  boundaries for concrete code defects; repair evidenced findings before gates.
+- RQ-qualification: run available native QR/transport and client checks, record
+  unavailable physical/network evidence as incomplete, and preserve production.
+- RQ-release: only after every acceptance item is evidenced, verify the final
+  integrated gate and hosted CI/CodeQL, then build and verify matching signed
+  artifacts from one clean source commit before publication/deployment.
+
+The parent owns integration, release decisions and status; scoped workers own
+audit implementation and independent review. No APK/AAB packaging, tag or
+production restart is authorized by a passing intermediate checkpoint alone.
+
 ## Active Deployment: Unified Invite Capsule V1 - Source Complete
 
 ### Goal

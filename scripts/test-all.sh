@@ -46,6 +46,7 @@ run_shell() {
   "$ROOT_DIR/scripts/test-deployment-inputs.sh"
   "$ROOT_DIR/scripts/test-web-release-archive.sh"
   "$ROOT_DIR/scripts/test-invite-qr-renderer.sh"
+  "$ROOT_DIR/scripts/test-cargo-audit-check.sh"
   python3 "$ROOT_DIR/scripts/test-private-transport-profiles.py"
 
   for sensitive_context_path in \
@@ -110,7 +111,43 @@ run_audit() {
     exit 1
   }
   npm --prefix "$ROOT_DIR" audit --audit-level=moderate
-  cargo audit --deny warnings --file "$ROOT_DIR/Cargo.lock"
+
+  # cargo-audit can return a clean JSON report while a registry/yank lookup
+  # failed on stderr, so validate both streams before accepting the result.
+  (
+    cargo_audit_tempdir="$(mktemp -d "${TMPDIR:-/tmp}/abyssal-cargo-audit.XXXXXX")"
+    cargo_audit_report="$cargo_audit_tempdir/report.json"
+    cargo_audit_stderr="$cargo_audit_tempdir/stderr"
+    : > "$cargo_audit_report"
+    : > "$cargo_audit_stderr"
+
+    cleanup_cargo_audit() {
+      rm -rf -- "$cargo_audit_tempdir"
+    }
+    trap cleanup_cargo_audit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    cargo_audit_status=0
+    cargo audit \
+      --deny warnings \
+      --format json \
+      --file "$ROOT_DIR/Cargo.lock" \
+      >"$cargo_audit_report" 2>"$cargo_audit_stderr" || cargo_audit_status=$?
+
+    cat -- "$cargo_audit_report"
+    cat -- "$cargo_audit_stderr" >&2
+    if "$ROOT_DIR/scripts/lib/verify-cargo-audit.sh" \
+        "$cargo_audit_status" \
+        "$cargo_audit_report" \
+        "$cargo_audit_stderr"; then
+      cargo_audit_validation_status=0
+    else
+      cargo_audit_validation_status=$?
+    fi
+    exit "$cargo_audit_validation_status"
+  )
 }
 
 run_web() {

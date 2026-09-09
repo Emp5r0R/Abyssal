@@ -147,6 +147,11 @@ interface AttachmentOperation {
   wipe: () => void;
 }
 
+interface CachedMlsApplication {
+  snapshot: PreparedMlsSnapshot;
+  evidence: Uint8Array;
+}
+
 const EMPTY_UPLOAD: UploadState = { active: false, name: "", loaded: 0, total: 0 };
 
 class AsyncCryptoGate {
@@ -272,6 +277,7 @@ export function useAbyssalSession() {
   const directoryNodeRef = useRef<string | null>(null);
   const directoryRevisionRef = useRef(0);
   const mlsSnapshotsRef = useRef(new Map<string, PreparedMlsSnapshot>());
+  const mlsApplicationSnapshotsRef = useRef(new Map<string, CachedMlsApplication>());
   const frameQueueRef = useRef<Promise<void>>(Promise.resolve());
   const sendReadReceiptRef = useRef<(chatId: string, messageId: string) => void>(() => undefined);
   const sendMlsSnapshotRef = useRef<(snapshot: PreparedMlsSnapshot) => Promise<EncryptedSendOutcome>>(async () => "NOT_SENT");
@@ -488,6 +494,8 @@ export function useAbyssalSession() {
     directoryNodeRef.current = null;
     directoryRevisionRef.current = 0;
     mlsSnapshotsRef.current.clear();
+    mlsApplicationSnapshotsRef.current.forEach(({ evidence }) => evidence.fill(0));
+    mlsApplicationSnapshotsRef.current.clear();
     clearDirectTrust();
     connectionGenerationRef.current += 1;
     frameQueueRef.current = Promise.resolve();
@@ -741,40 +749,105 @@ export function useAbyssalSession() {
     if (frame.type === "mls_application") {
       const generation = sessionGenerationRef.current; const token = sessionRef.current?.token;
       await cryptoGateRef.current.run(async () => {
-        if (!token || generation !== sessionGenerationRef.current || sessionRef.current?.token !== token) return;
+        const accountActive = () => generation === sessionGenerationRef.current && sessionRef.current?.token === token;
+        if (!token || !accountActive()) return;
         const replay = `${frame.room_id}\u0000${frame.message_id}`;
-        const prior = mlsSnapshotsRef.current.get(replay);
-        if (prior) {
-          if (await sendMlsSnapshotRef.current(prior) !== "ACCEPTED") clearMemory();
-          return;
-        }
+        let evidence: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
         let plaintext: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
         let unpublishedMessage: ChatMessage | null = null;
         try {
+          evidence = await mlsApplicationEvidence(frame);
+          if (!accountActive()) return;
+          const prior = mlsApplicationSnapshotsRef.current.get(replay);
+          if (prior) {
+            if (!equalBytes(prior.evidence, evidence)) {
+              clearMemory();
+              return;
+            }
+            const outcome = await sendMlsSnapshotRef.current(prior.snapshot);
+            if (!accountActive()) return;
+            if (outcome !== "ACCEPTED") clearMemory();
+            return;
+          }
+
+          // Native state admission is independent from application schema parsing.
+          // Commit and cache the exact accepted snapshot before touching plaintext.
           const decrypted = mlsRef.current?.receiveApplication(frame);
           if (!decrypted) throw new Error("Payload unavailable");
           plaintext = decrypted.plaintext;
-          const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
-          const room = roomsRef.current.find((candidate) => candidate.id === frame.room_id);
-          const message = plainRecord(decoded) && sessionRef.current
-            ? parsePayload(frame.room_id, frame.message_id, decoded, room, sessionRef.current.username, frame.sender_username, undefined, ownMessageIdsRef.current)
-            : null;
-          unpublishedMessage = message;
-          if (!message || await sendMlsSnapshotRef.current(decrypted.snapshot) !== "ACCEPTED") throw new Error("Payload unavailable");
-          if (generation !== sessionGenerationRef.current || sessionRef.current?.token !== token) return;
-          const label = mlsRef.current?.acceptRoomProfile(frame.room_id, frame.sender_username, plainRecord(decoded) ? decoded.room_profile : undefined);
-          if (label !== undefined) {
-            roomsRef.current = roomsRef.current.map((candidate) => candidate.id === frame.room_id ? { ...candidate, name: label } : candidate);
-            setRooms(roomsRef.current);
+          const outcome = await sendMlsSnapshotRef.current(decrypted.snapshot);
+          if (!accountActive()) return;
+          if (outcome !== "ACCEPTED") {
+            clearMemory();
+            return;
           }
-          mlsSnapshotsRef.current.set(replay, { ...decrypted.snapshot, nativePending: false });
-          while (mlsSnapshotsRef.current.size > 256) mlsSnapshotsRef.current.delete(mlsSnapshotsRef.current.keys().next().value!);
-          updateMessages((current) => appendBoundedMessage(current, message));
-          unpublishedMessage = null;
-        } catch { clearMemory(); }
+          mlsApplicationSnapshotsRef.current.set(replay, {
+            snapshot: { ...decrypted.snapshot, nativePending: false },
+            evidence: evidence.slice(),
+          });
+          while (mlsApplicationSnapshotsRef.current.size > 256) {
+            const oldest = mlsApplicationSnapshotsRef.current.keys().next().value;
+            if (oldest === undefined) break;
+            const evicted = mlsApplicationSnapshotsRef.current.get(oldest);
+            mlsApplicationSnapshotsRef.current.delete(oldest);
+            evicted?.evidence.fill(0);
+          }
+
+          try {
+            const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
+            if (!plainRecord(decoded)) return;
+            if (!directoryStampMatches(directoryStampRef.current, decoded)) return;
+            if (decoded.kind === "read_receipt") {
+              if (typeof decoded.id !== "string" || !validControlId(decoded.id) || decoded.id !== frame.message_id) return;
+              const targetId = decoded.message_id;
+              if (typeof targetId !== "string" || !validControlId(targetId) || !ownMessageIdsRef.current.has(targetId)) return;
+              if (!accountActive()) return;
+              const readAtMs = Date.now();
+              updateMessages((current) => {
+                const list = current[frame.room_id];
+                if (!list) return current;
+                let changed = false;
+                const next = list.map((message) => {
+                  if (message.id !== targetId || message.readAtMs !== undefined) return message;
+                  changed = true;
+                  return { ...message, readAtMs };
+                });
+                return changed ? { ...current, [frame.room_id]: next } : current;
+              });
+              return;
+            }
+            const room = roomsRef.current.find((candidate) => candidate.id === frame.room_id);
+            const currentSession = sessionRef.current;
+            if (!currentSession || !accountActive()) return;
+            const message = parsePayload(
+              frame.room_id,
+              frame.message_id,
+              decoded,
+              room,
+              currentSession.username,
+              frame.sender_username,
+              undefined,
+              ownMessageIdsRef.current,
+            );
+            unpublishedMessage = message;
+            if (!message || !accountActive()) return;
+            const label = mlsRef.current?.acceptRoomProfile(frame.room_id, frame.sender_username, decoded.room_profile);
+            if (!accountActive()) return;
+            if (label !== undefined) {
+              roomsRef.current = roomsRef.current.map((candidate) => candidate.id === frame.room_id ? { ...candidate, name: label } : candidate);
+              setRooms(roomsRef.current);
+            }
+            if (!accountActive()) return;
+            updateMessages((current) => appendBoundedMessage(current, message));
+            unpublishedMessage = null;
+          } catch {
+            // Authenticated native state is retained; malformed application data is discarded.
+          }
+        } catch { if (accountActive()) clearMemory(); }
         finally {
           if (unpublishedMessage) wipeEvictedMessage(unpublishedMessage);
           plaintext.fill(0);
+          evidence.fill(0);
         }
       });
       return;
@@ -962,7 +1035,11 @@ export function useAbyssalSession() {
           failClosed(currentSession);
           return;
         }
-        if (!directoryStampMatches(frame, decryptedPayload)) {
+        if (!directoryStampMatches({
+          directory_node_id: frame.directory_node_id,
+          directory_revision: frame.directory_revision,
+          directory_digest: frame.directory_digest,
+        }, decryptedPayload)) {
           failClosed(currentSession);
           return;
         }
@@ -1566,7 +1643,16 @@ export function useAbyssalSession() {
       outcome = await (socketRef.current?.sendMlsTransaction(
         prepared.roomId, prepared.messageId, prepared.revision, prepared.frame,
       ) ?? Promise.resolve("NOT_SENT"));
-      if (!accountActive()) outcome = outcome === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
+      const accountStillActive = accountActive();
+      const connectionStillActive = accountStillActive &&
+        connectionGeneration === connectionGenerationRef.current;
+      if (!connectionStillActive) {
+        // A late ACK cannot be applied to a replacement or resynced MLS manager.
+        const uncertain = outcome === "ACCEPTED" || outcome === "AMBIGUOUS";
+        outcome = uncertain ? "AMBIGUOUS" : "NOT_SENT";
+        if (accountStillActive && outcome === "AMBIGUOUS") failClosed(currentSession);
+        return outcome;
+      }
       mlsRef.current?.finishTransaction(prepared, outcome);
       if (outcome === "AMBIGUOUS") failClosed(currentSession);
       return outcome;
@@ -1585,7 +1671,17 @@ export function useAbyssalSession() {
     try {
       if (!connectionActive()) return "NOT_SENT";
       const raw = await (socketRef.current?.sendMlsSnapshot(prepared.roomId, prepared.messageId, prepared.revision, prepared.frame) ?? Promise.resolve("NOT_SENT"));
-      const outcome: EncryptedSendOutcome = accountActive() ? raw : raw === "ACCEPTED" ? "AMBIGUOUS" : "NOT_SENT";
+      const accountStillActive = accountActive();
+      const connectionStillActive = accountStillActive &&
+        connectionGeneration === connectionGenerationRef.current;
+      const outcome: EncryptedSendOutcome = connectionStillActive
+        ? raw
+        : raw === "ACCEPTED" || raw === "AMBIGUOUS" ? "AMBIGUOUS" : "NOT_SENT";
+      if (!connectionStillActive) {
+        // Do not finish a snapshot against a manager that may have been resynced.
+        if (accountStillActive && outcome === "AMBIGUOUS") failClosed(current);
+        return outcome;
+      }
       mlsRef.current?.finishSnapshot(prepared, outcome);
       if (outcome === "AMBIGUOUS") failClosed(current);
       return outcome;
@@ -2544,17 +2640,43 @@ function directoryStampFields(stamp: DirectoryStamp): Record<string, unknown> {
   };
 }
 
-function directoryStampMatches(
-  frame: Extract<IncomingFrame, { type: "message" }>,
-  payload: unknown,
-): boolean {
-  if (!plainRecord(payload) ||
-    typeof frame.directory_node_id !== "string" ||
-    typeof frame.directory_revision !== "number" ||
-    typeof frame.directory_digest !== "string") return false;
-  return payload.directory_node_id === frame.directory_node_id &&
-    payload.directory_revision === frame.directory_revision &&
-    payload.directory_digest === frame.directory_digest;
+async function mlsApplicationEvidence(
+  frame: Extract<IncomingFrame, { type: "mls_application" }>,
+): Promise<Uint8Array> {
+  const input = new TextEncoder().encode([
+    frame.room_id,
+    frame.message_id,
+    frame.sender_username,
+    frame.epoch,
+    frame.revision,
+    frame.membership_digest_b64,
+    frame.ciphertext_b64,
+    frame.authenticated_data_b64,
+  ].join("\u0000"));
+  try {
+    return new Uint8Array(await crypto.subtle.digest("SHA-256", input));
+  } finally {
+    input.fill(0);
+  }
+}
+
+function directoryStampMatches(stamp: DirectoryStamp | null, payload: unknown): boolean {
+  if (!stamp || !plainRecord(payload) ||
+    typeof stamp.directory_node_id !== "string" ||
+    !/^[A-Za-z0-9._:-]{1,128}$/u.test(stamp.directory_node_id) ||
+    typeof stamp.directory_revision !== "number" ||
+    !Number.isSafeInteger(stamp.directory_revision) ||
+    stamp.directory_revision < 1 || stamp.directory_revision > MAX_DIRECTORY_REVISION ||
+    !canonicalBase64Bytes(stamp.directory_digest, 32) ||
+    typeof payload.directory_node_id !== "string" ||
+    typeof payload.directory_revision !== "number" ||
+    !Number.isSafeInteger(payload.directory_revision) ||
+    payload.directory_revision < 1 || payload.directory_revision > MAX_DIRECTORY_REVISION ||
+    typeof payload.directory_digest !== "string" ||
+    !canonicalBase64Bytes(payload.directory_digest, 32)) return false;
+  return payload.directory_node_id === stamp.directory_node_id &&
+    payload.directory_revision === stamp.directory_revision &&
+    payload.directory_digest === stamp.directory_digest;
 }
 
 function messagePayload(

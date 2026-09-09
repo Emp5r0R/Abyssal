@@ -27,7 +27,10 @@ const mocks = vi.hoisted(() => {
     acceptedProfiles = 0;
     lastApplication: unknown;
     incomingAttachment = false;
+    roomProfile: unknown;
     senderProfile: unknown;
+    applicationPlaintext: string | null = null;
+    receiveApplicationError: Error | null = null;
     pendingJoinItems: Array<{ roomId: string; requestId: string; username: string }> = [];
     ownJoin: { roomId: string; requestId: string } | null = null;
     pendingLeaveItems: Array<{ roomId: string; requestId: string; username: string }> = [];
@@ -105,11 +108,18 @@ const mocks = vi.hoisted(() => {
       return { roomId, messageId, revision: 2n, frame: { type: "mls_application", room_id: roomId, message_id: messageId, revision: "2" } };
     }
     outgoingRoomProfile() { return this.profile; }
-    acceptRoomProfile(_room: string, _sender: string, profile: { version: 1; name: string } | undefined) {
+    acceptRoomProfile(_room: string, _sender: string, profile: unknown) {
       if (!profile) return undefined;
+      if (typeof profile !== "object" || Object.getPrototypeOf(profile) !== Object.prototype ||
+        Object.keys(profile).length !== 2) throw new Error("Room unavailable");
+      const candidate = profile as Record<string, unknown>;
+      if (candidate.version !== 1 || typeof candidate.name !== "string" || !candidate.name ||
+        candidate.name.length > 36 || candidate.name !== candidate.name.trim() || /[\p{Cc}\uD800-\uDFFF]/u.test(candidate.name)) {
+        throw new Error("Room unavailable");
+      }
       if (this.snapshotOutcomes.at(-1) !== "ACCEPTED") throw new Error("Premature profile publication");
       this.acceptedProfiles += 1;
-      return profile.name;
+      return candidate.name;
     }
     finishTransaction(prepared: { requestType?: string; requestId?: string; roomId?: string }, outcome: string) {
       this.finishOutcomes.push(outcome);
@@ -117,20 +127,25 @@ const mocks = vi.hoisted(() => {
         this.forgetLeave(prepared.roomId, prepared.requestId);
       }
     }
-    receiveApplication(frame: { room_id: string; message_id: string }) {
+    receiveApplication(frame: { room_id: string; message_id: string; sender_username?: string }) {
       this.receiveApplicationCount += 1;
+      if (this.receiveApplicationError) throw this.receiveApplicationError;
+      if (frame.sender_username && frame.sender_username !== "Bob") throw new Error("sender mismatch");
+      const payload = JSON.stringify({
+        ...FakeCipher.directoryStamp,
+        kind: "text", id: frame.message_id, sender: "Bob", content: "incoming MLS", timestamp_ms: Date.now(),
+        sender_client: "android",
+        room_profile: this.roomProfile ?? this.profile,
+        sender_profile: this.senderProfile,
+        ...(this.incomingAttachment ? {
+          kind: "attachment", attachment_id: "attachment-profile", attachment_cipher_version: 2,
+          attachment_key_b64: btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replaceAll("=", ""),
+          media_type: "FILE", name: "private.txt", mime_type: "text/plain", size_bytes: 4,
+        } : {}),
+      });
+      const plaintext = this.applicationPlaintext ?? payload;
       return {
-        plaintext: new TextEncoder().encode(JSON.stringify({
-          kind: "text", id: frame.message_id, sender: "Bob", content: "incoming MLS", timestamp_ms: Date.now(),
-          sender_client: "android",
-          room_profile: this.profile,
-          sender_profile: this.senderProfile,
-          ...(this.incomingAttachment ? {
-            kind: "attachment", attachment_id: "attachment-profile", attachment_cipher_version: 2,
-            attachment_key_b64: btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replaceAll("=", ""),
-            media_type: "FILE", name: "private.txt", mime_type: "text/plain", size_bytes: 4,
-          } : {}),
-        })),
+        plaintext: new TextEncoder().encode(plaintext),
         snapshot: {
           roomId: frame.room_id, messageId: frame.message_id, revision: 3n, nativePending: true,
           frame: { type: "mls_state_snapshot", protocol_version: 10, room_id: frame.room_id, message_id: frame.message_id, revision: "3" },
@@ -299,6 +314,8 @@ const mocks = vi.hoisted(() => {
     static readonly instances: FakeRelay[] = [];
     static encryptedOutcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS" = "ACCEPTED";
     static encryptedResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
+    static mlsTransactionResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
+    static mlsSnapshotResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
     static leaseFailureAt: number | null = null;
     static leaseFailureCode: "NOT_SENT" | "AMBIGUOUS" | "CLOSED" = "NOT_SENT";
     static acknowledgeResult: Promise<typeof FakeRelay.encryptedOutcome> | null = null;
@@ -378,10 +395,10 @@ const mocks = vi.hoisted(() => {
     createRoom(): boolean { return this.send({ type: "create_room" }); }
     sendMlsControl(frame: object): boolean { return FakeRelay.mlsControlResult && this.send(frame); }
     sendMlsTransaction(_room: string, _message: string, _revision: bigint, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
-      this.send(frame); return Promise.resolve(FakeRelay.encryptedOutcome);
+      this.send(frame); return FakeRelay.mlsTransactionResult ?? Promise.resolve(FakeRelay.encryptedOutcome);
     }
     sendMlsSnapshot(_room: string, _message: string, _revision: bigint, frame: object): Promise<typeof FakeRelay.encryptedOutcome> {
-      this.send(frame); return Promise.resolve(FakeRelay.encryptedOutcome);
+      this.send(frame); return FakeRelay.mlsSnapshotResult ?? Promise.resolve(FakeRelay.encryptedOutcome);
     }
     deleteRoom(): boolean { return this.send({ type: "delete_room" }); }
     wipe(): boolean { return this.send({ type: "global_wipe" }); }
@@ -420,6 +437,8 @@ const mocks = vi.hoisted(() => {
       FakeRelay.instances.length = 0;
       FakeRelay.encryptedOutcome = "ACCEPTED";
       FakeRelay.encryptedResult = null;
+      FakeRelay.mlsTransactionResult = null;
+      FakeRelay.mlsSnapshotResult = null;
       FakeRelay.leaseFailureAt = null;
       FakeRelay.leaseFailureCode = "NOT_SENT";
       FakeRelay.acknowledgeResult = null;
@@ -615,6 +634,32 @@ function stampedFrame(
   stamp: DirectoryStamp,
 ): Extract<IncomingFrame, { type: "message" }> {
   return { ...frame, ...stamp };
+}
+
+function mlsPlaintext(
+  messageId: string,
+  stamp: DirectoryStamp,
+  overrides: Record<string, unknown> = {},
+): string {
+  return JSON.stringify({
+    ...stamp,
+    kind: "text",
+    id: messageId,
+    sender: "Bob",
+    content: "incoming MLS",
+    timestamp_ms: Date.now(),
+    sender_client: "android",
+    ...overrides,
+  });
+}
+
+function relayEmitMlsApplication(relay: ReturnType<typeof mocks.getLastRelay>, messageId: string): void {
+  relay?.emit({ type: "presence", users: presenceCatalog(["Alice", "Bob"]).users });
+  relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+  relay?.emit({
+    type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: messageId,
+    sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+  } as unknown as IncomingFrame);
 }
 
 afterEach(() => {
@@ -2256,7 +2301,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay();
-    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
     await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
     act(() => result.current.openRoom("forum_mls"));
 
@@ -2286,7 +2336,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0];
-    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
     const incoming = {
       type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "incoming-mls",
       sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
@@ -2302,6 +2357,258 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
+  it.each([
+    ["sender", (frame: IncomingFrame) => ({ ...frame, sender_username: "Mallory" })],
+    ["ciphertext", (frame: IncomingFrame) => ({ ...frame, ciphertext_b64: "changed-ciphertext" })],
+    ["revision", (frame: IncomingFrame) => ({ ...frame, revision: "4" })],
+  ] as const)("fails closed on an MLS replay with changed %s evidence", async (_label, alter) => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
+    const incoming = {
+      type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "replay-evidence",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+    } as unknown as IncomingFrame;
+    await act(async () => relay?.emit(incoming));
+    await waitFor(() => expect(result.current.messages.forum_mls).toHaveLength(1));
+    expect(manager.receiveApplicationCount).toBe(1);
+    expect(relay?.sent.filter((frame) => (frame as { type?: string }).type === "mls_state_snapshot")).toHaveLength(1);
+
+    await act(async () => relay?.emit(alter(incoming)));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(manager.receiveApplicationCount).toBe(1);
+    expect(relay?.sent.filter((frame) => (frame as { type?: string }).type === "mls_state_snapshot")).toHaveLength(1);
+    unmount();
+  });
+
+  it.each([
+    ["malformed JSON", (manager: InstanceType<typeof mocks.FakeMlsManager>) => { manager.applicationPlaintext = "{"; }],
+    ["malformed sender profile", (manager: InstanceType<typeof mocks.FakeMlsManager>) => {
+      manager.senderProfile = { version: 1, display_name: 42 };
+    }],
+    ["malformed room profile", (manager: InstanceType<typeof mocks.FakeMlsManager>) => {
+      manager.roomProfile = { version: 1, name: 42 };
+    }],
+  ] as const)("discards authenticated MLS application with %s without logout and replays its accepted snapshot", async (_label, prepare) => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Bob", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
+    prepare(manager);
+    const incoming = { type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "malformed-mls",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x" } as unknown as IncomingFrame;
+    await act(async () => relay?.emit(incoming));
+    await waitFor(() => expect(manager.snapshotOutcomes).toEqual(["ACCEPTED"]));
+    expect(result.current.session).not.toBeNull();
+    expect(result.current.messages.forum_mls).toBeUndefined();
+    expect(manager.receiveApplicationCount).toBe(1);
+    await act(async () => relay?.emit(incoming));
+    await waitFor(() => expect(manager.snapshotOutcomes).toEqual(["ACCEPTED", "ACCEPTED"]));
+    expect(manager.receiveApplicationCount).toBe(1);
+    expect(result.current.session).not.toBeNull();
+    expect(result.current.messages.forum_mls).toBeUndefined();
+    unmount();
+  });
+
+  it("fails closed on native MLS application rejection before snapshot admission", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    manager.receiveApplicationError = new Error("native rejection");
+    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
+    await act(async () => relay?.emit({
+      type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "native-rejection",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+    } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(manager.snapshotOutcomes).toEqual([]);
+    expect(result.current.messages).toEqual({});
+    unmount();
+  });
+
+  it("publishes a valid MLS message only with the current directory checkpoint", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
+    manager.applicationPlaintext = mlsPlaintext("directory-valid", catalog.stamp);
+    await act(async () => relay?.emit({
+      type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "directory-valid",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+    } as unknown as IncomingFrame));
+    await waitFor(() => expect(result.current.messages.forum_mls).toHaveLength(1));
+    expect(result.current.session).not.toBeNull();
+    unmount();
+  });
+
+  it.each([
+    ["missing directory node", (payload: Record<string, unknown>) => { delete payload.directory_node_id; }],
+    ["foreign directory node", (payload: Record<string, unknown>) => { payload.directory_node_id = "node-foreign"; }],
+    ["stale directory revision", (payload: Record<string, unknown>) => { payload.directory_revision = 0; }],
+    ["different directory digest", (payload: Record<string, unknown>) => { payload.directory_digest = presenceCatalog(["Alice", "Carol"]).stamp.directory_digest; }],
+  ] as const)("drops an MLS message with %s without accepting its snapshot as application evidence", async (_label, alter) => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
+    const payload = JSON.parse(mlsPlaintext("directory-invalid", catalog.stamp)) as Record<string, unknown>;
+    alter(payload);
+    manager.applicationPlaintext = JSON.stringify(payload);
+    await act(async () => relay?.emit({
+      type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "directory-invalid",
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+    } as unknown as IncomingFrame));
+    await waitFor(() => expect(manager.snapshotOutcomes).toEqual(["ACCEPTED"]));
+    expect(result.current.session).not.toBeNull();
+    expect(result.current.messages.forum_mls).toBeUndefined();
+    expect(manager.receiveApplicationCount).toBe(1);
+    unmount();
+  });
+
+  it("applies only a valid MLS read receipt for an own message and current directory", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
+    act(() => result.current.openRoom("forum_mls"));
+    await act(async () => expect(result.current.sendText("receipt target")).resolves.toBe(true));
+    const ownMessageId = result.current.messages.forum_mls?.[0]?.id;
+    expect(ownMessageId).toBeDefined();
+
+    const receiptFrame = (frameId: string): IncomingFrame => ({
+      type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: frameId,
+      sender_username: "Bob", epoch: "0", revision: "3", membership_digest_b64: "x", ciphertext_b64: "x", authenticated_data_b64: "x",
+    } as unknown as IncomingFrame);
+    const sendReceipt = async (frameId: string, payload: string) => {
+      manager.applicationPlaintext = payload;
+      const expectedSnapshots = manager.snapshotOutcomes.length + 1;
+      await act(async () => relay?.emit(receiptFrame(frameId)));
+      await waitFor(() => expect(manager.snapshotOutcomes.length).toBe(expectedSnapshots));
+    };
+    await sendReceipt("receipt-wrong-id", mlsPlaintext("receipt-other-id", catalog.stamp, { kind: "read_receipt", message_id: ownMessageId }));
+    expect(result.current.messages.forum_mls?.[0]?.readAtMs).toBeUndefined();
+    await sendReceipt("receipt-foreign-target", mlsPlaintext("receipt-foreign-target", catalog.stamp, { kind: "read_receipt", message_id: "not-my-message" }));
+    expect(result.current.messages.forum_mls?.[0]?.readAtMs).toBeUndefined();
+    await sendReceipt("receipt-invalid-directory", mlsPlaintext("receipt-invalid-directory", { ...catalog.stamp, directory_revision: 0 }, { kind: "read_receipt", message_id: ownMessageId }));
+    expect(result.current.messages.forum_mls?.[0]?.readAtMs).toBeUndefined();
+    await sendReceipt("receipt-valid", mlsPlaintext("receipt-valid", catalog.stamp, { kind: "read_receipt", message_id: ownMessageId }));
+    await waitFor(() => expect(result.current.messages.forum_mls?.[0]?.readAtMs).toEqual(expect.any(Number)));
+    expect(result.current.session).not.toBeNull();
+    unmount();
+  });
+
+  it("does not finish an MLS snapshot after the account is replaced while its ACK is pending", async () => {
+    let resolveSnapshot!: (outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
+    mocks.FakeRelay.mlsSnapshotResult = new Promise((resolve) => { resolveSnapshot = resolve; });
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const oldRelay = mocks.getLastRelay(); const oldManager = mocks.FakeMlsManager.instances[0]!;
+    await act(async () => relayEmitMlsApplication(oldRelay, "stale-snapshot"));
+    await waitFor(() => expect(oldRelay?.sent.some((frame) => (frame as { type?: string }).type === "mls_state_snapshot")).toBe(true));
+
+    await act(async () => {
+      await result.current.logout();
+      await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true });
+    });
+    const replacementRelay = mocks.getLastRelay();
+    expect(replacementRelay).not.toBe(oldRelay);
+    resolveSnapshot("ACCEPTED");
+    await act(async () => { await Promise.resolve(); });
+    expect(oldManager.snapshotOutcomes).toEqual([]);
+    expect(result.current.session).not.toBeNull();
+    unmount();
+  });
+
+  it("does not finish a late MLS transaction on a replacement account", async () => {
+    let resolveTransaction!: (outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
+    mocks.FakeRelay.mlsTransactionResult = new Promise((resolve) => { resolveTransaction = resolve; });
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const oldRelay = mocks.getLastRelay();
+    const oldManager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      oldRelay?.emit({ type: "presence", users: catalog.users });
+      oldRelay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
+    act(() => result.current.openRoom("forum_mls"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("forum_mls"));
+    let pending: Promise<boolean> | undefined;
+    act(() => { pending = result.current.sendText("stale MLS transaction"); });
+    await waitFor(() => expect(oldRelay?.sent.some((frame) => (frame as { type?: string }).type === "mls_application")).toBe(true));
+
+    await act(async () => {
+      await result.current.logout();
+      await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true });
+    });
+    const replacementManager = mocks.FakeMlsManager.instances.at(-1)!;
+    resolveTransaction("ACCEPTED");
+    await act(async () => expect(pending).resolves.toBe(false));
+    expect(oldManager.finishOutcomes).toEqual([]);
+    expect(replacementManager.finishOutcomes).toEqual([]);
+    expect(result.current.session).not.toBeNull();
+    expect(result.current.messages).toEqual({});
+    unmount();
+  });
+
+  it("does not finish a late MLS transaction across a reconnect", async () => {
+    let resolveTransaction!: (outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
+    mocks.FakeRelay.mlsTransactionResult = new Promise((resolve) => { resolveTransaction = resolve; });
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    const relay = mocks.getLastRelay();
+    const manager = mocks.FakeMlsManager.instances[0]!;
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.rooms[0]?.mlsActive).toBe(true));
+    act(() => result.current.openRoom("forum_mls"));
+    await waitFor(() => expect(result.current.activeRoomId).toBe("forum_mls"));
+    let pending: Promise<boolean> | undefined;
+    act(() => { pending = result.current.sendText("stale after reconnect"); });
+    await waitFor(() => expect(relay?.sent.some((frame) => (frame as { type?: string }).type === "mls_application")).toBe(true));
+
+    act(() => relay?.close());
+    await waitFor(() => expect(result.current.connection).toBe("disconnected"));
+    act(() => relay?.connect());
+    await waitFor(() => expect(result.current.connection).toBe("connected"));
+    resolveTransaction("ACCEPTED");
+    await act(async () => expect(pending).resolves.toBe(false));
+    expect(manager.finishOutcomes).toEqual([]);
+    expect(result.current.messages).toEqual({});
+    expect(result.current.session).toBeNull();
+    unmount();
+  });
+
   it.each(["ACCEPTED", "REJECTED", "AMBIGUOUS"] as const)("publishes encrypted room names only after accepted delivery: %s", async (outcome) => {
     const wipe = vi.spyOn(messageMemory, "wipeEvictedMessage");
     const { result, unmount } = renderHook(() => useAbyssalSession());
@@ -2310,7 +2617,12 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     manager.profile = { version: 1, name: "Private incident response" };
     manager.incomingAttachment = true;
     manager.senderProfile = { version: 1, display_name: "Alice" };
-    await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Bob", active: true }] } as unknown as IncomingFrame));
+    const catalog = presenceCatalog(["Alice", "Bob"]);
+    await act(async () => {
+      relay?.emit({ type: "presence", users: catalog.users });
+      relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Bob", active: true }] } as unknown as IncomingFrame);
+    });
+    await waitFor(() => expect(result.current.presence).toHaveLength(2));
     expect(result.current.rooms[0]?.name).toBe("MLS room");
     mocks.FakeRelay.encryptedOutcome = outcome;
     const incoming = { type: "mls_application", protocol_version: 10, room_id: "forum_mls", message_id: "profile-message",
@@ -2327,11 +2639,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await waitFor(() => expect(result.current.session).toBeNull());
       expect(manager.acceptedProfiles).toBe(0);
       expect(result.current.rooms).toEqual([]);
-      expect(wipe).toHaveBeenCalled();
-      const discarded = wipe.mock.calls.find(([message]) => message.id === "profile-message")?.[0];
-      expect(discarded?.attachment?.encryptionKey).toEqual(new Uint8Array(32));
-      expect(discarded?.content).toBe("");
-      expect(discarded?.senderDisplayName).toBeUndefined();
+      expect(wipe).not.toHaveBeenCalled();
     }
     unmount();
     wipe.mockRestore();

@@ -35,9 +35,11 @@ publishing plaintext or consuming the replay ID.
 Both clients accept a profile only from the room owner recorded in their bound
 room context. It may initialize an unknown name or repeat the known name, but
 cannot rename it. Publication waits for the exact accepted inbound snapshot
-transaction. Invalid profiles close the local session without publishing the
-message/name; this application validation can occur after the relay ACK, so it
-does not promise redelivery of invalid content. An absent field is compatible
+transaction. Invalid profiles do not publish the message/name; web drops this
+authenticated application data without closing the local session. Application
+validation can occur after the relay ACK, so it does not promise redelivery of
+invalid content. Native authentication and state failures remain fail closed.
+An absent field is compatible
 with older clients and does not change a known name. Read receipts and direct
 messages do not publish profiles.
 
