@@ -428,6 +428,11 @@ class ChatViewModelPolicyTest {
         )
         assertNotNull(androidTagged)
         assertEquals(SenderClient.ANDROID, androidTagged?.senderClient)
+        val profiled = taggedPayload("android").put("sender_profile", JSONObject().put("version", 1).put("display_name", "Alice"))
+        val privateName = invokeParseIncomingMessage(viewModel, "dm_bob", "message-1", profiled.toString(), "Bob", ByteArray(608))
+        assertEquals("Alice", privateName?.senderDisplayName)
+        assertEquals("Bob", privateName?.sender)
+        assertNull(invokeParseIncomingMessage(viewModel, "dm_bob", "message-1", profiled.put("sender_profile", JSONObject.NULL).toString(), "Bob", ByteArray(608)))
 
         assertNull(
             invokeParseIncomingMessage(
@@ -718,14 +723,23 @@ class ChatViewModelPolicyTest {
             val bob = nativeIdentity(22)
             val carol = nativeIdentity(23)
             val senderKey = sender.publicKey()
-            val user = User("Alice", senderKey, sender.prekeyId())
+            val user = User("Alice", senderKey, sender.prekeyId(), displayName = "PrivateAlice")
             val bobRecipient = recipientFromNative("Bob", bob)
             val carolRecipient = recipientFromNative("Carol", carol)
             val probe = TransactionTransportProbe(
                 cipher = sender,
                 leases = listOf(leaseFor("dm_ops", "message-first", "Bob", bob),
                     leaseFor("dm_ops", "message-first", "Carol", carol)),
-                sendResult = OutboundSendResult.ACCEPTED
+                sendResult = OutboundSendResult.ACCEPTED,
+                inspectSent = { chatId, payload ->
+                    assertFalse(String(payload.ciphertext, Charsets.UTF_8).contains("PrivateAlice"))
+                    val received = bob.decrypt(incomingFrom(payload, senderKey, "Alice", "Bob").copy(chatId = chatId), "Bob")
+                    try {
+                        val json = JSONObject(String(received.plaintext, Charsets.UTF_8))
+                        assertEquals("PrivateAlice", json.getJSONObject("sender_profile").getString("display_name"))
+                        assertEquals("Alice", json.getString("sender"))
+                    } finally { received.plaintext.fill(0) }
+                }
             )
             val viewModel = transactionViewModel(sender, user, probe)
             val stamp = invokeCaptureSessionStamp(viewModel)
@@ -1472,7 +1486,8 @@ class ChatViewModelPolicyTest {
         private val sendResult: OutboundSendResult,
         private val connectionGeneration: AtomicLong = AtomicLong(1L),
         private val invalidateAfterSend: Boolean = false,
-        private val presence: List<com.abyssal.chat.domain.model.UserPresence> = emptyList()
+        private val presence: List<com.abyssal.chat.domain.model.UserPresence> = emptyList(),
+        private val inspectSent: ((String, EncryptedTransportPayload) -> Unit)? = null
     ) {
         val events = mutableListOf<String>()
         private var leaseIndex = 0
@@ -1519,6 +1534,7 @@ class ChatViewModelPolicyTest {
                         "native encrypt did not stage before relay send"
                     }
                     events += "send:encrypted"
+                    inspectSent?.invoke(args?.getOrNull(0) as String, args.getOrNull(1) as EncryptedTransportPayload)
                     if (invalidateAfterSend) connectionGeneration.incrementAndGet()
                     sendResult
                 }

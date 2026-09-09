@@ -237,6 +237,7 @@ function SecureWorkspace({
   return (
     <AppShell
       username={session.username}
+      displayName={session.displayName}
       nodeId={session.nodeId}
       connection={abyssal.connection}
       rooms={abyssal.rooms}

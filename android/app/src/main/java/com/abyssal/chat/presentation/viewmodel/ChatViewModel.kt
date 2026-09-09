@@ -13,6 +13,7 @@ import com.abyssal.chat.data.network.normalizeAttachmentId
 import com.abyssal.chat.data.network.InMemoryPayloadCipher
 import com.abyssal.chat.data.network.MlsRoomManager
 import com.abyssal.chat.data.network.MlsWireCodec
+import com.abyssal.chat.data.network.SenderProfileCodec
 import com.abyssal.chat.data.network.protocolAttachmentLimitBytes
 import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
@@ -1089,7 +1090,8 @@ class ChatViewModel(
                     val identity = User(
                         username = result.username ?: "AbyssalUser",
                         publicKey = publicKey,
-                        prekeyId = prekeyId
+                        prekeyId = prekeyId,
+                        displayName = SenderProfileCodec.newDisplayName()
                     )
                     ensureActive()
                     mlsManager?.close()
@@ -2582,6 +2584,9 @@ class ChatViewModel(
                 put("directory_node_id", directoryStamp.nodeId)
                 put("directory_revision", directoryStamp.revision.toLong())
                 put("directory_digest", directoryStamp.digest)
+                if (optString("kind") in setOf("text", "attachment")) {
+                    currentUser.value?.displayName?.let { put("sender_profile", SenderProfileCodec.encode(it)) }
+                }
             }.toString()
         }.getOrElse { return@withLock OutboundSendResult.NOT_SENT }
         val mlsManagerForChat = mlsManager
@@ -2899,6 +2904,7 @@ class ChatViewModel(
             !matchesAuthoritativeMessageId(json, authoritativeMessageId)
         ) return null
         val senderClient = SenderClient.fromWire(json.optString("sender_client")) ?: return null
+        val senderDisplayName = runCatching { SenderProfileCodec.decode(json.opt("sender_profile")) }.getOrElse { return null }
         val sender = authoritativeSender
         if (sender.equals(currentUser.value?.username, ignoreCase = true)) return null
         val replyToMessageId = json.replyToMessageId()
@@ -2951,7 +2957,7 @@ class ChatViewModel(
                     repliesToCurrentUser = repliesToCurrentUser,
                     senderPublicKey = retainedSenderPublicKey,
                     senderClient = senderClient
-                ).also { ownershipTransferred = true }
+                ).copy(senderDisplayName = senderDisplayName).also { ownershipTransferred = true }
             } finally {
                 if (!ownershipTransferred) {
                     attachmentKey.fill(0)
@@ -2981,7 +2987,8 @@ class ChatViewModel(
                 ),
                 repliesToCurrentUser = repliesToCurrentUser,
                 senderPublicKey = retainedSenderPublicKey,
-                senderClient = senderClient
+                senderClient = senderClient,
+                senderDisplayName = senderDisplayName
             )
         }
 

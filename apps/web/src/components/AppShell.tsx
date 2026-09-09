@@ -21,6 +21,7 @@ import { PrivacyBlur } from "./PrivacyBlur";
 
 interface AppShellProps {
   username: string;
+  displayName?: string;
   nodeId: string;
   connection: ConnectionState;
   rooms: RoomRecord[];
@@ -51,6 +52,7 @@ interface AppShellProps {
 
 export function AppShell({
   username,
+  displayName,
   nodeId,
   connection,
   rooms,
@@ -99,7 +101,7 @@ export function AppShell({
 
         <button className="identity-row" type="button" onClick={() => onOpenRoom(null)}>
           <div className="identity-avatar"><UserRound size={19} /></div>
-          <div><PrivacyBlur><strong>{username}</strong></PrivacyBlur><span>{shortNode(nodeId)}</span></div>
+          <div><PrivacyBlur><strong>{displayName ?? username}</strong></PrivacyBlur>{displayName && <PrivacyBlur><small>{username}</small></PrivacyBlur>}<span>{shortNode(nodeId)}</span></div>
           <span className={`connection-dot state-${connection}`} title={connection} />
         </button>
 

@@ -218,9 +218,10 @@ export function ChatView({
               id={`message-${message.id}`}
             >
               <div className="message-meta">
-                {message.mine ? <PrivacyBlur>{username}</PrivacyBlur> : (
-                  <button type="button" className={`message-author ${PRIVACY_BLUR_CLASS}`} onClick={() => insertComposerToken(`@${message.sender}`)}>
-                    {message.sender}
+                {message.mine ? <PrivacyBlur>{message.senderDisplayName ?? username}</PrivacyBlur> : (
+                  <button type="button" className={`message-author ${PRIVACY_BLUR_CLASS}`} aria-label={message.senderDisplayName ? `${message.senderDisplayName} (${message.sender})` : message.sender} onClick={() => insertComposerToken(`@${message.sender}`)}>
+                    {message.senderDisplayName ?? message.sender}
+                    {message.senderDisplayName && <small className="message-account-id">{message.sender}</small>}
                   </button>
                 )}
                 <time>{formatTime(message.createdAtMs)}</time>

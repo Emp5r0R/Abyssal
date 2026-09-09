@@ -39,7 +39,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
-use rand::{rngs::OsRng, Rng, RngCore};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
@@ -56,6 +56,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
+mod account_identifiers;
 mod advertised_locators;
 mod attachment_upload;
 mod attachments;
@@ -1701,54 +1702,12 @@ async fn available_capability_is_live(state: &AppState, code_id: &CodeId) -> boo
     true
 }
 
-fn random_username() -> String {
-    const PREFIXES: &[&str] = &[
-        "Silent",
-        "Nebula",
-        "Quantum",
-        "Vortex",
-        "Solar",
-        "Cosmic",
-        "Lunar",
-        "Alpha",
-        "Shadow",
-        "Ghost",
-        "Starlight",
-        "Obsidian",
-        "Frozen",
-        "Electric",
-    ];
-    const SUFFIXES: &[&str] = &[
-        "Wolf", "Tiger", "Fox", "Eagle", "Falcon", "Leopard", "Spectre", "Titan", "Node", "Warp",
-        "Core", "Entity", "Daemon", "Vector",
-    ];
-    let mut rng = OsRng;
-    let prefix = PREFIXES[rng.gen_range(0..PREFIXES.len())];
-    let suffix = SUFFIXES[rng.gen_range(0..SUFFIXES.len())];
-    let number = rng.gen_range(100..1000);
-    format!("{prefix}{suffix}{number}")
-}
-
-fn random_unique_username(accounts: &HashMap<CodeId, Account>) -> String {
-    for _ in 0..128 {
-        let candidate = random_username();
-        if accounts
+fn random_unique_username(accounts: &HashMap<CodeId, Account>) -> Option<String> {
+    account_identifiers::unique_account_id(|candidate| {
+        accounts
             .values()
-            .all(|account| !account.username.eq_ignore_ascii_case(&candidate))
-        {
-            return candidate;
-        }
-    }
-
-    loop {
-        let candidate = format!("Abyssal{}", Uuid::new_v4().simple());
-        if accounts
-            .values()
-            .all(|account| !account.username.eq_ignore_ascii_case(&candidate))
-        {
-            return candidate;
-        }
-    }
+            .any(|account| account.username.eq_ignore_ascii_case(candidate))
+    })
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

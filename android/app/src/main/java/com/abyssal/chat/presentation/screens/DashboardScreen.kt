@@ -468,13 +468,16 @@ private fun DashboardHeader(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = currentUser?.username ?: "Anonymous",
+                    text = currentUser?.displayName ?: currentUser?.username ?: "Anonymous",
                     color = NeonGreen,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                if (currentUser?.displayName != null) {
+                    Text(text = currentUser.username, color = SteelMuted, fontSize = 10.sp)
+                }
             }
             MirageIconButton(
                 contentDescription = "Open security settings",

@@ -115,6 +115,7 @@ export function wipeMessageAttachmentKey(message: ChatMessage): void {
 export function wipeEvictedMessage(message: ChatMessage): void {
   wipeMessageAttachmentKey(message);
   message.content = "";
+  message.senderDisplayName = undefined;
   message.replyToId = undefined;
   if (message.attachment) {
     message.attachment.name = "";

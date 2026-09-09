@@ -364,6 +364,11 @@ pub(super) async fn finish_opaque_account(
                 // same transaction domain. The outer account guard is already
                 // held, preserving account_ops -> conversation_ops lock order.
                 let _conversation_guard = state.conversation_ops.lock().await;
+                let username = random_unique_username(&*state.accounts.lock().await);
+                let Some(username) = username else {
+                    return account_error(StatusCode::SERVICE_UNAVAILABLE, &state, String::new())
+                        .await;
+                };
                 if let Some(mut removed_code_id) = state.available_codes.lock().await.take(code_id)
                 {
                     removed_code_id.zeroize();
@@ -371,7 +376,6 @@ pub(super) async fn finish_opaque_account(
                 let mut expiries = state.capability_expiries.lock().await;
                 remove_code_id_map_entry(&mut expiries, code_id);
                 let mut accounts = state.accounts.lock().await;
-                let username = random_unique_username(&accounts);
                 accounts.insert(
                     *code_id,
                     Account {

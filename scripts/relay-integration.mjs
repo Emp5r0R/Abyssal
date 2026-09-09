@@ -804,7 +804,7 @@ async function register(invite, password) {
     account = await finishResponse.json();
     assert.equal(account.accepted, true);
     assert.ok(account.token);
-    assert.ok(account.username);
+    assert.match(account.username, /^acct_[0-9a-f]{32}$/u);
     assert.equal(account.identity_public_b64, encode(identityPublic));
     assert.equal(account.identity_prekey_id, identityPrekeyId);
     return { ...account, identity };
@@ -1860,12 +1860,13 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
     const firstMessageId = randomUUID();
     const privateRoomName = "Private incident response";
     const firstPlaintext = encoder.encode(JSON.stringify({ kind: "text", content: "MLS application secret", id: firstMessageId,
-      room_profile: { version: 1, name: privateRoomName } }));
+      room_profile: { version: 1, name: privateRoomName }, sender_profile: { version: 1, display_name: "SilentSignal0203040506FF" } }));
     let firstFrame;
     try {
       firstFrame = await sendAliceApplication(firstPlaintext, firstMessageId);
       assert.equal(JSON.stringify(firstFrame).includes("MLS application secret"), false);
       assert.equal(JSON.stringify(firstFrame).includes(privateRoomName), false);
+      assert.equal(JSON.stringify(firstFrame).includes("SilentSignal0203040506FF"), false);
       for (const field of ["authenticated_data_b64", "ciphertext_b64", "state_envelope_b64"]) {
         const bytes = decode(firstFrame[field]);
         try { assert.equal(Buffer.from(bytes).includes(Buffer.from(privateRoomName)), false); } finally { bytes.fill(0); }
@@ -2601,6 +2602,7 @@ try {
     id: textMessageId,
     sender: alice.username,
     content: "live secret",
+    sender_profile: { version: 1, display_name: "SilentSignal0203040506FF" },
     ...directoryStamp,
   });
   const delivered = waitForFrame(
@@ -2620,6 +2622,8 @@ try {
   const deliveredFrame = await delivered;
   const deliveredPlain = decryptFrame(bob, deliveredFrame, latestDirectoryStamp(bobSocket));
   assert.equal(deliveredPlain.payload.content, "live secret");
+  assert.deepEqual(deliveredPlain.payload.sender_profile, { version: 1, display_name: "SilentSignal0203040506FF" });
+  assert.equal(JSON.stringify(deliveredFrame).includes("SilentSignal0203040506FF"), false);
   await acknowledgeFrame(bob, bobSocket, deliveredFrame, deliveredPlain);
 
   const controlMessageId = randomUUID();

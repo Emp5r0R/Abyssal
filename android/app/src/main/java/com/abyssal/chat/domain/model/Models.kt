@@ -3,12 +3,14 @@ package com.abyssal.chat.domain.model
 data class User(
     val username: String,
     val publicKey: ByteArray,
-    val prekeyId: String = ""
+    val prekeyId: String = "",
+    val displayName: String? = null
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is User) return false
         return username == other.username &&
+            displayName == other.displayName &&
             prekeyId == other.prekeyId &&
             publicKey.contentEquals(other.publicKey)
     }
@@ -17,6 +19,7 @@ data class User(
         var result = username.hashCode()
         result = 31 * result + publicKey.contentHashCode()
         result = 31 * result + prekeyId.hashCode()
+        result = 31 * result + (displayName?.hashCode() ?: 0)
         return result
     }
 }
@@ -47,7 +50,8 @@ data class Message(
     val mentionsCurrentUser: Boolean = false,
     val repliesToCurrentUser: Boolean = false,
     val senderPublicKey: ByteArray? = null,
-    val senderClient: SenderClient = SenderClient.ANDROID
+    val senderClient: SenderClient = SenderClient.ANDROID,
+    val senderDisplayName: String? = null
 ) {
     val isExpired: Boolean
         get() {

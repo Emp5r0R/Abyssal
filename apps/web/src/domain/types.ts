@@ -10,6 +10,7 @@ export interface NodeEndpoint {
 }
 
 export interface AccountSession {
+  displayName?: string;
   token: string;
   nodeId: string;
   username: string;
@@ -97,6 +98,7 @@ export interface DirectRecord {
 }
 
 export interface ChatMessage {
+  senderDisplayName?: string;
   id: string;
   chatId: string;
   sender: string;

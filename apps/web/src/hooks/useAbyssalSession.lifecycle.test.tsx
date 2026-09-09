@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => {
     acceptedProfiles = 0;
     lastApplication: unknown;
     incomingAttachment = false;
+    senderProfile: unknown;
     pendingJoinItems: Array<{ roomId: string; requestId: string; username: string }> = [];
     ownJoin: { roomId: string; requestId: string } | null = null;
     pendingLeaveItems: Array<{ roomId: string; requestId: string; username: string }> = [];
@@ -123,6 +124,7 @@ const mocks = vi.hoisted(() => {
           kind: "text", id: frame.message_id, sender: "Bob", content: "incoming MLS", timestamp_ms: Date.now(),
           sender_client: "android",
           room_profile: this.profile,
+          sender_profile: this.senderProfile,
           ...(this.incomingAttachment ? {
             kind: "attachment", attachment_id: "attachment-profile", attachment_cipher_version: 2,
             attachment_key_b64: btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replaceAll("=", ""),
@@ -1056,6 +1058,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       id: "android-tagged-message",
       sender: "Bob",
       content: "from the hardened client",
+      sender_profile: { version: 1, display_name: "PrivateBob" },
       timestamp_ms: Date.now(),
       sender_client: "android",
     };
@@ -1076,6 +1079,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     }, catalog.stamp)));
     await waitFor(() => expect(result.current.messages[room.id]).toHaveLength(1));
     expect(result.current.messages[room.id]?.[0]?.senderClient).toBe("android");
+    expect(result.current.messages[room.id]?.[0]).toMatchObject({ sender: "Bob", senderDisplayName: "PrivateBob" });
     unmount();
   });
 
@@ -1547,7 +1551,13 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     expect(outboundFrames).toHaveLength(3);
     outboundFrames.forEach((frame, index) => {
       const inner = JSON.parse(mocks.FakeCipher.encryptedPlaintexts[index] ?? "{}") as Record<string, unknown>;
-      if (inner.kind !== "read_receipt") expect(inner.sender_client).toBe("web");
+      if (inner.kind !== "read_receipt") {
+        expect(inner.sender_client).toBe("web");
+        expect(inner.sender_profile).toEqual({ version: 1, display_name: result.current.session?.displayName });
+      } else {
+        expect(inner).not.toHaveProperty("sender_profile");
+      }
+      expect(frame).not.toHaveProperty("sender_profile");
       expect(frame.directory_node_id).toBe(inner.directory_node_id);
       expect(frame.directory_revision).toBe(inner.directory_revision);
       expect(frame.directory_digest).toBe(inner.directory_digest);
@@ -2255,6 +2265,9 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await act(async () => expect(result.current.sendText("MLS accepted")).resolves.toBe(true));
     expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_application", room_id: "forum_mls" });
     expect(manager.lastApplication).toMatchObject({ room_profile: manager.profile, content: "MLS accepted" });
+    expect(manager.lastApplication).toMatchObject({ sender: "Alice", sender_profile: { version: 1, display_name: result.current.session?.displayName } });
+    expect(result.current.session?.displayName).toMatch(/^[A-Za-z][A-Za-z0-9_-]{0,35}$/u);
+    expect(JSON.stringify(relay?.sent)).not.toContain(result.current.session?.displayName);
     expect(JSON.stringify(relay?.sent.at(-1))).not.toContain(manager.profile.name);
     expect(mocks.FakeMlsManager.instances[0]?.finishOutcomes).toEqual(["ACCEPTED"]);
 
@@ -2296,6 +2309,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     manager.profile = { version: 1, name: "Private incident response" };
     manager.incomingAttachment = true;
+    manager.senderProfile = { version: 1, display_name: "Alice" };
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Bob", active: true }] } as unknown as IncomingFrame));
     expect(result.current.rooms[0]?.name).toBe("MLS room");
     mocks.FakeRelay.encryptedOutcome = outcome;
@@ -2306,6 +2320,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await waitFor(() => expect(result.current.rooms[0]?.name).toBe(manager.profile?.name));
       expect(manager.acceptedProfiles).toBe(1);
       expect(result.current.messages.forum_mls).toHaveLength(1);
+      expect(result.current.messages.forum_mls?.[0]).toMatchObject({ sender: "Bob", senderDisplayName: "Alice" });
       await act(async () => relay?.emit(incoming));
       expect(manager.acceptedProfiles).toBe(1);
     } else {
@@ -2316,6 +2331,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       const discarded = wipe.mock.calls.find(([message]) => message.id === "profile-message")?.[0];
       expect(discarded?.attachment?.encryptionKey).toEqual(new Uint8Array(32));
       expect(discarded?.content).toBe("");
+      expect(discarded?.senderDisplayName).toBeUndefined();
     }
     unmount();
     wipe.mockRestore();

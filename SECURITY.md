@@ -143,7 +143,8 @@ and preventing unsafe metadata interpretation are different properties:
 | Uploaded file contents, including embedded EXIF/GPS, document properties and other file metadata | Encrypted as part of the original file. Not automatically stripped; recipients who decrypt the file can inspect its metadata. |
 | Imported QR image metadata | Local bounded raster decoding only. No metadata URLs are fetched and no metadata paths are opened. This is input safety, not encryption or metadata removal. |
 | Room names | Shared only in the owner's MLS-encrypted text/attachment payloads. Recipients accept a bounded V1 profile from the authenticated owner after exact delivery acceptance; other members cannot override it. Names are absent from room creation, policy and native snapshots. They remain in bounded client RAM handles and are forgotten with those handles; new/recovered clients use ID-derived labels until receiving an owner profile. |
-| Usernames, room IDs/catalog, membership, presence, routing identifiers and relay-enforced retention policy | Visible to the relay in the current protocol; HTTPS protects transit only up to its TLS terminator. These fields are not all E2EE. |
+| Client display names | Generated locally per login, shared only inside authenticated E2EE text/attachment payloads, and retained with the received message. No relay profile directory or extra persistent/local peer-name cache. Display names are untrusted labels, not routing or verification identities. |
+| Account routing IDs, room IDs/catalog, membership, presence, routing identifiers and relay-enforced retention policy | Visible to the relay in the current protocol; HTTPS protects transit only up to its TLS terminator. New accounts receive random UUIDv4-derived IDs in the legacy `username` wire field. Existing legacy usernames remain visible until those accounts are destroyed; random IDs do not hide the relationship graph. |
 | Invite locators, node public key and compatibility fields | Signed, not encrypted. Anyone holding the capsule can decode them and its bearer capability. |
 | Endpoint addresses, connection timing, packet counts and padded transfer lengths | Remain observable to the corresponding network/relay observers. Padding reduces precision, not visibility. |
 
@@ -154,6 +155,16 @@ byte counts. HTTP request tracing is removed; the diagnostic sink rejects
 dependency targets and their spans even with `RUST_LOG=trace`. This reduces
 accidental logging exposure, not the relay's in-memory knowledge, warning-event
 timing, upstream access logs or a malicious host administrator's access.
+
+Private sender profiles are separate from the account identifier used by OPAQUE
+account responses, directory checkpoints, safety-number tokens, DM signatures,
+MLS credentials, read receipts and attachment context. These bindings remain
+unchanged. Clients display the original sender account ID alongside a received
+profile; profile text never changes routing, mentions, trust or ownership. Names
+can collide, change at login, or be deliberately imitated by a malicious member.
+The profile is authenticated as that sender's assertion, not proof of a person's
+identity. Old clients ignore the optional encrypted field and display account IDs.
+See [private sender profiles](docs/PRIVATE_SENDER_PROFILES.md).
 
 Official clients send attachment uploads to the fixed `/v2/attachment` path.
 The bounded 1 KiB upload envelope moves chat/message IDs, media class and

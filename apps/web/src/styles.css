@@ -638,6 +638,7 @@ button:disabled {
 }
 
 .identity-row strong,
+.identity-row small,
 .identity-row span {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1492,6 +1493,10 @@ button:disabled {
 }
 
 .message-author {
+  min-width: 0;
+  max-width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
   padding: 0;
   border: 0;
   color: var(--muted-strong);
@@ -1499,6 +1504,13 @@ button:disabled {
   font-weight: 700;
   background: transparent;
   cursor: pointer;
+}
+
+.message-account-id {
+  display: block;
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--muted);
 }
 
 .message-author:hover,

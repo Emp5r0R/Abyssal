@@ -91,6 +91,9 @@ identities and account fixtures were separate from production.
   publish a metadata-free claim or silently treat these limits as accepted.
   Room names now travel in owner-authenticated MLS text/attachment payloads;
   clients learn them on owner-message delivery and keep them only in RAM.
+  New account identifiers are opaque random values; client display names are
+  carried only by encrypted messages. Identifiers and relationship graphs are
+  still relay-visible, and legacy account names are not retroactively hidden.
   Attachment upload metadata now travels in a bounded body envelope rather than
   URL queries; this is access-log minimization, not an end-to-end metadata channel.
   Coordinate relay/web/Android updates for the v2 upload endpoint; v1 uploads

@@ -141,7 +141,7 @@ describe("sender-client origin badges", () => {
         username="Self"
         connected
         safetyNumber={null}
-        messages={[baseMessage({ senderClient: "android" })]}
+        messages={[baseMessage({ senderClient: "android", senderDisplayName: "PrivateProfile" })]}
         users={[]}
         upload={{ active: false, name: "", loaded: 0, total: 0 }}
         onBack={vi.fn()}
@@ -156,6 +156,9 @@ describe("sender-client origin badges", () => {
     );
 
     expect(screen.getByRole("img", { name: /sent from the android app/i })).toBeInTheDocument();
+    const author = screen.getByRole("button", { name: "PrivateProfile (Peer)" });
+    fireEvent.click(author);
+    expect(screen.getByLabelText("Message")).toHaveValue("@Peer ");
     expect(screen.queryByRole("img", { name: /web client/i })).toBeNull();
   });
 

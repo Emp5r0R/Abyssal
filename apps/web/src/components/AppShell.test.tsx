@@ -72,6 +72,11 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> =
 afterEach(cleanup);
 
 describe("AppShell direct-message navigation", () => {
+  it("shows a private own profile without replacing the routing identifier", () => {
+    renderShell({ username: "acct_1234567890abcdef1234567890abcdef", displayName: "PrivateProfile" });
+    expect(screen.getByText("PrivateProfile")).toBeInTheDocument();
+    expect(screen.getByText("acct_1234567890abcdef1234567890abcdef")).toBeInTheDocument();
+  });
   it("opens an existing canonical direct conversation", () => {
     const props = renderShell();
     const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });

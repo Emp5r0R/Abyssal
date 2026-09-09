@@ -1490,11 +1490,12 @@ private fun MessageBubbleItem(
                 modifier = Modifier.padding(bottom = 4.dp)
             ) {
                 Text(
-                    text = message.sender,
+                    text = message.senderDisplayName?.let { "$it\n${message.sender}" } ?: message.sender,
                     color = SteelMuted,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier
+                        .weight(1f, fill = false)
                         .padding(start = 8.dp)
                         .clickable(role = Role.Button) { onMentionSender(message.sender) }
                 )

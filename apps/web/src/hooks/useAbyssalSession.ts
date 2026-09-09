@@ -9,6 +9,7 @@ import {
   readRetention,
 } from "../domain/messagePolicy";
 import { mentionsUsername, replyTargetsCurrentUser } from "../domain/messageAttention";
+import { newPrivateDisplayName, readSenderProfile, senderProfile } from "../domain/senderProfile";
 import { LOCAL_SENDER_CLIENT, parseSenderClient } from "../domain/senderClient";
 import {
   appendBoundedMessage,
@@ -459,7 +460,10 @@ export function useAbyssalSession() {
     mlsRef.current = null;
     cipherRef.current.clear();
     clearMedia();
-    if (currentSession) wipeBytes(currentSession.identityPublicKey);
+    if (currentSession) {
+      wipeBytes(currentSession.identityPublicKey);
+      currentSession.displayName = undefined;
+    }
     const currentMessages = messagesRef.current;
     messagesRef.current = {};
     wipeMessageMap(currentMessages);
@@ -1218,6 +1222,7 @@ export function useAbyssalSession() {
       lastActivitySignalRef.current = Date.now();
       setRemainingSessionSec(nextSession.sessionInactivitySec);
       const candidate = nextSession;
+      candidate.displayName = newPrivateDisplayName();
       candidateRelay = new RelaySocket(
         candidate,
         (frame) => {
@@ -1644,6 +1649,7 @@ export function useAbyssalSession() {
       id: crypto.randomUUID(),
       chatId,
       sender: currentSession.username,
+      senderDisplayName: currentSession.displayName,
       content: clean.slice(0, 8_000),
       kind: "text",
       createdAtMs: now,
@@ -1781,6 +1787,7 @@ export function useAbyssalSession() {
         id: messageId,
         chatId,
         sender: currentSession.username,
+        senderDisplayName: currentSession.displayName,
         content: file.name || "attachment",
         kind: "attachment",
         createdAtMs: now,
@@ -2436,6 +2443,7 @@ function parsePayload(
   const replyToId = cleanString(payload.reply_to_id, 128) || undefined;
   const senderClient = parseSenderClient(payload.sender_client);
   if (!senderClient) return null;
+  const senderDisplayName = readSenderProfile(payload.sender_profile);
 
   if (kind === "text") {
     const content = cleanString(payload.content, 8_000);
@@ -2456,6 +2464,7 @@ function parsePayload(
       repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
       senderPublicKeyB64: authoritativeSenderPublicKeyB64,
       senderClient,
+      senderDisplayName,
     };
   }
 
@@ -2500,6 +2509,7 @@ function parsePayload(
     repliesToCurrentUser: replyTargetsCurrentUser(sender, currentUsername, replyToId, ownMessageIds),
     senderPublicKeyB64: authoritativeSenderPublicKeyB64,
     senderClient,
+    senderDisplayName,
     attachment: {
       id: attachmentId,
       encryptionVersion,
@@ -2559,6 +2569,7 @@ function messagePayload(
     self_destruct_sec: message.selfDestructSec,
     absolute_expiry_sec: message.absoluteExpirySec,
     sender_client: LOCAL_SENDER_CLIENT,
+    ...(message.senderDisplayName ? { sender_profile: senderProfile(message.senderDisplayName) } : {}),
     ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
   };
   if (message.replyToId) common.reply_to_id = message.replyToId;

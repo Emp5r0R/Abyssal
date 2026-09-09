@@ -10,6 +10,13 @@ The web client and Android client share the same Abyssal visual language: dark r
 
 Android uses `FLAG_SECURE`, so production device screenshots are intentionally blocked instead of being used as README media.
 
+New accounts use random `acct_<UUID hex>` routing IDs. Android and web generate
+a private display name at each login and share it only inside encrypted text and
+attachment messages. The account ID remains visible beside received display names
+and remains the target for mentions, direct routing and safety-number verification.
+Names are not identities and are not published in presence or the room directory.
+See [private sender profiles](docs/PRIVATE_SENDER_PROFILES.md).
+
 Both clients provide a reusable Abyssal mark loader for entry and verification
 states; Android also uses it for update, dashboard, and chat loading states.
 Web verification is inline and fail-closed: the signed origin audit blocks
