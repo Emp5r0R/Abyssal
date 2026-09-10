@@ -58,10 +58,23 @@ the real shared WASM raster/parser and client QR decoder, not a mocked decoder.
 On 2026-09-09, the native terminal-QR round trip and real browser QR matrix
 passed at 1440x1000 and 390x844. The isolated native Tor/I2P profile test also
 passed startup and stable destination-key checks; this is not live I2P ingress
-evidence. Source checkpoint `9d512b6` passed hosted CI and CodeQL. Subsequent
-MLS lifecycle and audit-gate changes require their own integrated verification.
-The paired A059 device currently has no Abyssal package installed; earlier
-device observations below do not qualify a new build.
+evidence. Source checkpoint `8e474ed` passed the full integrated `all` gate,
+including 440 web tests and 367 Rust tests, Android JVM/lint/Kotlin checks,
+live relay integration, generated-artifact checks, and strict advisory gates.
+Hosted CI (`34357801497`) and CodeQL (`34357801504`) also passed that checkpoint.
+
+A qualification-only debug APK and instrumentation APK from `8e474ed` were
+installed on the paired A059 Android 16 device. The invite-field Compose
+instrumentation test passed on the unlocked device. Account entry loaded;
+camera background teardown, repeated open/close, denied-permission fallback
+and recovery after granting permission, and image-picker cancellation passed.
+Importing the independent PNG fixture through the local document provider
+populated a masked invite, left the password empty and kept login disabled.
+A screenshot captured into host memory showed a black central app region;
+the activity and scanner dialog also carried `FLAG_SECURE`. Rotating during
+scanning dismissed the scanner and released the camera; reopening worked
+after restoring the original rotation setting. These checks do not establish
+a successful physical camera decode or qualify a production-signed release.
 
 On 2026-09-06, source `0f4e898f4d12b0c2c0dbca2345f96f5c98aa1758`
 passed hosted CI (run `34037354761`) and CodeQL (run `34037354781`).
@@ -83,10 +96,27 @@ requests during network startup timed out; success required established
 circuits. This qualifies the supplied Tor forwarding profile with test state,
 not a production overlay deployment or a claim of anonymity.
 
-The isolated I2P 2.61.0 instance loaded an owner-only destination key and
-populated its router database, but reported unavailable peers when attempting
-inbound tunnels. End-to-end I2P ingress remains unverified. All overlay test
-identities and account fixtures were separate from production.
+On 2026-09-10, isolated i2pd 2.61.0 server and probe routers on the operator's
+ARM64 host passed live ingress qualification against a disposable `8e474ed`
+relay. An SSH reverse forward connected the server destination only to that
+local test relay; a separate loopback forward reached the probe router's I2P
+client tunnel. Health, the shared-core-verified signed node descriptor, OPAQUE
+registration and the authenticated WebSocket upgrade all passed through I2P.
+After stopping and restarting both routers, their owner-only destination key
+digests were unchanged and all four network checks passed again. Initial
+requests during tunnel establishment failed before routing became available.
+The checked-in generic TCP server profile was used with only its target port
+changed; diagnostics were enabled explicitly for this disposable qualification.
+Router keys and logs stayed in tmpfs, and all identities/accounts were separate
+from production. This closes the live I2P ingress check, not client overlay
+support, anonymity, production deployment, or a guarantee of network uptime.
+
+The full integrated gate also passed locally on 2026-09-10. An independent
+server audit using the official digest-verified cargo-audit 0.22.2 ARM64 asset,
+the exact same lockfile, and the unchanged strict validator checked 358
+dependencies against 1,243 advisories with no findings, warnings or diagnostics.
+Earlier local registry timeouts were rejected, not suppressed or counted as
+successful audits.
 
 ## Release Checks Still Required
 
@@ -106,13 +136,11 @@ identities and account fixtures were separate from production.
   URL queries; this is access-log minimization, not an end-to-end metadata channel.
   Coordinate relay/web/Android updates for the v2 upload endpoint; v1 uploads
   are intentionally rejected without fallback.
-- Physical Android camera scan, permission denial/regrant, backgrounding,
-  rotation, repeated scans and local document-provider cancellation. Confirm
-  secure screenshots and that no QR action submits credentials automatically.
-- Live operator-controlled I2P ingress qualification: descriptor
-  identity/signature, health, WebSocket upgrade and stable service identity
-  after restart. Local native profile checks only prove startup/configuration
-  and destination-key behavior, not routability or anonymity.
+- Successful physical Android camera decode of an operator-generated QR,
+  including repeated successful scans and confirmation that camera import
+  fills only the masked invite without submitting credentials. Camera
+  lifecycle, image import, cancellation and screenshot observations above
+  cover the qualification debug build, not a later production-signed artifact.
 - Hosted CI and CodeQL for the committed final checkpoint, then coordinated
   signed web/Android artifacts from that exact source. Verify manifest, asset
   sizes/digests, native package signatures and deployment admission together.
