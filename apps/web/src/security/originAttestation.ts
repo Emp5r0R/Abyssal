@@ -325,7 +325,15 @@ async function boundedFetch(
       throw new MismatchError();
     }
     const reader = response.body?.getReader();
-    if (!reader) throw new Error("unavailable");
+    // Some standards-compliant browser/edge combinations expose a successful
+    // response without a ReadableStream body. Keep the same bounded semantics
+    // by using ArrayBuffer as a compatibility fallback instead of treating a
+    // valid response as an unavailable release.
+    if (!reader) {
+      const buffer = await awaitAbortable(response.arrayBuffer(), request.signal);
+      if (buffer.byteLength > maximum) throw new MismatchError();
+      return { bytes: new Uint8Array(buffer), url: response.url || url };
+    }
     const chunks: Uint8Array[] = [];
     let total = 0;
     try {
