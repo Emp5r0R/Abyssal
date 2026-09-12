@@ -65,6 +65,7 @@ pub(super) fn room_info_for(
             Vec::new()
         },
         policy: room.policy,
+        visibility: room.visibility,
     }
 }
 
@@ -88,6 +89,7 @@ pub(super) fn pending_room_info_for(room: &RelayRoom, state_envelope: &[u8]) -> 
         membership_digest: Vec::new(),
         roster: Vec::new(),
         policy: room.policy,
+        visibility: room.visibility,
     }
 }
 

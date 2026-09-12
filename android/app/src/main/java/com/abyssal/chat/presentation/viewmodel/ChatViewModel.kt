@@ -35,6 +35,8 @@ import com.abyssal.chat.domain.model.IdentityValidationResult
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
 import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.MlsIncomingFrame
+import com.abyssal.chat.domain.model.MlsPublicRoomSummary
+import com.abyssal.chat.domain.model.MlsRoomVisibility
 import com.abyssal.chat.domain.model.PendingMlsJoinSummary
 import com.abyssal.chat.domain.model.PendingMlsLeaveSummary
 import com.abyssal.chat.domain.model.PreparedMlsSnapshot
@@ -497,6 +499,8 @@ class ChatViewModel(
     val pendingMlsJoins: StateFlow<List<PendingMlsJoinSummary>> = _pendingMlsJoins.asStateFlow()
     private val _pendingMlsLeaves = MutableStateFlow<List<PendingMlsLeaveSummary>>(emptyList())
     val pendingMlsLeaves: StateFlow<List<PendingMlsLeaveSummary>> = _pendingMlsLeaves.asStateFlow()
+    private val _publicMlsRooms = MutableStateFlow<List<MlsPublicRoomSummary>>(emptyList())
+    val publicMlsRooms: StateFlow<List<MlsPublicRoomSummary>> = _publicMlsRooms.asStateFlow()
     private var mlsManager: MlsRoomManager? = null
     private val requestedMlsRooms = LinkedHashSet<String>()
     private data class CachedMlsSnapshot(val evidence: ByteArray, val snapshot: PreparedMlsSnapshot)
@@ -738,11 +742,17 @@ class ChatViewModel(
                         catalog.forEach { session ->
                             mutateRepositoryIfCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, session) }
                         }
+                        _publicMlsRooms.value = _publicMlsRooms.value.filterNot { it.roomId in incomingIds }
+                    }
+                    is MlsIncomingFrame.PublicRooms -> {
+                        val joined = sessions.value.asSequence().filter { it.isForum }.map { it.id }.toSet()
+                        _publicMlsRooms.value = frame.rooms.filterNot { it.roomId in joined }
                     }
                     is MlsIncomingFrame.RoomCreated -> {
                         val session = runCatching { manager.confirmCreatedRoom(frame.room) }.getOrElse {
                             failClosedAfterAmbiguous(); return@withLock
                         }
+                        _publicMlsRooms.value = _publicMlsRooms.value.filterNot { it.roomId == session.id }
                         mutateRepositoryIfCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, session) }
                     }
                     is MlsIncomingFrame.RoomDiscovered -> if (requestedMlsRooms.remove(frame.roomId)) {
@@ -894,6 +904,7 @@ class ChatViewModel(
         viewModelScope.launch {
             serverStatus.collect { status ->
                 if (status.state != "CONNECTED") {
+                    _publicMlsRooms.value = emptyList()
                     directTrustStore.clear()
                     cancelAttachmentOperations()
                     activeAttachmentViews.clear()
@@ -1181,7 +1192,6 @@ class ChatViewModel(
         val chatId = _activeChatId.value ?: return
         if (serverStatus.value.state != "CONNECTED") return
         if (content.isBlank() || content.length > MAX_TEXT_MESSAGE_CHARS) return
-        if (!isDirectChatTrusted(chatId)) return
         val stamp = captureSessionStamp() ?: return
         launchMessageOperation(stamp) sendMessageOperation@{ capturedStamp ->
                 if (!isSessionStampValid(capturedStamp)) return@sendMessageOperation
@@ -1274,11 +1284,6 @@ class ChatViewModel(
         }
         if (serverStatus.value.state != "CONNECTED") {
             _attachmentError.value = "Wrong information."
-            source.destroy()
-            return
-        }
-        if (!isDirectChatTrusted(chatId)) {
-            _attachmentError.value = "Verify this direct chat's safety number before sending."
             source.destroy()
             return
         }
@@ -1599,10 +1604,6 @@ class ChatViewModel(
         val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
         if (activeMessages.value.none { it.id == message.id && it.attachmentId == attachmentId }) return
-        if (!isDirectChatTrusted(chatId)) {
-            _attachmentError.value = "Verify this direct chat's safety number before opening attachments."
-            return
-        }
         val capturedSession = nodeConfigService.getActiveSession() ?: return
         val generation = sessionGeneration.get()
         val connectionGeneration = chatTransport.currentConnectionGeneration()
@@ -1694,10 +1695,6 @@ class ChatViewModel(
         val chatId = _activeChatId.value ?: return
         val attachmentId = message.attachmentId ?: return
         if (activeMessages.value.none { it.id == message.id && it.attachmentId == attachmentId }) return
-        if (!isDirectChatTrusted(chatId)) {
-            _attachmentError.value = "Verify this direct chat's safety number before exporting attachments."
-            return
-        }
         if (!AttachmentSavePolicy.canSave(message)) return
         val capturedSession = nodeConfigService.getActiveSession() ?: return
         val generation = sessionGeneration.get()
@@ -1786,7 +1783,6 @@ class ChatViewModel(
     fun markMessageAsRead(messageId: String) {
         val chatId = _activeChatId.value ?: return
         if (sessions.value.none { it.id == chatId }) return
-        val trusted = isDirectChatTrusted(chatId)
         val stamp = captureSessionStamp() ?: return
         launchMessageOperation(stamp) markReadOperation@{ capturedStamp ->
             if (!isSessionStampValid(capturedStamp)) return@markReadOperation
@@ -1799,7 +1795,7 @@ class ChatViewModel(
                     )
                 }
             ) return@markReadOperation
-            if (trusted && isDirectChatTrusted(chatId) && message != null &&
+            if (message != null &&
                 message.sender != "You" && serverStatus.value.state == "CONNECTED"
             ) {
                 val receiptId = UUID.randomUUID().toString()
@@ -1847,7 +1843,8 @@ class ChatViewModel(
         enforceVideoAbsoluteExpiry: Boolean,
         fileReadTimerSec: Int,
         fileOverallExpirySec: Int,
-        enforceFileAbsoluteExpiry: Boolean
+        enforceFileAbsoluteExpiry: Boolean,
+        visibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE
     ) {
         val connectionGeneration = chatTransport.currentConnectionGeneration()
         viewModelScope.launch {
@@ -1873,7 +1870,8 @@ class ChatViewModel(
                 fileReadTimerSec = fileReadTimerSec,
                 fileOverallExpirySec = fileOverallExpirySec,
                 enforceFileAbsoluteExpiry = enforceFileAbsoluteExpiry,
-                ownerUsername = currentUser.value?.username
+                ownerUsername = currentUser.value?.username,
+                roomVisibility = visibility
             )
             val manager = mlsManager ?: return@launch
             val transport = mlsTransport ?: return@launch
@@ -2308,6 +2306,7 @@ class ChatViewModel(
         requestedMlsRooms.clear()
         _pendingMlsJoins.value = emptyList()
         _pendingMlsLeaves.value = emptyList()
+        _publicMlsRooms.value = emptyList()
         mlsSnapshotCache.values.forEach { it.evidence.fill(0) }
         mlsSnapshotCache.clear()
         payloadCipher.clear()
@@ -3176,7 +3175,7 @@ class ChatViewModel(
         mlsManager?.close()
         mlsManager = null
         payloadCipher.clear()
-        chatTransport.disconnect()
+        chatTransport.close()
         super.onCleared()
     }
 

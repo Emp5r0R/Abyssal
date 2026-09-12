@@ -1,4 +1,5 @@
-// Optional native renderer qualification: requires qrencode on PATH and Node 26.
+// Optional native renderer qualification: requires qrencode on PATH and Node's
+// built-in TypeScript stripping support.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";

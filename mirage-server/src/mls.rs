@@ -12,7 +12,8 @@ use super::{
     rebind_staged_attachment_recipients, remove_chat_attachments, require_recipient_code_platforms,
     revoke_mls_attachment_access, rollback_staged_attachment, send_client_result, send_to_client,
     staged_attachment_for_message, touch_activity, AppState, ClientPlatform, CodeId, InteropPolicy,
-    MlsRecoverySnapshotWire, MlsRoomWire, MlsRosterWire, OutboundFrame, TransactionTicket,
+    MlsPublicRoomWire, MlsRecoverySnapshotWire, MlsRoomWire, MlsRosterWire, OutboundFrame,
+    TransactionTicket,
 };
 
 pub(super) fn mls_room_wire(info: rooms::RoomInfo) -> MlsRoomWire {
@@ -50,6 +51,16 @@ pub(super) fn mls_room_wire(info: rooms::RoomInfo) -> MlsRoomWire {
                     })
                     .collect(),
             }),
+        policy: info.policy,
+        visibility: info.visibility,
+    }
+}
+
+fn mls_public_room_wire(info: rooms::PublicRoom) -> MlsPublicRoomWire {
+    MlsPublicRoomWire {
+        room_id: info.room_id.clone(),
+        group_id_b64: URL_SAFE_NO_PAD.encode(&info.group_id),
+        owner_username: info.owner_username.clone(),
         policy: info.policy,
     }
 }
@@ -94,6 +105,40 @@ pub(super) async fn send_mls_catalog(state: &AppState, client_id: Uuid, code_id:
         },
     )
     .await;
+}
+
+async fn mls_public_catalog_frame(state: &AppState) -> OutboundFrame {
+    let rooms = state
+        .mls_rooms
+        .lock()
+        .await
+        .public_rooms()
+        .into_iter()
+        .map(mls_public_room_wire)
+        .collect();
+    OutboundFrame::MlsPublicRooms {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        rooms,
+    }
+}
+
+pub(super) async fn send_mls_public_catalog(state: &AppState, client_id: Uuid) {
+    let frame = mls_public_catalog_frame(state).await;
+    send_to_client(state, client_id, &frame).await;
+}
+
+async fn broadcast_mls_public_catalog(state: &AppState) {
+    let frame = mls_public_catalog_frame(state).await;
+    let client_ids = state
+        .clients
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for client_id in client_ids {
+        send_to_client(state, client_id, &frame).await;
+    }
 }
 
 pub(super) async fn mls_discover_room(
@@ -148,24 +193,30 @@ pub(super) async fn mls_create_room(
     stable_identity_b64: String,
     state_envelope_b64: String,
     policy: rooms::RoomPolicy,
+    visibility: rooms::RoomVisibility,
 ) -> Result<(), String> {
     let _conversation_guard = state.conversation_ops.lock().await;
     let (owner_code_id, owner_username) = client_identity(state, sender_id).await?;
     let group_id = decode_exact(&group_id_b64, rooms::GROUP_ID_BYTES)?;
     let digest = decode_exact(&membership_digest_b64, rooms::MEMBERSHIP_DIGEST_BYTES)?;
     let stable = authenticated_mls_identity(state, &owner_code_id, &stable_identity_b64).await?;
-    let info = state.mls_rooms.lock().await.create_with_policy_and_state(
-        owner_code_id,
-        owner_username,
-        room_id,
-        group_id,
-        epoch,
-        revision,
-        digest,
-        stable,
-        policy,
-        decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
-    )?;
+    let info = state
+        .mls_rooms
+        .lock()
+        .await
+        .create_with_policy_visibility_and_state(
+            owner_code_id,
+            owner_username,
+            room_id,
+            group_id,
+            epoch,
+            revision,
+            digest,
+            stable,
+            policy,
+            visibility,
+            decode_bounded(&state_envelope_b64, rooms::MAX_STATE_BYTES)?,
+        )?;
     send_to_client(
         state,
         sender_id,
@@ -175,6 +226,9 @@ pub(super) async fn mls_create_room(
         },
     )
     .await;
+    if visibility == rooms::RoomVisibility::Public {
+        broadcast_mls_public_catalog(state).await;
+    }
     Ok(())
 }
 
@@ -813,7 +867,7 @@ pub(super) async fn mls_delete_room(
     let _conversation_guard = state.conversation_ops.lock().await;
     let (owner_code_id, _) = client_identity(state, sender_id).await?;
     let member_code_ids = state.mls_rooms.lock().await.member_code_ids(room_id)?;
-    state
+    let deleted = state
         .mls_rooms
         .lock()
         .await
@@ -836,6 +890,9 @@ pub(super) async fn mls_delete_room(
     };
     for client_id in clients {
         send_to_client(state, client_id, &frame).await;
+    }
+    if deleted.visibility == rooms::RoomVisibility::Public {
+        broadcast_mls_public_catalog(state).await;
     }
     Ok(())
 }

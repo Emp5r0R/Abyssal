@@ -3,8 +3,10 @@ package com.abyssal.chat.data.network
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.MLS_PROTOCOL_VERSION
 import com.abyssal.chat.domain.model.MlsIncomingFrame
+import com.abyssal.chat.domain.model.MlsPublicRoomSummary
 import com.abyssal.chat.domain.model.MlsRecoverySnapshotWire
 import com.abyssal.chat.domain.model.MlsRoomPolicyWire
+import com.abyssal.chat.domain.model.MlsRoomVisibility
 import com.abyssal.chat.domain.model.MlsRoomWire
 import com.abyssal.chat.domain.model.MlsRosterMemberWire
 import java.nio.ByteBuffer
@@ -39,6 +41,10 @@ internal object MlsWireCodec {
                 val rooms = value.optJSONArray("rooms")?.rooms() ?: return null
                 MlsIncomingFrame.Rooms(rooms)
             } else null
+            "mls_public_rooms" -> if (value.exact("type", "protocol_version", "rooms")) {
+                val rooms = value.optJSONArray("rooms")?.publicRooms() ?: return null
+                MlsIncomingFrame.PublicRooms(rooms)
+            } else null
             "mls_room_created" -> if (value.exact("type", "protocol_version", "room")) {
                 value.optJSONObject("room")?.room()?.let(MlsIncomingFrame::RoomCreated)
             } else null
@@ -62,11 +68,13 @@ internal object MlsWireCodec {
     fun isStrictControl(value: JSONObject): Boolean {
         if (value.opt("protocol_version") != MLS_PROTOCOL_VERSION) return false
         return when (value.opt("type") as? String) {
-            "mls_create_room" -> value.exact("type", "protocol_version", "room_id", "group_id_b64", "epoch", "revision", "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy") &&
+            "mls_create_room" -> (value.exact("type", "protocol_version", "room_id", "group_id_b64", "epoch", "revision", "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy") ||
+                value.exact("type", "protocol_version", "room_id", "visibility", "group_id_b64", "epoch", "revision", "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy")) &&
                 validId(value, "room_id") && validB64Field(value, "group_id_b64", 32, 32) &&
                 value.string("epoch") == "0" && value.string("revision") == "0" &&
                 validB64Field(value, "membership_digest_b64", 32, 32) && validB64Field(value, "stable_identity_b64", 64, 64) &&
-                validB64Field(value, "state_envelope_b64", 1, MAX_STATE_BYTES) && value.optJSONObject("policy")?.policy() != null
+                validB64Field(value, "state_envelope_b64", 1, MAX_STATE_BYTES) && value.optJSONObject("policy")?.policy() != null &&
+                MlsRoomVisibility.fromWire(value.string("visibility") ?: "private") != null
             "mls_discover_room", "mls_delete_room" -> value.exact("type", "protocol_version", "room_id") && validId(value, "room_id")
             "mls_join_request" -> value.exact("type", "protocol_version", "room_id", "request_id", "stable_identity_b64", "key_package_b64", "state_envelope_b64") &&
                 validId(value, "room_id") && validId(value, "request_id") && validB64Field(value, "stable_identity_b64", 64, 64) &&
@@ -170,7 +178,8 @@ internal object MlsWireCodec {
         enforceVideoAbsoluteExpiry = room.policy.enforceVideoAbsoluteExpiry,
         fileReadTimerSec = room.policy.fileReadTimerSec.toInt(), fileOverallExpirySec = room.policy.fileOverallExpirySec.toInt(),
         enforceFileAbsoluteExpiry = room.policy.enforceFileAbsoluteExpiry,
-        ownerUsername = room.ownerUsername
+        ownerUsername = room.ownerUsername,
+        roomVisibility = room.visibility
     )
 
     private fun parseJoinRequested(v: JSONObject): MlsIncomingFrame? {
@@ -264,7 +273,14 @@ internal object MlsWireCodec {
     }
 
     private fun JSONObject.room(): MlsRoomWire? {
-        if (!exact("room_id", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision", "membership_digest_b64", "roster", "recovery_snapshot", "policy")) return null
+        val hasVisibility = has("visibility")
+        if (!(exact("room_id", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision", "membership_digest_b64", "roster", "recovery_snapshot", "policy") ||
+                exact("room_id", "visibility", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision", "membership_digest_b64", "roster", "recovery_snapshot", "policy"))) return null
+        val visibility = if (hasVisibility) {
+            MlsRoomVisibility.fromWire(string("visibility")) ?: return null
+        } else {
+            MlsRoomVisibility.PRIVATE
+        }
         val active = opt("active") as? Boolean ?: return null
         val synchronized = opt("synchronized") as? Boolean ?: return null
         val epoch = canonicalU64(opt("epoch")) ?: return null
@@ -280,6 +296,7 @@ internal object MlsWireCodec {
                 recovery.membershipDigestB64 != digest || !sameRoster(recovery.roster, roster))) return null
         return MlsRoomWire(
             roomId = string("room_id")?.takeIf(id::matches) ?: return null,
+            visibility = visibility,
             ownerUsername = string("owner_username")?.takeIf(username::matches) ?: return null,
             groupIdB64 = string("group_id_b64")?.takeIf { validB64(it, 32, 32) } ?: return null,
             active = active,
@@ -291,6 +308,24 @@ internal object MlsWireCodec {
             policy = optJSONObject("policy")?.policy() ?: return null,
             synchronized = synchronized
         )
+    }
+
+    private fun JSONArray.publicRooms(): List<MlsPublicRoomSummary>? {
+        if (length() > MAX_ROOMS) return null
+        val result = ArrayList<MlsPublicRoomSummary>(length())
+        val roomIds = HashSet<String>()
+        val groups = HashSet<String>()
+        for (i in 0 until length()) {
+            val value = optJSONObject(i) ?: return null
+            if (!value.exact("room_id", "group_id_b64", "owner_username", "policy")) return null
+            val roomId = value.string("room_id")?.takeIf(id::matches) ?: return null
+            val groupId = value.string("group_id_b64")?.takeIf { validB64(it, 32, 32) } ?: return null
+            val owner = value.string("owner_username")?.takeIf(username::matches) ?: return null
+            val policy = value.optJSONObject("policy")?.policy() ?: return null
+            if (!roomIds.add(roomId) || !groups.add(groupId)) return null
+            result += MlsPublicRoomSummary(roomId, groupId, owner, policy)
+        }
+        return result
     }
 
     private fun JSONArray.roster(allowEmpty: Boolean = false): List<MlsRosterMemberWire>? {

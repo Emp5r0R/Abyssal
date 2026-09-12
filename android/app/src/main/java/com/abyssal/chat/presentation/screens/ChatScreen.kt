@@ -61,6 +61,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -85,6 +86,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -99,6 +101,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.abyssal.chat.domain.model.AttachmentUploadProgress
 import com.abyssal.chat.domain.model.AttachmentSavePolicy
 import com.abyssal.chat.domain.model.ChatSession
@@ -114,6 +118,7 @@ import com.abyssal.chat.data.network.ByteArrayAttachmentSource
 import com.abyssal.chat.data.network.ContentUriAttachmentSource
 import com.abyssal.chat.data.network.attachmentSelectionLimitBytes
 import com.abyssal.chat.data.network.protocolAttachmentLimitBytes
+import com.abyssal.chat.data.qr.LocalQrImageReader
 import com.abyssal.chat.domain.repository.IAttachmentPlaintextSource
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
@@ -128,6 +133,7 @@ import com.abyssal.chat.theme.SteelMuted
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
@@ -447,7 +453,9 @@ private fun ChatContent(
                 safetyNumber = directTrust.safetyNumber,
                 verificationToken = directTrust.verificationToken,
                 onDismiss = { showTrustDialog = false },
-                onVerify = onVerifyToken
+                onVerify = onVerifyToken,
+                onExternalSystemUiStart = onExternalSystemUiStart,
+                onExternalSystemUiEnd = onExternalSystemUiEnd
             )
         }
 
@@ -557,9 +565,9 @@ private fun ChatHeader(
                     } else {
                         Text(
                             text = if (directTrust.verified) {
-                                "Comparison confirmed · Safety ${directTrust.safetyNumber ?: "unavailable"}"
+                                "Identity verified · Safety ${directTrust.safetyNumber ?: "unavailable"}"
                             } else {
-                                "Not compared · Safety ${directTrust.safetyNumber ?: "unavailable"}"
+                                "Verification recommended · Safety ${directTrust.safetyNumber ?: "unavailable"}"
                             },
                             color = if (directTrust.verified) NeonGreen else SelfDestructAmber,
                             fontSize = 10.sp,
@@ -574,7 +582,7 @@ private fun ChatHeader(
 
             if (session?.isForum == false && directTrust.active && directTrust.safetyNumber != null) {
                 MirageSecondaryButton(
-                    text = if (directTrust.verified) "CONFIRMED" else "COMPARE",
+                    text = if (directTrust.verified) "Identity verified" else "Verification recommended",
                     onClick = onVerifySafetyNumber,
                     modifier = Modifier.padding(start = 6.dp),
                 )
@@ -594,13 +602,70 @@ private fun DirectTrustDialog(
     safetyNumber: String,
     verificationToken: String,
     onDismiss: () -> Unit,
-    onVerify: (String) -> Boolean
+    onVerify: (String) -> Boolean,
+    onExternalSystemUiStart: () -> Long,
+    onExternalSystemUiEnd: (Long) -> Boolean
 ) {
     var presentedToken by remember(verificationToken) { mutableStateOf("") }
     var rejected by remember(verificationToken) { mutableStateOf(false) }
-    MirageDialog(title = "Verify direct chat", onDismiss = onDismiss, accent = NeonCyan) {
+    var scanning by remember(verificationToken) { mutableStateOf(false) }
+    var readingImage by remember(verificationToken) { mutableStateOf(false) }
+    var imageError by remember(verificationToken) { mutableStateOf(false) }
+    var imagePickerToken by remember(verificationToken) { mutableStateOf<Long?>(null) }
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
+    var imageJob by remember(verificationToken) { mutableStateOf<Job?>(null) }
+    DisposableEffect(lifecycle, verificationToken) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) imageJob?.cancel()
+        }
+        lifecycle.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.lifecycle.removeObserver(observer)
+            imageJob?.cancel()
+            imagePickerToken?.let(onExternalSystemUiEnd)
+            imagePickerToken = null
+        }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val token = imagePickerToken
+        imagePickerToken = null
+        val accepted = token != null && onExternalSystemUiEnd(token)
+        if (accepted && uri != null && !readingImage) {
+            readingImage = true
+            imageError = false
+            imageJob = scope.launch {
+                try {
+                    val value = LocalQrImageReader.read(context.contentResolver, uri)
+                    require(isCanonicalVerificationToken(value))
+                    presentedToken = value
+                    rejected = false
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    imageError = true
+                } finally {
+                    readingImage = false
+                }
+            }
+        }
+    }
+    if (scanning) {
+        DirectVerificationQrScanner(
+            onScanned = {
+                presentedToken = it
+                rejected = false
+                scanning = false
+            },
+            onDismiss = { scanning = false },
+            onExternalSystemUiStart = onExternalSystemUiStart,
+            onExternalSystemUiEnd = onExternalSystemUiEnd
+        )
+    }
+    MirageDialog(title = "Verify direct chat (optional)", onDismiss = onDismiss, accent = NeonCyan) {
         Text(
-            text = "Scan this QR through a separate trusted channel, then paste your peer's token below.",
+            text = "Verification is recommended, but encrypted messaging works without it. Compare this QR through a separate trusted channel, then scan or paste your peer's token.",
             color = SteelMuted,
             fontSize = 13.sp,
             lineHeight = 19.sp
@@ -619,6 +684,32 @@ private fun DirectTrustDialog(
                 .padding(vertical = 16.dp)
                 .semantics { contentDescription = "Safety number $safetyNumber" }
         )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            TextButton(
+                onClick = { scanning = true },
+                enabled = !readingImage,
+                modifier = Modifier.weight(1f)
+            ) { Text("SCAN PEER QR") }
+            TextButton(
+                onClick = {
+                    imagePickerToken = onExternalSystemUiStart()
+                    imagePicker.launch("image/*")
+                },
+                enabled = !readingImage,
+                modifier = Modifier.weight(1f)
+            ) { Text(if (readingImage) "READING..." else "OPEN QR IMAGE") }
+        }
+        if (imageError) {
+            Text(
+                text = "QR image not accepted.",
+                color = SelfDestructAmber,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+        }
         OutlinedTextField(
             value = presentedToken,
             onValueChange = {
@@ -891,7 +982,7 @@ private fun ChatInputBar(
             onValueChange = onValueChange,
             placeholder = {
                 Text(
-                    if (isConnected) "Message" else "Waiting for node",
+                    if (isConnected) "Message" else "Reconnecting",
                     color = SteelMuted.copy(alpha = 0.65f),
                     fontSize = 14.sp
                 )

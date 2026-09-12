@@ -47,24 +47,81 @@ import kotlinx.coroutines.delay
 
 @Composable
 internal fun InviteQrScanner(onScanned: (String) -> Unit, onDismiss: () -> Unit) {
+    QrCameraScanner(
+        title = "Scan Abyssal invite",
+        onScanned = onScanned,
+        onDismiss = onDismiss,
+        accept = { InviteQrDecoder.isVerifiedInvite(it, BuildConfig.DEBUG) }
+    )
+}
+
+@Composable
+internal fun DirectVerificationQrScanner(onScanned: (String) -> Unit, onDismiss: () -> Unit) {
+    QrCameraScanner(
+        title = "Scan peer verification QR",
+        onScanned = onScanned,
+        onDismiss = onDismiss,
+        accept = ::isCanonicalVerificationToken
+    )
+}
+
+@Composable
+internal fun DirectVerificationQrScanner(
+    onScanned: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onExternalSystemUiStart: () -> Long,
+    onExternalSystemUiEnd: (Long) -> Boolean
+) {
+    QrCameraScanner(
+        title = "Scan peer verification QR",
+        onScanned = onScanned,
+        onDismiss = onDismiss,
+        accept = ::isCanonicalVerificationToken,
+        onExternalSystemUiStart = onExternalSystemUiStart,
+        onExternalSystemUiEnd = onExternalSystemUiEnd
+    )
+}
+
+@Composable
+private fun QrCameraScanner(
+    title: String,
+    onScanned: (String) -> Unit,
+    onDismiss: () -> Unit,
+    accept: (String) -> Boolean,
+    onExternalSystemUiStart: (() -> Long)? = null,
+    onExternalSystemUiEnd: ((Long) -> Boolean)? = null
+) {
     val context = LocalContext.current
     var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     var requested by remember { mutableStateOf(false) }
+    var permissionToken by remember { mutableStateOf<Long?>(null) }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        permissionToken?.let { onExternalSystemUiEnd?.invoke(it) }
+        permissionToken = null
         granted = it
         requested = true
     }
     LaunchedEffect(Unit) {
-        if (!granted) permission.launch(Manifest.permission.CAMERA)
+        if (!granted) {
+            permissionToken = onExternalSystemUiStart?.invoke()
+            permission.launch(Manifest.permission.CAMERA)
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            permissionToken?.let { onExternalSystemUiEnd?.invoke(it) }
+            permissionToken = null
+        }
     }
     val dismiss by rememberUpdatedState(onDismiss)
+    val accepted by rememberUpdatedState(accept)
     LaunchedEffect(Unit) { delay(60_000); dismiss() }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(securePolicy = SecureFlagPolicy.SecureOn)) {
         GlassSurface {
             Column(Modifier.padding(16.dp)) {
-                Text("Scan Abyssal invite", color = PureWhite)
+                Text(title, color = PureWhite)
                 if (granted) {
-                    InviteCameraPreview(onScanned, onDismiss)
+                    InviteCameraPreview(onScanned, onDismiss, accepted)
                 } else {
                     Text(if (requested) "Camera unavailable. You can paste or open a QR image." else "Waiting for camera permission.", color = PureWhite)
                 }
@@ -75,11 +132,16 @@ internal fun InviteQrScanner(onScanned: (String) -> Unit, onDismiss: () -> Unit)
 }
 
 @Composable
-private fun InviteCameraPreview(onScanned: (String) -> Unit, onDismiss: () -> Unit) {
+private fun InviteCameraPreview(
+    onScanned: (String) -> Unit,
+    onDismiss: () -> Unit,
+    accept: (String) -> Boolean
+) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current
     val scanned by rememberUpdatedState(onScanned)
     val dismiss by rememberUpdatedState(onDismiss)
+    val accepted by rememberUpdatedState(accept)
     val preview = remember(context) { PreviewView(context).apply { implementationMode = PreviewView.ImplementationMode.COMPATIBLE } }
     var status by remember { mutableStateOf("Camera active.") }
     DisposableEffect(context, lifecycle, preview) {
@@ -118,7 +180,7 @@ private fun InviteCameraPreview(onScanned: (String) -> Unit, onDismiss: () -> Un
                         bytes = InviteQrDecoder.copyPlane(plane.buffer, frame.width, frame.height, plane.rowStride, plane.pixelStride)
                         val value = InviteQrDecoder.decodeLuminance(requireNotNull(bytes), frame.width, frame.height)
                             ?: return@setImageAnalysisAnalyzer
-                        val valid = InviteQrDecoder.isVerifiedInvite(value, BuildConfig.DEBUG)
+                        val valid = accepted(value)
                         handler.post {
                             if (active.get()) {
                                 if (valid && delivered.compareAndSet(false, true)) { stop(); scanned(value) }

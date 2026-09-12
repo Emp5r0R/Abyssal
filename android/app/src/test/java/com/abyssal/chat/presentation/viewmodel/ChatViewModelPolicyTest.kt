@@ -221,9 +221,10 @@ class ChatViewModelPolicyTest {
     }
 
     @Test
-    fun unverifiedDirectPathsRejectBeforeTransportAndForumsRemainAllowed() = runBlocking {
+    fun unverifiedDirectMessagingRemainsAvailableAndForumsRemainAllowed() = runBlocking {
         val sender = nativeIdentity(13)
         val bob = nativeIdentity(14)
+        establishReciprocalSession(sender, bob)
         val user = User("Alice", sender.publicKey(), sender.prekeyId())
         val direct = ChatSession(
             id = "dm_bob",
@@ -282,9 +283,9 @@ class ChatViewModelPolicyTest {
             delay(100)
 
             assertArrayEquals(ByteArray(3), bytes)
-            assertEquals(0L, attachmentCalls.get())
+            assertTrue(attachmentCalls.get() > 0L)
             assertEquals(1L, markReadCalls.get())
-            assertTrue(probe.events.isEmpty())
+            assertTrue(probe.events.contains("send:encrypted"))
         } finally {
             viewModel.clear()
             user.publicKey.fill(0)

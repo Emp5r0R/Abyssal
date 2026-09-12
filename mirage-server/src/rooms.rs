@@ -177,6 +177,36 @@ impl RoomAuthority {
         policy: RoomPolicy,
         state_envelope: Vec<u8>,
     ) -> Result<RoomInfo, String> {
+        self.create_with_policy_visibility_and_state(
+            owner_code_id,
+            owner_username,
+            room_id,
+            group_id,
+            epoch,
+            revision,
+            membership_digest,
+            stable_identity,
+            policy,
+            RoomVisibility::Private,
+            state_envelope,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_policy_visibility_and_state(
+        &mut self,
+        owner_code_id: CodeId,
+        owner_username: String,
+        room_id: String,
+        group_id: Vec<u8>,
+        epoch: u64,
+        revision: u64,
+        membership_digest: Vec<u8>,
+        stable_identity: Vec<u8>,
+        policy: RoomPolicy,
+        visibility: RoomVisibility,
+        state_envelope: Vec<u8>,
+    ) -> Result<RoomInfo, String> {
         self.prune_expired(now_ms());
         validate_room_id(&room_id)?;
         validate_username(&owner_username)?;
@@ -251,6 +281,7 @@ impl RoomAuthority {
             owner_code_id,
             owner_username,
             policy: policy.normalized(),
+            visibility,
             group_id,
             epoch: 0,
             membership_digest,
@@ -348,6 +379,24 @@ impl RoomAuthority {
     pub fn discover(&mut self, room_id: &str) -> Result<RoomInfo, String> {
         self.prune_expired(now_ms());
         Ok(room_info_for(self.room(room_id)?, None, false))
+    }
+
+    pub fn public_rooms(&mut self) -> Vec<PublicRoom> {
+        self.prune_expired(now_ms());
+        let mut rooms = self
+            .rooms
+            .values()
+            .filter(|room| room.visibility == RoomVisibility::Public)
+            .map(|room| PublicRoom {
+                room_id: room.room_id.clone(),
+                owner_username: room.owner_username.clone(),
+                group_id: room.group_id.clone(),
+                policy: room.policy,
+            })
+            .collect::<Vec<_>>();
+        rooms.sort_unstable_by(|left, right| left.room_id.cmp(&right.room_id));
+        rooms.truncate(MAX_ROOMS_TOTAL);
+        rooms
     }
 
     pub fn deliveries_for_member(
@@ -2852,5 +2901,70 @@ mod tests {
                 .count(),
             MAX_ROOMS_PER_MEMBER
         );
+    }
+
+    #[test]
+    fn room_visibility_defaults_private_and_exact_discovery_remains_available() {
+        let mut authority = RoomAuthority::new(2);
+        let created = authority
+            .create(
+                code(1),
+                "Alice".to_string(),
+                "private-room".to_string(),
+                vec![7; GROUP_ID_BYTES],
+                0,
+                0,
+                digest(8),
+                stable(1),
+            )
+            .unwrap();
+
+        assert_eq!(created.visibility, RoomVisibility::Private);
+        assert!(authority.public_rooms().is_empty());
+        let discovered = authority.discover("private-room").unwrap();
+        assert_eq!(discovered.visibility, RoomVisibility::Private);
+        assert_eq!(discovered.room_id, "private-room");
+        assert!(discovered.roster.is_empty());
+        assert!(discovered.recovery_snapshot.is_none());
+    }
+
+    #[test]
+    fn public_catalog_is_sorted_bounded_and_contains_only_public_summaries() {
+        let mut authority = RoomAuthority::new(4);
+        for (room_id, visibility, seed) in [
+            ("z-public", RoomVisibility::Public, 1),
+            ("private", RoomVisibility::Private, 2),
+            ("a-public", RoomVisibility::Public, 3),
+        ] {
+            authority
+                .create_with_policy_visibility_and_state(
+                    code(seed),
+                    format!("Owner{seed}"),
+                    room_id.to_string(),
+                    vec![seed; GROUP_ID_BYTES],
+                    0,
+                    0,
+                    digest(seed),
+                    stable(seed),
+                    RoomPolicy::default(),
+                    visibility,
+                    vec![seed],
+                )
+                .unwrap();
+        }
+
+        let catalog = authority.public_rooms();
+        assert!(catalog.len() <= MAX_ROOMS_TOTAL);
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|room| room.room_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-public", "z-public"]
+        );
+        assert!(catalog.iter().all(|room| room.room_id != "private"));
+
+        authority.delete(code(1), "z-public").unwrap();
+        assert_eq!(authority.public_rooms().len(), 1);
     }
 }

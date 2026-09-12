@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage, RoomRecord } from "../domain/types";
+import type { PublicRoomSummary } from "../transport/mlsWire";
 import { AppShell } from "./AppShell";
 
 const room: RoomRecord = {
@@ -69,6 +70,19 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> =
   return props;
 }
 
+const publicRoom = (roomId: string): PublicRoomSummary => ({
+  room_id: roomId,
+  group_id_b64: "A".repeat(43),
+  owner_username: "Carol",
+  policy: {
+    self_destruct_timer_sec: "5", overall_expiry_sec: "60", allow_images: true, allow_videos: false,
+    allow_files: true, enforce_text_absolute_expiry: false, image_read_timer_sec: "5", image_overall_expiry_sec: "60",
+    enforce_image_absolute_expiry: false, video_read_timer_sec: "5", video_overall_expiry_sec: "60",
+    enforce_video_absolute_expiry: false, file_read_timer_sec: "5", file_overall_expiry_sec: "60",
+    enforce_file_absolute_expiry: false,
+  },
+});
+
 afterEach(cleanup);
 
 describe("AppShell direct-message navigation", () => {
@@ -89,6 +103,37 @@ describe("AppShell direct-message navigation", () => {
     const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });
     fireEvent.click(within(directNavigation).getByRole("button", { name: /Carol/i }));
     expect(props.onOpenDirect).toHaveBeenCalledWith("Carol");
+  });
+
+  it("closes the mobile sidebar when identity navigation returns to the dashboard", () => {
+    const props = renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Open rooms" }));
+    const sidebar = document.querySelector(".sidebar")!;
+    expect(sidebar).toHaveClass("is-open");
+    fireEvent.click(document.querySelector<HTMLButtonElement>(".identity-row")!);
+    expect(sidebar).not.toHaveClass("is-open");
+    expect(props.onOpenRoom).toHaveBeenCalledWith(null);
+  });
+
+  it("reports a failed room join request", () => {
+    renderShell({ onJoinRoom: vi.fn(() => false) });
+    fireEvent.change(screen.getByLabelText("Join room ID"), { target: { value: "forum_ops" } });
+    fireEvent.click(screen.getByRole("button", { name: "JOIN" }));
+    expect(screen.getByRole("status")).toHaveTextContent(/could not be sent/u);
+  });
+
+  it("lists only unjoined public rooms and joins by the opaque exact room ID", () => {
+    const onJoinRoom = vi.fn(() => true);
+    renderShell({
+      onJoinRoom,
+      publicRooms: [publicRoom(room.id), publicRoom("forum_public_abc")],
+    });
+
+    expect(screen.queryByRole("button", { name: "Join public room forum_ops" })).not.toBeInTheDocument();
+    const join = screen.getByRole("button", { name: "Join public room forum_public_abc" });
+    expect(join.closest(".public-room-row")).not.toHaveTextContent(/Public Secret/u);
+    fireEvent.click(join);
+    expect(onJoinRoom).toHaveBeenCalledWith("forum_public_abc");
   });
 
   it("does not allow messaging the current account", () => {

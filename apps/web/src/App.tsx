@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
 import { flushSync } from "react-dom";
 import { AppShell } from "./components/AppShell";
 import { AttachmentDialog } from "./components/AttachmentDialog";
@@ -182,7 +183,20 @@ export default function App() {
         />
       ) : null}
       {abyssal.media ? <MediaViewer media={abyssal.media} onClose={abyssal.clearMedia} /> : null}
-      {abyssal.notice ? <button type="button" className="notice" onClick={abyssal.clearNotice}>{abyssal.notice}</button> : null}
+      {abyssal.notice ? (
+        <div className="notice" role="status" aria-live="polite">
+          <span>{abyssal.notice}</span>
+          <button
+            className="notice-dismiss"
+            type="button"
+            aria-label="Dismiss notice"
+            title="Dismiss notice"
+            onClick={abyssal.clearNotice}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -241,6 +255,7 @@ function SecureWorkspace({
       nodeId={session.nodeId}
       connection={abyssal.connection}
       rooms={abyssal.rooms}
+      publicRooms={abyssal.publicRooms}
       directs={abyssal.directs}
       messages={abyssal.messages}
       presence={abyssal.presence}

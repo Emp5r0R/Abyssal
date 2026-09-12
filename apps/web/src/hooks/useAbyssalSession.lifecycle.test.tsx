@@ -2059,7 +2059,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
-  it("blocks direct text before IDs or encryption until the exact safety number is confirmed", async () => {
+  it("allows direct text before verification while recommending an exact safety-number comparison", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
@@ -2077,17 +2077,18 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     act(() => result.current.openRoom("dm_bob"));
     await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
 
-    await act(async () => expect(await result.current.sendText("blocked")).toBe(false));
-    expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(0);
-    expect(relay?.sent.some((frame) => (frame as { type?: string }).type === "message")).toBe(false);
+    await act(async () => expect(await result.current.sendText("unverified direct text")).toBe(true));
+    expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(1);
+    expect(relay?.sent.some((frame) => (frame as { type?: string }).type === "message")).toBe(true);
+    expect(result.current.directTrust.verified).toBe(false);
     expect(result.current.verifyDirectVerificationToken("abyssal:verify:v1:wrong-token")).toBe(false);
     await waitFor(() => expect(result.current.directTrust.verificationToken).toEqual(expect.any(String)));
     act(() => expect(result.current.verifyDirectVerificationToken(result.current.directTrust.verificationToken!)).toBe(true));
-    await act(async () => expect(await result.current.sendText("allowed")).toBe(true));
+    await act(async () => expect(await result.current.sendText("verified direct text")).toBe(true));
     unmount();
   });
 
-  it("rejects every unverified direct data path before crypto, prekeys, or network side effects", async () => {
+  it("keeps every direct data path functional before verification", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {
       await result.current.login({
@@ -2107,11 +2108,11 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     await waitFor(() => expect(result.current.activeRoomId).toBe("dm_bob"));
 
     const uuidSpy = vi.spyOn(globalThis.crypto, "randomUUID");
-    await act(async () => expect(await result.current.sendText("blocked")).toBe(false));
+    await act(async () => expect(await result.current.sendText("unverified direct text")).toBe(true));
     await act(async () => expect(await result.current.sendAttachment({
       file: new File([new Uint8Array([1, 2, 3])], "secret.bin", { type: "application/octet-stream" }),
       options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0 },
-    })).toBe(false));
+    })).toBe(true));
     const attachmentMessage = {
       id: "attachment-message",
       chatId: "dm_bob",
@@ -2140,17 +2141,16 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.exportAttachment(attachmentMessage);
     });
 
-    expect(uuidSpy).not.toHaveBeenCalled();
-    expect(mocks.FakeCipher.encryptedPlaintexts).toHaveLength(0);
-    expect(mocks.FakeCipher.lastAttachmentPlain).toBeNull();
+    expect(uuidSpy).toHaveBeenCalled();
+    expect(mocks.FakeCipher.encryptedPlaintexts.length).toBeGreaterThanOrEqual(2);
+    expect(mocks.FakeCipher.lastAttachmentPlain).toEqual(expect.any(Uint8Array));
     expect(relay?.leasesRequested).toEqual([]);
-    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message")).toHaveLength(0);
-    expect(mocks.uploadEncryptedAttachment).not.toHaveBeenCalled();
-    expect(mocks.streamEncryptedAttachmentRecords).not.toHaveBeenCalled();
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message").length).toBeGreaterThanOrEqual(2);
+    expect(mocks.uploadEncryptedAttachment).toHaveBeenCalledOnce();
+    expect(mocks.streamEncryptedAttachmentRecords).toHaveBeenCalledTimes(2);
 
-    // An incoming message may be decrypted and acknowledged, but opening the
-    // unverified direct chat must not emit a read receipt. Local read state is
-    // allowed to update independently of that outbound authorization.
+    // Incoming direct messages remain readable, and opening them can publish an
+    // encrypted read receipt before the optional identity comparison.
     const incoming = stampedFrame({
       type: "message",
       chat_id: "dm_bob",
@@ -2167,13 +2167,13 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       is_prekey: false,
     }, catalog.stamp);
     await act(async () => relay?.emit(incoming));
-    await waitFor(() => expect(result.current.messages.dm_bob).toHaveLength(1));
+    await waitFor(() => expect(result.current.messages.dm_bob?.length).toBeGreaterThanOrEqual(3));
     act(() => result.current.openRoom("dm_bob"));
     await new Promise((resolve) => window.setTimeout(resolve, 400));
-    // The local inbound frame is still rendered/read locally; the security
-    // interlock requirement here is that no encrypted read receipt is sent.
-    expect(result.current.messages.dm_bob?.[0]?.readAtMs).toEqual(expect.any(Number));
-    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message")).toHaveLength(0);
+    expect(result.current.messages.dm_bob?.find((message) => message.id === "incoming-direct-message")?.readAtMs)
+      .toEqual(expect.any(Number));
+    expect(relay?.sent.filter((item) => (item as { type?: string }).type === "message").length).toBeGreaterThanOrEqual(3);
+    expect(result.current.directTrust.verified).toBe(false);
     uuidSpy.mockRestore();
     unmount();
   });

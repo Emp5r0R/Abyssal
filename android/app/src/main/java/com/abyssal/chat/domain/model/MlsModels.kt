@@ -4,6 +4,21 @@ import org.json.JSONObject
 
 const val MLS_PROTOCOL_VERSION = 10
 
+enum class MlsRoomVisibility {
+    PUBLIC,
+    PRIVATE;
+
+    companion object {
+        fun fromWire(value: String?): MlsRoomVisibility? = when (value) {
+            "public" -> PUBLIC
+            "private" -> PRIVATE
+            else -> null
+        }
+
+        fun toWire(value: MlsRoomVisibility): String = if (value == PUBLIC) "public" else "private"
+    }
+}
+
 data class MlsRosterMemberWire(val username: String, val stableIdentityB64: String)
 
 data class MlsRoomPolicyWire(
@@ -44,11 +59,20 @@ data class MlsRoomWire(
     val roster: List<MlsRosterMemberWire>,
     val recoverySnapshot: MlsRecoverySnapshotWire?,
     val policy: MlsRoomPolicyWire,
-    val synchronized: Boolean
+    val synchronized: Boolean,
+    val visibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE
+)
+
+data class MlsPublicRoomSummary(
+    val roomId: String,
+    val groupIdB64: String,
+    val ownerUsername: String,
+    val policy: MlsRoomPolicyWire
 )
 
 sealed interface MlsIncomingFrame {
     data class Rooms(val rooms: List<MlsRoomWire>) : MlsIncomingFrame
+    data class PublicRooms(val rooms: List<MlsPublicRoomSummary>) : MlsIncomingFrame
     data class RoomCreated(val room: MlsRoomWire) : MlsIncomingFrame
     data class RoomDiscovered(val roomId: String, val groupIdB64: String, val ownerUsername: String) : MlsIncomingFrame
     data class JoinRequested(

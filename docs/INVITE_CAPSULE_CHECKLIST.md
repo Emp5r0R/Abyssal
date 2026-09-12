@@ -33,7 +33,7 @@ Run against the final integrated source, not an earlier checkpoint:
 ```bash
 ./scripts/test-all.sh crypto
 ./scripts/test-all.sh all
-node scripts/test-invite-qr-roundtrip.mjs
+node --experimental-strip-types scripts/test-invite-qr-roundtrip.mjs
 python3 scripts/test-private-transport-profiles.py --tor /usr/bin/tor --i2pd /usr/bin/i2pd
 ```
 

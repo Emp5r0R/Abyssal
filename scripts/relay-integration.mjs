@@ -1391,10 +1391,11 @@ function mlsRosterFromNative(rosterJson) {
 function assertMlsRoomWire(room, expectedRoomId, expectedOwner) {
   exactKeys(room, [
     "room_id", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision",
-    "membership_digest_b64", "roster", "recovery_snapshot", "policy",
+    "membership_digest_b64", "roster", "recovery_snapshot", "policy", "visibility",
   ]);
   assert.equal(room.room_id, expectedRoomId);
   assert.equal(room.owner_username, expectedOwner);
+  assert.equal(room.visibility, "private");
   assert.equal(typeof room.active, "boolean");
   assert.equal(typeof room.synchronized, "boolean");
   assert.match(room.group_id_b64, /^[A-Za-z0-9_-]{43}$/u);

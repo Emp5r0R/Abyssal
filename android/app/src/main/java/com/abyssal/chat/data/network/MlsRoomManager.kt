@@ -5,6 +5,7 @@ import com.abyssal.chat.domain.model.DecryptedMlsApplication
 import com.abyssal.chat.domain.model.MLS_PROTOCOL_VERSION
 import com.abyssal.chat.domain.model.MlsIncomingFrame
 import com.abyssal.chat.domain.model.MlsRoomWire
+import com.abyssal.chat.domain.model.MlsRoomVisibility
 import com.abyssal.chat.domain.model.MlsRosterMemberWire
 import com.abyssal.chat.domain.model.PendingMlsJoinSummary
 import com.abyssal.chat.domain.model.PendingMlsLeaveSummary
@@ -102,7 +103,7 @@ internal class MlsRoomManager(
             rooms[room.id] = RoomSlot(handle, group.clone(), username, roster, true, true, localLabel = localLabel)
             handle = null
             JSONObject().put("type", "mls_create_room").put("protocol_version", MLS_PROTOCOL_VERSION)
-                .put("room_id", room.id).put("group_id_b64", MlsWireCodec.encode(group))
+                .put("room_id", room.id).put("visibility", MlsRoomVisibility.toWire(room.roomVisibility)).put("group_id_b64", MlsWireCodec.encode(group))
                 .put("epoch", "0").put("revision", "0")
                 .put("membership_digest_b64", MlsWireCodec.encode(digest))
                 .put("stable_identity_b64", MlsWireCodec.encode(stableIdentity))

@@ -61,6 +61,21 @@ class MlsWireCodecTest {
         assertNull(MlsWireCodec.parse(JSONObject().put("type", "mls_room_created").put("protocol_version", 10).put("room", badPolicy)))
     }
 
+    @Test fun publicRoomCatalogAcceptsBoundedOpaqueSummariesAndRejectsPrivateFields() {
+        val policy = room().getJSONObject("policy")
+        val summary = JSONObject()
+            .put("room_id", "forum_public")
+            .put("group_id_b64", MlsWireCodec.encode(ByteArray(32)))
+            .put("owner_username", "Alice")
+            .put("policy", policy)
+        val frame = JSONObject()
+            .put("type", "mls_public_rooms")
+            .put("protocol_version", 10)
+            .put("rooms", JSONArray().put(summary))
+        assertTrue(MlsWireCodec.parse(frame) is MlsIncomingFrame.PublicRooms)
+        assertNull(MlsWireCodec.parse(JSONObject(frame.toString()).put("rooms", JSONArray().put(JSONObject(summary.toString()).put("roster", JSONArray())))))
+    }
+
     @Test fun catalogRequiresSynchronizedAndHistoricalRecoveryRosterFields() {
         val valid = room()
         assertTrue(MlsWireCodec.parse(JSONObject().put("type", "mls_room_created").put("protocol_version", 10).put("room", valid)) is MlsIncomingFrame.RoomCreated)

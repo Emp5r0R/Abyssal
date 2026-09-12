@@ -1,5 +1,5 @@
 import type { WasmE2eeSession, WasmMlsProcessedControl, WasmMlsRoom, WasmMlsRoomInfo } from "../generated/abyssal_core/abyssal_core";
-import type { RoomRecord } from "../domain/types";
+import type { RoomRecord, RoomVisibility } from "../domain/types";
 import { readRoomProfile, roomProfile, type RoomProfile } from "../domain/roomProfile";
 import {
   decodeBase64Url,
@@ -71,6 +71,7 @@ interface PendingMlsLeave extends PendingMlsLeaveSummary {
 
 interface RoomSlot {
   localLabel?: string;
+  visibility: RoomVisibility;
   handle: WasmMlsRoom;
   groupId: Uint8Array;
   ownerUsername: string;
@@ -107,6 +108,8 @@ export class MlsRoomManager {
   createRoom(room: RoomRecord): Record<string, unknown> {
     this.assertOpen();
     if (!ID.test(room.id) || this.#rooms.has(room.id) || this.#rooms.size >= MAX_ROOMS) throw new Error("Room unavailable");
+    const visibility = room.visibility ?? "private";
+    if (!validVisibility(visibility)) throw new Error("Room unavailable");
     const localLabel = room.name.trim();
     roomProfile(localLabel);
     const groupId = crypto.getRandomValues(new Uint8Array(32));
@@ -126,13 +129,13 @@ export class MlsRoomManager {
       stateEnvelope = handle.sealState();
       const roster = [{ username: this.#username, stable_identity_b64: encodeBase64Url(this.#stableIdentity) }];
       this.#rooms.set(room.id, {
-        localLabel,
+        localLabel, visibility,
         handle, groupId: groupId.slice(), ownerUsername: this.#username, roster, active: true, synchronized: true,
         pendingMessageId: null, pendingRevision: null, pendingRoster: null, ownJoinRequestId: null,
       });
       handle = null;
       const frame = {
-        type: "mls_create_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: room.id,
+        type: "mls_create_room", protocol_version: MLS_PROTOCOL_VERSION, room_id: room.id, visibility,
         group_id_b64: encodeBase64Url(groupId), epoch: decimalU64(info.epoch), revision: decimalU64(info.revision),
         membership_digest_b64: encodeBase64Url(infoDigest),
         stable_identity_b64: encodeBase64Url(this.#stableIdentity), state_envelope_b64: encodeBase64Url(stateEnvelope),
@@ -151,7 +154,7 @@ export class MlsRoomManager {
   confirmCreatedRoom(room: MlsRoomWire): RoomRecord {
     this.assertOpen();
     const slot = this.#rooms.get(room.room_id);
-    if (!slot?.localLabel || !validCatalogRoom(room, this.#username, this.#stableIdentity) ||
+    if (!slot?.localLabel || !validCatalogRoom(room, this.#username, this.#stableIdentity) || room.visibility !== slot.visibility ||
       room.owner_username !== this.#username || !room.active || !room.synchronized ||
       room.epoch !== "0" || room.revision !== "0" || !sameRoster(room.roster, slot.roster)) {
       throw new Error("Room unavailable");
@@ -250,7 +253,7 @@ export class MlsRoomManager {
             }
           } finally { info.groupId.fill(0); info.membershipDigest.fill(0); }
           this.#rooms.set(room.room_id, {
-            handle, groupId: groupId.slice(), ownerUsername: room.owner_username, roster: cloneRoster(recovery.roster),
+            handle, groupId: groupId.slice(), ownerUsername: room.owner_username, visibility: room.visibility, roster: cloneRoster(recovery.roster),
             active: recovery.active, synchronized: room.synchronized,
             pendingMessageId: null, pendingRevision: null, pendingRoster: null, ownJoinRequestId: null,
           });
@@ -282,7 +285,7 @@ export class MlsRoomManager {
       keyPackage = handle.keyPackage();
       state = handle.sealState();
       this.#rooms.set(frame.room_id, {
-        handle, groupId: groupId.slice(), ownerUsername: frame.owner_username, roster: [], active: false, synchronized: false,
+        handle, groupId: groupId.slice(), ownerUsername: frame.owner_username, visibility: "private", roster: [], active: false, synchronized: false,
         pendingMessageId: null, pendingRevision: null, pendingRoster: null, ownJoinRequestId: requestId,
       });
       handle = null;
@@ -730,7 +733,7 @@ function sameRoster(left: MlsRosterMemberWire[], right: MlsRosterMemberWire[]): 
 }
 function validCatalogRoom(room: MlsRoomWire, username: string, stableIdentity: Uint8Array): boolean {
   const snapshot = room.recovery_snapshot;
-  if (!snapshot || snapshot.active !== room.active || room.synchronized && !room.active) return false;
+  if (!snapshot || !validVisibility(room.visibility) || snapshot.active !== room.active || room.synchronized && !room.active) return false;
   const pending = !room.active && room.roster.length === 0;
   if (pending) {
     if (room.synchronized || room.epoch !== "0" || room.revision !== "0" || room.membership_digest_b64 !== "" ||
@@ -744,6 +747,7 @@ function validCatalogRoom(room: MlsRoomWire, username: string, stableIdentity: U
   return !room.synchronized || snapshot.epoch === room.epoch && snapshot.revision === room.revision &&
     snapshot.membership_digest_b64 === room.membership_digest_b64 && sameRoster(snapshot.roster, room.roster);
 }
+function validVisibility(value: unknown): value is RoomVisibility { return value === "public" || value === "private"; }
 function validActiveRoster(roster: MlsRosterMemberWire[], owner: string, username: string, stableIdentity: Uint8Array): boolean {
   if (!isUniqueRoster(roster)) return false;
   const ownerMember = uniqueMember(roster, owner);

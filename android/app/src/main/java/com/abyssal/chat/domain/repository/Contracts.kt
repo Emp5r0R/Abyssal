@@ -94,6 +94,8 @@ enum class OutboundSendResult {
 interface IChatTransport {
     fun connect()
     fun disconnect()
+    /** Releases transport resources after the owning ViewModel is permanently cleared. */
+    fun close() { disconnect() }
     /** Epoch of the active connection; zero keeps simple test transports source-compatible. */
     fun currentConnectionGeneration(): Long = 0L
     /** Runs one synchronous mutation while the expected connection epoch cannot advance. */

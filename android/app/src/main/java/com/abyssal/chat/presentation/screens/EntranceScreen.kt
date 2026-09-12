@@ -306,7 +306,7 @@ private fun EntranceContent(
                                     .padding(start = 6.dp)
                             ) {
                                 Text(
-                                    text = "Remember this session",
+                                    text = "Keep session behind privacy cover",
                                     color = PureWhite,
                                     fontSize = 14.sp,
                                     fontWeight = FontWeight.SemiBold

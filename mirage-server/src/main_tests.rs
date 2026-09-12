@@ -5649,6 +5649,7 @@ fn protocol_v10_counters_and_policy_durations_are_decimal_strings() {
             }],
         }),
         policy,
+        visibility: rooms::RoomVisibility::Private,
     };
     let wire = serde_json::to_value(OutboundFrame::MlsRoomCreated {
         protocol_version: rooms::MLS_PROTOCOL_VERSION,
@@ -5728,6 +5729,7 @@ fn every_mls_counter_field_accepts_only_canonical_decimal_strings() {
             roster: Vec::new(),
         }),
         policy,
+        visibility: rooms::RoomVisibility::Private,
     };
     let outbound = vec![
         (
@@ -5991,7 +5993,7 @@ fn non_mls_counters_remain_json_numbers() {
 }
 
 #[test]
-fn mls_create_room_omitted_policy_uses_default_policy() {
+fn mls_create_room_omitted_policy_and_visibility_use_private_defaults() {
     let frame = serde_json::json!({
         "type": "mls_create_room",
         "protocol_version": rooms::MLS_PROTOCOL_VERSION,
@@ -6003,12 +6005,136 @@ fn mls_create_room_omitted_policy_uses_default_policy() {
         "stable_identity_b64": "identity",
         "state_envelope_b64": "state",
     });
-    let InboundFrame::MlsCreateRoom { policy, .. } =
-        serde_json::from_value(frame).expect("MLS create room")
+    let InboundFrame::MlsCreateRoom {
+        policy, visibility, ..
+    } = serde_json::from_value(frame).expect("MLS create room")
     else {
         panic!("expected MLS create room frame");
     };
     assert_eq!(policy, rooms::RoomPolicy::default());
+    assert_eq!(visibility, rooms::RoomVisibility::Private);
+}
+
+#[test]
+fn mls_create_room_visibility_is_strictly_typed() {
+    let frame = serde_json::json!({
+        "type": "mls_create_room",
+        "protocol_version": rooms::MLS_PROTOCOL_VERSION,
+        "room_id": "room",
+        "group_id_b64": "group",
+        "epoch": "0",
+        "revision": "0",
+        "membership_digest_b64": "digest",
+        "stable_identity_b64": "identity",
+        "state_envelope_b64": "state",
+        "visibility": "public",
+    });
+    let InboundFrame::MlsCreateRoom { visibility, .. } =
+        serde_json::from_value(frame.clone()).expect("public visibility")
+    else {
+        panic!("expected MLS create room frame");
+    };
+    assert_eq!(visibility, rooms::RoomVisibility::Public);
+
+    let mut unknown = frame;
+    unknown["visibility"] = "unlisted".into();
+    assert!(serde_json::from_value::<InboundFrame>(unknown).is_err());
+}
+
+#[test]
+fn mls_public_catalog_wire_exposes_only_discovery_summary_fields() {
+    let wire = serde_json::to_value(OutboundFrame::MlsPublicRooms {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        rooms: vec![MlsPublicRoomWire {
+            room_id: "public-room".to_string(),
+            group_id_b64: "group".to_string(),
+            owner_username: "Alice".to_string(),
+            policy: rooms::RoomPolicy::default(),
+        }],
+    })
+    .unwrap();
+    assert_eq!(wire["type"], "mls_public_rooms");
+    let room = wire["rooms"][0].as_object().unwrap();
+    let mut keys = room.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["group_id_b64", "owner_username", "policy", "room_id"]
+    );
+    for secret in [
+        "roster",
+        "membership_digest_b64",
+        "recovery_snapshot",
+        "state_envelope_b64",
+        "ciphertext_b64",
+    ] {
+        assert!(
+            room.get(secret).is_none(),
+            "unexpected public field {secret}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn public_room_create_and_delete_broadcast_exact_catalog_updates() {
+    let state = test_state();
+    add_test_account(&state, "public-owner", "Alice").await;
+    add_test_account(&state, "public-observer", "Bob").await;
+    let (owner_id, mut owner_rx) = add_test_client(&state, "public-owner", "Alice").await;
+    let (_observer_id, mut observer_rx) = add_test_client(&state, "public-observer", "Bob").await;
+    let stable_identity = {
+        let accounts = state.accounts.lock().await;
+        accounts[&test_code_id("public-owner")].identity_public[..rooms::STABLE_IDENTITY_BYTES]
+            .to_vec()
+    };
+
+    mls_create_room(
+        &state,
+        owner_id,
+        "public-room".to_string(),
+        URL_SAFE_NO_PAD.encode([7_u8; rooms::GROUP_ID_BYTES]),
+        0,
+        0,
+        URL_SAFE_NO_PAD.encode([8_u8; rooms::MEMBERSHIP_DIGEST_BYTES]),
+        URL_SAFE_NO_PAD.encode(stable_identity),
+        URL_SAFE_NO_PAD.encode([1_u8]),
+        rooms::RoomPolicy::default(),
+        rooms::RoomVisibility::Public,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        owner_rx.recv().await,
+        Some(OutboundFrame::MlsRoomCreated { ref room, .. })
+            if room.visibility == rooms::RoomVisibility::Public
+    ));
+    assert!(matches!(
+        owner_rx.recv().await,
+        Some(OutboundFrame::MlsPublicRooms { ref rooms, .. })
+            if rooms.len() == 1 && rooms[0].room_id == "public-room"
+    ));
+    assert!(matches!(
+        observer_rx.recv().await,
+        Some(OutboundFrame::MlsPublicRooms { ref rooms, .. })
+            if rooms.len() == 1 && rooms[0].room_id == "public-room"
+    ));
+
+    mls_delete_room(&state, owner_id, "public-room")
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner_rx.recv().await,
+        Some(OutboundFrame::MlsRoomDeleted { ref room_id, .. }) if room_id == "public-room"
+    ));
+    assert!(matches!(
+        owner_rx.recv().await,
+        Some(OutboundFrame::MlsPublicRooms { ref rooms, .. }) if rooms.is_empty()
+    ));
+    assert!(matches!(
+        observer_rx.recv().await,
+        Some(OutboundFrame::MlsPublicRooms { ref rooms, .. }) if rooms.is_empty()
+    ));
 }
 
 #[test]
@@ -6064,11 +6190,16 @@ fn every_outbound_mls_frame_carries_protocol_v10() {
         roster: Vec::new(),
         recovery_snapshot: None,
         policy: rooms::RoomPolicy::default(),
+        visibility: rooms::RoomVisibility::Private,
     };
     let frames = vec![
         OutboundFrame::MlsRooms {
             protocol_version: rooms::MLS_PROTOCOL_VERSION,
             rooms: vec![room()],
+        },
+        OutboundFrame::MlsPublicRooms {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            rooms: Vec::new(),
         },
         OutboundFrame::MlsRoomDiscovered {
             protocol_version: rooms::MLS_PROTOCOL_VERSION,

@@ -18,7 +18,7 @@ const policy = {
   file_overall_expiry_sec: "60", enforce_file_absolute_expiry: true,
 };
 const room = (): MlsRoomWire => ({
-  room_id: "forum_alpha", owner_username: "Alice", group_id_b64: b64(32), active: true, synchronized: true,
+  room_id: "forum_alpha", visibility: "private", owner_username: "Alice", group_id_b64: b64(32), active: true, synchronized: true,
   epoch: "0", revision: "1", membership_digest_b64: b64(32, 2),
   roster: [{ username: "Alice", stable_identity_b64: b64(64, 3) }],
   recovery_snapshot: {
@@ -33,6 +33,7 @@ describe("protocol-v10 MLS wire", () => {
     expect(frame?.type).toBe("mls_rooms");
     const record = roomFromMlsWire(room());
     expect(record.mlsEpoch).toBe(0n);
+    expect(record.visibility).toBe("private");
     expect(record.overall_expiry_sec).toBe(86400);
   });
 
@@ -115,7 +116,7 @@ describe("protocol-v10 MLS wire", () => {
 
   it("allows only strict nontransactional MLS client controls", () => {
     const create = {
-      type: "mls_create_room", protocol_version: 10, room_id: "forum_alpha", group_id_b64: b64(32),
+      type: "mls_create_room", protocol_version: 10, room_id: "forum_alpha", visibility: "public", group_id_b64: b64(32),
       epoch: "0", revision: "0", membership_digest_b64: b64(32, 2), stable_identity_b64: b64(64, 3),
       state_envelope_b64: b64(96, 4), policy,
     };
@@ -125,6 +126,21 @@ describe("protocol-v10 MLS wire", () => {
     expect(validMlsControlFrame({ type: "mls_application", protocol_version: 10, room_id: "forum_alpha" })).toBe(false);
     expect(validMlsControlFrame({ type: "mls_state_snapshot", protocol_version: 10, room_id: "forum_alpha" })).toBe(false);
     expect(validMlsControlFrame({ type: "mls_discover_room", protocol_version: 10, room_id: "forum_alpha" })).toBe(true);
+  });
+
+  it("accepts only bounded exact-key public room summaries", () => {
+    const summary = {
+      room_id: "forum_public",
+      group_id_b64: b64(32),
+      owner_username: "Alice",
+      policy,
+    };
+    const frame = { type: "mls_public_rooms", protocol_version: 10, rooms: [summary] };
+    expect(parseMlsIncomingFrame(frame)).toEqual(frame);
+    expect(parseMlsIncomingFrame({ ...frame, rooms: [{ ...summary, extra: true }] })).toBeNull();
+    expect(parseMlsIncomingFrame({ ...frame, rooms: [{ ...summary, policy: { ...policy, overall_expiry_sec: "01" } }] })).toBeNull();
+    expect(parseMlsIncomingFrame({ ...frame, rooms: [summary, summary] })).toBeNull();
+    expect(parseMlsIncomingFrame({ ...frame, rooms: Array.from({ length: 129 }, (_, index) => ({ ...summary, room_id: `forum_${index}` })) })).toBeNull();
   });
 
   it("accepts only exact leave controls and bounded leave events", () => {

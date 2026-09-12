@@ -145,6 +145,7 @@ pub(super) async fn socket_loop(
     }
     broadcast_presence(&state).await;
     send_mls_catalog(&state, client_id, &auth.code_id).await;
+    send_mls_public_catalog(&state, client_id).await;
     send_mls_pending(&state, client_id, &auth.code_id).await;
     send_mls_pending_joins(&state, client_id, &auth.code_id).await;
     send_mls_pending_leaves(&state, client_id, &auth.code_id).await;

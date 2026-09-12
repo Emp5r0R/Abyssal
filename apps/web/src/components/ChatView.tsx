@@ -157,6 +157,11 @@ export function ChatView({
     setFlashTargetId(messageId);
     window.setTimeout(() => setFlashTargetId((current) => current === messageId ? null : current), 1_300);
   };
+  const closeTrustDialog = () => {
+    setPresentedVerificationToken("");
+    setVerificationRejected(false);
+    setShowTrustDialog(false);
+  };
   const effectiveRetentionSec = isDirect ? directRetentionSec : room.self_destruct_timer_sec;
 
   return (
@@ -173,12 +178,12 @@ export function ChatView({
               onClick={() => setShowTrustDialog(true)}
               disabled={!safetyNumber || !directTrust.verificationToken || !onVerifyToken}
               aria-label={directTrust.verified
-                ? "Direct chat safety number comparison confirmed"
-                : "Confirm direct chat safety number comparison"}
+                ? "Peer identity verified"
+                : "Verify peer identity (recommended)"}
             >
               <ShieldCheck size={13} />
-              {directTrust.verified ? "COMPARISON CONFIRMED" : "NOT COMPARED"}
-              {safetyNumber ? ` · Safety ${safetyNumber}` : " · Safety unavailable"}
+              {directTrust.verified ? "IDENTITY VERIFIED" : "VERIFICATION RECOMMENDED"}
+              {safetyNumber ? ` · Safety number ${safetyNumber}` : " · Safety number unavailable"}
             </button>
           ) : (
             <span>
@@ -259,6 +264,7 @@ export function ChatView({
                   ) : (
                     <AttachmentMessage
                       message={message}
+                      disabled={!connected}
                       onView={() => onViewAttachment(message)}
                       onExport={() => onExportAttachment(message)}
                     />
@@ -363,15 +369,12 @@ export function ChatView({
       </footer>
       {showTrustDialog && isDirect && safetyNumber && directTrust.verificationToken && onVerifyToken ? (
         <Dialog
-          title="Verify direct chat"
-          description="Scan your peer's QR through a separate trusted channel."
+          title="Verify peer identity"
+          description="Compare this safety number with your peer through a trusted channel. Verification is recommended but optional."
+          onClose={closeTrustDialog}
           actions={
             <>
-              <button className="secondary-button" type="button" onClick={() => {
-                setPresentedVerificationToken("");
-                setVerificationRejected(false);
-                setShowTrustDialog(false);
-              }}>CANCEL</button>
+              <button className="secondary-button" type="button" onClick={closeTrustDialog}>CANCEL</button>
               <button
                 className="primary-button"
                 type="button"
@@ -409,26 +412,42 @@ export function ChatView({
             }}
           />
           {verificationRejected ? <p className="field-error" role="alert">Verification did not match.</p> : null}
-          <p>The QR and safety number are derived locally. Trust stays in RAM and clears after reconnect, identity change, logout, wipe, or expiry.</p>
+          <p>The QR and safety number are derived locally. Verification stays in RAM and clears after reconnect, identity change, logout, wipe, or expiry.</p>
         </Dialog>
       ) : null}
     </section>
   );
 }
 
-function AttachmentMessage({ message, onView, onExport }: { message: ChatMessage; onView: () => void; onExport: () => void }) {
+function AttachmentMessage({
+  message,
+  disabled,
+  onView,
+  onExport,
+}: {
+  message: ChatMessage;
+  disabled: boolean;
+  onView: () => void;
+  onExport: () => void;
+}) {
   const attachment = message.attachment;
   if (!attachment) return null;
   const reaction = reactionByShortcode(attachment.reactionShortcode);
   if (reaction && !attachment.oneTime) {
     return (
       <div className="inline-reaction">
-        <button type="button" className="inline-reaction-preview" onClick={onView} aria-label={`Open ${reaction.shortcode}`}>
+        <button
+          type="button"
+          className="inline-reaction-preview"
+          onClick={onView}
+          disabled={disabled}
+          aria-label={disabled ? `Open ${reaction.shortcode} (offline)` : `Open ${reaction.shortcode}`}
+        >
           <img src={reaction.path} alt={reaction.label} />
         </button>
         <div className="inline-reaction-footer">
           <code>{reaction.shortcode}</code>
-          <IconButton label="Save reaction" onClick={onExport}><ArrowDownToLine size={16} /></IconButton>
+          <IconButton label={disabled ? "Save reaction (offline)" : "Save reaction"} disabled={disabled} onClick={onExport}><ArrowDownToLine size={16} /></IconButton>
         </div>
       </div>
     );
@@ -441,8 +460,8 @@ function AttachmentMessage({ message, onView, onExport }: { message: ChatMessage
         <strong>{attachment.name}</strong>
         <span>{attachment.mediaType} · {formatBytes(attachment.sizeBytes)}{attachment.oneTime ? " · ONE-TIME" : ""}</span>
       </div>
-      <IconButton label="View attachment" onClick={onView}><Play size={17} /></IconButton>
-      {!attachment.oneTime ? <IconButton label="Save attachment" onClick={onExport}><ArrowDownToLine size={17} /></IconButton> : null}
+      <IconButton label={disabled ? "View attachment (offline)" : "View attachment"} disabled={disabled} onClick={onView}><Play size={17} /></IconButton>
+      {!attachment.oneTime ? <IconButton label={disabled ? "Save attachment (offline)" : "Save attachment"} disabled={disabled} onClick={onExport}><ArrowDownToLine size={17} /></IconButton> : null}
     </div>
   );
 }

@@ -1,12 +1,13 @@
 import { useState, type FormEvent } from "react";
 import { clampRoom } from "../domain/messagePolicy";
-import type { RoomRecord } from "../domain/types";
+import type { RoomRecord, RoomVisibility } from "../domain/types";
 import { Dialog, Field, Toggle } from "./Ui";
 
 function newRoom(): RoomRecord {
   return {
     id: "forum_pending",
     name: "",
+    visibility: "private",
     self_destruct_timer_sec: 10,
     overall_expiry_sec: 300,
     allow_images: true,
@@ -27,6 +28,7 @@ function newRoom(): RoomRecord {
 
 export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void; onCreate: (room: RoomRecord) => boolean }) {
   const [room, setRoom] = useState(newRoom);
+  const [feedback, setFeedback] = useState<string | null>(null);
   const number = (key: keyof RoomRecord, value: string) => setRoom((current) => ({ ...current, [key]: Number(value) || 0 }));
   const boolean = (key: keyof RoomRecord, value: boolean) => setRoom((current) => ({ ...current, [key]: value }));
   const submit = (event: FormEvent) => {
@@ -34,6 +36,7 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
     const next = clampRoom(room);
     next.id = `forum_${crypto.randomUUID().replaceAll("-", "")}`;
     if (next.name && onCreate(next)) onCancel();
+    else if (next.name) setFeedback("Room could not be created. Try again.");
   };
 
   return (
@@ -41,6 +44,7 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
       className="room-dialog"
       title="Create room"
       description="Room policy applies to every participant."
+      onClose={onCancel}
       actions={
         <>
           <button className="secondary-button" type="button" onClick={onCancel}>CANCEL</button>
@@ -49,7 +53,33 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
       }
     >
       <form id="create-room-form" className="room-form" onSubmit={submit}>
-        <Field label="Room name" autoFocus maxLength={36} value={room.name} onChange={(event) => setRoom((current) => ({ ...current, name: event.target.value }))} />
+        <Field label="Room name" autoFocus maxLength={36} value={room.name} onChange={(event) => {
+          setFeedback(null);
+          setRoom((current) => ({ ...current, name: event.target.value }));
+        }} />
+        {feedback ? <p className="form-feedback" role="status" aria-live="polite">{feedback}</p> : null}
+        <fieldset className="visibility-section">
+          <legend>Room visibility</legend>
+          <div className="visibility-control" role="radiogroup" aria-label="Room visibility">
+            {(["public", "private"] as const).map((visibility: RoomVisibility) => (
+              <label className={`visibility-option ${room.visibility === visibility ? "is-selected" : ""}`} key={visibility}>
+                <input
+                  type="radio"
+                  name="room-visibility"
+                  value={visibility}
+                  checked={room.visibility === visibility}
+                  onChange={() => setRoom((current) => ({ ...current, visibility }))}
+                />
+                <span>{visibility === "public" ? "PUBLIC" : "PRIVATE"}</span>
+              </label>
+            ))}
+          </div>
+          <p className="field-hint">
+            {room.visibility === "public"
+              ? "Discoverable to authenticated users; the owner still approves every join."
+              : "Omitted from discovery; share the generated room ID with invitees."}
+          </p>
+        </fieldset>
 
         <PolicySection title="Text" enabled>
           <NumberPair

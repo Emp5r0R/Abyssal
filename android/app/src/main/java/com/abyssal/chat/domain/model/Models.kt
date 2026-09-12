@@ -93,7 +93,8 @@ data class ChatSession(
     val fileReadTimerSec: Int = 5,
     val fileOverallExpirySec: Int = 0,
     val enforceFileAbsoluteExpiry: Boolean = false,
-    val ownerUsername: String? = null
+    val ownerUsername: String? = null,
+    val roomVisibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE
 )
 
 data class ServerStatus(

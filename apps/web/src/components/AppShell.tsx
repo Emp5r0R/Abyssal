@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
+import type { PublicRoomSummary } from "../transport/mlsWire";
 import { Brand, Dialog, Field, IconButton } from "./Ui";
 import { PrivacyBlur } from "./PrivacyBlur";
 
@@ -25,6 +26,7 @@ interface AppShellProps {
   nodeId: string;
   connection: ConnectionState;
   rooms: RoomRecord[];
+  publicRooms?: PublicRoomSummary[];
   directs: DirectRecord[];
   messages: Record<string, ChatMessage[]>;
   presence: PresenceUser[];
@@ -56,6 +58,7 @@ export function AppShell({
   nodeId,
   connection,
   rooms,
+  publicRooms = [],
   directs,
   messages,
   presence,
@@ -99,7 +102,7 @@ export function AppShell({
           <IconButton className="mobile-only" label="Close rooms" onClick={() => setMobileMenu(false)}><X size={19} /></IconButton>
         </div>
 
-        <button className="identity-row" type="button" onClick={() => onOpenRoom(null)}>
+        <button className="identity-row" type="button" onClick={() => { onOpenRoom(null); setMobileMenu(false); }}>
           <div className="identity-avatar"><UserRound size={19} /></div>
           <div><PrivacyBlur><strong>{displayName ?? username}</strong></PrivacyBlur>{displayName && <PrivacyBlur><small>{username}</small></PrivacyBlur>}<span>{shortNode(nodeId)}</span></div>
           <span className={`connection-dot state-${connection}`} title={connection} />
@@ -192,6 +195,7 @@ export function AppShell({
           <Dashboard
             username={username}
             rooms={rooms}
+            publicRooms={publicRooms}
             directs={directs}
             maxRooms={maxRooms}
             connection={connection}
@@ -235,6 +239,7 @@ export function AppShell({
         <Dialog
           title="Wipe relay memory?"
           description="Accounts, sessions, rooms, pending frames, and attachments disappear immediately."
+          onClose={() => setConfirmWipe(false)}
           actions={
             <>
               <button className="secondary-button" type="button" onClick={() => setConfirmWipe(false)}>CANCEL</button>
@@ -252,6 +257,7 @@ export function AppShell({
 function Dashboard({
   username,
   rooms,
+  publicRooms,
   directs,
   maxRooms,
   connection,
@@ -269,6 +275,7 @@ function Dashboard({
 }: {
   username: string;
   rooms: RoomRecord[];
+  publicRooms: PublicRoomSummary[];
   directs: DirectRecord[];
   maxRooms: number;
   connection: ConnectionState;
@@ -286,6 +293,17 @@ function Dashboard({
 }) {
   const owned = rooms.filter((room) => room.owner_username === username).length;
   const [joinId, setJoinId] = useState("");
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const joinedRoomIds = new Set(rooms.map((room) => room.id));
+  const discoverablePublicRooms = publicRooms.filter((room) => !joinedRoomIds.has(room.room_id));
+  const requestJoin = (roomId: string) => {
+    if (onJoinRoom(roomId)) {
+      setJoinId("");
+      setActionNotice(null);
+    } else {
+      setActionNotice("Room join request could not be sent.");
+    }
+  };
   const ownerLeaveRequests = pendingRoomLeaves.filter((request) =>
     rooms.some((room) => room.id === request.roomId && room.owner_username === username && request.username !== username),
   );
@@ -303,10 +321,45 @@ function Dashboard({
         <div><span>RELAY</span><strong className={`text-${connection}`}>{connection.toUpperCase()}</strong></div>
       </div>
 
-      <form className="room-join-form" onSubmit={(event) => { event.preventDefault(); if (onJoinRoom(joinId.trim())) setJoinId(""); }}>
-        <Field label="Join room ID" value={joinId} maxLength={128} placeholder="forum_..." onChange={(event) => setJoinId(event.target.value)} />
+      <form className="room-join-form" onSubmit={(event) => {
+        event.preventDefault();
+        requestJoin(joinId.trim());
+      }}>
+        <Field label="Join room ID" value={joinId} maxLength={128} placeholder="forum_..." onChange={(event) => {
+          setActionNotice(null);
+          setJoinId(event.target.value);
+        }} />
         <button className="secondary-button" type="submit" disabled={connection !== "connected" || !joinId.trim()}>JOIN</button>
       </form>
+      {actionNotice ? <p className="form-feedback" role="status" aria-live="polite">{actionNotice}</p> : null}
+
+      {publicRooms.length > 0 ? <section className="public-room-catalog" aria-labelledby="public-room-catalog-title">
+        <div className="dashboard-section-heading">
+          <div><Radio size={16} /><span id="public-room-catalog-title">PUBLIC ROOMS</span></div>
+          <strong>{discoverablePublicRooms.length}</strong>
+        </div>
+        {discoverablePublicRooms.length === 0 ? (
+          <p className="catalog-empty">No new public rooms.</p>
+        ) : (
+          <div className="public-room-list" role="list" aria-label="Discoverable public rooms">
+            {discoverablePublicRooms.map((room) => (
+              <div className="public-room-row" key={room.room_id} role="listitem">
+                <div className="public-room-summary">
+                  <PrivacyBlur><strong>{room.room_id}</strong></PrivacyBlur>
+                  <PrivacyBlur><small>OWNER {room.owner_username}</small></PrivacyBlur>
+                </div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={connection !== "connected"}
+                  aria-label={`Join public room ${room.room_id}`}
+                  onClick={() => requestJoin(room.room_id)}
+                >JOIN</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section> : null}
 
       {pendingRoomJoins.length > 0 ? <div className="pending-room-joins" aria-label="Pending room joins">
         {pendingRoomJoins.map((request) => <div key={request.requestId}>

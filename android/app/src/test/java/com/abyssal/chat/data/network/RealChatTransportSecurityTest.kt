@@ -13,10 +13,12 @@ import com.abyssal.chat.domain.model.Message
 import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RecipientEnvelope
 import com.abyssal.chat.domain.repository.OutboundSendResult
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -542,6 +544,45 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
+    fun directCatalogFromAnotherClientPublishesAnAndroidConversation() = runBlocking {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+
+        listener.onMessage(
+            socket,
+            paddedControl(
+                JSONObject().put("type", "directs")
+                    .put("directs", JSONArray().put(direct("dm_web", "WebPeer")))
+            )
+        )
+
+        val change = withTimeout(1_000L) { transport.getRoomChanges().first() }
+        assertEquals("upsert", change.action)
+        assertEquals("dm_web", change.session?.id)
+        assertEquals("WebPeer", change.session?.name)
+        assertEquals(false, change.session?.isForum)
+    }
+
+    @Test
+    fun malformedDirectCatalogFailsClosedInsteadOfSilentlyHidingDms() {
+        val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+
+        listener.onMessage(
+            socket,
+            paddedControl(
+                JSONObject().put("type", "directs")
+                    .put("directs", JSONArray().put(direct("dm_bad", "Peer").put("unexpected", true)))
+            )
+        )
+
+        assertEquals(1008, socket.closeCode)
+        assertEquals("invalid direct catalog", socket.closeReason)
+    }
+
+    @Test
     fun staleSocketCallbacksCannotMutateOrCloseTheCurrentGeneration() = runBlocking {
         val transport = RealChatTransport(InMemoryNodeConfigService(), OkHttpClient())
         val oldSocket = RecordingWebSocket()
@@ -1037,6 +1078,89 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
+    fun transientTicketFailureSchedulesOneSessionScopedRetryAndLogoutCancelsIt() = runBlocking {
+        val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
+        val factory = TransientTicketFailureCallFactory()
+        val transport = RealChatTransport(node, OkHttpClient(), factory, TEST_BUILD_ATTESTATION)
+
+        transport.connect()
+
+        assertTrue(factory.firstFailure.await(2, TimeUnit.SECONDS))
+        withTimeout(3_000L) {
+            while (factory.calls.get() < 2) yield()
+        }
+        assertEquals(2, factory.calls.get())
+
+        transport.disconnect()
+        val callsAfterLogout = factory.calls.get()
+        Thread.sleep(RECONNECT_INITIAL_DELAY_MS + 100L)
+        assertEquals(callsAfterLogout, factory.calls.get())
+        assertEquals("DISCONNECTED", transport.getServerStatus().first().state)
+    }
+
+    @Test
+    fun sessionReplacementCancelsAQueuedReconnectBeforeItCanIssueAStaleTicket() = runBlocking {
+        val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
+        val factory = TransientTicketFailureCallFactory()
+        val transport = RealChatTransport(node, OkHttpClient(), factory, TEST_BUILD_ATTESTATION)
+
+        transport.connect()
+        assertTrue(factory.firstFailure.await(2, TimeUnit.SECONDS))
+        node.setActiveSession(testSession().copy(token = "replacement-token"))
+        Thread.sleep(RECONNECT_INITIAL_DELAY_MS + RECONNECT_JITTER_MS + 250L)
+
+        assertEquals(1, factory.calls.get())
+        transport.close()
+    }
+
+    @Test
+    fun socketFailureSchedulesOnlyOneReconnectAttemptForCurrentSession() = runBlocking {
+        val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
+        val factory = CountingTicketCallFactory()
+        val transport = RealChatTransport(node, OkHttpClient(), factory, TEST_BUILD_ATTESTATION)
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+
+        listener.onFailure(socket, IOException("transient socket"), null)
+        assertTrue(factory.firstCall.await(3, TimeUnit.SECONDS))
+        Thread.sleep(RECONNECT_INITIAL_DELAY_MS + RECONNECT_JITTER_MS + 250L)
+        assertEquals(1, factory.calls.get())
+        transport.close()
+    }
+
+    @Test
+    fun ticketAdmission401And403AreTerminalAndNeverRetried() = runBlocking {
+        for (code in listOf(401, 403)) {
+            val server = MockWebServer()
+            server.enqueue(MockResponse().setResponseCode(code))
+            server.start()
+            val base = server.url("/")
+            val endpoint = NodeEndpoint(
+                inputUrl = base.toString(),
+                apiBaseUrl = base.toString().removeSuffix("/"),
+                wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
+                displayHost = base.host
+            )
+            val node = InMemoryNodeConfigService().apply {
+                setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
+            }
+            val transport = RealChatTransport(node, OkHttpClient(), OkHttpClient(), TEST_BUILD_ATTESTATION)
+            try {
+                transport.connect()
+                val status = withTimeout(2_000L) {
+                    transport.getServerStatus().first { it.state == "SECURITY_REJECTED" }
+                }
+                assertEquals("node-1", status.nodeId)
+                Thread.sleep(RECONNECT_INITIAL_DELAY_MS + RECONNECT_JITTER_MS + 100L)
+                assertEquals(1, server.requestCount)
+            } finally {
+                transport.close()
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
     fun unconfiguredBuildFailsBeforeTicketNetworkAccess() = runBlocking {
         val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
         val calls = AtomicBoolean(false)
@@ -1088,6 +1212,9 @@ class RealChatTransportSecurityTest {
                 setOf("platform", "version", "build_signature_b64"),
                 payload.keys().asSequence().toSet()
             )
+            Thread.sleep(RECONNECT_INITIAL_DELAY_MS + 100L)
+            assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
+            transport.disconnect()
         } finally {
             server.shutdown()
         }
@@ -1748,6 +1875,54 @@ class RealChatTransportSecurityTest {
             assertEquals("A".repeat(86), payload.getString("build_signature_b64"))
             assertTrue(request.url.encodedPath.endsWith("/v1/ws-ticket"))
             return call
+        }
+    }
+
+    private class TransientTicketFailureCallFactory : Call.Factory {
+        val calls = AtomicInteger(0)
+        val firstFailure = CountDownLatch(1)
+
+        override fun newCall(request: Request): Call {
+            val index = calls.incrementAndGet()
+            return object : Call {
+                private val canceled = AtomicBoolean(false)
+
+                override fun request(): Request = request
+                override fun execute(): Response = error("not used")
+                override fun enqueue(responseCallback: Callback) {
+                    if (index == 1) {
+                        firstFailure.countDown()
+                        responseCallback.onFailure(this, IOException("transient"))
+                    }
+                }
+                override fun cancel() { canceled.set(true) }
+                override fun isExecuted(): Boolean = index == 1 || calls.get() > index
+                override fun isCanceled(): Boolean = canceled.get()
+                override fun timeout() = okio.Timeout.NONE
+                override fun clone(): Call = this
+            }
+        }
+    }
+
+    private class CountingTicketCallFactory : Call.Factory {
+        val calls = AtomicInteger(0)
+        val firstCall = CountDownLatch(1)
+
+        override fun newCall(request: Request): Call {
+            calls.incrementAndGet()
+            firstCall.countDown()
+            return object : Call {
+                private val canceled = AtomicBoolean(false)
+
+                override fun request(): Request = request
+                override fun execute(): Response = error("not used")
+                override fun enqueue(responseCallback: Callback) = Unit
+                override fun cancel() { canceled.set(true) }
+                override fun isExecuted(): Boolean = false
+                override fun isCanceled(): Boolean = canceled.get()
+                override fun timeout() = okio.Timeout.NONE
+                override fun clone(): Call = this
+            }
         }
     }
 

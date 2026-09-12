@@ -90,7 +90,7 @@ ABYSSAL_NODE_SIGNING_KEY_FILE="$NODE_KEY" \
 ABYSSAL_PUBLIC_URL= \
 ABYSSAL_PUBLIC_LOCATORS="[\"http://pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion\",\"http://ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p\",\"http://127.0.0.1:$PORT\"]" \
 ABYSSAL_WEB_ROOT="$TMP_DIR/no-web" \
-  node "$ROOT_DIR/scripts/test-startup-invite-qr.mjs"
+  node --experimental-strip-types "$ROOT_DIR/scripts/test-startup-invite-qr.mjs"
 
 coproc RELAY_PROCESS {
   ABYSSAL_BIND_ADDR="127.0.0.1:$PORT" \
@@ -157,4 +157,4 @@ ABYSSAL_TEST_BASE_URL="http://127.0.0.1:$PORT" \
 ABYSSAL_TEST_INVITE_A="${invites[0]}" \
 ABYSSAL_TEST_INVITE_B="${invites[1]}" \
 ABYSSAL_TEST_BUILD_SIGNATURE_B64="$WEB_BUILD_SIGNATURE_B64" \
-  node --trace-uncaught "$ROOT_DIR/scripts/relay-integration.mjs"
+  node --experimental-strip-types --trace-uncaught "$ROOT_DIR/scripts/relay-integration.mjs"

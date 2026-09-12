@@ -48,7 +48,7 @@ const mocks = vi.hoisted(() => {
     remainingSessionSec: 900,
     upload: { active: false, name: "", loaded: 0, total: 0 },
     media: null,
-    notice: null,
+    notice: null as string | null,
     retainWhenHiddenRef: { current: true },
     login: vi.fn(),
     logout: vi.fn(async () => undefined),
@@ -78,6 +78,7 @@ const mocks = vi.hoisted(() => {
     reset: () => {
       controller.session = session;
       controller.securityWarning = null;
+      controller.notice = null;
       controller.retainWhenHiddenRef.current = true;
       mocks.gates.length = 0;
       preflight.mockResolvedValue({ status: "OK" });
@@ -232,5 +233,15 @@ describe("App privacy lifecycle policy", () => {
     expect(await screen.findByRole("heading", { name: "Build rejected by node" })).toBeInTheDocument();
     expect(screen.queryByTestId("workspace")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "END SESSION" })).toBeInTheDocument();
+  });
+
+  it("announces notices and exposes a separate dismiss action", async () => {
+    mocks.controller.notice = "Action unavailable.";
+    render(<App />);
+    await configureCover();
+
+    expect(screen.getByRole("status")).toHaveTextContent("Action unavailable.");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+    expect(mocks.controller.clearNotice).toHaveBeenCalledOnce();
   });
 });

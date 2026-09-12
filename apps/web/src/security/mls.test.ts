@@ -90,7 +90,7 @@ describe("MlsRoomManager", () => {
     expect(frame.policy).not.toHaveProperty("name");
     const roster = [{ username: "Alice", stable_identity_b64: encodeBase64Url(bytes(64, 7)) }];
     const wire: MlsRoomWire = {
-      room_id: roomRecord.id, owner_username: "Alice", group_id_b64: String(frame.group_id_b64),
+      room_id: roomRecord.id, visibility: "private", owner_username: "Alice", group_id_b64: String(frame.group_id_b64),
       active: true, synchronized: true, epoch: "0", revision: "0",
       membership_digest_b64: String(frame.membership_digest_b64), roster,
       recovery_snapshot: {
@@ -205,7 +205,7 @@ describe("MlsRoomManager", () => {
     const fake = sessionWith(ownerRoom);
     const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
     manager.recoverCatalog([{
-      room_id: roomRecord.id, owner_username: "Bob", group_id_b64: encodeBase64Url(ownerRoom.groupId), active: true, synchronized: true,
+      room_id: roomRecord.id, visibility: "private", owner_username: "Bob", group_id_b64: encodeBase64Url(ownerRoom.groupId), active: true, synchronized: true,
       epoch: "0", revision: "0", membership_digest_b64: encodeBase64Url(bytes(32, 2)),
       roster: [
         { username: "Alice", stable_identity_b64: encodeBase64Url(bytes(64, 7)) },
@@ -309,7 +309,7 @@ describe("MlsRoomManager", () => {
     const fake = sessionWith();
     const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
     const catalog: MlsRoomWire = {
-      room_id: roomRecord.id, owner_username: "Alice", group_id_b64: encodeBase64Url(fake.room.groupId),
+      room_id: roomRecord.id, visibility: "private", owner_username: "Alice", group_id_b64: encodeBase64Url(fake.room.groupId),
       active: true, synchronized: false, epoch: "1", revision: "1",
       membership_digest_b64: encodeBase64Url(bytes(32, 3)),
       roster: [
@@ -338,7 +338,7 @@ describe("MlsRoomManager", () => {
     const fake = sessionWith(room);
     const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
     const catalog: MlsRoomWire = {
-      room_id: roomRecord.id, owner_username: "Bob", group_id_b64: encodeBase64Url(room.groupId),
+      room_id: roomRecord.id, visibility: "private", owner_username: "Bob", group_id_b64: encodeBase64Url(room.groupId),
       active: false, synchronized: false, epoch: "1", revision: "1",
       membership_digest_b64: encodeBase64Url(bytes(32, 3)),
       roster: [
@@ -448,7 +448,7 @@ describe("MlsRoomManager", () => {
   it("clears all manager state when catalog recovery conflicts with an established room", () => {
     const fake = sessionWith(); const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7)); manager.createRoom(roomRecord);
     const conflicting: MlsRoomWire = {
-      room_id: roomRecord.id, owner_username: "Bob", group_id_b64: encodeBase64Url(fake.room.groupId), active: true, synchronized: true,
+      room_id: roomRecord.id, visibility: "private", owner_username: "Bob", group_id_b64: encodeBase64Url(fake.room.groupId), active: true, synchronized: true,
       epoch: "0", revision: "0", membership_digest_b64: encodeBase64Url(bytes(32, 2)),
       roster: [
         { username: "Alice", stable_identity_b64: encodeBase64Url(bytes(64, 7)) },

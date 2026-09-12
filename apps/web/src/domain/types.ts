@@ -2,6 +2,7 @@ import type { SenderClient } from "./senderClient";
 
 export type ConnectionState = "connecting" | "connected" | "disconnected";
 export type MediaType = "IMAGE" | "VIDEO" | "FILE";
+export type RoomVisibility = "public" | "private";
 
 export interface NodeEndpoint {
   apiBaseUrl: string;
@@ -68,6 +69,7 @@ export interface DirectoryStamp {
 export interface RoomRecord {
   id: string;
   name: string;
+  visibility?: RoomVisibility;
   owner_username?: string;
   self_destruct_timer_sec: number;
   overall_expiry_sec: number;

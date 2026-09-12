@@ -1,4 +1,4 @@
-import type { RoomRecord } from "../domain/types";
+import type { RoomRecord, RoomVisibility } from "../domain/types";
 
 export const MLS_PROTOCOL_VERSION = 10;
 export const MLS_MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -7,6 +7,7 @@ export const MLS_MAX_STATE_BYTES = 4 * 1024 * 1024;
 export const MLS_MAX_CONTROL_BYTES = 2 * 1024 * 1024;
 export const MLS_MAX_AAD_BYTES = 4096;
 export const MLS_MAX_MEMBERS = 117;
+export const MLS_MAX_ROOMS = 1024;
 const U64_MAX = 18_446_744_073_709_551_615n;
 const ID = /^[A-Za-z0-9_-]{1,128}$/u;
 const USERNAME = /^[A-Za-z0-9_-]{1,80}$/u;
@@ -28,6 +29,7 @@ export interface MlsRecoverySnapshotWire {
 
 export interface MlsRoomWire {
   room_id: string;
+  visibility: RoomVisibility;
   owner_username: string;
   group_id_b64: string;
   active: boolean;
@@ -37,6 +39,14 @@ export interface MlsRoomWire {
   membership_digest_b64: string;
   roster: MlsRosterMemberWire[];
   recovery_snapshot: MlsRecoverySnapshotWire | null;
+  policy: MlsRoomPolicyWire;
+}
+
+/** Public catalog entries intentionally carry no display name or membership state. */
+export interface PublicRoomSummary {
+  room_id: string;
+  group_id_b64: string;
+  owner_username: string;
   policy: MlsRoomPolicyWire;
 }
 
@@ -60,6 +70,7 @@ export interface MlsRoomPolicyWire {
 
 export type MlsIncomingFrame =
   | { type: "mls_rooms"; protocol_version: 10; rooms: MlsRoomWire[] }
+  | { type: "mls_public_rooms"; protocol_version: 10; rooms: PublicRoomSummary[] }
   | { type: "mls_room_discovered"; protocol_version: 10; room_id: string; group_id_b64: string; owner_username: string }
   | { type: "mls_room_created"; protocol_version: 10; room: MlsRoomWire }
   | { type: "mls_join_requested"; protocol_version: 10; room_id: string; request_id: string; username: string; stable_identity_b64: string; key_package_b64: string }
@@ -115,6 +126,7 @@ export function roomFromMlsWire(room: MlsRoomWire): RoomRecord {
   return {
     id: room.room_id,
     name: room.room_id.replace(/^forum_/u, "").replace(/_[0-9a-f]{8}$/u, "").replace(/_/gu, " ").slice(0, 36) || "Secure room",
+    visibility: room.visibility,
     owner_username: room.owner_username,
     conversation_type: "room",
     mlsActive: room.active,
@@ -144,8 +156,11 @@ export function parseMlsIncomingFrame(value: Record<string, unknown>): MlsIncomi
   const exact = (keys: string[]) => exactKeys(value, ["type", "protocol_version", ...keys]);
   switch (value.type) {
     case "mls_rooms":
-      return exact(["rooms"]) && Array.isArray(value.rooms) && value.rooms.length <= 1024 &&
+      return exact(["rooms"]) && Array.isArray(value.rooms) && value.rooms.length <= MLS_MAX_ROOMS &&
         value.rooms.every(validRoom) ? value as unknown as MlsIncomingFrame : null;
+    case "mls_public_rooms":
+      return exact(["rooms"]) && validPublicRoomCatalog(value.rooms)
+        ? value as unknown as MlsIncomingFrame : null;
     case "mls_room_created":
       return exact(["room"]) && validRoom(value.room) ? value as unknown as MlsIncomingFrame : null;
     case "mls_room_discovered":
@@ -195,8 +210,8 @@ export function validMlsControlFrame(value: Record<string, unknown>): boolean {
   const exact = (keys: string[]) => exactKeys(value, ["type", "protocol_version", ...keys]);
   switch (value.type) {
     case "mls_create_room":
-      return exact(["room_id", "group_id_b64", "epoch", "revision", "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy"]) &&
-        validId(value.room_id) && validB64(value.group_id_b64, 32, 32) && value.epoch === "0" && value.revision === "0" &&
+      return exact(["room_id", "visibility", "group_id_b64", "epoch", "revision", "membership_digest_b64", "stable_identity_b64", "state_envelope_b64", "policy"]) &&
+        validId(value.room_id) && validVisibility(value.visibility) && validB64(value.group_id_b64, 32, 32) && value.epoch === "0" && value.revision === "0" &&
         validB64(value.membership_digest_b64, 32, 32) && validB64(value.stable_identity_b64, 64, 64) &&
         validB64(value.state_envelope_b64, 1, MLS_MAX_STATE_BYTES) && validPolicy(value.policy);
     case "mls_discover_room":
@@ -216,8 +231,8 @@ export function validMlsControlFrame(value: Record<string, unknown>): boolean {
 }
 
 function validRoom(value: unknown): value is MlsRoomWire {
-  if (!record(value) || !exactKeys(value, ["room_id", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision", "membership_digest_b64", "roster", "recovery_snapshot", "policy"])) return false;
-  if (!validId(value.room_id) || !validUsername(value.owner_username) || !validB64(value.group_id_b64, 32, 32) ||
+  if (!record(value) || !exactKeys(value, ["room_id", "visibility", "owner_username", "group_id_b64", "active", "synchronized", "epoch", "revision", "membership_digest_b64", "roster", "recovery_snapshot", "policy"])) return false;
+  if (!validId(value.room_id) || !validVisibility(value.visibility) || !validUsername(value.owner_username) || !validB64(value.group_id_b64, 32, 32) ||
     typeof value.active !== "boolean" || typeof value.synchronized !== "boolean" ||
     !validCounters(value, ["epoch", "revision"]) || !validRecovery(value.recovery_snapshot) ||
     value.recovery_snapshot.active !== value.active || !validPolicy(value.policy)) return false;
@@ -236,6 +251,21 @@ function validRoom(value: unknown): value is MlsRoomWire {
     value.recovery_snapshot.revision === value.revision &&
     value.recovery_snapshot.membership_digest_b64 === value.membership_digest_b64 &&
     sameRoster(value.recovery_snapshot.roster, value.roster);
+}
+
+function validPublicRoomCatalog(value: unknown): value is PublicRoomSummary[] {
+  if (!Array.isArray(value) || value.length > MLS_MAX_ROOMS) return false;
+  const roomIds = new Set<string>();
+  const groups = new Set<string>();
+  for (const summary of value) {
+    if (!record(summary) || !exactKeys(summary, ["room_id", "group_id_b64", "owner_username", "policy"]) ||
+      !validId(summary.room_id) || !validB64(summary.group_id_b64, 32, 32) ||
+      !validUsername(summary.owner_username) || !validPolicy(summary.policy) ||
+      roomIds.has(summary.room_id) || groups.has(summary.group_id_b64)) return false;
+    roomIds.add(summary.room_id);
+    groups.add(summary.group_id_b64);
+  }
+  return true;
 }
 
 function validRecovery(value: unknown): value is MlsRecoverySnapshotWire {
@@ -271,6 +301,7 @@ function validPolicy(value: unknown): value is MlsRoomPolicyWire {
 
 function validCounters(value: Record<string, unknown>, keys: string[]): boolean { return keys.every((key) => parseCanonicalU64(value[key]) !== null); }
 function validId(value: unknown): value is string { return typeof value === "string" && ID.test(value); }
+function validVisibility(value: unknown): value is RoomVisibility { return value === "public" || value === "private"; }
 function validUsername(value: unknown): value is string { return typeof value === "string" && USERNAME.test(value); }
 function canonicalUsername(value: string): string { return value.toLowerCase(); }
 function sameRoster(left: MlsRosterMemberWire[], right: MlsRosterMemberWire[]): boolean {

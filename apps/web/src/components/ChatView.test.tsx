@@ -55,7 +55,7 @@ describe("direct message retention", () => {
     await waitFor(() => expect(send).toHaveBeenCalledWith("kept in session", undefined, 0));
   });
 
-  it("shows an unverified direct status and requires out-of-band confirmation", async () => {
+  it("shows that verification is recommended while keeping out-of-band confirmation optional", async () => {
     const verify = vi.fn(() => true);
     render(
       <ChatView
@@ -79,11 +79,25 @@ describe("direct message retention", () => {
       />,
     );
 
-    const verifyButton = screen.getAllByRole("button", { name: "Confirm direct chat safety number comparison" }).find((button) => !(button as HTMLButtonElement).disabled);
-    expect(verifyButton).toHaveTextContent("NOT COMPARED");
+    const verifyButton = screen.getAllByRole("button", { name: "Verify peer identity (recommended)" }).find((button) => !(button as HTMLButtonElement).disabled);
+    expect(verifyButton).toHaveTextContent("VERIFICATION RECOMMENDED");
+    verifyButton!.focus();
     fireEvent.click(verifyButton!);
-    expect(screen.getByRole("heading", { name: "Verify direct chat" })).toBeInTheDocument();
-    expect(screen.getByText(/separate trusted channel/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Verify peer identity" })).toBeInTheDocument();
+    expect(screen.getByText(/trusted channel/i)).toBeInTheDocument();
+    expect(screen.getByText(/recommended but optional/i)).toBeInTheDocument();
+    const qrImageButton = screen.getByRole("button", { name: /OPEN QR IMAGE/u });
+    const scanButton = screen.getByRole("button", { name: /SCAN PEER QR/u });
+    const cancelAction = screen.getByRole("button", { name: "CANCEL" });
+    await waitFor(() => expect(scanButton).toHaveFocus());
+    qrImageButton.focus();
+    expect(qrImageButton).toHaveFocus();
+    scanButton.focus();
+    fireEvent.keyDown(scanButton, { key: "Tab", shiftKey: true });
+    expect(cancelAction).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(verifyButton).toHaveFocus());
+    fireEvent.click(verifyButton!);
     fireEvent.change(screen.getByLabelText("Peer verification token"), {
       target: { value: "abyssal:verify:v1:test-token" },
     });
@@ -107,6 +121,45 @@ describe("sender-client origin badges", () => {
     absoluteExpirySec: 0,
     mine: false,
     ...overrides,
+  });
+
+  it("disables attachment view and export controls while disconnected", () => {
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected={false}
+        safetyNumber={null}
+        messages={[baseMessage({
+          kind: "attachment",
+          content: "private.txt",
+          attachment: {
+            id: "123e4567-e89b-42d3-a456-426614174000",
+            encryptionVersion: 2,
+            encryptionKey: new Uint8Array(32).fill(9),
+            name: "private.txt",
+            mediaType: "FILE",
+            mimeType: "text/plain",
+            sizeBytes: 3,
+            oneTime: false,
+            deleteAfterDownload: false,
+          },
+        })]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn()}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "View attachment (offline)" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save attachment (offline)" })).toBeDisabled();
   });
 
   it("warns on each message sent from the web client", () => {

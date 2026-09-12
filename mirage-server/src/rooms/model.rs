@@ -8,6 +8,22 @@ use super::policy::RoomPolicy;
 
 pub type CodeId = [u8; 32];
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomVisibility {
+    Public,
+    #[default]
+    Private,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicRoom {
+    pub room_id: String,
+    pub owner_username: String,
+    pub group_id: Vec<u8>,
+    pub policy: RoomPolicy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ReplayDomain {
     Membership,
@@ -71,6 +87,7 @@ pub struct RoomInfo {
     pub membership_digest: Vec<u8>,
     pub roster: Vec<RosterMember>,
     pub policy: RoomPolicy,
+    pub visibility: RoomVisibility,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +230,7 @@ pub(super) struct RelayRoom {
     pub(super) owner_code_id: CodeId,
     pub(super) owner_username: String,
     pub(super) policy: RoomPolicy,
+    pub(super) visibility: RoomVisibility,
     pub(super) group_id: Vec<u8>,
     pub(super) epoch: u64,
     pub(super) membership_digest: Vec<u8>,
@@ -419,6 +437,14 @@ impl Drop for RelayRoom {
         self.member_revisions.clear();
         self.deliveries.clear();
         self.expired_sender_gaps.clear();
+    }
+}
+
+impl Drop for PublicRoom {
+    fn drop(&mut self) {
+        self.room_id.zeroize();
+        self.owner_username.zeroize();
+        self.group_id.zeroize();
     }
 }
 

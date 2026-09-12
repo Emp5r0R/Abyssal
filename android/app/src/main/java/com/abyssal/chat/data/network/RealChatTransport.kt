@@ -30,6 +30,11 @@ import java.security.MessageDigest
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.CancellationException
@@ -87,11 +92,19 @@ private const val WS_TICKET_B64_LENGTH = 43
 private val WS_TICKET_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
 private const val TRANSACTION_RETRY_INTERVAL_MS = 3_000L
 private const val TRANSACTION_RECOVERY_TIMEOUT_MS = 30_000L
+internal const val RECONNECT_INITIAL_DELAY_MS = 750L
+internal const val RECONNECT_MAX_DELAY_MS = 15_000L
+internal const val RECONNECT_JITTER_MS = 250L
 internal const val PREKEY_LEASE_REQUEST_TIMEOUT_MS = 5_000L
 internal const val IDENTITY_PUBLIC_KEY_BYTES_V9 = 608
 internal val PREKEY_ID_REGEX_V9 = Regex("^[A-Za-z0-9_-]{1,32}$")
 
 private val CANONICAL_BASE64_URL_REGEX_V9 = Regex("^[A-Za-z0-9_-]+$")
+
+private fun newReconnectExecutor(): ScheduledExecutorService =
+    Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "abyssal-transport-reconnect").apply { isDaemon = true }
+    }
 
 private fun isSafeProtocolIdentifier(value: String): Boolean =
     value.isNotEmpty() && value.length <= 128 &&
@@ -235,8 +248,15 @@ internal class RealChatTransport(
     private val nodeConfigService: INodeConfigService,
     private val client: OkHttpClient,
     private val callFactory: Call.Factory = client,
-    private val buildAttestationProvider: BuildAttestationProvider = AndroidBuildAttestationProvider
+    private val buildAttestationProvider: BuildAttestationProvider = AndroidBuildAttestationProvider,
+    private val reconnectExecutor: ScheduledExecutorService = newReconnectExecutor()
 ) : IChatTransport, IMlsTransport {
+    private data class ReconnectIntent(
+        val generation: Long,
+        val token: Long,
+        val session: NodeSession
+    )
+
     private interface RecoverableOperation {
         var generation: Long
         var exactFrame: String
@@ -297,6 +317,12 @@ internal class RealChatTransport(
     private val connectionGeneration = AtomicLong(0L)
     private val purgeSignaled = AtomicBoolean(false)
     private val connectionLock = Any()
+    private var reconnectFuture: ScheduledFuture<*>? = null
+    private var reconnectToken = 0L
+    private var reconnectAttempt = 0
+    private var closed = false
+    /** The socket binding for the current generation; replaced on each ticket attempt. */
+    private var connectionSession: NodeSession? = null
     private val identityPins = Collections.synchronizedMap(
         LinkedHashMap<String, String>(MAX_PINNED_IDENTITIES, 0.75f, true)
     )
@@ -322,22 +348,48 @@ internal class RealChatTransport(
     private val pendingMls = LinkedHashMap<String, PendingMlsOperation>()
 
     override fun connect() {
+        connectInternal()
+    }
+
+    private fun connectInternal(reconnect: ReconnectIntent? = null) {
+        synchronized(connectionLock) {
+            if (closed) return
+            if (reconnect != null &&
+                (reconnect.generation != connectionGeneration.get() ||
+                    reconnect.token != reconnectToken ||
+                    !isSameSession(nodeConfigService.getActiveSession(), reconnect.session))
+            ) return
+        }
         val session = nodeConfigService.getActiveSession()
         if (session == null) {
-            _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
+            synchronized(connectionLock) {
+                cancelReconnectLocked(reset = true)
+                _serverStatus.value = ServerStatus("DISCONNECTED", "No node", 0)
+            }
             return
         }
         val buildAttestation = buildAttestationProvider.current()
         if (buildAttestation == null) {
-            _serverStatus.value = ServerStatus("SECURITY_REJECTED", session.nodeId, 0)
+            synchronized(connectionLock) {
+                cancelReconnectLocked(reset = true)
+                _serverStatus.value = ServerStatus("SECURITY_REJECTED", session.nodeId, 0)
+            }
             return
         }
 
         val generation: Long
         synchronized(connectionLock) {
-            if (webSocket != null || connecting.get()) return
+            if (closed || webSocket != null || connecting.get()) return
+            if (reconnect == null) cancelReconnectLocked(reset = true)
+            if (reconnect != null &&
+                (reconnect.generation != connectionGeneration.get() ||
+                    reconnect.token != reconnectToken ||
+                    !isSameSession(nodeConfigService.getActiveSession(), reconnect.session))
+            ) return
+            if (!isSameSession(nodeConfigService.getActiveSession(), session)) return
             connecting.set(true)
             generation = connectionGeneration.incrementAndGet()
+            connectionSession = session
             if (purgeSignaled.get()) {
                 while (_wipeCommands.tryReceive().isSuccess) Unit
                 signalPurgeLocked(generation, force = true)
@@ -355,8 +407,10 @@ internal class RealChatTransport(
                 )
             )
             .build()
-        val call = runCatching { callFactory.newCall(request) }.getOrElse {
-            failTicketConnection(generation, session)
+        val call = try {
+            callFactory.newCall(request)
+        } catch (_: RuntimeException) {
+            if (failTicketConnection(generation, session)) scheduleReconnect(generation, session)
             return
         }
         synchronized(connectionLock) {
@@ -369,12 +423,14 @@ internal class RealChatTransport(
         try {
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    synchronized(connectionLock) {
-                        if (!isCurrentTicket(call, generation, session)) return
+                    val retry = synchronized(connectionLock) {
+                        if (!isCurrentTicket(call, generation, session)) return@synchronized false
                         ticketCall = null
                         connecting.set(false)
                         _serverStatus.value = ServerStatus("DISCONNECTED", session.nodeId, 0)
+                        true
                     }
+                    if (retry) scheduleReconnect(generation, session)
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -382,39 +438,43 @@ internal class RealChatTransport(
                         response.close()
                         return
                     }
-                    val buildRejected = response.code == 426
+                    val securityRejected = response.code in setOf(401, 403, 426)
                     val ticket = response.use { parseWsTicket(it) }
                     if (ticket == null || !isCurrentTicket(call, generation, session)) {
-                        failTicketConnection(
+                        val retry = failTicketConnection(
                             generation,
                             session,
-                            if (buildRejected) "SECURITY_REJECTED" else "DISCONNECTED"
+                            if (securityRejected) "SECURITY_REJECTED" else "DISCONNECTED"
                         )
+                        if (retry) scheduleReconnect(generation, session)
                         return
                     }
+                    var retry = false
                     synchronized(connectionLock) {
-                        if (!isCurrentTicket(call, generation, session)) return
+                        if (!isCurrentTicket(call, generation, session)) return@synchronized
                         ticketCall = null
                         val active = nodeConfigService.getActiveSession()
                         if (active == null || !isSameSession(active, session) || generation != connectionGeneration.get()) {
                             connecting.set(false)
                             _serverStatus.value = ServerStatus("DISCONNECTED", session.nodeId, 0)
-                            return
+                            return@synchronized
                         }
-                        webSocket = runCatching {
+                        webSocket = try {
                             val wsRequest = websocketUpgradeRequest(active.endpoint, ticket.value)
-                            client.newWebSocket(wsRequest, listener(active.nodeId, generation))
-                        }.getOrElse {
+                            client.newWebSocket(wsRequest, listener(active.nodeId, generation, active))
+                        } catch (_: RuntimeException) {
                             connecting.set(false)
                             _serverStatus.value = ServerStatus("DISCONNECTED", active.nodeId, 0)
-                            return
+                            retry = true
+                            null
                         }
                     }
+                    if (retry) scheduleReconnect(generation, session)
                 }
             })
         } catch (_: RuntimeException) {
             call.cancel()
-            failTicketConnection(generation, session)
+            if (failTicketConnection(generation, session)) scheduleReconnect(generation, session)
         }
     }
 
@@ -423,6 +483,7 @@ internal class RealChatTransport(
         val socket: WebSocket?
         val drainedPending: DrainedPendingOperations
         synchronized(connectionLock) {
+            cancelReconnectLocked(reset = true)
             drainedPending = advanceConnectionEpochAndDrainRoomChangesLocked()
             connecting.set(false)
             pendingCall = ticketCall
@@ -438,6 +499,15 @@ internal class RealChatTransport(
         // Resolve before clearing local cryptographic state. Callers must treat
         // every in-flight frame as ambiguous and fail closed.
         completeDrainedPendingOperations(drainedPending, OutboundSendResult.AMBIGUOUS)
+    }
+
+    override fun close() {
+        synchronized(connectionLock) {
+            closed = true
+            cancelReconnectLocked(reset = true)
+        }
+        disconnect()
+        reconnectExecutor.shutdownNow()
     }
 
     override fun getServerStatus(): Flow<ServerStatus> = _serverStatus.asStateFlow()
@@ -546,17 +616,74 @@ internal class RealChatTransport(
         generation: Long,
         expected: NodeSession,
         state: String = "DISCONNECTED"
-    ) {
+    ): Boolean {
         synchronized(connectionLock) {
-            if (!isCurrentConnection(generation, expected)) return
+            if (!isCurrentConnection(generation, expected)) return false
             ticketCall = null
             connecting.set(false)
             _serverStatus.value = ServerStatus(state, expected.nodeId, 0)
+            return state == "DISCONNECTED"
         }
     }
 
+    /** Schedules one cancellable retry for the exact authenticated session and epoch. */
+    private fun scheduleReconnect(generation: Long, expected: NodeSession) {
+        synchronized(connectionLock) {
+            if (generation != connectionGeneration.get() ||
+                closed ||
+                purgeSignaled.get() ||
+                webSocket != null ||
+                connecting.get() ||
+                !isSameSession(nodeConfigService.getActiveSession(), expected) ||
+                reconnectFuture?.isDone == false
+            ) return
+            val baseDelay = minOf(
+                RECONNECT_MAX_DELAY_MS,
+                RECONNECT_INITIAL_DELAY_MS * (1L shl minOf(reconnectAttempt, 5))
+            )
+            val jitter = ThreadLocalRandom.current().nextLong(RECONNECT_JITTER_MS + 1L)
+            val delay = minOf(RECONNECT_MAX_DELAY_MS, baseDelay + jitter)
+            reconnectAttempt += 1
+            val token = ++reconnectToken
+            val intent = ReconnectIntent(generation, token, expected)
+            reconnectFuture = try {
+                reconnectExecutor.schedule({
+                    val shouldRun = synchronized(connectionLock) {
+                        if (token != reconnectToken ||
+                            closed ||
+                            purgeSignaled.get() ||
+                            generation != connectionGeneration.get() ||
+                            !isSameSession(nodeConfigService.getActiveSession(), expected) ||
+                            webSocket != null ||
+                            connecting.get()
+                        ) {
+                            false
+                        } else {
+                            reconnectFuture = null
+                            true
+                        }
+                    }
+                    if (shouldRun) connectInternal(intent)
+                }, delay, TimeUnit.MILLISECONDS)
+            } catch (_: RuntimeException) {
+                null
+            }
+        }
+    }
+
+    /** Must be called under [connectionLock]. */
+    private fun cancelReconnectLocked(reset: Boolean) {
+        reconnectToken += 1
+        reconnectFuture?.cancel(false)
+        reconnectFuture = null
+        if (reset) reconnectAttempt = 0
+    }
+
     private fun isCurrentSocket(socket: WebSocket, generation: Long): Boolean =
-        generation == connectionGeneration.get() && webSocket === socket
+        generation == connectionGeneration.get() &&
+            webSocket === socket &&
+            connectionSession?.let { isSameSession(nodeConfigService.getActiveSession(), it) }
+                ?: true
 
     /** Must be called under [connectionLock]. Registration also takes this lock. */
     private fun advanceConnectionEpochAndDrainRoomChangesLocked(
@@ -564,6 +691,7 @@ internal class RealChatTransport(
     ): DrainedPendingOperations {
         connectionGeneration.incrementAndGet()
         val currentGeneration = connectionGeneration.get()
+        connectionSession = null
         while (_roomChanges.tryReceive().isSuccess) {
             // Catalog changes are scoped to the invalidated connection epoch.
         }
@@ -1450,7 +1578,14 @@ internal class RealChatTransport(
         sendCommandFrame(frame, expectedGeneration)
     }
 
-    private fun listener(nodeId: String, generation: Long): WebSocketListener {
+    private fun listener(nodeId: String, generation: Long): WebSocketListener =
+        listener(nodeId, generation, nodeConfigService.getActiveSession())
+
+    private fun listener(
+        nodeId: String,
+        generation: Long,
+        expectedSession: NodeSession?
+    ): WebSocketListener {
         return object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 val chatsToJoin = synchronized(connectionLock) {
@@ -1462,6 +1597,7 @@ internal class RealChatTransport(
                         // connectionLock as well, matching invalidation's
                         // connectionLock -> joinedChatIds lock order.
                         connecting.set(false)
+                        cancelReconnectLocked(reset = true)
                         _serverStatus.value = ServerStatus("CONNECTED", nodeId, 0)
                         synchronized(joinedChatIds) { joinedChatIds.toList() }
                     }
@@ -1525,7 +1661,7 @@ internal class RealChatTransport(
                                 else OutboundSendResult.REJECTED
                             )
                         }
-                        "mls_rooms", "mls_room_created", "mls_room_discovered", "mls_join_requested",
+                        "mls_rooms", "mls_public_rooms", "mls_room_created", "mls_room_discovered", "mls_join_requested",
                         "mls_join_rejected", "mls_leave_requested", "mls_leave_pending", "mls_leave_rejected",
                         "mls_left", "mls_membership", "mls_application", "mls_room_deleted" -> {
                             val frame = MlsWireCodec.parse(json) ?: run {
@@ -1676,9 +1812,18 @@ internal class RealChatTransport(
                             return
                         }
                         "directs" -> {
-                            val directs = json.optJSONArray("directs") ?: return
-                            val sessions = directs.toDirectSessions() ?: return
-                            if (!installDirectCatalogForSocket(webSocket, generation, sessions)) return
+                            val directs = json.optJSONArray("directs") ?: run {
+                                closeCurrentSocket(webSocket, nodeId, "invalid direct catalog")
+                                return
+                            }
+                            val sessions = directs.toDirectSessions() ?: run {
+                                closeCurrentSocket(webSocket, nodeId, "invalid direct catalog")
+                                return
+                            }
+                            if (!installDirectCatalogForSocket(webSocket, generation, sessions)) {
+                                closeCurrentSocket(webSocket, nodeId, "stale direct catalog")
+                                return
+                            }
                             sessions.forEach { session ->
                                 if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
                                     emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
@@ -1686,13 +1831,17 @@ internal class RealChatTransport(
                             }
                         }
                         "direct_opened" -> {
-                            json.optJSONObject("direct")?.toDirectSession()
-                                ?.takeIf { acceptDynamicDirectForSocket(webSocket, generation, it) }
-                                ?.let { session ->
-                                    if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
-                                        emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
-                                    }
-                                }
+                            val session = json.optJSONObject("direct")?.toDirectSession() ?: run {
+                                closeCurrentSocket(webSocket, nodeId, "invalid direct catalog")
+                                return
+                            }
+                            if (!acceptDynamicDirectForSocket(webSocket, generation, session)) {
+                                closeCurrentSocket(webSocket, nodeId, "conflicting direct catalog")
+                                return
+                            }
+                            if (rememberJoinedChatForSocket(webSocket, generation, session.id)) {
+                                emitRoomChange(webSocket, generation, RoomChange("upsert", session = session))
+                            } else Unit
                         }
                         else -> Unit
                     }
@@ -1701,32 +1850,43 @@ internal class RealChatTransport(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 val purge = isPurgeClose(code, reason)
+                val securityRejected = code == 1002 || code == 1008
                 val recover = invalidateCurrentSocket(
                     socket = webSocket,
                     nodeId = nodeId,
                     closeCode = null,
                     reason = reason,
                     signalPurge = purge,
-                    preserveRecoverableTransactions = !purge
+                    preserveRecoverableTransactions = !purge && !securityRejected,
+                    terminalState = if (securityRejected) "SECURITY_REJECTED" else null
                 )
-                if (recover && !purge) connect()
+                if (recover && !purge && !securityRejected) {
+                    val active = expectedSession ?: nodeConfigService.getActiveSession()
+                    if (active != null) scheduleReconnect(connectionGeneration.get(), active)
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                val securityRejected = response?.code in setOf(401, 403, 426)
                 val recover = invalidateCurrentSocket(
                     socket = webSocket,
                     nodeId = nodeId,
                     closeCode = null,
                     reason = "socket failure",
-                    preserveRecoverableTransactions = true
+                    preserveRecoverableTransactions = !securityRejected,
+                    terminalState = if (securityRejected) "SECURITY_REJECTED" else null
                 )
-                if (recover) connect()
+                if (recover && !securityRejected) {
+                    val active = expectedSession ?: nodeConfigService.getActiveSession()
+                    if (active != null) scheduleReconnect(connectionGeneration.get(), active)
+                }
             }
         }
     }
 
     internal fun signalPurge() {
         val drained = synchronized(connectionLock) {
+            cancelReconnectLocked(reset = true)
             signalPurgeLocked(connectionGeneration.get(), force = false)
             drainPendingPrekeyLeasesLocked(connectionGeneration.get())
         }
@@ -1860,7 +2020,8 @@ internal class RealChatTransport(
         closeCode: Int?,
         reason: String,
         signalPurge: Boolean = false,
-        preserveRecoverableTransactions: Boolean = false
+        preserveRecoverableTransactions: Boolean = false,
+        terminalState: String? = null
     ): Boolean {
         val drainedPending: DrainedPendingOperations
         val shouldReconnect: Boolean
@@ -1884,7 +2045,7 @@ internal class RealChatTransport(
             // catalog between invalidation and the old catalog being purged.
             clearAuthorizationStateLocked()
             clearPresence()
-            _serverStatus.value = ServerStatus("DISCONNECTED", nodeId, 0)
+            _serverStatus.value = ServerStatus(terminalState ?: "DISCONNECTED", nodeId, 0)
         }
         completeDrainedPendingOperations(drainedPending, OutboundSendResult.AMBIGUOUS)
         if (closeCode != null && !socket.close(closeCode, reason)) socket.cancel()

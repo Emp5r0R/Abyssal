@@ -702,6 +702,8 @@ enum InboundFrame {
         state_envelope_b64: String,
         #[serde(default)]
         policy: rooms::RoomPolicy,
+        #[serde(default)]
+        visibility: rooms::RoomVisibility,
     },
     #[serde(rename = "mls_discover_room")]
     MlsDiscoverRoom {
@@ -866,6 +868,11 @@ enum OutboundFrame {
         protocol_version: u32,
         rooms: Vec<MlsRoomWire>,
     },
+    #[serde(rename = "mls_public_rooms")]
+    MlsPublicRooms {
+        protocol_version: u32,
+        rooms: Vec<MlsPublicRoomWire>,
+    },
     #[serde(rename = "mls_room_discovered")]
     MlsRoomDiscovered {
         protocol_version: u32,
@@ -1008,6 +1015,7 @@ impl OutboundFrame {
         matches!(
             self,
             Self::MlsRooms { .. }
+                | Self::MlsPublicRooms { .. }
                 | Self::MlsRoomDiscovered { .. }
                 | Self::MlsRoomCreated { .. }
                 | Self::MlsJoinRequested { .. }
@@ -1219,6 +1227,13 @@ impl OutboundFrame {
                     }
                 }
             }
+            Self::MlsPublicRooms { rooms, .. } => {
+                for room in rooms {
+                    room.room_id.zeroize();
+                    room.owner_username.zeroize();
+                    room.group_id_b64.zeroize();
+                }
+            }
             _ => {}
         }
     }
@@ -1262,6 +1277,7 @@ struct MlsRoomWire {
     roster: Vec<MlsRosterWire>,
     recovery_snapshot: Option<MlsRecoverySnapshotWire>,
     policy: rooms::RoomPolicy,
+    visibility: rooms::RoomVisibility,
 }
 
 impl Drop for MlsRoomWire {
@@ -1272,6 +1288,22 @@ impl Drop for MlsRoomWire {
         self.membership_digest_b64.zeroize();
         self.recovery_snapshot = None;
         self.roster.clear();
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct MlsPublicRoomWire {
+    room_id: String,
+    group_id_b64: String,
+    owner_username: String,
+    policy: rooms::RoomPolicy,
+}
+
+impl Drop for MlsPublicRoomWire {
+    fn drop(&mut self) {
+        self.room_id.zeroize();
+        self.group_id_b64.zeroize();
+        self.owner_username.zeroize();
     }
 }
 
@@ -2130,6 +2162,7 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
             stable_identity_b64,
             state_envelope_b64,
             policy,
+            visibility,
         } => {
             require_mls_protocol_version(protocol_version)?;
             touch_activity_on_success(
@@ -2145,6 +2178,7 @@ async fn handle_frame(state: &AppState, sender_id: Uuid, text: &str) -> Result<(
                     stable_identity_b64,
                     state_envelope_b64,
                     policy,
+                    visibility,
                 )
                 .await,
             )

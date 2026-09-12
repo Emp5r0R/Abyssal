@@ -32,7 +32,9 @@ impl InteropPolicy {
 
     pub(crate) fn from_env() -> Self {
         Self::new(
-            strict_bool_env("ABYSSAL_ALLOW_ANDROID_TO_WEB", false),
+            // Interoperability is the default; operators can explicitly
+            // isolate either direction for a mixed-version deployment.
+            strict_bool_env("ABYSSAL_ALLOW_ANDROID_TO_WEB", true),
             strict_bool_env("ABYSSAL_ALLOW_WEB_TO_ANDROID", true),
         )
     }

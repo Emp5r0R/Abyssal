@@ -1,4 +1,6 @@
 // Disposable-relay qualification: decode terminal output with the client QR reader.
+// Node's built-in type stripping keeps this test on the exact source decoder
+// without adding a runtime TypeScript loader or writing a cache to disk.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createPrivateKey, createPublicKey } from "node:crypto";

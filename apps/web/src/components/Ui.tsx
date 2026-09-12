@@ -1,17 +1,18 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import { forwardRef, useId, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode } from "react";
+import { useDialogA11y } from "./useDialogA11y";
 
-export function IconButton({
+export const IconButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTMLButtonElement> & { label: string; children: ReactNode }>(function IconButton({
   label,
   children,
   className = "",
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; children: ReactNode }) {
+}, ref) {
   return (
-    <button className={`icon-button ${className}`} aria-label={label} title={label} type="button" {...props}>
+    <button ref={ref} className={`icon-button ${className}`} aria-label={label} title={label} type="button" {...props}>
       {children}
     </button>
   );
-}
+});
 
 export function Field({
   label,
@@ -80,20 +81,34 @@ export function Dialog({
   children,
   actions,
   className = "",
+  onClose,
 }: {
   title: string;
   description?: string;
   children: ReactNode;
   actions?: ReactNode;
   className?: string;
+  onClose?: () => void;
 }) {
+  const titleId = `${useId()}-title`;
+  const descriptionId = `${titleId}-description`;
+  const dialogRef = useDialogA11y({ onClose });
+
   return (
     <div className="dialog-backdrop" role="presentation">
-      <section className={`dialog ${className}`} role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      <section
+        ref={dialogRef}
+        className={`dialog ${className}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
+        tabIndex={-1}
+      >
         <header className="dialog-header">
           <div>
-            <h2 id="dialog-title">{title}</h2>
-            {description ? <p>{description}</p> : null}
+            <h2 id={titleId}>{title}</h2>
+            {description ? <p id={descriptionId}>{description}</p> : null}
           </div>
         </header>
         <div className="dialog-body">{children}</div>

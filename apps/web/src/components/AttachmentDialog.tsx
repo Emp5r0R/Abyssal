@@ -1,5 +1,5 @@
 import { FileArchive, Image, Upload, Video, X } from "lucide-react";
-import { useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { classifyMedia, MEDIA_LIMIT_BYTES, mediaAllowed } from "../domain/messagePolicy";
 import { formatBytes } from "../domain/format";
 import type { AttachmentOptions, RoomRecord } from "../domain/types";
@@ -20,10 +20,26 @@ export function AttachmentDialog({
   onSend: (file: File, options: AttachmentOptions) => Promise<boolean>;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const pickerStateRef = useRef(onPickerState);
   const [file, setFile] = useState<File | null>(null);
   const [oneTime, setOneTime] = useState(false);
   const [deleteAfterDownload, setDeleteAfterDownload] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+
+  useEffect(() => {
+    pickerStateRef.current = onPickerState;
+  }, [onPickerState]);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return undefined;
+    const resetPickerState = () => pickerStateRef.current(false);
+    input.addEventListener("cancel", resetPickerState);
+    return () => input.removeEventListener("cancel", resetPickerState);
+  }, []);
+
+  useEffect(() => () => pickerStateRef.current(false), []);
 
   const choose = () => {
     onPickerState(true);
@@ -32,19 +48,41 @@ export function AttachmentDialog({
   const selected = (event: ChangeEvent<HTMLInputElement>) => {
     onPickerState(false);
     const next = event.target.files?.[0] ?? null;
+    event.currentTarget.value = "";
     if (!next) return;
     const type = classifyMedia(next);
-    if (next.size <= 0 || next.size > MEDIA_LIMIT_BYTES[type] || !mediaAllowed(room, type)) return;
+    if (next.size <= 0) {
+      setFile(null);
+      setFeedback("Choose a non-empty file.");
+      return;
+    }
+    if (next.size > MEDIA_LIMIT_BYTES[type]) {
+      setFile(null);
+      setFeedback(`File exceeds the ${type.toLowerCase()} limit of ${formatBytes(MEDIA_LIMIT_BYTES[type])}.`);
+      return;
+    }
+    if (!mediaAllowed(room, type)) {
+      setFile(null);
+      setFeedback(`This room does not allow ${type.toLowerCase()} attachments.`);
+      return;
+    }
     setFile(next);
+    setFeedback(null);
     if (type === "FILE") setOneTime(false);
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!file || busy) return;
     setBusy(true);
-    const accepted = await onSend(file, { oneTime, deleteAfterDownload, ttlSec: 0 });
-    setBusy(false);
-    if (accepted) onCancel();
+    try {
+      const accepted = await onSend(file, { oneTime, deleteAfterDownload, ttlSec: 0 });
+      if (accepted) onCancel();
+      else setFeedback("Attachment could not be sent. Try again.");
+    } catch {
+      setFeedback("Attachment could not be sent. Try again.");
+    } finally {
+      setBusy(false);
+    }
   };
   const mediaType = file ? classifyMedia(file) : null;
 
@@ -52,6 +90,7 @@ export function AttachmentDialog({
     <Dialog
       title="Encrypted attachment"
       description={`Plaintext stays in current browser process. ${retentionSec === 0 ? "No read expiry." : `Expires ${retentionSec}s after read.`}`}
+      onClose={onCancel}
       actions={
         <>
           <button className="secondary-button" type="button" onClick={onCancel}>CANCEL</button>
@@ -76,7 +115,7 @@ export function AttachmentDialog({
               <PrivacyBlur><strong>{file.name}</strong></PrivacyBlur>
               <PrivacyBlur><span>{formatBytes(file.size)} · {mediaType}</span></PrivacyBlur>
             </div>
-            <IconButton label="Remove attachment" onClick={() => setFile(null)}><X size={18} /></IconButton>
+            <IconButton label="Remove attachment" onClick={() => { setFile(null); setFeedback(null); }}><X size={18} /></IconButton>
           </div>
         ) : (
           <button className="file-drop" type="button" onClick={choose}>
@@ -85,6 +124,7 @@ export function AttachmentDialog({
             <span>Images 20 MB · Videos 100 MB · Files 200 MB</span>
           </button>
         )}
+        {feedback ? <p className="form-feedback" role="status" aria-live="polite">{feedback}</p> : null}
         <div className="attachment-options">
           <Toggle
             checked={oneTime}

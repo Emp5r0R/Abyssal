@@ -63,6 +63,7 @@ import {
   type PreparedMlsApplication,
   type PreparedMlsSnapshot,
 } from "../security/mls";
+import type { PublicRoomSummary } from "../transport/mlsWire";
 import {
   DirectTrustStore,
   type DirectTrustContext,
@@ -236,6 +237,7 @@ export function useAbyssalSession() {
   const [session, setSession] = useState<AccountSession | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
   const [rooms, setRooms] = useState<RoomRecord[]>([]);
+  const [publicRooms, setPublicRooms] = useState<PublicRoomSummary[]>([]);
   const [directs, setDirects] = useState<DirectRecord[]>([]);
   const [presence, setPresence] = useState<PresenceUser[]>([]);
   const [messages, setMessages] = useState<Record<string, ChatMessage[]>>({});
@@ -263,6 +265,7 @@ export function useAbyssalSession() {
   const retainWhenHiddenRef = useRef(false);
   const sessionRef = useRef<AccountSession | null>(null);
   const roomsRef = useRef<RoomRecord[]>([]);
+  const publicRoomsRef = useRef<PublicRoomSummary[]>([]);
   const directsRef = useRef<DirectRecord[]>([]);
   const presenceRef = useRef<PresenceUser[]>([]);
   const messagesRef = useRef<Record<string, ChatMessage[]>>({});
@@ -412,17 +415,6 @@ export function useAbyssalSession() {
     context?.peerIdentity.fill(0);
   }, [activeDirectTrustContext]);
 
-  const directOperationAllowed = useCallback((chatId: string): boolean => {
-    const context = activeDirectTrustContext(chatId);
-    directTrustRef.current.invalidateIfIdentityChanged(context);
-    const allowed = directTrustRef.current.isVerified(context);
-    context?.localIdentity.fill(0);
-    context?.peerIdentity.fill(0);
-    const isDirect = directsRef.current.some((direct) => direct.id === chatId);
-    const isRoom = roomsRef.current.some((room) => room.id === chatId);
-    return isDirect ? allowed : isRoom;
-  }, [activeDirectTrustContext]);
-
   const verifyDirectVerificationToken = useCallback((presentedToken: string): boolean => {
     const context = activeDirectTrustContext();
     if (!context) return false;
@@ -476,6 +468,8 @@ export function useAbyssalSession() {
     setSession(null);
     setConnection("disconnected");
     setRooms([]);
+    publicRoomsRef.current = [];
+    setPublicRooms([]);
     setDirects([]);
     setPresence([]);
     setMessages({});
@@ -667,6 +661,12 @@ export function useAbyssalSession() {
         roomsRef.current = next;
         setRooms(next);
       } catch { clearMemory(); }
+      return;
+    }
+    if (frame.type === "mls_public_rooms") {
+      const next = [...frame.rooms].sort((left, right) => left.room_id.localeCompare(right.room_id));
+      publicRoomsRef.current = next;
+      setPublicRooms(next);
       return;
     }
     if (frame.type === "mls_room_created") {
@@ -1323,6 +1323,8 @@ export function useAbyssalSession() {
             cancelAttachmentOperations();
             clearMedia();
             clearExportUrls();
+            publicRoomsRef.current = [];
+            setPublicRooms([]);
           }
           setConnection(state);
         },
@@ -1415,7 +1417,6 @@ export function useAbyssalSession() {
   }, [clearMemory]);
 
   const markRoomRead = useCallback((chatId: string) => {
-    const trusted = directOperationAllowed(chatId);
     const knownChat = roomsRef.current.some((room) => room.id === chatId) ||
       directsRef.current.some((direct) => direct.id === chatId);
     if (!knownChat) return;
@@ -1433,8 +1434,8 @@ export function useAbyssalSession() {
       });
       return changed ? { ...current, [chatId]: nextMessages } : current;
     });
-    if (trusted) receipts.forEach((messageId) => sendReadReceiptRef.current(chatId, messageId));
-  }, [directOperationAllowed, updateMessages]);
+    receipts.forEach((messageId) => sendReadReceiptRef.current(chatId, messageId));
+  }, [updateMessages]);
 
   const openRoom = useCallback((chatId: string | null) => {
     clearMedia();
@@ -1694,7 +1695,7 @@ export function useAbyssalSession() {
     const currentSession = sessionRef.current;
     if (!currentSession || connection !== "connected" || !validControlId(messageId)) return;
     const conversation = conversationForId(roomsRef.current, directsRef.current, chatId);
-    if (!conversation || conversation.mlsActive !== undefined || !directOperationAllowed(chatId)) return;
+    if (!conversation || conversation.mlsActive !== undefined) return;
     const recipients = recipientKeysFor(chatId);
     if (recipients.length === 0) return;
     const generation = sessionGenerationRef.current;
@@ -1718,7 +1719,7 @@ export function useAbyssalSession() {
         recipients,
       ),
     );
-  }, [connection, directOperationAllowed, recipientKeysFor, runOutboundTransaction]);
+  }, [connection, recipientKeysFor, runOutboundTransaction]);
 
   useEffect(() => {
     sendReadReceiptRef.current = sendReadReceipt;
@@ -1730,10 +1731,6 @@ export function useAbyssalSession() {
     const room = conversationForId(roomsRef.current, directsRef.current, chatId);
     const clean = content.trim();
     if (!currentSession || !chatId || !room || !clean || connection !== "connected") return false;
-    if (!directOperationAllowed(chatId)) {
-      setNotice("Verify this direct chat's safety number before sending.");
-      return false;
-    }
     const connectionGeneration = connectionGenerationRef.current;
     if (connectionGeneration !== connectionGenerationRef.current || connection !== "connected") return false;
     const recipients = recipientKeysFor(chatId);
@@ -1796,7 +1793,7 @@ export function useAbyssalSession() {
       updateMessages((current) => appendBoundedMessage(current, message));
     }
     return outcome === "ACCEPTED";
-  }, [activeRoomId, connection, directOperationAllowed, messages, recipientKeysFor, runMlsTransaction, runOutboundTransaction, updateMessages]);
+  }, [activeRoomId, connection, messages, recipientKeysFor, runMlsTransaction, runOutboundTransaction, updateMessages]);
 
   const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
@@ -1819,10 +1816,6 @@ export function useAbyssalSession() {
       ))
     ) {
       setNotice("Action unavailable.");
-      return false;
-    }
-    if (!directOperationAllowed(chatId)) {
-      setNotice("Verify this direct chat's safety number before sending.");
       return false;
     }
     const recipients = recipientKeysFor(chatId);
@@ -1954,7 +1947,6 @@ export function useAbyssalSession() {
     activeRoomId,
     attachmentOperationActive,
     connection,
-    directOperationAllowed,
     finishAttachmentOperation,
     messages,
     recipientKeysFor,
@@ -1971,10 +1963,6 @@ export function useAbyssalSession() {
     if (!currentSession || !attachment || !chatId || message.chatId !== chatId ||
       !conversationForId(roomsRef.current, directsRef.current, message.chatId) ||
       connection !== "connected") return;
-    if (!directOperationAllowed(message.chatId)) {
-      setNotice("Verify this direct chat's safety number before opening attachments.");
-      return;
-    }
     clearMedia();
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -2049,7 +2037,6 @@ export function useAbyssalSession() {
     attachmentOperationActive,
     clearMedia,
     connection,
-    directOperationAllowed,
     finishAttachmentOperation,
     markRoomRead,
     startAttachmentOperation,
@@ -2062,10 +2049,6 @@ export function useAbyssalSession() {
     if (!currentSession || !attachment || attachment.oneTime || !chatId || message.chatId !== chatId ||
       !conversationForId(roomsRef.current, directsRef.current, message.chatId) ||
       connection !== "connected") return;
-    if (!directOperationAllowed(message.chatId)) {
-      setNotice("Verify this direct chat's safety number before exporting attachments.");
-      return;
-    }
     let plain: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let key: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
     let claim: string | undefined;
@@ -2138,7 +2121,6 @@ export function useAbyssalSession() {
   }, [
     attachmentOperationActive,
     connection,
-    directOperationAllowed,
     finishAttachmentOperation,
     markRoomRead,
     revokeExportUrl,
@@ -2246,6 +2228,7 @@ export function useAbyssalSession() {
     session,
     connection,
     rooms,
+    publicRooms,
     directs,
     presence,
     messages,

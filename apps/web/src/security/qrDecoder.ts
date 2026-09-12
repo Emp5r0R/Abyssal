@@ -1,4 +1,18 @@
-import { BinaryBitmap, ChecksumException, DecodeHintType, FormatException, HybridBinarizer, NotFoundException, QRCodeReader, RGBLuminanceSource } from "@zxing/library";
+// Keep the decoder consumable by both Vite and the bounded Node qualification
+// scripts. Node loads @zxing/library as CommonJS, so a default namespace import
+// avoids environment-specific named-export interop failures.
+import * as ZXingModule from "@zxing/library";
+
+const {
+  BinaryBitmap,
+  ChecksumException,
+  DecodeHintType,
+  FormatException,
+  HybridBinarizer,
+  NotFoundException,
+  QRCodeReader,
+  RGBLuminanceSource,
+} = ((ZXingModule as unknown as Record<string, unknown>)["default"] ?? ZXingModule) as typeof ZXingModule;
 
 export const MAX_QR_TEXT = 2048;
 export const MAX_QR_SIDE = 960;

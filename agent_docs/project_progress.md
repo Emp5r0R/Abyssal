@@ -1,5 +1,70 @@
 # Project Progress
 
+## Active Deployment: Cross-Platform Parity and Connection Reliability
+
+### Goal
+
+Restore reliable Android connectivity after account entry, close the highest-impact
+web/Android feature and UI gaps, make direct safety-number comparison strongly
+recommended without blocking ordinary messaging or attachment workflows, and add
+explicit public/private MLS room discovery without weakening membership controls.
+
+### Bounded Plan
+
+1. Add generation-scoped, cancellable Android WebSocket reconnection with bounded
+   backoff and no retry after logout, purge, expiry, or release rejection.
+2. Make direct verification advisory on both clients while preserving identity-change
+   invalidation, visible warnings, and the existing RAM-only verification workflow.
+3. Add Android camera and image-import support for peer-verification QR tokens using
+   strict canonical parsing and lifecycle cleanup.
+4. Reconcile objective connection, verification, and action copy inconsistencies and
+   verify affected Android/web layouts at realistic device and browser sizes.
+5. Show the authenticated peer directory on Android instead of presenting only
+   already-opened direct conversations. Add a bounded public-room discovery catalog;
+   private rooms remain absent and require an exact random room ID, while both
+   visibility modes retain owner-approved MLS joins and existing authorization.
+6. Run focused tests, Android device and web browser checks, then the complete
+   repository unit/security gate. Commit, publish, and deploy only from a green tree.
+
+### Acceptance
+
+- A transient Android ticket/socket failure recovers without reinstall or login, while
+  stale generations and terminated sessions cannot reconnect.
+- Direct text, attachments, viewing, export, and read state work before comparison on
+  both clients; comparison remains available, explicit, and locally invalidated.
+- Android accepts canonical peer-verification tokens from camera and bounded local QR
+  images without persisting decoded material or accepting unrelated QR payloads.
+- Android displays valid cross-platform peers from the authenticated presence catalog.
+  Public rooms are listed without recovery state, roster, plaintext room names, or
+  other member-only data; private rooms are discoverable only by exact room ID.
+- Room visibility never bypasses owner approval, MLS membership, application fanout,
+  attachment authorization, retention, or platform-direction policy.
+- User-facing connection and verification states are concise, consistent, accessible,
+  and non-overlapping on tested Android/web viewports.
+- Final applicable generated-artifact, dependency, integration, unit, lint, build, and
+  security gates pass after the final implementation edit.
+
+### Verified Checkpoint
+
+- Android transport now scopes reconnect attempts to the authenticated session and
+  connection generation, cancels retries on logout/purge/expiry, and fails closed on
+  malformed or conflicting direct catalogs instead of silently hiding conversations.
+- Android consumes authenticated presence for its People directory, supports public
+  MLS room catalogs while private rooms remain exact-ID discovery, and carries room
+  visibility through the shared wire model. Web and Android allow direct messaging,
+  attachments, and read state before optional safety-number comparison; identity
+  pinning and change warnings remain available.
+- Cross-platform delivery defaults to Android↔web interoperability. Operators can set
+  `ABYSSAL_ALLOW_ANDROID_TO_WEB=false` or `ABYSSAL_ALLOW_WEB_TO_ANDROID=false` to
+  isolate a direction without changing the protocol.
+- Final `./scripts/test-all.sh all` passed repository/deployment checks, web 455 tests
+  plus lint/build, Rust core/invite/release/server tests (78/9/8/20/257), Android
+  unit/lint/Kotlin checks, live OPAQUE/v9/v10 relay integration, generated artifact
+  checks, and dependency advisories (0 vulnerabilities). Startup QR qualification and
+  the direct TypeScript integration harness both pass.
+- No APK/AAB packaging, tag, release, or production restart was performed in this
+  checkpoint; physical-device and live-production qualification remain separate gates.
+
 ## Active Qualification: Production Release Readiness
 
 Source checkpoint `9d512b6` passed the full local gate and hosted CI/CodeQL.

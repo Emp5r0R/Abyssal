@@ -16,12 +16,22 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatWriter
 import com.google.zxing.common.BitMatrix
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import java.util.Base64
 
 private val VERIFICATION_TOKEN_PATTERN =
     Regex("^abyssal:verify:v1:[A-Za-z0-9_-]{43}$")
 
-internal fun isCanonicalVerificationToken(value: String): Boolean =
-    VERIFICATION_TOKEN_PATTERN.matches(value)
+internal fun isCanonicalVerificationToken(value: String): Boolean {
+    if (!VERIFICATION_TOKEN_PATTERN.matches(value)) return false
+    val encoded = value.substringAfterLast(':')
+    val decoded = runCatching { Base64.getUrlDecoder().decode(encoded) }.getOrNull() ?: return false
+    return try {
+        decoded.size == 32 &&
+            Base64.getUrlEncoder().withoutPadding().encodeToString(decoded) == encoded
+    } finally {
+        decoded.fill(0)
+    }
+}
 
 internal fun verificationQrMatrix(token: String, size: Int = 224): BitMatrix? {
     if (!isCanonicalVerificationToken(token) || size !in 96..1024) return null

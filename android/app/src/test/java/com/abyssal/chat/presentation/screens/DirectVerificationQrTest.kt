@@ -15,6 +15,8 @@ class DirectVerificationQrTest {
         assertFalse(isCanonicalVerificationToken(" $token"))
         assertFalse(isCanonicalVerificationToken("abyssal:verify:v2:${"A".repeat(43)}"))
         assertFalse(isCanonicalVerificationToken("abyssal:verify:v1:${"A".repeat(42)}"))
+        assertFalse(isCanonicalVerificationToken("abyssal:verify:v1:${"A".repeat(42)}="))
+        assertFalse(isCanonicalVerificationToken("abyssal:verify:v1:${"!".repeat(43)}"))
         assertNull(verificationQrMatrix(token, 95))
         assertNull(verificationQrMatrix("wrong", 224))
     }
