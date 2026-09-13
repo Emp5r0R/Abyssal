@@ -1657,8 +1657,7 @@ fn seal_state(state: &E2eeState, sealing: &SealingMaterial) -> Result<Vec<u8>, S
     }
     let cipher = ChaCha20Poly1305::new_from_slice(&sealing.key)
         .map_err(|_| "Identity unavailable".to_string())?;
-    let mut nonce = [0u8; NONCE_BYTES];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let encrypted = cipher
         .encrypt(
             Nonce::from_slice(&nonce),

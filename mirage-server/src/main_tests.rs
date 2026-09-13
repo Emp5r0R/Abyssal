@@ -6068,10 +6068,7 @@ fn mls_public_catalog_wire_exposes_only_discovery_summary_fields() {
         "state_envelope_b64",
         "ciphertext_b64",
     ] {
-        assert!(
-            room.get(secret).is_none(),
-            "unexpected public field {secret}"
-        );
+        assert!(room.get(secret).is_none(), "unexpected discovery field");
     }
 }
 

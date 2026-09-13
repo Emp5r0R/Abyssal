@@ -5,9 +5,12 @@ use super::{
     MAX_STATE_PLAINTEXT_BYTES, STATE_ENVELOPE_OVERHEAD_BYTES, STATE_ENVELOPE_VERSION, STATE_MAGIC,
     STATE_NONCE_BYTES,
 };
-use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{
+    aead::{Aead, AeadCore},
+    KeyInit, XChaCha20Poly1305, XNonce,
+};
 use hkdf::Hkdf;
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::OsRng;
 use sha2::Sha256;
 use std::{collections::VecDeque, mem};
 use zeroize::{Zeroize, Zeroizing};
@@ -252,8 +255,7 @@ pub(super) fn seal_state(
     }
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).map_err(|_| "Room unavailable".to_string())?;
-    let mut nonce = [0_u8; STATE_NONCE_BYTES];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
     let aad = canonical_fields(
         STATE_MAGIC,
         &[

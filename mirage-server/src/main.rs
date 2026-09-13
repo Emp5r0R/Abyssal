@@ -1423,8 +1423,8 @@ async fn main() {
 impl AppState {
     fn from_env() -> Self {
         let (purge_epoch, _) = watch::channel(0_u64);
-        let mut invite_code_pepper = [0_u8; 32];
-        OsRng.fill_bytes(&mut invite_code_pepper);
+        let mut rng = OsRng;
+        let invite_code_pepper: CodeId = std::array::from_fn(|_| rng.next_u32() as u8);
         let bootstrap = BootstrapMaterials::from_env(now_ms() / 1_000).unwrap_or_else(|error| {
             panic!("Abyssal node bootstrap configuration rejected: {error}")
         });
