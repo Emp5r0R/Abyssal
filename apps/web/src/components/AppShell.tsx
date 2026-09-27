@@ -215,7 +215,7 @@ export function AppShell({
       </section>
 
       <aside className="presence-rail">
-        <header><UsersRound size={17} /><span>CONNECTED</span><strong>{activeUsers.length}</strong></header>
+        <header><UsersRound size={17} /><span>ONLINE</span><strong>{activeUsers.length}</strong></header>
         <div className="presence-list">
           {presence.map((user) => (
             <button
@@ -339,7 +339,7 @@ function Dashboard({
           <strong>{discoverablePublicRooms.length}</strong>
         </div>
         {discoverablePublicRooms.length === 0 ? (
-          <p className="catalog-empty">No new public rooms.</p>
+          <p className="catalog-empty">You have joined every public room.</p>
         ) : (
           <div className="public-room-list" role="list" aria-label="Discoverable public rooms">
             {discoverablePublicRooms.map((room) => (
@@ -389,7 +389,7 @@ function Dashboard({
 
       <div className="direct-dashboard" role="list" aria-label="Direct messages">
         {directs.length === 0 ? (
-          <div className="direct-empty">Select a peer from the Direct list to begin.</div>
+          <div className="direct-empty">Select a peer under DIRECT to start a conversation.</div>
         ) : directs.map((direct) => (
             <button type="button" key={direct.id} onClick={() => onOpenRoom(direct.id)} role="listitem">
               <span className="presence-avatar"><PrivacyBlur>{initials(direct.peer_username)}</PrivacyBlur></span>
@@ -404,7 +404,7 @@ function Dashboard({
           <div className="empty-dashboard">
             <Hash size={30} />
             <strong>NO ROOMS</strong>
-            <span>Create first room when relay is connected.</span>
+            <span>{connection === "connected" ? "Create a room or join one by ID." : "Rooms can be created once the relay is connected."}</span>
           </div>
         ) : rooms.map((room) => {
           const owner = room.owner_username === username;

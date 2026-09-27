@@ -227,7 +227,7 @@ private fun ChatContent(
     val hapticFeedback = LocalHapticFeedback.current
     val messagesById = remember(messages) { messages.associateBy(Message::id) }
     val replyingToMessage = replyingToMessageId?.let(messagesById::get)
-    val isConnected = status.state == "CONNECTED"
+    val isConnected = ConnectionStatusCopy.isLive(status.state)
     val bundledAssets = remember { context.listBundledEmojiAssets() }
     val bundledByShortcode = remember(bundledAssets) {
         bundledAssets.associateBy { it.shortcode.lowercase(Locale.ROOT) }
@@ -442,6 +442,7 @@ private fun ChatContent(
                 },
                 canSend = textInput.isNotBlank() && isConnected,
                 isConnected = isConnected,
+                connectionState = status.state,
                 focusRequester = inputFocusRequester
             )
         }
@@ -554,7 +555,7 @@ private fun ChatHeader(
                     LockIcon(modifier = Modifier.size(10.dp), color = NeonGreen)
                     if (session?.isForum != false) {
                         Text(
-                            text = "Encrypted  ${status.latencyMs}ms",
+                            text = "Encrypted",
                             color = NeonGreen,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
@@ -942,6 +943,7 @@ private fun ChatInputBar(
     onSend: () -> Unit,
     canSend: Boolean,
     isConnected: Boolean,
+    connectionState: String,
     focusRequester: FocusRequester
 ) {
     Row(
@@ -982,7 +984,7 @@ private fun ChatInputBar(
             onValueChange = onValueChange,
             placeholder = {
                 Text(
-                    if (isConnected) "Message" else "Reconnecting",
+                    ConnectionStatusCopy.composerPlaceholder(connectionState),
                     color = SteelMuted.copy(alpha = 0.65f),
                     fontSize = 14.sp
                 )

@@ -529,18 +529,24 @@ private fun DashboardHeader(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             StatusPill(
-                label = if (status.state == "CONNECTED") {
-                    "CONNECTED ${status.latencyMs}ms"
-                } else {
-                    status.state
-                },
-                color = if (status.state == "CONNECTED") NeonGreen else SelfDestructAmber,
+                label = ConnectionStatusCopy.pillLabel(status.state),
+                color = if (ConnectionStatusCopy.isLive(status.state)) NeonGreen else SelfDestructAmber,
                 modifier = Modifier.weight(1f)
             )
             StatusPill(
                 label = sessionStatusLabel(sessionSecurity),
                 color = NeonCyan,
                 modifier = Modifier.weight(1f)
+            )
+        }
+        ConnectionStatusCopy.rejectionNotice(status.state)?.let { notice ->
+            Text(
+                text = notice,
+                color = SelfDestructAmber,
+                fontSize = 12.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp)
             )
         }
     }

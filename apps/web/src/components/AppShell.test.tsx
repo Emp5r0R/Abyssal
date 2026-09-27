@@ -136,6 +136,15 @@ describe("AppShell direct-message navigation", () => {
     expect(onJoinRoom).toHaveBeenCalledWith("forum_public_abc");
   });
 
+  it("guides empty dashboards according to relay connectivity", () => {
+    renderShell({ rooms: [], directs: [] });
+    expect(screen.getByText("Create a room or join one by ID.")).toBeInTheDocument();
+    expect(screen.getByText("Select a peer under DIRECT to start a conversation.")).toBeInTheDocument();
+    cleanup();
+    renderShell({ rooms: [], connection: "disconnected" });
+    expect(screen.getByText("Rooms can be created once the relay is connected.")).toBeInTheDocument();
+  });
+
   it("does not allow messaging the current account", () => {
     renderShell();
     expect(screen.getByTitle("Current account")).toBeDisabled();
