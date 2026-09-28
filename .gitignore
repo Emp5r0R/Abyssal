@@ -26,6 +26,8 @@ output-metadata.json
 # Local Android SDK and downloaded toolchains
 android-sdk/
 gradle-temp/
+.npm-cache/
+.rustup-local/
 
 # Rust build outputs
 target/

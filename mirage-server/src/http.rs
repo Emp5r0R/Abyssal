@@ -12,6 +12,22 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/v1/ws-ticket", post(issue_ws_ticket))
         .route("/v1/account/logout", post(logout_account))
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
+    let bootstrap_routes = Router::new()
+        .route("/v1/bootstrap", post(relay_bootstrap::handle_bootstrap))
+        .layer(DefaultBodyLimit::max(
+            relay_bootstrap::BOOTSTRAP_REQUEST_BYTES,
+        ));
+    let control_routes = Router::new()
+        .route("/v1/control", post(control::handle_control_route))
+        .layer(DefaultBodyLimit::max(control::CONTROL_RECORD_BYTES));
+    let attachment_v3_routes = Router::new()
+        .route(
+            "/v3/attachment",
+            post(attachment_transport::handle_attachment),
+        )
+        .layer(DefaultBodyLimit::max(
+            attachment_transport::ATTACHMENT_V3_MAX_BODY_BYTES,
+        ));
     let attachment_upload_routes = Router::new()
         .route(
             "/v2/attachment",
@@ -34,6 +50,9 @@ pub(super) fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/node", get(node_descriptor_endpoint))
+        .merge(bootstrap_routes)
+        .merge(control_routes)
+        .merge(attachment_v3_routes)
         .route(
             release_admission::RELEASE_MANIFEST_ENDPOINT,
             get(release_manifest_endpoint),

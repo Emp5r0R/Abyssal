@@ -927,6 +927,23 @@ pub(super) async fn reserve_attachment_download(
     attachment_id: Uuid,
     requester_code_id: &CodeId,
 ) -> Result<AttachmentDownloadReservation, StatusCode> {
+    reserve_attachment_download_inner(state, attachment_id, requester_code_id, false).await
+}
+
+pub(super) async fn reserve_attachment_download_retryable(
+    state: &AppState,
+    attachment_id: Uuid,
+    requester_code_id: &CodeId,
+) -> Result<AttachmentDownloadReservation, StatusCode> {
+    reserve_attachment_download_inner(state, attachment_id, requester_code_id, true).await
+}
+
+async fn reserve_attachment_download_inner(
+    state: &AppState,
+    attachment_id: Uuid,
+    requester_code_id: &CodeId,
+    allow_existing_claim: bool,
+) -> Result<AttachmentDownloadReservation, StatusCode> {
     prune_expired_attachments_locked(state).await;
     let requester_platform = state
         .accounts
@@ -981,33 +998,64 @@ pub(super) async fn reserve_attachment_download(
     let claim_id = if !destructive || owner {
         None
     } else {
+        if allow_existing_claim {
+            // A client may lose the streamed response after the claim is
+            // admitted. Reusing the existing claim lets a fresh encrypted
+            // transport handle resume the download without admitting a
+            // second destructive recipient.
+            record.download_claims.retain(|_, claim| {
+                now_ms().saturating_sub(claim.created_at_ms) < ATTACHMENT_CLAIM_TTL_MS
+            });
+        }
         if record
             .completed_recipient_code_ids
             .contains(requester_code_id)
         {
             return Err(StatusCode::NOT_FOUND);
         }
-        if record
+        let existing_claim = record
             .download_claims
-            .values()
-            .any(|claim| claim.recipient_code_id == *requester_code_id)
-        {
+            .iter()
+            .find(|(_, claim)| claim.recipient_code_id == *requester_code_id)
+            .map(|(claim_id, _)| *claim_id);
+        if !allow_existing_claim && existing_claim.is_some() {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        let claim_id = loop {
-            let candidate = Uuid::new_v4();
-            if !record.download_claims.contains_key(&candidate) {
-                break candidate;
+        if allow_existing_claim {
+            if let Some(claim_id) = existing_claim {
+                Some(claim_id)
+            } else {
+                let claim_id = loop {
+                    let candidate = Uuid::new_v4();
+                    if !record.download_claims.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
+                record.download_claims.insert(
+                    claim_id,
+                    AttachmentDownloadClaim {
+                        recipient_code_id: *requester_code_id,
+                        created_at_ms: now_ms(),
+                    },
+                );
+                Some(claim_id)
             }
-        };
-        record.download_claims.insert(
-            claim_id,
-            AttachmentDownloadClaim {
-                recipient_code_id: *requester_code_id,
-                created_at_ms: now_ms(),
-            },
-        );
-        Some(claim_id)
+        } else {
+            let claim_id = loop {
+                let candidate = Uuid::new_v4();
+                if !record.download_claims.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            record.download_claims.insert(
+                claim_id,
+                AttachmentDownloadClaim {
+                    recipient_code_id: *requester_code_id,
+                    created_at_ms: now_ms(),
+                },
+            );
+            Some(claim_id)
+        }
     };
     Ok(AttachmentDownloadReservation {
         blob: Arc::clone(&record.blob),

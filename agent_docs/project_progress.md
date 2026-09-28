@@ -1,5 +1,153 @@
 # Project Progress
 
+## Active Deployment: Protocol-v11 Transport Confidentiality
+
+### Goal
+
+Remove avoidable semantic plaintext from the TLS/CDN boundary while preserving
+OPAQUE, direct protocol v9, MLS protocol v10, RAM-only state, bounded resources,
+and exact transactional delivery. The connected relay remains the routing and
+policy authority and therefore necessarily sees the opaque relationship graph
+and enforcement inputs after authenticated decryption.
+
+### Bounded Plan
+
+1. Add a node-signed ephemeral X25519 bootstrap encryption key to the bounded
+   node descriptor. Encrypt capability and OPAQUE start/finish payloads before
+   transmission, with strict origin binding, replay limits, expiry, and no
+   plaintext fallback.
+2. Derive a transport root from the OPAQUE login session key on both client and
+   relay without exposing the raw session key. Registration completes through
+   an automatic fresh OPAQUE login before a usable session is issued.
+3. Replace bearer-authenticated plaintext HTTP control bodies with versioned,
+   domain-separated AEAD records and bounded single-use request handles. Bind
+   method, fixed endpoint, direction, node, session generation, and request ID;
+   reject replay, gaps, exhaustion, ambiguity, and downgrade.
+4. Add an authenticated protocol-v11 WebSocket handshake and directional binary
+   record layer. Encrypt the existing canonical padded application/control frame,
+   use fresh connection nonces and monotonic counters, and emit no catalogs or
+   queued data before proof completion.
+5. Replace metadata-bearing attachment paths/prefixes with generic v3 operations.
+   Encrypt upload metadata, bind the streamed E2EE ciphertext digest and length,
+   encrypt download/action requests and responses, and keep current staging,
+   claim, publication, quota, retention, and zeroization invariants.
+6. Integrate the shared Rust implementation through WASM and UniFFI in web and
+   Android. Remove protocol-v2/plaintext compatibility from production; keep
+   only explicit debug-loopback fixtures where required by tests.
+7. Add cross-platform vectors, tamper/replay/reordering/concurrency tests,
+   registration/login integration, reconnect/session-generation checks,
+   attachment streaming tests, and proxy-observer assertions that no capability,
+   token, account ID, room/direct metadata, attachment metadata, or message frame
+   is visible outside encrypted records.
+8. Reconcile README, SECURITY, release procedure, and acceptance checklist with
+   verified behavior and irreducible limits. Run crypto regeneration, complete
+   local gates, hosted CI/CodeQL, physical Android qualification, signed artifact
+   verification, then one release and exact production deployment.
+
+### Acceptance
+
+- Signed public node/locator/build material is the only semantic bootstrap data
+  intentionally readable before the encrypted account exchange.
+- Capability, OPAQUE messages, account/session secrets, authenticated HTTP
+  metadata, WebSocket application/control JSON, and attachment-operation metadata
+  are absent from observer-visible request URLs, headers, and plaintext bodies.
+- Every encrypted record has canonical bounded framing, explicit version and
+  direction, domain separation, origin/node/session binding, freshness, and
+  deterministic replay rejection; there is no downgrade path in production.
+- Registration, login, reconnect, direct messaging, MLS rooms, public/private
+  discovery, attachments, wipe, expiry, and optional safety verification retain
+  current behavior across web and Android.
+- The relay still sees data required after decryption for routing, membership,
+  authorization, quotas, retention, and lifecycle enforcement. IP addresses,
+  timing, packet counts, and padded lengths remain observer-visible and are not
+  mislabeled as solved without an anonymity/cover-traffic design.
+- No tag, package publication, or production restart occurs before all final-tree
+  checks, hosted security workflows, physical-device checks, and artifact/signing
+  checks pass on one exact release commit.
+
+### Verified Checkpoints
+
+- Transport foundation is implemented in the standalone `abyssal-transport`
+  crate: HPKE bootstrap exchange, OPAQUE-derived transport-root scheduling,
+  authenticated directional HTTP/WebSocket records, strict canonical bounds,
+  replay rejection, cross-context isolation, and zeroizing secret ownership.
+- The relay serves a node-signed descriptor V2 containing its process-lifetime
+  HPKE bootstrap key and accepts fixed-size binary account-bootstrap requests.
+  Registration returns an automatic OPAQUE login continuation; a usable
+  transport session is issued only after successful login.
+- Bootstrap execution is cancellation-safe through exact-request encrypted
+  receipts. Receipts are TTL-bound and capped at 32 MiB; worker admission is
+  nonblocking and capped at 32. Capacity rejection rolls back only the exact
+  authenticated replay reservation before any account/session mutation.
+- Transport sessions are indexed by zeroizing client-visible opaque session IDs
+  while internal legacy bearer tokens remain relay-local. Expiry, logout,
+  replacement, wipe, and connection invalidation remove both session layers.
+- Independent relay-bootstrap verification passed 268 relay tests, 16 transport
+  tests, warning-denied Clippy, rustfmt, and diff checks. Cross-platform client
+  adoption and encrypted attachment operations remain pending; no release or
+  deployment is authorized at this checkpoint.
+- Shared UniFFI/WASM account-bootstrap bindings now use the relay's canonical
+  fixed-size codec and a retry-safe one-shot exchange. Unauthenticated short,
+  random, or tampered responses preserve the exact sealed request; the first
+  authenticated response consumes and wipes the exchange even when its decoded
+  payload is malformed. Authenticated session results carry bounded creation,
+  room-limit, and inactivity policy fields, with fresh registration and normal
+  login distinguished by server state. Independent verification passed 22
+  transport tests, 86 core tests, 12 focused relay tests, strict Clippy and
+  rustfmt, generated-binding regeneration, and artifact/source-digest checks.
+- Protocol-v11 HTTP control now uses one fixed-size binary `/v1/control` route
+  for encrypted release admission, WebSocket-ticket issuance, and logout.
+  Exact-record receipts execute authenticated operations once, survive logout
+  for bounded retries, reject altered handle reuse, and cannot be exhausted by
+  unauthenticated forged records. Independent verification added six adversarial
+  tests and passed the 276-test Rust gate, strict formatting and Clippy, WASM
+  compilation, binding regeneration, and all source/artifact digest checks.
+- Protocol-v11 WebSocket admission now exposes only an exact fixed subprotocol
+  marker before an authenticated, fixed-size binary ClientHello. The one-time
+  ticket remains encrypted under the OPAQUE-derived transport root; a bounded
+  ServerHello authenticates fresh connection context before any client state or
+  catalog is published. Directional AEAD records reject plaintext, downgrade,
+  replay, gaps, cross-context use, and malformed counters. An AppState-owned
+  staging barrier publishes a complete initial snapshot before raced live data,
+  aborts without partial publication on overflow, preserves weighted accounting,
+  and restores control/result priority after bootstrap. Dedicated handshake
+  capacity prevents stalled upgrades from starving encrypted HTTP controls.
+  Independent testing found and drove closure of duplicate-subprotocol-header
+  smuggling; the repaired package passed 285 relay tests, 30 transport tests,
+  strict Clippy/rustfmt, crypto regeneration/digest checks, and 17 focused
+  adversarial WebSocket admission tests.
+- The shared attachment-v3 foundation now encodes all attachment operations and
+  results inside fixed 4,170-byte authenticated HTTP records and streams opaque
+  inner E2EE blobs through fixed 262,184-byte directional records. Operation,
+  node, session, direction, and counter binding reject cross-context use,
+  tampering, replay, gaps, reflection, malformed sequencing, and nonce-unsafe
+  partial-upload retry. Power-of-two buckets cover the full 200 MiB file limit;
+  one-time view and delete-after-download remain independent policy flags.
+  UniFFI/WASM facades accept authenticated early upload rejection, reject and
+  destroy premature success, and preserve exact state only across unauthenticated
+  failures. Independent verification passed 44 transport tests, 98 core unit
+  tests plus four integration tests, strict Clippy/rustfmt, WASM compilation,
+  crypto regeneration/digest checks, and diff checks.
+- Relay attachment `/v3/attachment` integration is complete with strict action
+  records, fixed-frame streaming, power-of-two padding, context-bound keys, and
+  authoritative quota and retention enforcement. Fixed Kotlin UniFFI Disposable
+  method collisions and invite descriptor V2 backward-compatible verification.
+  Remediated security advisory RUSTSEC-2026-0285 by updating rustls to 0.23.45.
+  Regenerated all UniFFI/WASM bindings and native Android targets with verified
+  SHA-256 digests.
+- The complete integrated test suite (`./scripts/test-all.sh all`) passed 100%:
+  - Crypto: byte-identical regenerations and SHA-256 digest checks passed.
+  - Shell: wrapper integrity, digest coverage, env parser, and security checks passed.
+  - Rust: all 299 tests across workspace (`mirage-server`, `abyssal-transport`,
+    `abyssal-invite`, `abyssal-core`), rustfmt, and warning-denied Clippy passed.
+  - Web: 455 tests across 42 files, ESLint, TypeScript compilation, and Vite build passed.
+  - Android: Gradle 8.7 build, debug compilation, unit tests, release compilation,
+    and release lint passed (no packaging performed).
+  - Integration: Live relay integration (OPAQUE auth, v9 E2EE DM, v10 MLS rooms,
+    offline replay/recovery, access control) passed.
+  - Audit: `npm audit` (0 vulnerabilities) and `cargo audit` (0 vulnerabilities) passed.
+  No release, tag, or deployment was performed at this intermediate source checkpoint.
+
 ## Active Deployment: Cross-Platform Parity and Connection Reliability
 
 ### Goal

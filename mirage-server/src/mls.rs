@@ -10,10 +10,10 @@ use super::{
     client_identity, client_identity_and_platform, decode_bounded, decode_bounded_allow_empty,
     decode_exact, finish_recoverable_transaction, publish_staged_attachment_checked,
     rebind_staged_attachment_recipients, remove_chat_attachments, require_recipient_code_platforms,
-    revoke_mls_attachment_access, rollback_staged_attachment, send_client_result, send_to_client,
-    staged_attachment_for_message, touch_activity, AppState, ClientPlatform, CodeId, InteropPolicy,
-    MlsPublicRoomWire, MlsRecoverySnapshotWire, MlsRoomWire, MlsRosterWire, OutboundFrame,
-    TransactionTicket,
+    revoke_mls_attachment_access, rollback_staged_attachment, send_client_result,
+    send_initial_to_client, send_to_client, staged_attachment_for_message, touch_activity,
+    AppState, ClientPlatform, CodeId, InteropPolicy, MlsPublicRoomWire, MlsRecoverySnapshotWire,
+    MlsRoomWire, MlsRosterWire, OutboundFrame, TransactionTicket,
 };
 
 pub(super) fn mls_room_wire(info: rooms::RoomInfo) -> MlsRoomWire {
@@ -83,6 +83,19 @@ pub(super) fn mls_roster_from_wire(
 }
 
 pub(super) async fn send_mls_catalog(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    send_mls_catalog_inner(state, client_id, code_id, false).await;
+}
+
+pub(super) async fn send_initial_mls_catalog(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    send_mls_catalog_inner(state, client_id, code_id, true).await;
+}
+
+async fn send_mls_catalog_inner(
+    state: &AppState,
+    client_id: Uuid,
+    code_id: &CodeId,
+    initial: bool,
+) {
     let mut authority = state.mls_rooms.lock().await;
     let mut rooms = authority
         .rooms_for_member(code_id)
@@ -96,15 +109,15 @@ pub(super) async fn send_mls_catalog(state: &AppState, client_id: Uuid, code_id:
             .map(mls_room_wire),
     );
     drop(authority);
-    send_to_client(
-        state,
-        client_id,
-        &OutboundFrame::MlsRooms {
-            protocol_version: rooms::MLS_PROTOCOL_VERSION,
-            rooms,
-        },
-    )
-    .await;
+    let frame = OutboundFrame::MlsRooms {
+        protocol_version: rooms::MLS_PROTOCOL_VERSION,
+        rooms,
+    };
+    if initial {
+        send_initial_to_client(state, client_id, &frame).await;
+    } else {
+        send_to_client(state, client_id, &frame).await;
+    }
 }
 
 async fn mls_public_catalog_frame(state: &AppState) -> OutboundFrame {
@@ -123,8 +136,20 @@ async fn mls_public_catalog_frame(state: &AppState) -> OutboundFrame {
 }
 
 pub(super) async fn send_mls_public_catalog(state: &AppState, client_id: Uuid) {
+    send_mls_public_catalog_inner(state, client_id, false).await;
+}
+
+pub(super) async fn send_initial_mls_public_catalog(state: &AppState, client_id: Uuid) {
+    send_mls_public_catalog_inner(state, client_id, true).await;
+}
+
+async fn send_mls_public_catalog_inner(state: &AppState, client_id: Uuid, initial: bool) {
     let frame = mls_public_catalog_frame(state).await;
-    send_to_client(state, client_id, &frame).await;
+    if initial {
+        send_initial_to_client(state, client_id, &frame).await;
+    } else {
+        send_to_client(state, client_id, &frame).await;
+    }
 }
 
 async fn broadcast_mls_public_catalog(state: &AppState) {
@@ -453,6 +478,19 @@ pub(super) async fn send_mls_delivery(state: &AppState, delivery: &rooms::Pendin
 }
 
 pub(super) async fn send_mls_pending(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    send_mls_pending_inner(state, client_id, code_id, false).await;
+}
+
+pub(super) async fn send_initial_mls_pending(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    send_mls_pending_inner(state, client_id, code_id, true).await;
+}
+
+async fn send_mls_pending_inner(
+    state: &AppState,
+    client_id: Uuid,
+    code_id: &CodeId,
+    initial: bool,
+) {
     let Some(recipient_platform) = state
         .clients
         .lock()
@@ -491,34 +529,73 @@ pub(super) async fn send_mls_pending(state: &AppState, client_id: Uuid, code_id:
         }
     }
     for delivery in deliveries {
-        send_to_client(state, client_id, &mls_delivery_frame(&delivery)).await;
+        let frame = mls_delivery_frame(&delivery);
+        if initial {
+            send_initial_to_client(state, client_id, &frame).await;
+        } else {
+            send_to_client(state, client_id, &frame).await;
+        }
     }
 }
 
 pub(super) async fn send_mls_pending_joins(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    send_mls_pending_joins_inner(state, client_id, code_id, false).await;
+}
+
+pub(super) async fn send_initial_mls_pending_joins(
+    state: &AppState,
+    client_id: Uuid,
+    code_id: &CodeId,
+) {
+    send_mls_pending_joins_inner(state, client_id, code_id, true).await;
+}
+
+async fn send_mls_pending_joins_inner(
+    state: &AppState,
+    client_id: Uuid,
+    code_id: &CodeId,
+    initial: bool,
+) {
     let joins = state
         .mls_rooms
         .lock()
         .await
         .pending_joins_for_owner(code_id);
     for request in joins {
-        send_to_client(
-            state,
-            client_id,
-            &OutboundFrame::MlsJoinRequested {
-                protocol_version: rooms::MLS_PROTOCOL_VERSION,
-                room_id: request.room_id.clone(),
-                request_id: request.request_id.clone(),
-                username: request.username.clone(),
-                stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
-                key_package_b64: URL_SAFE_NO_PAD.encode(request.key_package.clone()),
-            },
-        )
-        .await;
+        let frame = OutboundFrame::MlsJoinRequested {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: request.room_id.clone(),
+            request_id: request.request_id.clone(),
+            username: request.username.clone(),
+            stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
+            key_package_b64: URL_SAFE_NO_PAD.encode(request.key_package.clone()),
+        };
+        if initial {
+            send_initial_to_client(state, client_id, &frame).await;
+        } else {
+            send_to_client(state, client_id, &frame).await;
+        }
     }
 }
 
 pub(super) async fn send_mls_pending_leaves(state: &AppState, client_id: Uuid, code_id: &CodeId) {
+    send_mls_pending_leaves_inner(state, client_id, code_id, false).await;
+}
+
+pub(super) async fn send_initial_mls_pending_leaves(
+    state: &AppState,
+    client_id: Uuid,
+    code_id: &CodeId,
+) {
+    send_mls_pending_leaves_inner(state, client_id, code_id, true).await;
+}
+
+async fn send_mls_pending_leaves_inner(
+    state: &AppState,
+    client_id: Uuid,
+    code_id: &CodeId,
+    initial: bool,
+) {
     let (owner_requests, member_requests) = {
         let mut authority = state.mls_rooms.lock().await;
         (
@@ -527,30 +604,30 @@ pub(super) async fn send_mls_pending_leaves(state: &AppState, client_id: Uuid, c
         )
     };
     for request in owner_requests {
-        send_to_client(
-            state,
-            client_id,
-            &OutboundFrame::MlsLeaveRequested {
-                protocol_version: rooms::MLS_PROTOCOL_VERSION,
-                room_id: request.room_id.clone(),
-                request_id: request.request_id.clone(),
-                username: request.username.clone(),
-                stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
-            },
-        )
-        .await;
+        let frame = OutboundFrame::MlsLeaveRequested {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: request.room_id.clone(),
+            request_id: request.request_id.clone(),
+            username: request.username.clone(),
+            stable_identity_b64: URL_SAFE_NO_PAD.encode(request.stable_identity.clone()),
+        };
+        if initial {
+            send_initial_to_client(state, client_id, &frame).await;
+        } else {
+            send_to_client(state, client_id, &frame).await;
+        }
     }
     for request in member_requests {
-        send_to_client(
-            state,
-            client_id,
-            &OutboundFrame::MlsLeavePending {
-                protocol_version: rooms::MLS_PROTOCOL_VERSION,
-                room_id: request.room_id.clone(),
-                request_id: request.request_id.clone(),
-            },
-        )
-        .await;
+        let frame = OutboundFrame::MlsLeavePending {
+            protocol_version: rooms::MLS_PROTOCOL_VERSION,
+            room_id: request.room_id.clone(),
+            request_id: request.request_id.clone(),
+        };
+        if initial {
+            send_initial_to_client(state, client_id, &frame).await;
+        } else {
+            send_to_client(state, client_id, &frame).await;
+        }
     }
 }
 

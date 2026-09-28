@@ -3,9 +3,10 @@
 use super::invite_output::{write_qr, InviteOutputMode};
 use abyssal_invite::{
     derive_node_id, encode_deep_link, encode_manual, generate_capability, node_key_fingerprint,
-    node_signing_key_from_seed, InviteCapsuleV1, NodeDescriptorV1, NodeLocator,
-    SignedInviteCapsule, SignedNodeDescriptor, DIRECT_PROTOCOL_VERSION, ROOM_PROTOCOL_VERSION,
+    node_signing_key_from_seed, InviteCapsuleV1, NodeDescriptorV2, NodeLocator,
+    SignedInviteCapsule, SignedNodeDescriptorV2, DIRECT_PROTOCOL_VERSION, ROOM_PROTOCOL_VERSION,
 };
+use abyssal_transport::{generate_bootstrap_keypair, BootstrapKeyPair};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
@@ -31,6 +32,7 @@ pub(super) struct IssuedInvite {
 pub(super) struct BootstrapMaterials {
     pub(super) node_id: String,
     pub(super) node_public_key: [u8; 32],
+    pub(super) bootstrap_hpke_keypair: BootstrapKeyPair,
     pub(super) descriptor_binary: Vec<u8>,
     pub(super) issued_invites: Vec<IssuedInvite>,
     pub(super) locators: Vec<NodeLocator>,
@@ -48,9 +50,17 @@ impl BootstrapMaterials {
         let node_public_key = signing_key.verifying_key().to_bytes();
         let node_id = derive_node_id(&node_public_key);
         let fingerprint = node_key_fingerprint(&node_public_key);
-        let descriptor = NodeDescriptorV1::abyssal(node_public_key, locators.clone())
-            .map_err(|_| "failed to create node descriptor".to_owned())?;
-        let descriptor_binary = SignedNodeDescriptor::sign(descriptor, &signing_key)
+        // This keypair is intentionally generated once per process. Only the
+        // public half is signed into the descriptor; the private half stays in
+        // AppState and is never persisted or logged.
+        let bootstrap_hpke_keypair = generate_bootstrap_keypair();
+        let descriptor = NodeDescriptorV2::abyssal(
+            node_public_key,
+            bootstrap_hpke_keypair.public_key,
+            locators.clone(),
+        )
+        .map_err(|_| "failed to create node descriptor".to_owned())?;
+        let descriptor_binary = SignedNodeDescriptorV2::sign(descriptor, &signing_key)
             .and_then(|value| value.canonical_binary())
             .map_err(|_| "failed to sign node descriptor".to_owned())?;
         let count = read_count_env_alias(
@@ -105,6 +115,7 @@ impl BootstrapMaterials {
         Ok(Self {
             node_id,
             node_public_key,
+            bootstrap_hpke_keypair,
             descriptor_binary,
             issued_invites,
             locators,

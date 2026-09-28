@@ -1,4 +1,5 @@
 use super::*;
+use axum::extract::FromRequest;
 use ed25519_dalek::{Signer, SigningKey};
 
 #[path = "attachment_upload_tests.rs"]
@@ -36,6 +37,1117 @@ fn cache_policy_forbids_storage_and_edge_transformation() {
     assert!(directives.contains("max-age=0"));
     assert!(directives.contains("must-revalidate"));
     assert!(!directives.contains("public"));
+}
+
+#[tokio::test]
+async fn binary_bootstrap_response_is_fixed_encrypted_and_replay_safe() {
+    let state = test_state();
+    let request_id = [0x71_u8; 32];
+    let context = abyssal_transport::BootstrapContext::new(
+        state.node_public_key,
+        state.bootstrap_hpke_public_key,
+        abyssal_transport::ACCOUNT_BOOTSTRAP_OPERATION.to_vec(),
+        request_id,
+    )
+    .unwrap();
+    let action = abyssal_transport::AccountBootstrapAction::Start {
+        capability: Zeroizing::new([9_u8; 32]),
+        registration_request: Zeroizing::new(vec![1_u8; 8]),
+        credential_request: Zeroizing::new(vec![2_u8; 8]),
+    };
+    let padded = abyssal_transport::encode_account_bootstrap_action(&action).unwrap();
+    let client = abyssal_transport::seal_bootstrap_request(&context, &padded).unwrap();
+    assert_eq!(
+        client.request.len(),
+        relay_bootstrap::BOOTSTRAP_REQUEST_BYTES
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+
+    let response = relay_bootstrap::handle_bootstrap(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(client.request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let encrypted = axum::body::to_bytes(
+        response.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(encrypted.len(), relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES);
+    let opened = client.response_opener.open(&encrypted).unwrap();
+    assert_eq!(opened.len(), relay_bootstrap::BOOTSTRAP_PLAINTEXT_BYTES);
+    assert!(matches!(
+        abyssal_transport::decode_account_bootstrap_result(&opened).unwrap(),
+        abyssal_transport::AccountBootstrapResult::Failure
+    ));
+
+    let replay = relay_bootstrap::handle_bootstrap(
+        State(state.clone()),
+        headers,
+        Bytes::from(client.request),
+    )
+    .await
+    .into_response();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = axum::body::to_bytes(
+        replay.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay_body.len(), relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES);
+    assert_eq!(replay_body.as_ref(), encrypted.as_ref());
+}
+
+#[tokio::test]
+async fn attachment_v3_route_completes_upload_download_command_and_exact_retries() {
+    let state = test_state();
+    let token = "attachment-v3-route-session";
+    let code = "attachment-v3-route-code";
+    let session_id = [0x81_u8; 32];
+    let transport_root = [0x82_u8; 32];
+    let chat_id = "attachment_v3_room";
+    let message_id = "attachment-v3-message";
+    add_test_session(&state, token, code, "Alice").await;
+    state
+        .accounts
+        .lock()
+        .await
+        .get_mut(&test_code_id(code))
+        .expect("test account")
+        .client_platform = Some(ClientPlatform::Android);
+    state.room_catalog.lock().await.insert(
+        chat_id.to_string(),
+        RoomEntry {
+            room: test_room(chat_id),
+            owner_code_id: test_code_id(code),
+        },
+    );
+    state.transport_sessions.lock().await.insert(
+        TransportSessionId::new(session_id),
+        SessionTransportState {
+            token: SessionToken::new(token.to_owned()),
+            root: Zeroizing::new(transport_root),
+            session_id,
+        },
+    );
+
+    let ciphertext = test_valid_encrypted_attachment_body(1);
+    let upload = abyssal_core::attachment_transport::AttachmentClientExchange::begin_upload(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+        abyssal_core::attachment_transport::AttachmentUploadInput {
+            chat_id: chat_id.to_owned(),
+            message_id: message_id.to_owned(),
+            media_type: "FILE".to_owned(),
+            cipher_version: ATTACHMENT_BLOB_VERSION,
+            ciphertext_len: ciphertext.len() as u64,
+            ciphertext_sha256: Sha256::digest(&ciphertext).to_vec(),
+            one_time: false,
+            delete_after_download: false,
+            requested_ttl_sec: 0,
+        },
+    )
+    .expect("upload exchange");
+    let upload_request = upload.request_bytes().expect("upload request");
+    let mut upload_body = upload_request.clone();
+    for payload in ciphertext.chunks(abyssal_transport::ATTACHMENT_STREAM_PAYLOAD_BYTES) {
+        upload_body.extend(
+            upload
+                .seal_data_frame(payload.to_vec())
+                .expect("upload data frame"),
+        );
+    }
+    let padding_frames = upload
+        .upload_bucket_frame_count()
+        .expect("upload bucket frame count")
+        .saturating_sub(
+            upload
+                .upload_data_frame_count()
+                .expect("upload data frame count"),
+        );
+    for _ in 0..padding_frames {
+        upload_body.extend(upload.seal_padding_frame().expect("upload padding frame"));
+    }
+    upload_body.extend(upload.seal_end_frame().expect("upload end frame"));
+    let upload_retry_body = upload_body.clone();
+    let upload_response = attachment_v3_response(&state, upload_body).await;
+    assert_eq!(
+        upload_response.len(),
+        abyssal_transport::ATTACHMENT_ACTION_RECORD_BYTES
+    );
+    let upload_result = upload
+        .open_response(upload_response.clone())
+        .expect("upload result");
+    let attachment_id = match upload_result {
+        abyssal_core::attachment_transport::AttachmentTransportResult::UploadAccepted {
+            attachment_id,
+        } => attachment_id,
+        _ => panic!("unexpected upload result"),
+    };
+    assert_eq!(
+        attachment_v3_response(&state, upload_request.clone()).await,
+        upload_response,
+        "upload action-only retry must replay the exact cached record"
+    );
+    assert_eq!(
+        attachment_v3_response(&state, upload_retry_body).await,
+        upload_response,
+        "a bounded full upload retry must drain and replay the cached record"
+    );
+    state.attachment_epoch.fetch_add(1, Ordering::AcqRel);
+    assert_ne!(
+        attachment_v3_response(&state, upload_request.clone()).await,
+        upload_response,
+        "a wiped attachment epoch must not replay an old encrypted receipt"
+    );
+
+    let attachment_uuid = Uuid::from_slice(&attachment_id).expect("attachment id");
+    publish_staged_attachment(
+        &state,
+        attachment_uuid,
+        &test_code_id(code),
+        chat_id,
+        message_id,
+    )
+    .await;
+
+    let download = abyssal_core::attachment_transport::AttachmentClientExchange::begin_download(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+        attachment_id.clone(),
+    )
+    .expect("download exchange");
+    let download_request = download.request_bytes().expect("download request");
+    let download_response = attachment_v3_response(&state, download_request.clone()).await;
+    let action_bytes = abyssal_transport::ATTACHMENT_ACTION_RECORD_BYTES;
+    let frame_bytes = abyssal_transport::ATTACHMENT_STREAM_FRAME_BYTES;
+    assert!(download_response.len() > action_bytes);
+    let download_result = download
+        .open_response(download_response[..action_bytes].to_vec())
+        .expect("download result");
+    assert!(matches!(
+        download_result,
+        abyssal_core::attachment_transport::AttachmentTransportResult::DownloadAccepted { .. }
+    ));
+    for frame in download_response[action_bytes..].chunks_exact(frame_bytes) {
+        let _ = download
+            .open_stream_frame(frame.to_vec())
+            .expect("download stream frame");
+    }
+    assert!(download.stream_complete());
+    assert_eq!(
+        attachment_v3_response(&state, download_request).await,
+        download_response[..action_bytes],
+        "download action-only retry must replay only its cached result"
+    );
+
+    let delete = abyssal_core::attachment_transport::AttachmentClientExchange::delete_attachment(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+        attachment_id.clone(),
+    )
+    .expect("delete exchange");
+    let delete_request = delete.request_bytes().expect("delete request");
+    let delete_response = attachment_v3_response(&state, delete_request.clone()).await;
+    assert!(matches!(
+        delete
+            .open_response(delete_response.clone())
+            .expect("delete result"),
+        abyssal_core::attachment_transport::AttachmentTransportResult::Success
+    ));
+    assert_eq!(
+        attachment_v3_response(&state, delete_request.clone()).await,
+        delete_response,
+        "command action-only retry must replay the exact cached record"
+    );
+    let missing_delete =
+        abyssal_core::attachment_transport::AttachmentClientExchange::delete_attachment(
+            state.node_public_key.to_vec(),
+            session_id.to_vec(),
+            transport_root.to_vec(),
+            attachment_id,
+        )
+        .expect("missing delete exchange");
+    let missing_delete_response = attachment_v3_response(
+        &state,
+        missing_delete.request_bytes().expect("request bytes"),
+    )
+    .await;
+    assert!(matches!(
+        missing_delete
+            .open_response(missing_delete_response)
+            .expect("missing delete result"),
+        abyssal_core::attachment_transport::AttachmentTransportResult::Success
+    ));
+    let mut trailing_command = delete_request;
+    trailing_command.push(1);
+    let trailing_response = attachment_v3_response(&state, trailing_command).await;
+    assert_eq!(
+        trailing_response.len(),
+        abyssal_transport::ATTACHMENT_ACTION_RECORD_BYTES
+    );
+    assert_ne!(
+        trailing_response, delete_response,
+        "cached commands with trailing bodies must fail without resealing"
+    );
+}
+
+#[tokio::test]
+async fn attachment_v3_rejects_oversized_declared_body_before_authentication() {
+    let state = test_state();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v3/attachment")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(
+            header::CONTENT_LENGTH,
+            (attachment_transport::ATTACHMENT_V3_MAX_BODY_BYTES + 1).to_string(),
+        )
+        .body(Body::empty())
+        .expect("oversized attachment request");
+    let response = attachment_transport::handle_attachment(State(state), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(
+        response.into_body(),
+        abyssal_transport::ATTACHMENT_ACTION_RECORD_BYTES + 1,
+    )
+    .await
+    .expect("fixed rejection body");
+    assert_eq!(
+        body.len(),
+        abyssal_transport::ATTACHMENT_ACTION_RECORD_BYTES
+    );
+}
+
+#[tokio::test]
+async fn binary_bootstrap_errors_are_fixed_size_and_same_request_is_exactly_replayable() {
+    let state = test_state();
+    let request_id = [0x73_u8; 32];
+    let context = abyssal_transport::BootstrapContext::new(
+        state.node_public_key,
+        state.bootstrap_hpke_public_key,
+        abyssal_transport::ACCOUNT_BOOTSTRAP_OPERATION.to_vec(),
+        request_id,
+    )
+    .unwrap();
+    let action = abyssal_transport::AccountBootstrapAction::Start {
+        capability: Zeroizing::new([0x0a_u8; 32]),
+        registration_request: Zeroizing::new(vec![1_u8; 8]),
+        credential_request: Zeroizing::new(vec![2_u8; 8]),
+    };
+    let padded = abyssal_transport::encode_account_bootstrap_action(&action).unwrap();
+    let client = abyssal_transport::seal_bootstrap_request(&context, &padded).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+
+    let malformed = relay_bootstrap::handle_bootstrap(
+        State(state.clone()),
+        HeaderMap::new(),
+        Bytes::from_static(b"malformed"),
+    )
+    .await
+    .into_response();
+    assert_eq!(malformed.status(), StatusCode::OK);
+    let malformed_body = axum::body::to_bytes(
+        malformed.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        malformed_body.len(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES
+    );
+
+    let request = Bytes::from(client.request);
+    let (first, second) = tokio::join!(
+        relay_bootstrap::handle_bootstrap(State(state.clone()), headers.clone(), request.clone()),
+        relay_bootstrap::handle_bootstrap(State(state), headers, request),
+    );
+    let first_body = axum::body::to_bytes(
+        first.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    let second_body = axum::body::to_bytes(
+        second.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_body.len(), relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES);
+    assert_eq!(second_body.len(), relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES);
+    assert_eq!(first_body.as_ref(), second_body.as_ref());
+}
+
+#[tokio::test]
+async fn binary_control_is_authenticated_retryable_and_survives_logout_cache() {
+    let state = test_state();
+    let token = "control-session";
+    let code = "control-code";
+    let session_id = [0x61_u8; 32];
+    let transport_root = [0x62_u8; 32];
+    add_test_session(&state, token, code, "Alice").await;
+    state.transport_sessions.lock().await.insert(
+        TransportSessionId::new(session_id),
+        SessionTransportState {
+            token: SessionToken::new(token.to_owned()),
+            root: Zeroizing::new(transport_root),
+            session_id,
+        },
+    );
+
+    let exchange = abyssal_core::transport_protocol::ControlClientExchange::issue_ws_ticket(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+        abyssal_core::transport_protocol::ControlAttestationInput {
+            platform: "web".to_owned(),
+            version: "2.1.0".to_owned(),
+            build_signature: URL_SAFE_NO_PAD.encode([2_u8; 64]),
+        },
+    )
+    .unwrap();
+    let request = exchange.request_bytes().unwrap();
+    assert_eq!(request.len(), control::CONTROL_RECORD_BYTES);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let mut same_handle_forgery = request.clone();
+    *same_handle_forgery.last_mut().unwrap() ^= 1;
+    let forged_response = control::handle_control(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(same_handle_forgery),
+    )
+    .await
+    .into_response();
+    assert_eq!(forged_response.status(), StatusCode::OK);
+    let forged_body = axum::body::to_bytes(
+        forged_response.into_body(),
+        control::CONTROL_RECORD_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(forged_body.len(), control::CONTROL_RECORD_BYTES);
+    let response = control::handle_control(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(request.clone()),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let encrypted = axum::body::to_bytes(response.into_body(), control::CONTROL_RECORD_BYTES + 1)
+        .await
+        .unwrap();
+    assert_eq!(encrypted.len(), control::CONTROL_RECORD_BYTES);
+    let first_ticket =
+        if let abyssal_core::transport_protocol::ControlResponse::WsTicket { ticket, .. } =
+            exchange.open_response(encrypted.to_vec()).unwrap()
+        {
+            ticket
+        } else {
+            panic!("unexpected control response");
+        };
+    assert_eq!(first_ticket.len(), WS_TICKET_B64_LEN);
+
+    let logout = abyssal_core::transport_protocol::ControlClientExchange::logout(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+    )
+    .unwrap();
+    let logout_request = logout.request_bytes().unwrap();
+    let logout_response = control::handle_control(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(logout_request.clone()),
+    )
+    .await
+    .into_response();
+    let logout_body = axum::body::to_bytes(
+        logout_response.into_body(),
+        control::CONTROL_RECORD_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    let logout_encrypted = logout_body.to_vec();
+    assert!(matches!(
+        logout.open_response(logout_body.to_vec()).unwrap(),
+        abyssal_core::transport_protocol::ControlResponse::LoggedOut
+    ));
+    assert!(state.sessions.lock().await.is_empty());
+    assert!(state.transport_sessions.lock().await.is_empty());
+
+    let logout_retry = control::handle_control(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(logout_request),
+    )
+    .await
+    .into_response();
+    let logout_retry_body =
+        axum::body::to_bytes(logout_retry.into_body(), control::CONTROL_RECORD_BYTES + 1)
+            .await
+            .unwrap();
+    assert_eq!(logout_retry_body.as_ref(), logout_encrypted.as_slice());
+
+    let retry = control::handle_control(State(state.clone()), headers, Bytes::from(request))
+        .await
+        .into_response();
+    let retry_body = axum::body::to_bytes(retry.into_body(), control::CONTROL_RECORD_BYTES + 1)
+        .await
+        .unwrap();
+    assert_eq!(retry_body.as_ref(), encrypted.as_ref());
+    assert_eq!(first_ticket.len(), WS_TICKET_B64_LEN);
+}
+
+#[tokio::test]
+async fn concurrent_identical_control_requests_execute_once_and_share_response() {
+    let state = test_state();
+    let token = "concurrent-control-session";
+    let session_id = [0x81_u8; 32];
+    let transport_root = [0x82_u8; 32];
+    add_test_session(&state, token, "concurrent-control-code", "Alice").await;
+    state.transport_sessions.lock().await.insert(
+        TransportSessionId::new(session_id),
+        SessionTransportState {
+            token: SessionToken::new(token.to_owned()),
+            root: Zeroizing::new(transport_root),
+            session_id,
+        },
+    );
+
+    let exchange = abyssal_core::transport_protocol::ControlClientExchange::logout(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+    )
+    .unwrap();
+    let request = exchange.request_bytes().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut calls = Vec::new();
+    for _ in 0..16 {
+        let state = state.clone();
+        let headers = headers.clone();
+        let request = request.clone();
+        let barrier = Arc::clone(&barrier);
+        calls.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let response = control::handle_control(State(state), headers, Bytes::from(request))
+                .await
+                .into_response();
+            let status = response.status();
+            let body =
+                axum::body::to_bytes(response.into_body(), control::CONTROL_RECORD_BYTES + 1)
+                    .await
+                    .expect("fixed control body");
+            (status, body.to_vec())
+        }));
+    }
+
+    let mut responses = Vec::new();
+    for call in calls {
+        responses.push(call.await.expect("control request task"));
+    }
+    let first = responses.first().expect("at least one control response");
+    assert!(responses
+        .iter()
+        .all(|(status, body)| *status == StatusCode::OK
+            && body.len() == control::CONTROL_RECORD_BYTES
+            && body == &first.1));
+    assert!(matches!(
+        exchange.open_response(first.1.clone()).unwrap(),
+        abyssal_core::transport_protocol::ControlResponse::LoggedOut
+    ));
+    assert!(state.sessions.lock().await.is_empty());
+    assert!(state.transport_sessions.lock().await.is_empty());
+    assert_eq!(state.control_receipts.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn authenticated_control_rejection_is_a_decryptable_terminal_failure() {
+    let mut state = test_state();
+    state.release_admission = Arc::new(ReleaseAdmissionStore::new());
+    let token = "rejected-control-session";
+    let session_id = [0x91_u8; 32];
+    let transport_root = [0x92_u8; 32];
+    add_test_session(&state, token, "rejected-control-code", "Alice").await;
+    state.transport_sessions.lock().await.insert(
+        TransportSessionId::new(session_id),
+        SessionTransportState {
+            token: SessionToken::new(token.to_owned()),
+            root: Zeroizing::new(transport_root),
+            session_id,
+        },
+    );
+    let exchange = abyssal_core::transport_protocol::ControlClientExchange::issue_ws_ticket(
+        state.node_public_key.to_vec(),
+        session_id.to_vec(),
+        transport_root.to_vec(),
+        abyssal_core::transport_protocol::ControlAttestationInput {
+            platform: "web".to_owned(),
+            version: "2.1.0".to_owned(),
+            build_signature: URL_SAFE_NO_PAD.encode([2_u8; 64]),
+        },
+    )
+    .unwrap();
+    let request = exchange.request_bytes().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let response = control::handle_control(State(state.clone()), headers, Bytes::from(request))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), control::CONTROL_RECORD_BYTES + 1)
+        .await
+        .expect("fixed control body");
+    assert_eq!(body.len(), control::CONTROL_RECORD_BYTES);
+    assert!(matches!(
+        exchange.open_response(body.to_vec()).unwrap(),
+        abyssal_core::transport_protocol::ControlResponse::Failure
+    ));
+    assert!(state.sessions.lock().await.contains_key(token));
+    assert!(state
+        .transport_sessions
+        .lock()
+        .await
+        .contains_key(&TransportSessionId::new(session_id)));
+}
+
+#[tokio::test]
+async fn forged_control_records_cannot_exhaust_authenticated_receipts() {
+    let state = test_state();
+    let token = "forged-control-session";
+    let session_id = [0x71_u8; 32];
+    let transport_root = [0x72_u8; 32];
+    add_test_session(&state, token, "forged-control-code", "Alice").await;
+    state.transport_sessions.lock().await.insert(
+        TransportSessionId::new(session_id),
+        SessionTransportState {
+            token: SessionToken::new(token.to_owned()),
+            root: Zeroizing::new(transport_root),
+            session_id,
+        },
+    );
+    let action =
+        abyssal_transport::encode_control_action(&abyssal_transport::ControlAction::Logout)
+            .unwrap();
+    let mut sealer = abyssal_transport::HttpSessionBinding::new(state.node_public_key, session_id)
+        .unwrap()
+        .into_client(&transport_root)
+        .unwrap()
+        .sealer;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    for index in 0..control::MAX_CONTROL_RECEIPTS {
+        let handle = (index as u128 + 1).to_be_bytes();
+        let mut forged = sealer
+            .seal(handle, abyssal_transport::CONTROL_AAD, &action)
+            .unwrap();
+        *forged.last_mut().unwrap() ^= 1;
+        let response =
+            control::handle_control(State(state.clone()), headers.clone(), Bytes::from(forged))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let mut final_sealer =
+        abyssal_transport::HttpSessionBinding::new(state.node_public_key, session_id)
+            .unwrap()
+            .into_client(&transport_root)
+            .unwrap()
+            .sealer;
+    let mut final_forged = final_sealer
+        .seal([0xff; 16], abyssal_transport::CONTROL_AAD, &action)
+        .unwrap();
+    *final_forged.last_mut().unwrap() ^= 1;
+    let response =
+        control::handle_control(State(state.clone()), headers, Bytes::from(final_forged))
+            .await
+            .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.control_receipts.lock().await.len(), 0);
+    assert!(state.sessions.lock().await.contains_key(token));
+}
+
+#[tokio::test]
+async fn control_failures_have_fixed_status_headers_and_body() {
+    let state = test_state();
+    let mut wrong_headers = HeaderMap::new();
+    wrong_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    let cases = [
+        (HeaderMap::new(), Bytes::from_static(b"bad")),
+        (
+            wrong_headers,
+            Bytes::from(vec![0_u8; control::CONTROL_RECORD_BYTES]),
+        ),
+        (
+            HeaderMap::new(),
+            Bytes::from(vec![0_u8; control::CONTROL_RECORD_BYTES]),
+        ),
+    ];
+    for (headers, body) in cases {
+        let response = control::handle_control(State(state.clone()), headers, body)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/octet-stream"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), control::CONTROL_RECORD_BYTES + 1)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), control::CONTROL_RECORD_BYTES);
+    }
+}
+
+#[tokio::test]
+async fn control_body_extractor_rejection_uses_the_fixed_response_envelope() {
+    let request = Request::new(Body::from_stream(futures_util::stream::once(async {
+        Err::<Bytes, _>(std::io::Error::other("test body failure"))
+    })));
+    let extracted = Bytes::from_request(request, &()).await;
+    assert!(
+        extracted.is_err(),
+        "stream failure must reach the extractor"
+    );
+    let response = control::handle_control_route(State(test_state()), HeaderMap::new(), extracted)
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/octet-stream"))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    assert_eq!(
+        response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+        Some(&HeaderValue::from_static("nosniff"))
+    );
+    let body = axum::body::to_bytes(response.into_body(), control::CONTROL_RECORD_BYTES + 1)
+        .await
+        .expect("fixed control body");
+    assert_eq!(body.len(), control::CONTROL_RECORD_BYTES);
+}
+
+#[tokio::test]
+async fn control_worker_overload_uses_the_fixed_response_envelope() {
+    let state = test_state();
+    let exchange = abyssal_core::transport_protocol::ControlClientExchange::logout(
+        state.node_public_key.to_vec(),
+        [0xA1_u8; 32].to_vec(),
+        [0xA2_u8; 32].to_vec(),
+    )
+    .unwrap();
+    let request = exchange.request_bytes().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let mut permits = Vec::new();
+    for _ in 0..control::CONTROL_WORKER_LIMIT {
+        permits.push(
+            state
+                .control_workers
+                .clone()
+                .try_acquire_owned()
+                .expect("control worker permit"),
+        );
+    }
+    let response = control::handle_control(State(state.clone()), headers, Bytes::from(request))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/octet-stream"))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+    let body = axum::body::to_bytes(response.into_body(), control::CONTROL_RECORD_BYTES + 1)
+        .await
+        .expect("fixed control body");
+    assert_eq!(body.len(), control::CONTROL_RECORD_BYTES);
+    assert_eq!(state.control_receipts.lock().await.len(), 0);
+}
+
+#[tokio::test]
+async fn bootstrap_worker_admission_is_bounded_and_releases_permits() {
+    let state = test_state();
+    let mut permits = Vec::with_capacity(relay_bootstrap::BOOTSTRAP_WORKER_LIMIT);
+    for _ in 0..relay_bootstrap::BOOTSTRAP_WORKER_LIMIT {
+        permits.push(
+            state
+                .bootstrap_workers
+                .clone()
+                .try_acquire_owned()
+                .expect("worker permit within configured bound"),
+        );
+    }
+    assert!(state.bootstrap_workers.clone().try_acquire_owned().is_err());
+    drop(permits);
+    assert!(state.bootstrap_workers.clone().try_acquire_owned().is_ok());
+}
+
+#[tokio::test]
+async fn bootstrap_worker_saturation_does_not_consume_request_id() {
+    let state = test_state();
+    let request_id = [0x94_u8; 32];
+    let context = abyssal_transport::BootstrapContext::new(
+        state.node_public_key,
+        state.bootstrap_hpke_public_key,
+        abyssal_transport::ACCOUNT_BOOTSTRAP_OPERATION.to_vec(),
+        request_id,
+    )
+    .unwrap();
+    let action = abyssal_transport::AccountBootstrapAction::Start {
+        capability: Zeroizing::new([0x0c_u8; 32]),
+        registration_request: Zeroizing::new(vec![1_u8; 8]),
+        credential_request: Zeroizing::new(vec![2_u8; 8]),
+    };
+    let padded = abyssal_transport::encode_account_bootstrap_action(&action).unwrap();
+    let client = abyssal_transport::seal_bootstrap_request(&context, &padded).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let mut permits = Vec::with_capacity(relay_bootstrap::BOOTSTRAP_WORKER_LIMIT);
+    for _ in 0..relay_bootstrap::BOOTSTRAP_WORKER_LIMIT {
+        permits.push(
+            state
+                .bootstrap_workers
+                .clone()
+                .try_acquire_owned()
+                .expect("worker permit within configured bound"),
+        );
+    }
+    let rejected = relay_bootstrap::handle_bootstrap(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(client.request.clone()),
+    )
+    .await
+    .into_response();
+    let rejected_body = axum::body::to_bytes(
+        rejected.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rejected_body.len(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES
+    );
+    assert!(state.sessions.lock().await.is_empty());
+    assert!(state.accounts.lock().await.is_empty());
+    drop(permits);
+
+    let retried =
+        relay_bootstrap::handle_bootstrap(State(state), headers, Bytes::from(client.request))
+            .await
+            .into_response();
+    let retried_body = axum::body::to_bytes(
+        retried.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert!(client.response_opener.open(&retried_body).is_ok());
+}
+
+#[tokio::test]
+async fn bootstrap_receipt_capacity_releases_replay_id_for_retry() {
+    let state = test_state();
+    let request_id = [0x93_u8; 32];
+    let context = abyssal_transport::BootstrapContext::new(
+        state.node_public_key,
+        state.bootstrap_hpke_public_key,
+        abyssal_transport::ACCOUNT_BOOTSTRAP_OPERATION.to_vec(),
+        request_id,
+    )
+    .unwrap();
+    let action = abyssal_transport::AccountBootstrapAction::Start {
+        capability: Zeroizing::new([0x0b_u8; 32]),
+        registration_request: Zeroizing::new(vec![1_u8; 8]),
+        credential_request: Zeroizing::new(vec![2_u8; 8]),
+    };
+    let padded = abyssal_transport::encode_account_bootstrap_action(&action).unwrap();
+    let client = abyssal_transport::seal_bootstrap_request(&context, &padded).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    state
+        .bootstrap_receipts
+        .lock()
+        .await
+        .fill_to_capacity_for_test(now_ms());
+
+    let rejected = relay_bootstrap::handle_bootstrap(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(client.request.clone()),
+    )
+    .await
+    .into_response();
+    let rejected_body = axum::body::to_bytes(
+        rejected.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rejected_body.len(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES
+    );
+    assert!(state.sessions.lock().await.is_empty());
+    assert!(state.accounts.lock().await.is_empty());
+
+    state.bootstrap_receipts.lock().await.clear();
+    let retried =
+        relay_bootstrap::handle_bootstrap(State(state), headers, Bytes::from(client.request))
+            .await
+            .into_response();
+    let retried_body = axum::body::to_bytes(
+        retried.into_body(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        retried_body.len(),
+        relay_bootstrap::BOOTSTRAP_RESPONSE_BYTES
+    );
+    assert!(client.response_opener.open(&retried_body).is_ok());
+}
+
+#[tokio::test]
+async fn binary_registration_continues_through_opaque_login_without_early_session() {
+    let state = test_state();
+    let capability = [0x72_u8; 32];
+    let code_id = derive_code_id(&state.invite_code_pepper[..], capability);
+    state.available_codes.lock().await.insert(code_id);
+    let password = b"correct horse battery staple".to_vec();
+    let opaque = abyssal_core::secure_protocol::opaque_client_start(password.clone()).unwrap();
+    let start = bootstrap_auth::bootstrap_start(
+        &state,
+        Zeroizing::new(capability),
+        Zeroizing::new(opaque.registration_request.clone()),
+        Zeroizing::new(opaque.credential_request.clone()),
+    )
+    .await;
+    let abyssal_transport::AccountBootstrapResult::RegistrationStart {
+        handshake_id,
+        registration_response,
+        challenge,
+    } = start
+    else {
+        panic!("registration start rejected");
+    };
+    let registration = abyssal_core::secure_protocol::opaque_client_finish_registration(
+        password.clone(),
+        opaque.registration_state,
+        registration_response.to_vec(),
+    )
+    .unwrap();
+    let identity =
+        abyssal_core::secure_protocol::E2eeSession::create(registration.export_key.clone())
+            .unwrap();
+    let public = identity.public_key();
+    let prekey_id = identity.prekey_id();
+    let context = account_context_v1(&state.node_public_key, &capability);
+    let envelope = identity
+        .seal_identity(registration.export_key.clone(), context.to_vec())
+        .unwrap();
+    let challenge = challenge.to_vec();
+    let handshake_uuid = Uuid::from_bytes(handshake_id);
+    let proof = identity
+        .sign_registration_identity_proof(
+            state.node_id.clone(),
+            handshake_uuid.to_string(),
+            challenge,
+            registration.registration_upload.clone(),
+            public.clone(),
+            prekey_id.clone(),
+            envelope.clone(),
+        )
+        .unwrap();
+    let continuation = bootstrap_auth::bootstrap_finish_registration(
+        &state,
+        handshake_uuid,
+        Zeroizing::new(registration.registration_upload),
+        Zeroizing::new(public),
+        Zeroizing::new(prekey_id),
+        Zeroizing::new(envelope),
+        Zeroizing::new(proof),
+    )
+    .await;
+    let abyssal_transport::AccountBootstrapResult::RegistrationContinuation {
+        handshake_id,
+        credential_response,
+    } = continuation
+    else {
+        panic!("registration did not return a login continuation");
+    };
+    assert!(state.sessions.lock().await.is_empty());
+    assert!(state.accounts.lock().await.contains_key(&code_id));
+
+    let login = abyssal_core::secure_protocol::opaque_client_finish_login(
+        password.clone(),
+        opaque.login_state,
+        credential_response.to_vec(),
+    )
+    .unwrap();
+    let session = bootstrap_auth::bootstrap_finish_login(
+        &state,
+        Uuid::from_bytes(handshake_id),
+        Zeroizing::new(login.credential_finalization),
+    )
+    .await;
+    let abyssal_transport::AccountBootstrapResult::Session {
+        session_id,
+        created,
+        max_rooms_per_user,
+        session_inactivity_sec,
+        ..
+    } = session
+    else {
+        panic!("login continuation rejected");
+    };
+    assert_ne!(session_id.as_ref(), &[0_u8; 32]);
+    assert!(created);
+    assert_eq!(max_rooms_per_user as usize, state.max_rooms_per_user);
+    assert_eq!(
+        session_inactivity_sec as u64,
+        state.session_inactivity_ms / 1000
+    );
+    assert_eq!(state.sessions.lock().await.len(), 1);
+    let transport = state.transport_sessions.lock().await;
+    assert_eq!(transport.len(), 1);
+    assert!(transport.contains_key(&TransportSessionId::new(*session_id)));
+    assert_ne!(
+        transport.values().next().unwrap().root.as_ref(),
+        &[0_u8; 32]
+    );
+    drop(transport);
+
+    state.sessions.lock().await.clear();
+    state.transport_sessions.lock().await.clear();
+    state.available_codes.lock().await.insert(code_id);
+    let opaque_login = abyssal_core::secure_protocol::opaque_client_start(password).unwrap();
+    let login_start = bootstrap_auth::bootstrap_start(
+        &state,
+        Zeroizing::new(capability),
+        Zeroizing::new(vec![7_u8; 8]),
+        Zeroizing::new(opaque_login.credential_request.clone()),
+    )
+    .await;
+    let abyssal_transport::AccountBootstrapResult::LoginStart {
+        handshake_id,
+        credential_response,
+        ..
+    } = login_start
+    else {
+        panic!("login start rejected");
+    };
+    let login = abyssal_core::secure_protocol::opaque_client_finish_login(
+        b"correct horse battery staple".to_vec(),
+        opaque_login.login_state,
+        credential_response.to_vec(),
+    )
+    .unwrap();
+    let session = bootstrap_auth::bootstrap_finish_login(
+        &state,
+        Uuid::from_bytes(handshake_id),
+        Zeroizing::new(login.credential_finalization),
+    )
+    .await;
+    let abyssal_transport::AccountBootstrapResult::Session {
+        created,
+        max_rooms_per_user,
+        session_inactivity_sec,
+        ..
+    } = session
+    else {
+        panic!("login rejected");
+    };
+    assert!(!created);
+    assert_eq!(max_rooms_per_user as usize, state.max_rooms_per_user);
+    assert_eq!(
+        session_inactivity_sec as u64,
+        state.session_inactivity_ms / 1000
+    );
+}
+
+#[tokio::test]
+async fn expired_transport_session_wipes_root_before_sweeper() {
+    let state = test_state();
+    let token = SessionToken::new("expired-transport-session".to_string());
+    state.sessions.lock().await.insert(
+        SessionToken::new(token.0.clone()),
+        AuthSession {
+            code_id: [0x81_u8; 32],
+            username: "expired".to_string(),
+            last_activity_ms: now_ms().saturating_sub(state.session_inactivity_ms),
+        },
+    );
+    state.transport_sessions.lock().await.insert(
+        TransportSessionId::new([0x83_u8; 32]),
+        SessionTransportState {
+            token: SessionToken::new(token.0.clone()),
+            root: Zeroizing::new([0x82_u8; 32]),
+            session_id: [0x83_u8; 32],
+        },
+    );
+
+    assert!(active_session(&state, token.0.as_str(), false)
+        .await
+        .is_none());
+    assert!(state.transport_sessions.lock().await.is_empty());
 }
 
 #[test]
@@ -1602,6 +2714,266 @@ async fn full_data_queue_does_not_block_global_wipe_control_channel() {
 }
 
 #[tokio::test]
+async fn v11_presence_broadcast_reaches_existing_clients_and_stays_after_snapshot() {
+    let state = test_state();
+    add_test_account(&state, "presence-existing", "Alice").await;
+    add_test_account(&state, "presence-new", "Bob").await;
+    state
+        .accounts
+        .lock()
+        .await
+        .get_mut(&test_code_id("presence-new"))
+        .expect("new account")
+        .connected = false;
+    let (_, mut existing_rx) = add_test_client(&state, "presence-existing", "Alice").await;
+    let (new_id, mut new_rx) = add_test_client(&state, "presence-new", "Bob").await;
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let bootstrap_rx =
+        transport::begin_client_stage(&state.client_stages, new_id, Arc::clone(&queued_bytes))
+            .await;
+
+    state
+        .accounts
+        .lock()
+        .await
+        .get_mut(&test_code_id("presence-new"))
+        .expect("new account")
+        .connected = true;
+    broadcast_presence(&state).await;
+    send_initial_presence(&state, new_id).await;
+    transport::commit_client_stage(&state, new_id).await;
+    bootstrap_rx.await.expect("snapshot barrier");
+
+    let existing_frame = existing_rx.recv().await.expect("existing client presence");
+    let OutboundFrame::Presence {
+        users: existing_users,
+    } = &existing_frame
+    else {
+        panic!("existing client must receive presence");
+    };
+    assert!(existing_users
+        .iter()
+        .any(|user| user.username == "Bob" && user.connected));
+
+    let initial_frame = new_rx.recv().await.expect("new client initial presence");
+    let OutboundFrame::Presence {
+        users: initial_users,
+    } = &initial_frame
+    else {
+        panic!("new client must receive initial presence");
+    };
+    let live_frame = new_rx.recv().await.expect("new client live presence");
+    let OutboundFrame::Presence { users: live_users } = &live_frame else {
+        panic!("new client must receive raced live presence");
+    };
+    assert!(initial_users
+        .iter()
+        .any(|user| user.username == "Bob" && user.connected));
+    assert!(live_users
+        .iter()
+        .any(|user| user.username == "Bob" && user.connected));
+}
+
+#[tokio::test]
+async fn v11_handshake_capacity_isolated_from_control_capacity() {
+    let state = test_state();
+    let mut handshake_permits = Vec::with_capacity(transport::WS_HANDSHAKE_WORKER_LIMIT);
+    for _ in 0..transport::WS_HANDSHAKE_WORKER_LIMIT {
+        handshake_permits.push(
+            state
+                .ws_handshake_workers
+                .clone()
+                .try_acquire_owned()
+                .expect("handshake permit within configured bound"),
+        );
+    }
+    assert!(state
+        .ws_handshake_workers
+        .clone()
+        .try_acquire_owned()
+        .is_err());
+    assert!(state.control_workers.clone().try_acquire_owned().is_ok());
+    drop(handshake_permits);
+    assert!(state
+        .ws_handshake_workers
+        .clone()
+        .try_acquire_owned()
+        .is_ok());
+}
+
+#[tokio::test]
+async fn staged_snapshot_overflow_discards_frames_and_accounting_before_close() {
+    let state = test_state();
+    let client_id = Uuid::new_v4();
+    let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+    let (result_tx, _result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    state.clients.lock().await.insert(
+        client_id,
+        ClientHandle {
+            code_id: test_code_id("stage-overflow"),
+            username: "Alice".to_string(),
+            platform: ClientPlatform::Android,
+            tx,
+            control_tx,
+            result_tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+        },
+    );
+    let bootstrap_rx =
+        transport::begin_client_stage(&state.client_stages, client_id, Arc::clone(&queued_bytes))
+            .await;
+    let frame = OutboundFrame::Presence { users: Vec::new() };
+    for _ in 0..CLIENT_OUTBOUND_QUEUE_CAPACITY {
+        send_initial_to_client(&state, client_id, &frame).await;
+    }
+    assert_eq!(rx.len(), 0);
+    send_initial_to_client(&state, client_id, &frame).await;
+    assert_eq!(state.outbound_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(queued_bytes.load(Ordering::SeqCst), 0);
+    assert_eq!(rx.len(), 0);
+    assert!(matches!(control_rx.try_recv(), Ok(ClientControl::Close)));
+
+    transport::commit_client_stage(&state, client_id).await;
+    bootstrap_rx.await.expect("aborted snapshot barrier");
+    assert_eq!(rx.len(), 0);
+}
+
+#[tokio::test]
+async fn staged_snapshot_commit_releases_frames_results_and_controls_after_bootstrap() {
+    let state = test_state();
+    let client_id = Uuid::new_v4();
+    let (tx, mut frame_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+    let (result_tx, mut result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    state.clients.lock().await.insert(
+        client_id,
+        ClientHandle {
+            code_id: test_code_id("stage-order"),
+            username: "Alice".to_string(),
+            platform: ClientPlatform::Web,
+            tx,
+            control_tx,
+            result_tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+        },
+    );
+
+    let bootstrap_rx =
+        transport::begin_client_stage(&state.client_stages, client_id, queued_bytes).await;
+    let initial = OutboundFrame::Presence { users: Vec::new() };
+    let live = OutboundFrame::Presence { users: Vec::new() };
+    assert!(matches!(
+        transport::stage_initial_outbound_frame(&state.client_stages, client_id, initial).await,
+        transport::StageOutcome::Pending
+    ));
+    assert!(matches!(
+        transport::stage_outbound_frame(&state.client_stages, client_id, live).await,
+        transport::StageOutcome::Pending
+    ));
+
+    let (delivered_tx, delivered_rx) = oneshot::channel();
+    assert!(matches!(
+        transport::stage_client_result(
+            &state.client_stages,
+            client_id,
+            ClientResult {
+                frame: OutboundFrame::AckResult {
+                    message_id: "queued-result".to_string(),
+                    accepted: true,
+                },
+                delivered: delivered_tx,
+            },
+        )
+        .await,
+        transport::StageResultOutcome::Pending
+    ));
+    assert!(matches!(
+        transport::stage_control(&state.client_stages, client_id, ClientControl::Close).await,
+        transport::StageControlOutcome::Pending
+    ));
+
+    transport::commit_client_stage(&state, client_id).await;
+    bootstrap_rx.await.expect("snapshot gate released");
+
+    assert!(matches!(
+        frame_rx.recv().await,
+        Some(OutboundFrame::Presence { .. })
+    ));
+    assert!(matches!(
+        frame_rx.recv().await,
+        Some(OutboundFrame::Presence { .. })
+    ));
+    let result = result_rx.recv().await.expect("result after bootstrap");
+    assert!(matches!(
+        &result.frame,
+        OutboundFrame::AckResult {
+            message_id,
+            accepted: true,
+        } if message_id == "queued-result"
+    ));
+    result.delivered.send(true).expect("delivery waiter");
+    assert!(delivered_rx.await.expect("delivery result"));
+    assert!(matches!(
+        control_rx.recv().await,
+        Some(ClientControl::Close)
+    ));
+}
+
+#[tokio::test]
+async fn aborted_snapshot_fails_staged_results_and_suppresses_controls() {
+    let state = test_state();
+    let client_id = Uuid::new_v4();
+    let (tx, _frame_rx) = mpsc::channel(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel(CLIENT_CONTROL_QUEUE_CAPACITY);
+    let (result_tx, _result_rx) = mpsc::channel(CLIENT_RESULT_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    state.clients.lock().await.insert(
+        client_id,
+        ClientHandle {
+            code_id: test_code_id("stage-abort"),
+            username: "Alice".to_string(),
+            platform: ClientPlatform::Web,
+            tx,
+            control_tx,
+            result_tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+        },
+    );
+
+    let bootstrap_rx =
+        transport::begin_client_stage(&state.client_stages, client_id, queued_bytes).await;
+    let (delivered_tx, delivered_rx) = oneshot::channel();
+    assert!(matches!(
+        transport::stage_client_result(
+            &state.client_stages,
+            client_id,
+            ClientResult {
+                frame: OutboundFrame::AckResult {
+                    message_id: "aborted-result".to_string(),
+                    accepted: false,
+                },
+                delivered: delivered_tx,
+            },
+        )
+        .await,
+        transport::StageResultOutcome::Pending
+    ));
+    assert!(matches!(
+        transport::stage_control(&state.client_stages, client_id, ClientControl::GlobalWipe).await,
+        transport::StageControlOutcome::Pending
+    ));
+
+    transport::abort_client_stage(&state.client_stages, &state.outbound_bytes, client_id).await;
+    assert!(!delivered_rx.await.expect("aborted result completion"));
+    transport::commit_client_stage(&state, client_id).await;
+    bootstrap_rx.await.expect("aborted snapshot gate released");
+    assert!(control_rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn bounded_attachment_body_rejects_overflow_empty_and_truncation() {
     assert_eq!(
         read_bounded_attachment_body(Body::from(vec![1_u8, 2, 3]), 2, None)
@@ -2921,6 +4293,101 @@ fn websocket_ticket_requires_protocol_v2_and_rejects_bearer() {
         HeaderValue::from_static("abyssal-v2, ticket.invalid"),
     );
     assert!(websocket_ticket_header(&headers).is_none());
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_str(&format!(
+            "abyssal-v2, ticket.{raw_ticket}, unknown-metadata"
+        ))
+        .expect("valid subprotocol"),
+    );
+    assert!(websocket_ticket_header(&headers).is_none());
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_str(&format!("abyssal-v2, ticket.{raw_ticket},"))
+            .expect("valid subprotocol"),
+    );
+    assert!(websocket_ticket_header(&headers).is_none());
+}
+
+#[test]
+fn websocket_ticket_rejects_duplicate_protocol_headers() {
+    let raw_ticket = URL_SAFE_NO_PAD.encode([9_u8; WS_TICKET_BYTES]);
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_str(&format!("abyssal-v2, ticket.{raw_ticket}"))
+            .expect("valid subprotocol"),
+    );
+    headers.append(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("unknown-metadata"),
+    );
+    assert!(websocket_ticket_header(&headers).is_none());
+}
+
+#[test]
+fn websocket_v11_upgrade_marker_is_exact_and_never_carries_metadata() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("abyssal-v11"),
+    );
+    assert!(transport::websocket_v11_marker(&headers));
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("abyssal-v11, ticket.abc"),
+    );
+    assert!(!transport::websocket_v11_marker(&headers));
+    assert!(transport::websocket_v11_present(&headers));
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("abyssal-v11, bearer.abc"),
+    );
+    assert!(!transport::websocket_v11_marker(&headers));
+    assert!(transport::websocket_v11_present(&headers));
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("ticket.abc, abyssal-v11"),
+    );
+    assert!(!transport::websocket_v11_marker(&headers));
+    assert!(transport::websocket_v11_present(&headers));
+    headers.insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("abyssal-v11, abyssal-v11"),
+    );
+    assert!(!transport::websocket_v11_marker(&headers));
+    assert!(transport::websocket_v11_present(&headers));
+}
+
+#[test]
+fn websocket_v11_upgrade_rejects_metadata_in_duplicate_protocol_headers() {
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("abyssal-v11"),
+    );
+    headers.append(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("ticket.credential-metadata"),
+    );
+
+    assert!(!transport::websocket_v11_marker(&headers));
+
+    // Header ordering must not let a valid legacy ticket hide a v11 marker in
+    // a later field-value. This is the downgrade direction a proxy can expose.
+    let raw_ticket = URL_SAFE_NO_PAD.encode([8_u8; WS_TICKET_BYTES]);
+    let mut reversed = HeaderMap::new();
+    reversed.append(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_str(&format!("abyssal-v2, ticket.{raw_ticket}"))
+            .expect("valid subprotocol"),
+    );
+    reversed.append(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("abyssal-v11"),
+    );
+    assert!(!transport::websocket_v11_marker(&reversed));
+    assert!(transport::websocket_v11_present(&reversed));
 }
 
 #[test]
@@ -2960,6 +4427,28 @@ fn ticket_build_attestation_for(platform: &str) -> BuildAttestationRequest {
 
 fn ticket_build_attestation() -> BuildAttestationRequest {
     ticket_build_attestation_for("web")
+}
+
+async fn attachment_v3_response(state: &AppState, body: Vec<u8>) -> Vec<u8> {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v3/attachment")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(body))
+        .expect("attachment v3 request");
+    let response = attachment_transport::handle_attachment(State(state.clone()), request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/octet-stream"))
+    );
+    axum::body::to_bytes(
+        response.into_body(),
+        attachment_transport::ATTACHMENT_V3_MAX_BODY_BYTES + 1,
+    )
+    .await
+    .expect("attachment v3 response body")
+    .to_vec()
 }
 
 async fn issue_test_ticket(state: &AppState, token: &str) -> (StatusCode, WsTicketResponse) {
@@ -3036,6 +4525,34 @@ async fn websocket_ticket_is_hash_only_no_store_and_single_use() {
     );
     assert!(consume_ws_ticket(&state, &response.ticket).await.is_none());
     assert!(state.ws_tickets.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn websocket_v11_ticket_mismatch_preserves_ticket_until_matching_session() {
+    let state = test_state();
+    add_test_session(&state, "v11-session-a", "v11-code-a", "Alice").await;
+    add_test_session(&state, "v11-session-b", "v11-code-b", "Bob").await;
+    let (status, response) = issue_test_ticket(&state, "v11-session-a").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(
+        consume_ws_ticket_for_session(&state, &response.ticket, "v11-session-b")
+            .await
+            .is_none()
+    );
+    assert_eq!(state.ws_tickets.lock().await.len(), 1);
+    let (token, session, platform) =
+        consume_ws_ticket_for_session(&state, &response.ticket, "v11-session-a")
+            .await
+            .expect("matching authenticated transport session consumes ticket");
+    assert_eq!(token.as_str(), "v11-session-a");
+    assert_eq!(session.username, "Alice");
+    assert_eq!(platform, ClientPlatform::Web);
+    assert!(
+        consume_ws_ticket_for_session(&state, &response.ticket, "v11-session-a")
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -8851,9 +10368,18 @@ async fn pending_android_ciphertext_is_not_delivered_to_a_web_connection() {
 }
 
 fn test_state() -> AppState {
+    let bootstrap_hpke_keypair = Arc::new(abyssal_transport::generate_bootstrap_keypair());
+    let bootstrap_hpke_public_key = bootstrap_hpke_keypair.public_key;
     AppState {
         node_id: "test-node".to_string(),
         node_public_key: [6_u8; 32],
+        bootstrap_hpke_public_key,
+        bootstrap_hpke_keypair,
+        bootstrap_replay_guard: Arc::new(Mutex::new(
+            abyssal_transport::BootstrapReplayGuard::new(60_000).unwrap(),
+        )),
+        bootstrap_receipts: Arc::new(Mutex::new(BootstrapReceiptStore::new())),
+        bootstrap_workers: Arc::new(Semaphore::new(relay_bootstrap::BOOTSTRAP_WORKER_LIMIT)),
         node_descriptor: Arc::new(vec![1]),
         release_admission: Arc::new(ReleaseAdmissionStore::ready_for_tests()),
         attachment_ram_limit_bytes: 8 * 1024 * 1024,
@@ -8873,6 +10399,7 @@ fn test_state() -> AppState {
         account_ops: Arc::new(Mutex::new(())),
         opaque_setup: Arc::new(Zeroizing::new(opaque_server_setup())),
         opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
+        registration_credential_requests: Arc::new(Mutex::new(HashMap::new())),
         invite_code_pepper: Arc::new(Zeroizing::new([7_u8; 32])),
         boot_invites: Arc::new(Mutex::new(None)),
         boot_invite_output: invite_output::InviteOutputMode::Qr,
@@ -8880,6 +10407,11 @@ fn test_state() -> AppState {
         capability_expiries: Arc::new(Mutex::new(HashMap::new())),
         accounts: Arc::new(Mutex::new(HashMap::new())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        transport_sessions: Arc::new(Mutex::new(HashMap::new())),
+        control_receipts: Arc::new(Mutex::new(ControlReceiptStore::new())),
+        control_workers: Arc::new(Semaphore::new(control::CONTROL_WORKER_LIMIT)),
+        ws_handshake_workers: Arc::new(Semaphore::new(transport::WS_HANDSHAKE_WORKER_LIMIT)),
+        client_stages: Arc::new(transport::ClientStageRegistry::new()),
         ws_tickets: Arc::new(Mutex::new(HashMap::new())),
         clients: Arc::new(Mutex::new(HashMap::new())),
         purge_epoch: watch::channel(0_u64).0,
@@ -8904,6 +10436,11 @@ fn test_state() -> AppState {
         attachment_uploads: Arc::new(Semaphore::new(1)),
         attachment_memory: Arc::new(Semaphore::new(8 * 1024 * 1024)),
         attachment_epoch: Arc::new(AtomicU64::new(0)),
+        attachment_receipts: Arc::new(Mutex::new(
+            attachment_transport::AttachmentReceiptStore::new(),
+        )),
+        attachment_prefix_workers: Arc::new(Semaphore::new(attachment_transport::WORKER_LIMIT)),
+        attachment_workers: Arc::new(Semaphore::new(attachment_transport::WORKER_LIMIT)),
         prekey_leases: Arc::new(Mutex::new(HashMap::new())),
     }
 }

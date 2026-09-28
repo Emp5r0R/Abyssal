@@ -13,6 +13,7 @@ pub(super) enum OpaqueHandshake {
         username: String,
         server_state: Vec<u8>,
         created_at_ms: u64,
+        created: bool,
     },
 }
 
@@ -107,6 +108,12 @@ pub(super) async fn active_session(
         .is_some_and(|session| session_is_expired(session, now, state.session_inactivity_ms));
     if expired {
         sessions.remove(token);
+        drop(sessions);
+        state
+            .transport_sessions
+            .lock()
+            .await
+            .retain(|_, transport| transport.token.0 != token);
         return None;
     }
 
@@ -120,8 +127,29 @@ pub(super) async fn active_session(
 pub(super) async fn code_has_active_session(state: &AppState, code_id: &CodeId) -> bool {
     let now = now_ms();
     let mut sessions = state.sessions.lock().await;
+    let mut expired_tokens = sessions
+        .iter()
+        .filter(|(_, session)| session_is_expired(session, now, state.session_inactivity_ms))
+        .map(|(token, _)| token.0.clone())
+        .collect::<Vec<_>>();
     sessions.retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
-    sessions.values().any(|session| session.code_id == *code_id)
+    let active = sessions.values().any(|session| session.code_id == *code_id);
+    drop(sessions);
+    if !expired_tokens.is_empty() {
+        state
+            .transport_sessions
+            .lock()
+            .await
+            .retain(|_, transport| {
+                !expired_tokens
+                    .iter()
+                    .any(|expired| expired == &transport.token.0)
+            });
+        for token in &mut expired_tokens {
+            token.zeroize();
+        }
+    }
+    active
 }
 
 pub(super) async fn start_opaque_account(
@@ -180,6 +208,7 @@ pub(super) async fn start_opaque_account(
                 username: account.username.clone(),
                 server_state,
                 created_at_ms: now_ms(),
+                created: false,
             },
         )
         .await
@@ -482,13 +511,21 @@ pub(super) fn opaque_start_error(
 
 pub(super) async fn prune_opaque_handshakes(state: &AppState) {
     let now = now_ms();
-    state.opaque_handshakes.lock().await.retain(|_, handshake| {
+    let mut handshakes = state.opaque_handshakes.lock().await;
+    handshakes.retain(|_, handshake| {
         let created_at_ms = match handshake {
             OpaqueHandshake::Registration { created_at_ms, .. }
             | OpaqueHandshake::Login { created_at_ms, .. } => *created_at_ms,
         };
         now.saturating_sub(created_at_ms) < OPAQUE_HANDSHAKE_TTL_MS
     });
+    let live_ids = handshakes.keys().copied().collect::<HashSet<_>>();
+    drop(handshakes);
+    state
+        .registration_credential_requests
+        .lock()
+        .await
+        .retain(|id, _| live_ids.contains(id));
 }
 
 pub(super) async fn store_opaque_handshake(
@@ -878,6 +915,39 @@ pub(super) async fn consume_ws_ticket(
     Some((session_token, session, client_platform))
 }
 
+/// Consume a ticket only when it is bound to the already-authenticated
+/// transport session that opened the v11 ClientHello. A valid ticket from a
+/// different session must remain available for its own connection attempt.
+pub(super) async fn consume_ws_ticket_for_session(
+    state: &AppState,
+    ticket_value: &str,
+    expected_session_token: &str,
+) -> Option<(Zeroizing<String>, AuthSession, ClientPlatform)> {
+    let mut digest = ws_ticket_digest(ticket_value)?;
+    let ticket = {
+        let mut tickets = state.ws_tickets.lock().await;
+        prune_ws_tickets_locked(&mut tickets, now_ms());
+        let Some(candidate) = tickets.get(&digest) else {
+            digest.zeroize();
+            return None;
+        };
+        if candidate.session_token.as_str() != expected_session_token {
+            digest.zeroize();
+            return None;
+        }
+        let (mut stored_digest, ticket) = tickets.remove_entry(&digest)?;
+        stored_digest.zeroize();
+        digest.zeroize();
+        ticket
+    };
+    let session_token = Zeroizing::new(ticket.session_token.as_str().to_owned());
+    let client_platform = ticket.client_platform;
+    drop(ticket);
+    let session = active_session(state, session_token.as_str(), true).await?;
+    touch_activity(state).await;
+    Some((session_token, session, client_platform))
+}
+
 pub(super) async fn logout_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -890,6 +960,11 @@ pub(super) async fn logout_account(
     let Some(session) = session else {
         return StatusCode::UNAUTHORIZED;
     };
+    state
+        .transport_sessions
+        .lock()
+        .await
+        .retain(|_, transport| transport.token.0 != token.as_str());
 
     clear_ws_tickets_for_session(&state, token.as_str()).await;
     replace_connected_clients_for_code(&state, &session.code_id).await;
@@ -961,6 +1036,11 @@ pub(super) async fn issue_session(
         },
     );
     drop(sessions);
+    state
+        .transport_sessions
+        .lock()
+        .await
+        .retain(|_, transport| !replaced_tokens.contains(&transport.token.0));
     for mut replaced_token in replaced_tokens {
         clear_ws_tickets_for_session(state, &replaced_token).await;
         replaced_token.zeroize();

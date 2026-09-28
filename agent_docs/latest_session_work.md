@@ -1,5 +1,30 @@
 # Latest Session Work
 
+## 2026-09-24 - Protocol-v11 Transport Confidentiality & Relay Integration
+
+Integrated Protocol-v11 transport confidentiality across relay, shared Rust core, UniFFI/WASM facades, and full test suite verification. No release, tag, or deployment was performed.
+
+### Implemented
+
+- Relay attachment `/v3/attachment` endpoint: single static POST route executing fixed-size encrypted action records (upload/download/delete/status/cancel), fixed 262,184-byte directional stream frames, context-bound keys, and power-of-two padding.
+- Preserved existing attachment retention invariants: independent one-time view and delete-after-download flags, authoritative record and byte quotas, and atomic staged publication.
+- Resolved node descriptor V2 invite verification in `rust-core/src/invite_protocol.rs`: supports both `SignedNodeDescriptorV2` (containing bootstrap HPKE key) and legacy `SignedNodeDescriptor`.
+- Resolved Kotlin UniFFI method signature clash: moved `destroy()` from exported UniFFI interface blocks to internal Rust implementation blocks, allowing generated Kotlin code to rely cleanly on UniFFI's `Disposable.destroy()` / `AutoCloseable.close()`.
+- Remediated security advisory `RUSTSEC-2026-0285` by updating `rustls` dependency to `0.23.45` in `Cargo.lock`.
+- Rebuilt crypto bindings and native libraries (`bash ./scripts/test-all.sh crypto`) for WASM and all four Android ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`), updating source and artifact SHA-256 digests.
+- Cleaned up untracked local state and added `.npm-cache/` and `.rustup-local/` to `.gitignore`.
+
+### Verification
+
+- Passed `./scripts/test-all.sh crypto`: regenerated WASM, UniFFI Kotlin bindings, and Android JNI libraries with matching digests.
+- Passed `./scripts/test-all.sh shell`: verified Gradle wrapper, checksums, env parser, and sensitive directory exclusions.
+- Passed `./scripts/test-all.sh rust`: all 299 tests passed across `mirage-server`, `abyssal-transport`, `abyssal-invite`, and `abyssal-core`; `cargo fmt` and `cargo clippy --workspace --all-targets --locked -- -D warnings` passed with 0 warnings; release-root guard passed.
+- Passed `./scripts/test-all.sh web`: all 455 tests across 42 files passed, ESLint passed, TypeScript build passed, and production Vite bundle built cleanly.
+- Passed `./scripts/test-all.sh android`: Gradle build, `:app:compileDebugKotlin`, `:app:testDebugUnitTest`, `:app:compileReleaseKotlin`, and `:app:lintRelease` passed (no APK/AAB packaging).
+- Passed `./scripts/test-all.sh integration`: live relay integration passed (node startup, QR auth, OPAQUE auth, v9 E2EE DM, v10 MLS rooms, offline recovery/replay, access control).
+- Passed `./scripts/test-all.sh audit`: `npm audit` (0 vulnerabilities) and `cargo audit` (0 vulnerabilities).
+- Passed complete master repository gate `./scripts/test-all.sh all` with 100% success.
+
 ## 2026-09-03 - Unified Invite Capsule V1 source complete
 
 Replaced the normal node-URL and access-code bootstrap with a signed,

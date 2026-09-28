@@ -23,6 +23,7 @@ use abyssal_core::secure_protocol::{
 #[cfg(test)]
 use abyssal_core::secure_protocol::{ATTACHMENT_BLOB_VERSION, ATTACHMENT_CHUNK_RECORD_BYTES};
 use abyssal_invite::account_context_v1;
+use abyssal_transport::{BootstrapKeyPair, BootstrapReplayGuard};
 use axum::{
     body::{Body, Bytes},
     extract::Request,
@@ -58,11 +59,16 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod account_identifiers;
 mod advertised_locators;
+mod attachment_stream;
+mod attachment_transport;
+mod attachment_transport_actions;
 mod attachment_upload;
 mod attachments;
 mod auth;
+mod bootstrap_auth;
 mod client_platform;
 mod config;
+mod control;
 mod http;
 mod invite_bootstrap;
 mod invite_output;
@@ -70,6 +76,7 @@ mod messages;
 mod mls;
 mod mls_wire;
 mod privacy_logging;
+mod relay_bootstrap;
 mod release_admission;
 mod rooms;
 mod transaction_receipts;
@@ -78,8 +85,10 @@ mod transport_padding;
 
 use attachments::*;
 use auth::*;
+use bootstrap_auth::{SessionTransportState, TransportSessionId};
 use client_platform::{ClientPlatform, InteropPolicy};
 use config::*;
+use control::ControlReceiptStore;
 #[cfg(test)]
 use http::{
     node_descriptor_endpoint, release_manifest_endpoint, release_signature_endpoint,
@@ -88,6 +97,7 @@ use http::{
 use invite_bootstrap::{write_boot_invites, BootstrapMaterials, IssuedInvite};
 use messages::*;
 use mls::*;
+use relay_bootstrap::BootstrapReceiptStore;
 use release_admission::{
     AdmissionError, BuildAttestationRequest, InstallOutcome, ReleaseAdmissionStore,
     ReleaseManifestMirror,
@@ -225,10 +235,12 @@ const ATTACHMENT_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // connection, but no single upload should retain an upload permit forever.
 const ATTACHMENT_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ATTACHMENT_DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+const ATTACHMENT_DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ATTACHMENT_CLAIM_HEADER: &str = "x-abyssal-attachment-claim";
 const CODE_ID_DOMAIN: &[u8] = b"ABYSSAL_CAPABILITY_ID_V1";
 
 type CodeId = [u8; 32];
+type RegistrationCredentialRequest = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 type WsTicketDigest = [u8; WS_TICKET_BYTES];
 type HmacSha256 = Hmac<Sha256>;
 
@@ -236,6 +248,11 @@ type HmacSha256 = Hmac<Sha256>;
 struct AppState {
     node_id: String,
     node_public_key: [u8; 32],
+    bootstrap_hpke_public_key: [u8; 32],
+    bootstrap_hpke_keypair: Arc<BootstrapKeyPair>,
+    bootstrap_replay_guard: Arc<Mutex<BootstrapReplayGuard>>,
+    bootstrap_receipts: Arc<Mutex<BootstrapReceiptStore>>,
+    bootstrap_workers: Arc<Semaphore>,
     node_descriptor: Arc<Vec<u8>>,
     release_admission: Arc<ReleaseAdmissionStore>,
     attachment_ram_limit_bytes: usize,
@@ -258,6 +275,7 @@ struct AppState {
     account_ops: Arc<Mutex<()>>,
     opaque_setup: Arc<Zeroizing<Vec<u8>>>,
     opaque_handshakes: Arc<Mutex<HashMap<Uuid, OpaqueHandshake>>>,
+    registration_credential_requests: Arc<Mutex<HashMap<Uuid, RegistrationCredentialRequest>>>,
     invite_code_pepper: Arc<Zeroizing<CodeId>>,
     boot_invites: Arc<Mutex<Option<Vec<IssuedInvite>>>>,
     boot_invite_output: invite_output::InviteOutputMode,
@@ -265,6 +283,11 @@ struct AppState {
     capability_expiries: Arc<Mutex<HashMap<CodeId, u64>>>,
     accounts: Arc<Mutex<HashMap<CodeId, Account>>>,
     sessions: Arc<Mutex<HashMap<SessionToken, AuthSession>>>,
+    transport_sessions: Arc<Mutex<HashMap<TransportSessionId, SessionTransportState>>>,
+    control_receipts: Arc<Mutex<ControlReceiptStore>>,
+    control_workers: Arc<Semaphore>,
+    ws_handshake_workers: Arc<Semaphore>,
+    client_stages: Arc<transport::ClientStageRegistry>,
     ws_tickets: Arc<Mutex<HashMap<WsTicketDigest, WsTicket>>>,
     active_connections: Arc<Mutex<HashMap<CodeId, Uuid>>>,
     clients: Arc<Mutex<HashMap<Uuid, ClientHandle>>>,
@@ -291,6 +314,9 @@ struct AppState {
     attachment_uploads: Arc<Semaphore>,
     attachment_memory: Arc<Semaphore>,
     attachment_epoch: Arc<AtomicU64>,
+    attachment_receipts: Arc<Mutex<attachment_transport::AttachmentReceiptStore>>,
+    attachment_prefix_workers: Arc<Semaphore>,
+    attachment_workers: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -330,6 +356,7 @@ struct ClientResult {
     delivered: oneshot::Sender<bool>,
 }
 
+#[derive(Clone)]
 enum ClientControl {
     GlobalWipe,
     Close,
@@ -1464,6 +1491,8 @@ impl AppState {
         let bootstrap = BootstrapMaterials::from_env(now_ms() / 1_000).unwrap_or_else(|error| {
             panic!("Abyssal node bootstrap configuration rejected: {error}")
         });
+        let bootstrap_hpke_public_key = bootstrap.bootstrap_hpke_keypair.public_key;
+        let bootstrap_hpke_keypair = Arc::new(bootstrap.bootstrap_hpke_keypair);
         let attachment_ram_limit_bytes = read_usize_env("ABYSSAL_ATTACHMENT_RAM_LIMIT_MB", 512)
             .saturating_mul(1024 * 1024)
             .min(Semaphore::MAX_PERMITS);
@@ -1541,6 +1570,14 @@ impl AppState {
         Self {
             node_id: bootstrap.node_id,
             node_public_key: bootstrap.node_public_key,
+            bootstrap_hpke_public_key,
+            bootstrap_hpke_keypair,
+            bootstrap_replay_guard: Arc::new(Mutex::new(
+                BootstrapReplayGuard::new(10 * 60 * 1000)
+                    .expect("bootstrap replay TTL must remain protocol-valid"),
+            )),
+            bootstrap_receipts: Arc::new(Mutex::new(BootstrapReceiptStore::new())),
+            bootstrap_workers: Arc::new(Semaphore::new(relay_bootstrap::BOOTSTRAP_WORKER_LIMIT)),
             node_descriptor: Arc::new(bootstrap.descriptor_binary),
             release_admission: Arc::new(ReleaseAdmissionStore::new()),
             attachment_ram_limit_bytes,
@@ -1560,6 +1597,7 @@ impl AppState {
             account_ops: Arc::new(Mutex::new(())),
             opaque_setup: Arc::new(Zeroizing::new(opaque_server_setup())),
             opaque_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            registration_credential_requests: Arc::new(Mutex::new(HashMap::new())),
             invite_code_pepper: Arc::new(Zeroizing::new(invite_code_pepper)),
             boot_invites: Arc::new(Mutex::new(Some(bootstrap.issued_invites))),
             boot_invite_output: bootstrap.output_mode,
@@ -1567,6 +1605,11 @@ impl AppState {
             capability_expiries: Arc::new(Mutex::new(capability_expiries)),
             accounts: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            transport_sessions: Arc::new(Mutex::new(HashMap::new())),
+            control_receipts: Arc::new(Mutex::new(ControlReceiptStore::new())),
+            control_workers: Arc::new(Semaphore::new(control::CONTROL_WORKER_LIMIT)),
+            ws_handshake_workers: Arc::new(Semaphore::new(transport::WS_HANDSHAKE_WORKER_LIMIT)),
+            client_stages: Arc::new(transport::ClientStageRegistry::new()),
             ws_tickets: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
@@ -1595,6 +1638,11 @@ impl AppState {
             attachment_uploads: Arc::new(Semaphore::new(attachment_upload_concurrency)),
             attachment_memory: Arc::new(Semaphore::new(attachment_ram_limit_bytes)),
             attachment_epoch: Arc::new(AtomicU64::new(0)),
+            attachment_receipts: Arc::new(Mutex::new(
+                attachment_transport::AttachmentReceiptStore::new(),
+            )),
+            attachment_prefix_workers: Arc::new(Semaphore::new(attachment_transport::WORKER_LIMIT)),
+            attachment_workers: Arc::new(Semaphore::new(attachment_transport::WORKER_LIMIT)),
         }
     }
 
@@ -1796,6 +1844,13 @@ async fn session_sweeper(state: AppState) {
         let mut sessions = state.sessions.lock().await;
         sessions
             .retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
+        state
+            .transport_sessions
+            .lock()
+            .await
+            .retain(|_, transport| sessions.contains_key(&transport.token));
+        state.bootstrap_receipts.lock().await.prune(now);
+        state.control_receipts.lock().await.prune(now);
         drop(sessions);
         prune_ws_tickets(&state, now).await;
         prune_pending_queues(&state, now).await;
@@ -2623,6 +2678,10 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
         drop(token);
     }
     drop(sessions);
+    state.transport_sessions.lock().await.clear();
+    state.bootstrap_receipts.lock().await.clear();
+    state.control_receipts.lock().await.clear();
+    state.attachment_receipts.lock().await.clear();
     let mut ws_tickets = state.ws_tickets.lock().await;
     clear_ws_tickets_locked(&mut ws_tickets);
     drop(ws_tickets);
@@ -2641,6 +2700,7 @@ async fn wipe_relay_state(state: &AppState, notify_clients: bool) {
     state.transaction_receipts.lock().await.clear();
     state.prekey_leases.lock().await.clear();
     state.opaque_handshakes.lock().await.clear();
+    state.registration_credential_requests.lock().await.clear();
     let mut login_limits = state.login_limits.lock().await;
     zeroize_code_id_map(&mut login_limits);
     drop(login_limits);
@@ -2864,6 +2924,19 @@ async fn open_direct(state: &AppState, sender_id: Uuid, peer_username: &str) -> 
 }
 
 async fn send_direct_catalog(state: &AppState, client_id: Uuid, username: &str) {
+    send_direct_catalog_inner(state, client_id, username, false).await;
+}
+
+async fn send_initial_direct_catalog(state: &AppState, client_id: Uuid, username: &str) {
+    send_direct_catalog_inner(state, client_id, username, true).await;
+}
+
+async fn send_direct_catalog_inner(
+    state: &AppState,
+    client_id: Uuid,
+    username: &str,
+    initial: bool,
+) {
     let directs = state
         .direct_catalog
         .lock()
@@ -2872,7 +2945,12 @@ async fn send_direct_catalog(state: &AppState, client_id: Uuid, username: &str) 
         .filter_map(|direct| direct.record_for(username))
         .take(MAX_DIRECT_CATALOG_PER_USER)
         .collect::<Vec<_>>();
-    send_to_client(state, client_id, &OutboundFrame::Directs { directs }).await;
+    let frame = OutboundFrame::Directs { directs };
+    if initial {
+        send_initial_to_client(state, client_id, &frame).await;
+    } else {
+        send_to_client(state, client_id, &frame).await;
+    }
 }
 
 async fn client_identity(state: &AppState, client_id: Uuid) -> Result<(CodeId, String), String> {
@@ -2991,6 +3069,26 @@ async fn broadcast_presence(state: &AppState) {
     // snapshot after a newer directory revision and force strict clients to
     // fail closed on an honest relay.
     let _broadcast_guard = state.presence_broadcast_ops.lock().await;
+    let frame = presence_frame(state).await;
+    let clients = state
+        .clients
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for client_id in clients {
+        send_to_client(state, client_id, &frame).await;
+    }
+}
+
+async fn send_initial_presence(state: &AppState, client_id: Uuid) {
+    let _broadcast_guard = state.presence_broadcast_ops.lock().await;
+    let frame = presence_frame(state).await;
+    send_initial_to_client(state, client_id, &frame).await;
+}
+
+async fn presence_frame(state: &AppState) -> OutboundFrame {
     let accounts = state.accounts.lock().await;
     let stamp = directory_stamp(&state.node_id, &accounts);
     let users = accounts
@@ -3005,18 +3103,7 @@ async fn broadcast_presence(state: &AppState) {
             directory_revision: stamp.revision,
         })
         .collect::<Vec<_>>();
-    drop(accounts);
-    let frame = OutboundFrame::Presence { users };
-    let clients = state
-        .clients
-        .lock()
-        .await
-        .keys()
-        .copied()
-        .collect::<Vec<_>>();
-    for client_id in clients {
-        send_to_client(state, client_id, &frame).await;
-    }
+    OutboundFrame::Presence { users }
 }
 
 #[cfg(test)]
@@ -3463,8 +3550,18 @@ async fn invalidate_client_connection(state: &AppState, client_id: Uuid) {
     let _ = control_tx.try_send(ClientControl::Close);
     let _account_guard = state.account_ops.lock().await;
     let mut sessions = state.sessions.lock().await;
+    let removed_tokens = sessions
+        .iter()
+        .filter(|(_, session)| session.code_id == code_id)
+        .map(|(token, _)| token.0.clone())
+        .collect::<Vec<_>>();
     sessions.retain(|_, session| session.code_id != code_id);
     drop(sessions);
+    state
+        .transport_sessions
+        .lock()
+        .await
+        .retain(|_, transport| !removed_tokens.contains(&transport.token.0));
     replace_connected_clients_for_code(state, &code_id).await;
 }
 
@@ -3529,15 +3626,30 @@ async fn send_client_result(
         return Err("client connection unavailable".to_string());
     };
     let (completion, delivered) = oneshot::channel();
-    if result_tx
-        .try_send(ClientResult {
-            frame,
-            delivered: completion,
-        })
-        .is_err()
-    {
-        close_client_transport(state, client_id).await;
-        return Err("client result channel unavailable".to_string());
+    let result = ClientResult {
+        frame,
+        delivered: completion,
+    };
+    let result = match stage_client_result(&state.client_stages, client_id, result).await {
+        transport::StageResultOutcome::Pending => None,
+        transport::StageResultOutcome::Ready(result) => Some(result),
+        transport::StageResultOutcome::Full(result) => {
+            transport::abort_client_stage(&state.client_stages, &state.outbound_bytes, client_id)
+                .await;
+            let _ = result.delivered.send(false);
+            close_client_transport(state, client_id).await;
+            return Err("client result channel unavailable".to_string());
+        }
+        transport::StageResultOutcome::Aborted(result) => {
+            let _ = result.delivered.send(false);
+            return Err("client staging aborted".to_string());
+        }
+    };
+    if let Some(result) = result {
+        if result_tx.try_send(result).is_err() {
+            close_client_transport(state, client_id).await;
+            return Err("client result channel unavailable".to_string());
+        }
     }
     let delivered = tokio::time::timeout(CLIENT_RESULT_SEND_TIMEOUT, delivered)
         .await
@@ -3552,6 +3664,19 @@ async fn send_client_result(
 }
 
 async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame) {
+    send_to_client_internal(state, client_id, frame, false).await;
+}
+
+async fn send_initial_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame) {
+    send_to_client_internal(state, client_id, frame, true).await;
+}
+
+async fn send_to_client_internal(
+    state: &AppState,
+    client_id: Uuid,
+    frame: &OutboundFrame,
+    initial: bool,
+) {
     let client = state
         .clients
         .lock()
@@ -3570,14 +3695,35 @@ async fn send_to_client(state: &AppState, client_id: Uuid, frame: &OutboundFrame
     if bytes > frame_limit
         || !reserve_outbound_bytes(&state.outbound_bytes, &queued_bytes, bytes, queue_limit)
     {
+        transport::abort_client_stage(&state.client_stages, &state.outbound_bytes, client_id).await;
         warn!("closing slow or over-budget client");
-        send_control_to_client(state, client_id, ClientControl::Close).await;
+        close_client_transport(state, client_id).await;
         return;
     }
-    if tx.try_send(frame.clone()).is_err() {
-        release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, frame);
-        warn!("closing slow or closed client");
-        send_control_to_client(state, client_id, ClientControl::Close).await;
+    let staged = if initial {
+        stage_initial_outbound_frame(&state.client_stages, client_id, frame.clone()).await
+    } else {
+        stage_outbound_frame(&state.client_stages, client_id, frame.clone()).await
+    };
+    match staged {
+        transport::StageOutcome::Pending => {}
+        transport::StageOutcome::Ready(frame) => {
+            if tx.try_send(frame.clone()).is_err() {
+                release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, &frame);
+                warn!("closing slow or closed client");
+                send_control_to_client(state, client_id, ClientControl::Close).await;
+            }
+        }
+        transport::StageOutcome::Full(frame) => {
+            release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, &frame);
+            transport::abort_client_stage(&state.client_stages, &state.outbound_bytes, client_id)
+                .await;
+            warn!("closing client with an overfull snapshot stage");
+            close_client_transport(state, client_id).await;
+        }
+        transport::StageOutcome::Aborted(frame) => {
+            release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, &frame);
+        }
     }
 }
 
@@ -3588,9 +3734,27 @@ async fn send_control_to_client(state: &AppState, client_id: Uuid, control: Clie
         .await
         .get(&client_id)
         .map(|client| client.control_tx.clone());
-    if let Some(control_tx) = control_tx {
-        if control_tx.try_send(control).is_err() {
-            warn!("dropping control frame for closed client");
+    let Some(control_tx) = control_tx else {
+        return;
+    };
+    match stage_control(&state.client_stages, client_id, control.clone()).await {
+        transport::StageControlOutcome::Pending => {}
+        transport::StageControlOutcome::Full => {
+            transport::abort_client_stage(&state.client_stages, &state.outbound_bytes, client_id)
+                .await;
+            let _ = control_tx.try_send(ClientControl::Close);
+        }
+        transport::StageControlOutcome::Aborted => {
+            if matches!(control, ClientControl::Close)
+                && control_tx.try_send(ClientControl::Close).is_err()
+            {
+                warn!("dropping close control for aborted client");
+            }
+        }
+        transport::StageControlOutcome::Ready => {
+            if control_tx.try_send(control).is_err() {
+                warn!("dropping control frame for closed client");
+            }
         }
     }
 }
@@ -3603,6 +3767,8 @@ async fn cleanup_client(state: &AppState, client_id: Uuid) {
         .await
         .remove(&client_id)
         .map(|client| client.code_id);
+    // Keep the same clients -> staging lock order as commit_client_stage.
+    discard_client_stage(state, client_id).await;
     for members in state.rooms.lock().await.values_mut() {
         members.remove(&client_id);
     }

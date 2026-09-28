@@ -5,6 +5,15 @@
 //! the parent module and is invoked only after admission succeeds.
 
 use super::*;
+use abyssal_transport::{
+    inspect_ws_client_hello, open_ws_client_hello, seal_ws_server_hello, ConnectionNonce,
+    WsConnectionBinding, WsSealer, WS_CLIENT_HELLO_BYTES,
+};
+
+const WS_PROTOCOL_V11: &str = "abyssal-v11";
+const WS_FRAME_AAD: &[u8] = b"ABYSSAL-TRANSPORT-V11-WS-FRAME";
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const WS_HANDSHAKE_WORKER_LIMIT: usize = 64;
 
 pub(super) async fn ws_handler(
     State(state): State<AppState>,
@@ -15,6 +24,27 @@ pub(super) async fn ws_handler(
         debug!("websocket_upgrade_rejected reason=origin");
         return StatusCode::FORBIDDEN.into_response();
     }
+    if websocket_v11_marker(&headers) {
+        return ws
+            .max_frame_size(CONTROL_TRANSPORT_MAX_BUCKET)
+            .max_message_size(CONTROL_TRANSPORT_MAX_BUCKET)
+            .protocols([WS_PROTOCOL_V11])
+            .on_failed_upgrade(|_| {
+                debug!("websocket_upgrade_failed reason=transport");
+            })
+            .on_upgrade(move |socket| socket_loop_v11(state, socket))
+            .into_response();
+    }
+
+    // Never reinterpret a request that mentions v11 as a legacy ticket
+    // upgrade. This closes marker-plus-ticket/bearer downgrade combinations.
+    if websocket_v11_present(&headers) {
+        debug!("websocket_upgrade_rejected reason=v11_metadata");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    // Keep the ticket-bearing v2 path only for clients that have not migrated
+    // yet. It is deliberately unreachable when the fixed v11 marker is used.
     let Some(ticket) = websocket_ticket_header(&headers) else {
         debug!("websocket_upgrade_rejected reason=protocol");
         return StatusCode::UNAUTHORIZED.into_response();
@@ -42,7 +72,7 @@ pub(super) async fn ws_handler(
                     });
                 })
                 .on_upgrade(move |socket| {
-                    socket_loop(state, token, session, client_platform, client_id, socket)
+                    legacy_socket_loop(state, token, session, client_platform, client_id, socket)
                 })
                 .into_response()
         }
@@ -53,8 +83,34 @@ pub(super) async fn ws_handler(
     }
 }
 
+pub(super) fn websocket_v11_marker(headers: &HeaderMap) -> bool {
+    let Some(protocols) = websocket_protocol_header(headers) else {
+        return false;
+    };
+    let mut values = protocols.split(',').map(str::trim);
+    values.next() == Some(WS_PROTOCOL_V11) && values.next().is_none()
+}
+
+pub(super) fn websocket_v11_present(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|protocols| protocols.split(',').map(str::trim))
+        .any(|protocol| protocol == WS_PROTOCOL_V11)
+}
+
+fn websocket_protocol_header(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::SEC_WEBSOCKET_PROTOCOL).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
 pub(super) fn websocket_ticket_header(headers: &HeaderMap) -> Option<Zeroizing<String>> {
-    let protocols = headers.get(header::SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
+    let protocols = websocket_protocol_header(headers)?;
     let mut has_protocol = false;
     let mut ticket = None;
     for protocol in protocols.split(',').map(str::trim) {
@@ -68,9 +124,7 @@ pub(super) fn websocket_ticket_header(headers: &HeaderMap) -> Option<Zeroizing<S
         if protocol.starts_with("bearer.") {
             return None;
         }
-        let Some(value) = protocol.strip_prefix("ticket.") else {
-            continue;
-        };
+        let value = protocol.strip_prefix("ticket.")?;
         if ticket.is_some() || ws_ticket_digest(value).is_none() {
             return None;
         }
@@ -106,7 +160,525 @@ pub(super) fn websocket_origin_allowed(headers: &HeaderMap, allowed_origins: &[S
             .any(|allowed| allowed == &normalized_origin)
 }
 
-pub(super) async fn socket_loop(
+struct PendingClientStage {
+    initial_frames: Vec<OutboundFrame>,
+    live_frames: Vec<OutboundFrame>,
+    results: Vec<ClientResult>,
+    controls: Vec<ClientControl>,
+    queued_bytes: Arc<AtomicUsize>,
+    bootstrap_tx: Option<oneshot::Sender<()>>,
+    aborted: bool,
+}
+
+pub(super) struct ClientStageRegistry {
+    stages: Mutex<HashMap<Uuid, PendingClientStage>>,
+}
+
+impl ClientStageRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            stages: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+pub(super) async fn begin_client_stage(
+    registry: &ClientStageRegistry,
+    client_id: Uuid,
+    queued_bytes: Arc<AtomicUsize>,
+) -> oneshot::Receiver<()> {
+    let (bootstrap_tx, bootstrap_rx) = oneshot::channel();
+    registry.stages.lock().await.insert(
+        client_id,
+        PendingClientStage {
+            initial_frames: Vec::new(),
+            live_frames: Vec::new(),
+            results: Vec::new(),
+            controls: Vec::new(),
+            queued_bytes,
+            bootstrap_tx: Some(bootstrap_tx),
+            aborted: false,
+        },
+    );
+    bootstrap_rx
+}
+
+pub(super) enum StageOutcome {
+    Pending,
+    Ready(OutboundFrame),
+    Full(OutboundFrame),
+    Aborted(OutboundFrame),
+}
+
+pub(super) async fn stage_outbound_frame(
+    registry: &ClientStageRegistry,
+    client_id: Uuid,
+    frame: OutboundFrame,
+) -> StageOutcome {
+    stage_frame(registry, client_id, frame, false).await
+}
+
+pub(super) async fn stage_initial_outbound_frame(
+    registry: &ClientStageRegistry,
+    client_id: Uuid,
+    frame: OutboundFrame,
+) -> StageOutcome {
+    stage_frame(registry, client_id, frame, true).await
+}
+
+async fn stage_frame(
+    registry: &ClientStageRegistry,
+    client_id: Uuid,
+    frame: OutboundFrame,
+    initial: bool,
+) -> StageOutcome {
+    let mut stages = registry.stages.lock().await;
+    let Some(stage) = stages.get_mut(&client_id) else {
+        return StageOutcome::Ready(frame);
+    };
+    if stage.aborted {
+        return StageOutcome::Aborted(frame);
+    }
+    if stage
+        .initial_frames
+        .len()
+        .saturating_add(stage.live_frames.len())
+        >= CLIENT_OUTBOUND_QUEUE_CAPACITY
+    {
+        return StageOutcome::Full(frame);
+    }
+    if initial {
+        stage.initial_frames.push(frame);
+    } else {
+        stage.live_frames.push(frame);
+    }
+    StageOutcome::Pending
+}
+
+pub(super) enum StageControlOutcome {
+    Ready,
+    Pending,
+    Full,
+    Aborted,
+}
+
+pub(super) async fn stage_control(
+    registry: &ClientStageRegistry,
+    client_id: Uuid,
+    control: ClientControl,
+) -> StageControlOutcome {
+    let mut stages = registry.stages.lock().await;
+    let Some(stage) = stages.get_mut(&client_id) else {
+        return StageControlOutcome::Ready;
+    };
+    if stage.aborted {
+        return StageControlOutcome::Aborted;
+    }
+    if stage.controls.len() >= CLIENT_CONTROL_QUEUE_CAPACITY {
+        return StageControlOutcome::Full;
+    }
+    stage.controls.push(control);
+    StageControlOutcome::Pending
+}
+
+pub(super) enum StageResultOutcome {
+    Pending,
+    Ready(ClientResult),
+    Full(ClientResult),
+    Aborted(ClientResult),
+}
+
+pub(super) async fn stage_client_result(
+    registry: &ClientStageRegistry,
+    client_id: Uuid,
+    result: ClientResult,
+) -> StageResultOutcome {
+    let mut stages = registry.stages.lock().await;
+    let Some(stage) = stages.get_mut(&client_id) else {
+        return StageResultOutcome::Ready(result);
+    };
+    if stage.aborted {
+        return StageResultOutcome::Aborted(result);
+    }
+    if stage.results.len() >= CLIENT_RESULT_QUEUE_CAPACITY {
+        return StageResultOutcome::Full(result);
+    }
+    stage.results.push(result);
+    StageResultOutcome::Pending
+}
+
+/// Commit the snapshot staging gate while holding the stage lock. This makes
+/// the order observable by the writer: snapshot frames, then any live frames
+/// that raced with snapshot collection, then control signals.
+pub(super) async fn abort_client_stage(
+    registry: &ClientStageRegistry,
+    global_outbound_bytes: &AtomicUsize,
+    client_id: Uuid,
+) {
+    let mut stages = registry.stages.lock().await;
+    let Some(stage) = stages.get_mut(&client_id) else {
+        return;
+    };
+    if stage.aborted {
+        return;
+    }
+    stage.aborted = true;
+    let queued_bytes = Arc::clone(&stage.queued_bytes);
+    for frame in stage
+        .initial_frames
+        .drain(..)
+        .chain(stage.live_frames.drain(..))
+    {
+        release_client_outbound_bytes(global_outbound_bytes, &queued_bytes, &frame);
+    }
+    for result in stage.results.drain(..) {
+        let _ = result.delivered.send(false);
+    }
+    stage.controls.clear();
+}
+
+pub(super) async fn commit_client_stage(state: &AppState, client_id: Uuid) {
+    let client = state.clients.lock().await.get(&client_id).map(|client| {
+        (
+            client.tx.clone(),
+            client.result_tx.clone(),
+            client.control_tx.clone(),
+        )
+    });
+    let Some((tx, result_tx, control_tx)) = client else {
+        discard_client_stage(state, client_id).await;
+        return;
+    };
+    let mut stages = state.client_stages.stages.lock().await;
+    let Some(stage) = stages.remove(&client_id) else {
+        return;
+    };
+    let PendingClientStage {
+        initial_frames,
+        live_frames,
+        results,
+        controls,
+        queued_bytes,
+        bootstrap_tx,
+        aborted,
+    } = stage;
+    if aborted {
+        if let Some(bootstrap_tx) = bootstrap_tx {
+            let _ = bootstrap_tx.send(());
+        }
+        return;
+    }
+    for frame in initial_frames.into_iter().chain(live_frames) {
+        if let Err(error) = tx.try_send(frame) {
+            // The frame was already included in the weighted queue budget.
+            // Restore that budget when the channel cannot accept it.
+            let frame = error.into_inner();
+            release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, &frame);
+        }
+    }
+    for result in results {
+        if let Err(error) = result_tx.try_send(result) {
+            let _ = error.into_inner().delivered.send(false);
+        }
+    }
+    for control in controls {
+        let _ = control_tx.try_send(control);
+    }
+    if let Some(bootstrap_tx) = bootstrap_tx {
+        let _ = bootstrap_tx.send(());
+    }
+}
+
+pub(super) async fn discard_client_stage(state: &AppState, client_id: Uuid) {
+    let Some(stage) = state.client_stages.stages.lock().await.remove(&client_id) else {
+        return;
+    };
+    let PendingClientStage {
+        initial_frames,
+        live_frames,
+        results,
+        queued_bytes,
+        bootstrap_tx,
+        ..
+    } = stage;
+    for frame in initial_frames.into_iter().chain(live_frames) {
+        release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, &frame);
+    }
+    for result in results {
+        let _ = result.delivered.send(false);
+    }
+    if let Some(bootstrap_tx) = bootstrap_tx {
+        let _ = bootstrap_tx.send(());
+    }
+}
+
+async fn socket_loop_v11(state: AppState, socket: WebSocket) {
+    let Some(handshake_permit) = state.ws_handshake_workers.clone().try_acquire_owned().ok() else {
+        debug!("websocket_upgrade_rejected reason=handshake_capacity");
+        return;
+    };
+    let (mut sink, mut stream) = socket.split();
+    let first = match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(Message::Binary(bytes)))) => bytes,
+        _ => return,
+    };
+    if first.len() != WS_CLIENT_HELLO_BYTES {
+        return;
+    }
+    let header = match inspect_ws_client_hello(&first) {
+        Ok(header) => header,
+        Err(_) => return,
+    };
+    let transport_key = TransportSessionId::new(header.session_id);
+    let Some((transport_root, expected_token)) = state
+        .transport_sessions
+        .lock()
+        .await
+        .get(&transport_key)
+        .map(|transport| (transport.root.clone(), transport.token.0.clone()))
+    else {
+        return;
+    };
+    let opened = match open_ws_client_hello(&transport_root, state.node_public_key, &first) {
+        Ok(opened) => opened,
+        Err(_) => return,
+    };
+    let Ok(ticket) = std::str::from_utf8(opened.ticket.as_slice()) else {
+        return;
+    };
+    let Some((session_token, auth, client_platform)) =
+        consume_ws_ticket_for_session(&state, ticket, expected_token.as_str()).await
+    else {
+        return;
+    };
+    let server_nonce = match ConnectionNonce::generate() {
+        Ok(nonce) => nonce,
+        Err(_) => return,
+    };
+    let server_hello = match seal_ws_server_hello(
+        &transport_root,
+        state.node_public_key,
+        header.session_id,
+        header.client_nonce,
+        server_nonce.to_bytes(),
+    ) {
+        Ok(hello) => hello,
+        Err(_) => return,
+    };
+    if !matches!(
+        tokio::time::timeout(
+            WS_HANDSHAKE_TIMEOUT,
+            sink.send(Message::Binary(server_hello.to_vec())),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    let client_nonce = match ConnectionNonce::new(header.client_nonce) {
+        Ok(nonce) => nonce,
+        Err(_) => return,
+    };
+    let records = match WsConnectionBinding::new(header.session_id, client_nonce, server_nonce) {
+        Ok(binding) => match binding.into_server(&transport_root) {
+            Ok(records) => records,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    drop(handshake_permit);
+
+    let client_id = Uuid::new_v4();
+    let code_id = auth.code_id;
+    let mut active_connections = state.active_connections.lock().await;
+    if !reserve_connection(&mut active_connections, code_id, client_id) {
+        return;
+    }
+    drop(active_connections);
+
+    let mut purge_rx = state.purge_epoch.subscribe();
+    let (tx, rx) = mpsc::channel::<OutboundFrame>(CLIENT_OUTBOUND_QUEUE_CAPACITY);
+    let (control_tx, control_rx) = mpsc::channel::<ClientControl>(CLIENT_CONTROL_QUEUE_CAPACITY);
+    let (result_tx, result_rx) = mpsc::channel::<ClientResult>(CLIENT_RESULT_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let bootstrap_rx =
+        begin_client_stage(&state.client_stages, client_id, Arc::clone(&queued_bytes)).await;
+    state.clients.lock().await.insert(
+        client_id,
+        ClientHandle {
+            code_id,
+            username: auth.username.clone(),
+            platform: client_platform,
+            tx,
+            control_tx,
+            result_tx,
+            queued_bytes: Arc::clone(&queued_bytes),
+        },
+    );
+    if let Some(account) = state.accounts.lock().await.get_mut(&code_id) {
+        account.connected = true;
+    }
+    broadcast_presence(&state).await;
+
+    let mut opener = records.opener;
+    let mut sealer = records.sealer;
+    let global_outbound_bytes = Arc::clone(&state.outbound_bytes);
+    let writer = tokio::spawn(async move {
+        let mut rx = rx;
+        let mut control_rx = control_rx;
+        let mut result_rx = result_rx;
+        let mut bootstrap_rx = bootstrap_rx;
+        let send_frame = |sealer: &mut WsSealer, frame: &OutboundFrame| {
+            serialize_outbound_frame(frame).and_then(|serialized| {
+                let serialized = Zeroizing::new(serialized);
+                sealer
+                    .seal(WS_FRAME_AAD, serialized.as_bytes())
+                    .ok()
+                    .map(Message::Binary)
+            })
+        };
+        let mut bootstrapped = false;
+        loop {
+            if !bootstrapped {
+                tokio::select! {
+                    biased;
+                    changed = purge_rx.changed() => {
+                        if changed.is_err() { break; }
+                        if let Some(record) = send_frame(&mut sealer, &OutboundFrame::GlobalWipe) {
+                            let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, sink.send(record)).await;
+                        }
+                        let _ = tokio::time::timeout(
+                            CLIENT_WIPE_SEND_TIMEOUT,
+                            sink.send(Message::Close(Some(CloseFrame { code: PURGE_CLOSE_CODE, reason: PURGE_CLOSE_REASON.into() }))),
+                        ).await;
+                        break;
+                    }
+                    control = control_rx.recv() => {
+                        match control {
+                            Some(ClientControl::GlobalWipe) => {
+                                if let Some(record) = send_frame(&mut sealer, &OutboundFrame::GlobalWipe) {
+                                    let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, sink.send(record)).await;
+                                }
+                                let _ = tokio::time::timeout(
+                                    CLIENT_WIPE_SEND_TIMEOUT,
+                                    sink.send(Message::Close(Some(CloseFrame { code: PURGE_CLOSE_CODE, reason: PURGE_CLOSE_REASON.into() }))),
+                                ).await;
+                            }
+                            Some(ClientControl::Close) | None => {
+                                let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, sink.send(Message::Close(None))).await;
+                            }
+                        }
+                        break;
+                    }
+                    _ = &mut bootstrap_rx => {
+                        bootstrapped = true;
+                    }
+                }
+                if !bootstrapped {
+                    continue;
+                }
+            }
+            tokio::select! {
+                biased;
+                changed = purge_rx.changed() => {
+                    if changed.is_err() { break; }
+                    if let Some(record) = send_frame(&mut sealer, &OutboundFrame::GlobalWipe) {
+                        let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, sink.send(record)).await;
+                    }
+                    let _ = tokio::time::timeout(
+                        CLIENT_WIPE_SEND_TIMEOUT,
+                        sink.send(Message::Close(Some(CloseFrame { code: PURGE_CLOSE_CODE, reason: PURGE_CLOSE_REASON.into() }))),
+                    ).await;
+                    break;
+                }
+                control = control_rx.recv() => {
+                    match control {
+                        Some(ClientControl::GlobalWipe) => {
+                            if let Some(record) = send_frame(&mut sealer, &OutboundFrame::GlobalWipe) {
+                                let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, sink.send(record)).await;
+                            }
+                            let _ = tokio::time::timeout(
+                                CLIENT_WIPE_SEND_TIMEOUT,
+                                sink.send(Message::Close(Some(CloseFrame { code: PURGE_CLOSE_CODE, reason: PURGE_CLOSE_REASON.into() }))),
+                            ).await;
+                        }
+                        Some(ClientControl::Close) => {
+                            let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, sink.send(Message::Close(None))).await;
+                        }
+                        None => break,
+                    }
+                    break;
+                }
+                result = result_rx.recv() => {
+                    let Some(result) = result else { break; };
+                    let delivered = send_frame(&mut sealer, &result.frame).map(|record| async {
+                        matches!(tokio::time::timeout(CLIENT_RESULT_SEND_TIMEOUT, sink.send(record)).await, Ok(Ok(())))
+                    });
+                    let delivered = match delivered { Some(future) => future.await, None => false };
+                    let _ = result.delivered.send(delivered);
+                    if !delivered { break; }
+                }
+                frame = rx.recv() => {
+                    let Some(frame) = frame else { break; };
+                    let Some(record) = send_frame(&mut sealer, &frame) else {
+                        release_client_outbound_bytes(&global_outbound_bytes, &queued_bytes, &frame);
+                        break;
+                    };
+                    release_client_outbound_bytes(&global_outbound_bytes, &queued_bytes, &frame);
+                    let sent = tokio::time::timeout(CLIENT_SINK_SEND_TIMEOUT, sink.send(record)).await;
+                    if !matches!(sent, Ok(Ok(()))) { break; }
+                }
+            }
+        }
+        while let Ok(frame) = rx.try_recv() {
+            release_client_outbound_bytes(&global_outbound_bytes, &queued_bytes, &frame);
+        }
+        while let Ok(result) = result_rx.try_recv() {
+            let _ = result.delivered.send(false);
+        }
+    });
+
+    // Snapshot builders only enqueue into the stage. The writer cannot see
+    // them until every snapshot has been collected and the gate is committed.
+    send_initial_presence(&state, client_id).await;
+    send_initial_mls_catalog(&state, client_id, &code_id).await;
+    send_initial_mls_public_catalog(&state, client_id).await;
+    send_initial_mls_pending(&state, client_id, &code_id).await;
+    send_initial_mls_pending_joins(&state, client_id, &code_id).await;
+    send_initial_mls_pending_leaves(&state, client_id, &code_id).await;
+    send_initial_direct_catalog(&state, client_id, &auth.username).await;
+    commit_client_stage(&state, client_id).await;
+
+    let mut session_watchdog = tokio::time::interval(Duration::from_secs(1));
+    session_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = session_watchdog.tick() => {
+                if active_session(&state, session_token.as_str(), false).await.is_none() { break; }
+            }
+            result = stream.next() => {
+                match result {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if bytes.len() > CONTROL_TRANSPORT_MAX_BUCKET || check_ws_frame_allowed(&state, client_id, bytes.len()).await.is_err() { break; }
+                        let plaintext = match opener.open(WS_FRAME_AAD, &bytes) { Ok(value) => value, Err(_) => break };
+                        let text = match String::from_utf8(plaintext.to_vec()) { Ok(value) => Zeroizing::new(value), Err(_) => break };
+                        if validate_inbound_transport_size_before_parse(&text).is_err() { break; }
+                        let inner = match strip_inbound_control_transport(&text) { Ok(inner) => Zeroizing::new(inner), Err(_) => break };
+                        if handle_frame(&state, client_id, inner.as_str()).await.is_err() { break; }
+                    }
+                    Some(Ok(Message::Text(_))) => break,
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+    cleanup_client(&state, client_id).await;
+    let _ = tokio::time::timeout(CLIENT_WIPE_SEND_TIMEOUT, writer).await;
+}
+
+pub(super) async fn legacy_socket_loop(
     state: AppState,
     session_token: Zeroizing<String>,
     auth: AuthSession,
