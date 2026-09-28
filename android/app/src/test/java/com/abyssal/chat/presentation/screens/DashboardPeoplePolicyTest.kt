@@ -17,7 +17,7 @@ class DashboardPeoplePolicyTest {
             currentUsername = "current"
         )
 
-        assertEquals(listOf("OfflinePeer", "OnlinePeer"), peers.map { it.username })
+        assertEquals(listOf("OnlinePeer", "OfflinePeer"), peers.map { it.username })
         assertTrue(peers.any { it.username == "OfflinePeer" && !it.connected })
     }
 

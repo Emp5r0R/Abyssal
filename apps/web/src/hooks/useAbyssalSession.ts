@@ -233,6 +233,11 @@ async function downloadAndDecryptAttachmentRecords(
   }
 }
 
+export type RelaySecurityWarning = "ATTESTATION_REJECTED" | "PLATFORM_CONFLICT";
+
+export const SESSION_EXPIRED_NOTICE =
+  "Your session ended because the relay restarted or you were inactive. Sign in again; after a relay restart you need a new invite.";
+
 export function useAbyssalSession() {
   const [session, setSession] = useState<AccountSession | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
@@ -246,7 +251,8 @@ export function useAbyssalSession() {
   const [upload, setUpload] = useState<UploadState>(EMPTY_UPLOAD);
   const [media, setMedia] = useState<DecryptedMedia | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [securityWarning, setSecurityWarning] = useState<"ATTESTATION_REJECTED" | null>(null);
+  const [securityWarning, setSecurityWarning] = useState<RelaySecurityWarning | null>(null);
+  const [entryNotice, setEntryNotice] = useState<string | null>(null);
   const [pendingMlsJoins, setPendingMlsJoins] = useState<PendingMlsJoinSummary[]>([]);
   const [pendingMlsLeaves, setPendingMlsLeaves] = useState<PendingMlsLeaveSummary[]>([]);
   const [directTrust, setDirectTrust] = useState<DirectTrustStatus>({
@@ -1165,6 +1171,7 @@ export function useAbyssalSession() {
     let parsedInvite: ParsedInvite | null = null;
     setNotice(null);
     setSecurityWarning(null);
+    setEntryNotice(null);
     try {
       parsedInvite = await parseInvite(input.invite);
       await verifyConnectedInviteNode(parsedInvite, loginAbort.signal);
@@ -1333,9 +1340,15 @@ export function useAbyssalSession() {
             failClosed(candidate);
           }
         },
-        () => {
-          if (sessionGenerationRef.current === relayGeneration && sessionRef.current?.token === candidate.token) {
-            setSecurityWarning("ATTESTATION_REJECTED");
+        (rejection) => {
+          if (sessionGenerationRef.current !== relayGeneration || sessionRef.current?.token !== candidate.token) return;
+          if (rejection === "session-expired") {
+            // The relay no longer recognizes the session (restart, wipe, or
+            // inactivity). Reconnecting cannot help; return to the entrance.
+            failClosed(candidate);
+            setEntryNotice(SESSION_EXPIRED_NOTICE);
+          } else {
+            setSecurityWarning(rejection === "platform-conflict" ? "PLATFORM_CONFLICT" : "ATTESTATION_REJECTED");
           }
         },
       );
@@ -2241,6 +2254,7 @@ export function useAbyssalSession() {
     media,
     notice,
     securityWarning,
+    entryNotice,
     pendingMlsJoins,
     pendingMlsLeaves,
     retainWhenHiddenRef,

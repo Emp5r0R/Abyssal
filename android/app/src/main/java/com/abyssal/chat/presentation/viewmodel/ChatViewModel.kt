@@ -450,6 +450,14 @@ class ChatViewModel(
     val presence: StateFlow<List<UserPresence>> = chatTransport.getPresence()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    private val _roomActionNotice = MutableStateFlow<String?>(null)
+    /** Outcome of the latest room create/join action, shown on the dashboard. */
+    val roomActionNotice: StateFlow<String?> = _roomActionNotice.asStateFlow()
+
+    fun dismissRoomActionNotice() {
+        _roomActionNotice.value = null
+    }
+
     private val _inviteError = mutableStateOf<String?>(null)
     val inviteError: State<String?> = _inviteError
 
@@ -903,6 +911,13 @@ class ChatViewModel(
 
         viewModelScope.launch {
             serverStatus.collect { status ->
+                if (status.state == "SESSION_EXPIRED") {
+                    // The relay no longer knows this session (restart, wipe, or
+                    // inactivity). Retrying cannot recover it; return to entry.
+                    endSession()
+                    _inviteError.value = SESSION_EXPIRED_NOTICE
+                    return@collect
+                }
                 if (status.state != "CONNECTED") {
                     _publicMlsRooms.value = emptyList()
                     directTrustStore.clear()
@@ -1174,6 +1189,7 @@ class ChatViewModel(
     }
 
     private fun safeInviteError(message: String?): String = when (message) {
+        SESSION_EXPIRED_NOTICE,
         "Invalid invite",
         "Unsupported invite version",
         "Invite belongs to another application",
@@ -1847,6 +1863,11 @@ class ChatViewModel(
         visibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE
     ) {
         val connectionGeneration = chatTransport.currentConnectionGeneration()
+        if (serverStatus.value.state != "CONNECTED") {
+            _roomActionNotice.value = ROOM_OFFLINE_NOTICE
+            return
+        }
+        _roomActionNotice.value = null
         viewModelScope.launch {
             val forumId = RoomIdentifiers.newForumId()
             val session = ChatSession(
@@ -1873,11 +1894,18 @@ class ChatViewModel(
                 ownerUsername = currentUser.value?.username,
                 roomVisibility = visibility
             )
-            val manager = mlsManager ?: return@launch
-            val transport = mlsTransport ?: return@launch
-            val frame = runCatching { manager.createRoom(session) }.getOrNull() ?: return@launch
+            val manager = mlsManager
+            val transport = mlsTransport
+            val frame = manager?.let { runCatching { it.createRoom(session) }.getOrNull() }
+            if (manager == null || transport == null || frame == null) {
+                _roomActionNotice.value = ROOM_CREATE_FAILED_NOTICE
+                return@launch
+            }
             try {
-                if (!transport.sendMlsControl(frame, connectionGeneration)) manager.removeRoom(session.id)
+                if (!transport.sendMlsControl(frame, connectionGeneration)) {
+                    manager.removeRoom(session.id)
+                    _roomActionNotice.value = ROOM_CREATE_FAILED_NOTICE
+                }
             } catch (error: CancellationException) {
                 withContext(NonCancellable) { manager.removeRoom(session.id) }
                 throw error
@@ -1896,13 +1924,32 @@ class ChatViewModel(
 
     fun requestJoinRoom(roomId: String) {
         val normalized = roomId.trim()
-        if (!Regex("^[A-Za-z0-9_-]{1,128}$").matches(normalized) || requestedMlsRooms.size >= 32) return
-        val transport = mlsTransport ?: return
+        if (!Regex("^[A-Za-z0-9_-]{1,128}$").matches(normalized)) {
+            _roomActionNotice.value = "Room IDs contain only letters, numbers, - and _."
+            return
+        }
+        if (requestedMlsRooms.size >= 32) {
+            _roomActionNotice.value = "Too many pending join requests. Wait for an owner to respond."
+            return
+        }
+        if (serverStatus.value.state != "CONNECTED") {
+            _roomActionNotice.value = ROOM_OFFLINE_NOTICE
+            return
+        }
+        val transport = mlsTransport ?: run {
+            _roomActionNotice.value = "Room join request could not be sent."
+            return
+        }
         val generation = chatTransport.currentConnectionGeneration()
         requestedMlsRooms += normalized
         viewModelScope.launch {
             val frame = JSONObject().put("type", "mls_discover_room").put("protocol_version", 10).put("room_id", normalized)
-            if (!transport.sendMlsControl(frame, generation)) requestedMlsRooms.remove(normalized)
+            if (transport.sendMlsControl(frame, generation)) {
+                _roomActionNotice.value = "Join request sent. The room owner must approve it."
+            } else {
+                requestedMlsRooms.remove(normalized)
+                _roomActionNotice.value = "Room join request could not be sent."
+            }
         }
     }
 
@@ -2027,6 +2074,12 @@ class ChatViewModel(
         )
         _isLocked.value = false
         _showCamouflagePinPrompt.value = false
+    }
+
+    /** Host left the foreground: safe point to swap launcher aliases. */
+    fun onHostStopped() {
+        lockForLifecycleExit()
+        disguiseManager.applyPendingLauncherAlias()
     }
 
     fun lockApp() {
@@ -3252,6 +3305,11 @@ class ChatViewModel(
         private const val SESSION_WATCHDOG_INTERVAL_MS = 1_000L
         private const val REMOTE_ACTIVITY_SIGNAL_INTERVAL_MS = 15_000L
         private const val DEFAULT_MAX_ROOMS_PER_USER = 5
+        internal const val ROOM_OFFLINE_NOTICE =
+            "You are offline. Rooms can be created and joined once the relay reconnects."
+        internal const val ROOM_CREATE_FAILED_NOTICE = "The room could not be created. Try again."
+        internal const val SESSION_EXPIRED_NOTICE =
+            "Your session ended because the relay restarted or you were inactive. Sign in again; after a relay restart you need a new invite."
         private const val IDENTITY_PUBLIC_KEY_BYTES = 608
         private val PREKEY_ID_REGEX = Regex("^[A-Za-z0-9_-]{1,32}$")
         private const val MAX_RECEIVED_FRAME_IDS = 10_000

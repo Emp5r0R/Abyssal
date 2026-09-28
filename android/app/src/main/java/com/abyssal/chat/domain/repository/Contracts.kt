@@ -280,13 +280,15 @@ interface IEncryptedAttachmentService {
 }
 
 interface IDisguiseManager {
-    /** Atomically configures the in-RAM verifier and launcher alias state. */
+    /** Configures the in-RAM verifier and requests the matching launcher alias. */
     fun configure(enabled: Boolean, unlockPin: String = "", duressPin: String = ""): Boolean
     fun isDisguiseEnabled(): Boolean
     /** Wipes verifier material during ViewModel teardown without waiting on I/O. */
     fun clear()
     fun verifyPin(pin: String): Boolean
     fun verifyDuressPin(pin: String): Boolean
+    /** Applies a launcher alias change deferred until the app left the foreground. */
+    fun applyPendingLauncherAlias() {}
 }
 
 interface IAppUpdateService {

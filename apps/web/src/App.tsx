@@ -120,10 +120,10 @@ export default function App() {
     return <SecurityVerificationGate status={originStatus} onRetry={checkOrigin} />;
   }
 
-  if (abyssal.securityWarning === "ATTESTATION_REJECTED") {
+  if (abyssal.securityWarning) {
     return (
       <SecurityVerificationGate
-        status="ATTESTATION_REJECTED"
+        status={abyssal.securityWarning}
         onRetry={() => window.location.reload()}
         onEndSession={() => { void abyssal.logout(); }}
       />
@@ -131,7 +131,7 @@ export default function App() {
   }
 
   if (!abyssal.session) {
-    return <Entrance onLogin={abyssal.login} onPreflight={preflightOrigin} />;
+    return <Entrance onLogin={abyssal.login} onPreflight={preflightOrigin} notice={abyssal.entryNotice} />;
   }
 
   if (!pinGate || pinGate.destroyed) {

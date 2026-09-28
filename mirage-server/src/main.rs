@@ -89,7 +89,8 @@ use invite_bootstrap::{write_boot_invites, BootstrapMaterials, IssuedInvite};
 use messages::*;
 use mls::*;
 use release_admission::{
-    BuildAttestationRequest, InstallOutcome, ReleaseAdmissionStore, ReleaseManifestMirror,
+    AdmissionError, BuildAttestationRequest, InstallOutcome, ReleaseAdmissionStore,
+    ReleaseManifestMirror,
 };
 use transaction_receipts::{
     BeginOutcome as TransactionBeginOutcome, ReceiptError as TransactionReceiptError,
@@ -172,6 +173,7 @@ const MAX_WS_TICKETS: usize = 1_024;
 const DEFAULT_RELEASE_MANIFEST_REFRESH_SECONDS: usize = 15 * 60;
 const MIN_RELEASE_MANIFEST_REFRESH_SECONDS: usize = 60;
 const MAX_RELEASE_MANIFEST_REFRESH_SECONDS: usize = 6 * 60 * 60;
+const RELEASE_MANIFEST_RETRY_BASE: Duration = Duration::from_secs(5);
 const OPAQUE_HANDSHAKE_TTL_MS: u64 = 60_000;
 const MAX_OPAQUE_HANDSHAKES: usize = 1_024;
 const IDENTITY_FINGERPRINT_BYTES: usize = 64;
@@ -1327,22 +1329,54 @@ impl Drop for MlsRecoverySnapshotWire {
     }
 }
 
-async fn refresh_release_manifest(store: &ReleaseAdmissionStore, mirror: &ReleaseManifestMirror) {
+/// Returns whether the relay now holds a verified manifest from this refresh.
+async fn refresh_release_manifest(
+    store: &ReleaseAdmissionStore,
+    mirror: &ReleaseManifestMirror,
+) -> bool {
     match mirror.refresh(store, now_ms()).await {
-        Ok(InstallOutcome::Installed) => info!("release_manifest_refresh result=installed"),
-        Ok(InstallOutcome::Unchanged) => debug!("release_manifest_refresh result=unchanged"),
-        Err(_) => warn!("release_manifest_refresh result=rejected"),
+        Ok(InstallOutcome::Installed) => {
+            info!("release_manifest_refresh result=installed");
+            true
+        }
+        Ok(InstallOutcome::Unchanged) => {
+            debug!("release_manifest_refresh result=unchanged");
+            true
+        }
+        Err(error) => {
+            warn!("release_manifest_refresh result=rejected reason={error:?}");
+            false
+        }
     }
+}
+
+/// Delay before the next mirror refresh. A failed refresh retries quickly with
+/// exponential backoff so a transient GitHub or network failure at startup
+/// does not leave every client unadmitted for a full refresh interval.
+fn next_manifest_refresh_delay(interval: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return interval;
+    }
+    let exponent = consecutive_failures.saturating_sub(1).min(10);
+    RELEASE_MANIFEST_RETRY_BASE
+        .saturating_mul(1_u32 << exponent)
+        .min(interval)
 }
 
 async fn release_manifest_watcher(
     store: Arc<ReleaseAdmissionStore>,
     mirror: ReleaseManifestMirror,
     interval: Duration,
+    initial_refresh_succeeded: bool,
 ) {
+    let mut consecutive_failures = u32::from(!initial_refresh_succeeded);
     loop {
-        tokio::time::sleep(interval).await;
-        refresh_release_manifest(&store, &mirror).await;
+        tokio::time::sleep(next_manifest_refresh_delay(interval, consecutive_failures)).await;
+        if refresh_release_manifest(&store, &mirror).await {
+            consecutive_failures = 0;
+        } else {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+        }
     }
 }
 
@@ -1374,7 +1408,8 @@ async fn main() {
 
     if !integration_manifest_installed {
         if let Ok(mirror) = ReleaseManifestMirror::new() {
-            refresh_release_manifest(&state.release_admission, &mirror).await;
+            let initial_refresh_succeeded =
+                refresh_release_manifest(&state.release_admission, &mirror).await;
             let refresh_seconds = read_usize_env(
                 "ABYSSAL_RELEASE_MANIFEST_REFRESH_SECONDS",
                 DEFAULT_RELEASE_MANIFEST_REFRESH_SECONDS,
@@ -1387,6 +1422,7 @@ async fn main() {
                 state.release_admission.clone(),
                 mirror,
                 Duration::from_secs(refresh_seconds as u64),
+                initial_refresh_succeeded,
             ));
         } else {
             warn!("release_admission_unavailable reason=client_configuration");

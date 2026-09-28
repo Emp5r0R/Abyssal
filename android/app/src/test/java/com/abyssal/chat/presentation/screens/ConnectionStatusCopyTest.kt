@@ -15,7 +15,12 @@ class ConnectionStatusCopyTest {
         assertEquals("OFFLINE", ConnectionStatusCopy.pillLabel("DISCONNECTED"))
         assertEquals("UPDATE REQUIRED", ConnectionStatusCopy.pillLabel("SECURITY_REJECTED"))
         assertEquals("OFFLINE", ConnectionStatusCopy.pillLabel("UNEXPECTED"))
-        listOf("CONNECTED", "CONNECTING", "DISCONNECTED", "SECURITY_REJECTED").forEach { state ->
+        assertEquals("WEB ACCOUNT", ConnectionStatusCopy.pillLabel("PLATFORM_CONFLICT"))
+        assertEquals("SIGNED OUT", ConnectionStatusCopy.pillLabel("SESSION_EXPIRED"))
+        listOf(
+            "CONNECTED", "CONNECTING", "DISCONNECTED", "SECURITY_REJECTED",
+            "PLATFORM_CONFLICT", "SESSION_EXPIRED"
+        ).forEach { state ->
             assertFalse(ConnectionStatusCopy.pillLabel(state).contains('_'))
             assertFalse(ConnectionStatusCopy.composerPlaceholder(state).contains('_'))
         }
@@ -31,5 +36,9 @@ class ConnectionStatusCopyTest {
         assertNotNull(ConnectionStatusCopy.rejectionNotice("SECURITY_REJECTED"))
         assertNull(ConnectionStatusCopy.rejectionNotice("DISCONNECTED"))
         assertNull(ConnectionStatusCopy.rejectionNotice("CONNECTED"))
+        assertTrue(
+            requireNotNull(ConnectionStatusCopy.rejectionNotice("PLATFORM_CONFLICT")).contains("web app")
+        )
+        assertNull(ConnectionStatusCopy.rejectionNotice("SESSION_EXPIRED"))
     }
 }

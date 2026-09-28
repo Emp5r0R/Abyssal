@@ -221,6 +221,9 @@ internal object MlsWireCodec {
 
     private fun parseMembership(v: JSONObject): MlsIncomingFrame? {
         if (!v.exact("type", "protocol_version", "room_id", "message_id", "from_epoch", "to_epoch", "revision", "from_membership_digest_b64", "group_id_b64", "membership_digest_b64", "roster", "control_b64", "welcome_b64", "authenticated_data_b64")) return null
+        // Existing members receive the commit; a joining member receives only the
+        // welcome (the relay withholds the commit). Exactly one must be present.
+        if (v.string("control_b64").isNullOrEmpty() == v.string("welcome_b64").isNullOrEmpty()) return null
         return MlsIncomingFrame.Membership(
             v.string("room_id")?.takeIf(id::matches) ?: return null,
             v.string("message_id")?.takeIf(id::matches) ?: return null,
@@ -230,7 +233,7 @@ internal object MlsWireCodec {
             v.string("group_id_b64")?.takeIf { validB64(it, 32, 32) } ?: return null,
             v.string("membership_digest_b64")?.takeIf { validB64(it, 32, 32) } ?: return null,
             v.optJSONArray("roster")?.roster() ?: return null,
-            v.string("control_b64")?.takeIf { validB64(it, 1, MAX_CONTROL_BYTES) } ?: return null,
+            v.string("control_b64")?.takeIf { validB64(it, 0, MAX_CONTROL_BYTES) } ?: return null,
             v.string("welcome_b64")?.takeIf { validB64(it, 0, MAX_CONTROL_BYTES) } ?: return null,
             v.string("authenticated_data_b64")?.takeIf { validB64(it, 1, MAX_AAD_BYTES) } ?: return null
         )

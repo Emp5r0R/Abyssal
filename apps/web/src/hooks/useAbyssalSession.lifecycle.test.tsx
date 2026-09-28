@@ -333,10 +333,17 @@ const mocks = vi.hoisted(() => {
       session: AccountSession,
       frameHandler: (frame: IncomingFrame) => void,
       private readonly stateHandler: (state: "connecting" | "connected" | "disconnected") => void,
+      _onPurge?: () => void,
+      private readonly rejectionHandler?: (rejection: "build" | "session-expired" | "platform-conflict") => void,
     ) {
       this.session = session;
       this.frameHandler = frameHandler;
       FakeRelay.instances.push(this);
+    }
+
+    reject(rejection: "build" | "session-expired" | "platform-conflict"): void {
+      this.stateHandler("disconnected");
+      this.rejectionHandler?.(rejection);
     }
 
     connect(): void {
@@ -686,6 +693,37 @@ beforeEach(() => {
 });
 
 describe("useAbyssalSession lifecycle cleanup", () => {
+  it("returns to the entrance with an explanation when the relay forgets the session", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        invite: "fixture-invite",
+        password: new TextEncoder().encode("password"),
+        retainWhenHidden: true,
+      });
+    });
+    expect(result.current.session).not.toBeNull();
+    await act(async () => { mocks.getLastRelay()?.reject("session-expired"); });
+    await waitFor(() => expect(result.current.session).toBeNull());
+    expect(result.current.entryNotice).toMatch(/session ended/u);
+    expect(result.current.securityWarning).toBeNull();
+    unmount();
+  });
+
+  it("explains a platform-bound account instead of retrying silently", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => {
+      await result.current.login({
+        invite: "fixture-invite",
+        password: new TextEncoder().encode("password"),
+        retainWhenHidden: true,
+      });
+    });
+    await act(async () => { mocks.getLastRelay()?.reject("platform-conflict"); });
+    await waitFor(() => expect(result.current.securityWarning).toBe("PLATFORM_CONFLICT"));
+    unmount();
+  });
+
   it("rejects malformed, duplicate, and oversized relay catalogs without replacing state", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
     await act(async () => {

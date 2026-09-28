@@ -185,7 +185,10 @@ export function parseMlsIncomingFrame(value: Record<string, unknown>): MlsIncomi
         validId(value.room_id) && validId(value.message_id) && validCounters(value, ["from_epoch", "to_epoch", "revision"]) &&
         validB64(value.from_membership_digest_b64, 32, 32) && validB64(value.group_id_b64, 32, 32) &&
         validB64(value.membership_digest_b64, 32, 32) && validRoster(value.roster, false) &&
-        validB64(value.control_b64, 1, MLS_MAX_CONTROL_BYTES) && validB64(value.welcome_b64, 0, MLS_MAX_CONTROL_BYTES) &&
+        // Existing members receive the commit; a joining member receives only the
+        // welcome (the relay withholds the commit). Exactly one must be present.
+        validB64(value.control_b64, 0, MLS_MAX_CONTROL_BYTES) && validB64(value.welcome_b64, 0, MLS_MAX_CONTROL_BYTES) &&
+        (value.control_b64 === "") !== (value.welcome_b64 === "") &&
         validB64(value.authenticated_data_b64, 1, MLS_MAX_AAD_BYTES) ? value as MlsIncomingFrame : null;
     case "mls_application":
       return exact(["room_id", "message_id", "sender_username", "epoch", "revision", "membership_digest_b64", "ciphertext_b64", "authenticated_data_b64"]) &&

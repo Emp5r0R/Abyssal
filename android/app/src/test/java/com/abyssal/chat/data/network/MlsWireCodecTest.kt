@@ -138,6 +138,24 @@ class MlsWireCodecTest {
         assertFalse(MlsWireCodec.isStrictSnapshot(JSONObject(snapshot.toString()).put("revision", "01")))
     }
 
+    @Test fun membershipAcceptsWelcomeOnlyForJoinersAndCommitOnlyForMembers() {
+        fun membership(control: ByteArray, welcome: ByteArray) = JSONObject().put("type", "mls_membership").put("protocol_version", 10)
+            .put("room_id", "forum_a").put("message_id", "message_1").put("from_epoch", "0").put("to_epoch", "1").put("revision", "0")
+            .put("from_membership_digest_b64", MlsWireCodec.encode(ByteArray(32) { 1 }))
+            .put("group_id_b64", MlsWireCodec.encode(ByteArray(32))).put("membership_digest_b64", MlsWireCodec.encode(ByteArray(32) { 2 }))
+            .put("roster", JSONArray()
+                .put(JSONObject().put("username", "Alice").put("stable_identity_b64", MlsWireCodec.encode(ByteArray(64) { 3 })))
+                .put(JSONObject().put("username", "Bob").put("stable_identity_b64", MlsWireCodec.encode(ByteArray(64) { 4 }))))
+            .put("control_b64", MlsWireCodec.encode(control)).put("welcome_b64", MlsWireCodec.encode(welcome))
+            .put("authenticated_data_b64", MlsWireCodec.encode(byteArrayOf(9)))
+        val payload = ByteArray(64) { 7 }
+
+        assertTrue(MlsWireCodec.parse(membership(ByteArray(0), payload)) is MlsIncomingFrame.Membership)
+        assertTrue(MlsWireCodec.parse(membership(payload, ByteArray(0))) is MlsIncomingFrame.Membership)
+        assertNull(MlsWireCodec.parse(membership(ByteArray(0), ByteArray(0))))
+        assertNull(MlsWireCodec.parse(membership(payload, payload)))
+    }
+
     private fun applicationFrame() = JSONObject().put("type", "mls_application").put("protocol_version", 10)
         .put("room_id", "forum_a").put("message_id", "message_1").put("sender_username", "Alice")
         .put("epoch", "0").put("revision", "1").put("membership_digest_b64", MlsWireCodec.encode(ByteArray(32) { 1 }))

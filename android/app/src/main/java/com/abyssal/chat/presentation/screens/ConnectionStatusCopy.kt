@@ -11,20 +11,25 @@ internal object ConnectionStatusCopy {
         "CONNECTED" -> "LIVE"
         "CONNECTING" -> "CONNECTING"
         "SECURITY_REJECTED" -> "UPDATE REQUIRED"
+        "PLATFORM_CONFLICT" -> "WEB ACCOUNT"
+        "SESSION_EXPIRED" -> "SIGNED OUT"
         else -> "OFFLINE"
     }
 
     fun composerPlaceholder(state: String): String = when (state) {
         "CONNECTED" -> "Message"
         "SECURITY_REJECTED" -> "Update the app to reconnect"
+        "PLATFORM_CONFLICT" -> "This account belongs to the web app"
+        "SESSION_EXPIRED" -> "Sign in again"
         else -> "Reconnecting"
     }
 
-    /** Explains a rejected build; null for states that recover automatically. */
-    fun rejectionNotice(state: String): String? =
-        if (state == "SECURITY_REJECTED") {
+    /** Explains a terminal state; null for states that recover automatically. */
+    fun rejectionNotice(state: String): String? = when (state) {
+        "SECURITY_REJECTED" ->
             "This node only admits the current signed release. Update Abyssal to reconnect."
-        } else {
-            null
-        }
+        "PLATFORM_CONFLICT" ->
+            "This account was first used in the web app. Each account works on one platform; use a new invite to create an Android account."
+        else -> null
+    }
 }

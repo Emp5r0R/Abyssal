@@ -5,6 +5,11 @@ import { Entrance } from "./Entrance";
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("account entrance secret lifetime", () => {
+  it("explains why a previous session ended", () => {
+    render(<Entrance onLogin={vi.fn()} onPreflight={async () => true} notice="Your session ended." />);
+    expect(screen.getByText("Your session ended.")).toBeInTheDocument();
+  });
+
   it("does not let a delayed clipboard result overwrite newer input or submit", async () => {
     let resolvePaste: ((value: string) => void) | undefined;
     const readText = vi.fn(() => new Promise<string>(resolve => { resolvePaste = resolve; }));

@@ -7,6 +7,47 @@ import org.junit.Test
 
 class AndroidDisguiseManagerTest {
     @Test
+    fun launcherAliasChangesWaitForTheHostToLeaveTheForeground() {
+        val applied = mutableListOf<Boolean>()
+        val alias = DeferredLauncherAlias { applied += it; true }
+
+        alias.request(disguised = true)
+        assertTrue(alias.isPending)
+        assertEquals(emptyList<Boolean>(), applied)
+
+        assertTrue(alias.flush())
+        assertEquals(listOf(true), applied)
+        assertFalse(alias.isPending)
+        assertTrue(alias.flush())
+        assertEquals(listOf(true), applied)
+
+        // Re-requesting the installed state, or toggling back before a flush,
+        // must not touch PackageManager at all.
+        alias.request(disguised = true)
+        assertFalse(alias.isPending)
+        alias.request(disguised = false)
+        alias.request(disguised = true)
+        assertTrue(alias.flush())
+        assertEquals(listOf(true), applied)
+    }
+
+    @Test
+    fun failedLauncherAliasChangeStaysPendingForTheNextBackground() {
+        var succeed = false
+        val alias = DeferredLauncherAlias { succeed }
+        alias.request(disguised = true)
+        assertFalse(alias.flush())
+        assertTrue(alias.isPending)
+        succeed = true
+        assertTrue(alias.flush())
+        assertFalse(alias.isPending)
+
+        alias.request(disguised = false)
+        alias.markInstalled(disguised = false)
+        assertFalse(alias.isPending)
+    }
+
+    @Test
     fun launcherTransitionEnablesTargetBeforeDisablingOpposite() {
         val events = mutableListOf<String>()
 

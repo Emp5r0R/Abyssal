@@ -287,9 +287,10 @@ async function requestWebSocketTicket(
     body: JSON.stringify(currentBuildAttestation()),
     signal,
   });
-  if (response.status === 426) {
+  const rejection = relayTicketRejection(response.status);
+  if (rejection) {
     await response.body?.cancel().catch(() => undefined);
-    throw new BuildAdmissionError();
+    throw rejection === "build" ? new BuildAdmissionError() : new RelayRejectionError(rejection);
   }
   const payload = await readBoundedJson(response, MAX_WS_TICKET_JSON_BYTES, signal).catch(() => null);
   if (!response.ok || !validWebSocketTicketResponse(payload)) {
@@ -298,9 +299,33 @@ async function requestWebSocketTicket(
   return payload.ticket;
 }
 
-export class BuildAdmissionError extends Error {
+/**
+ * Terminal ws-ticket outcomes. Anything else (5xx, 429, network) is transient
+ * and retried with backoff.
+ */
+export type RelayRejection = "build" | "session-expired" | "platform-conflict";
+
+export function relayTicketRejection(status: number): RelayRejection | null {
+  switch (status) {
+    case 401: return "session-expired";
+    case 403:
+    case 426: return "build";
+    case 409: return "platform-conflict";
+    default: return null;
+  }
+}
+
+export class RelayRejectionError extends Error {
+  constructor(readonly rejection: RelayRejection) {
+    super("Relay rejected the session");
+    this.name = "RelayRejectionError";
+  }
+}
+
+export class BuildAdmissionError extends RelayRejectionError {
   constructor() {
-    super("Release verification rejected");
+    super("build");
+    this.message = "Release verification rejected";
     this.name = "BuildAdmissionError";
   }
 }
@@ -327,7 +352,7 @@ export class RelaySocket {
     private readonly onFrame: (frame: IncomingFrame) => void,
     private readonly onState: (state: "connecting" | "connected" | "disconnected") => void,
     private readonly onPurge?: () => void,
-    private readonly onBuildRejected?: () => void,
+    private readonly onRejected?: (rejection: RelayRejection) => void,
   ) {}
 
   connect(): void {
@@ -740,9 +765,9 @@ export class RelaySocket {
         this.#ticketAbort = null;
         this.#connecting = false;
         this.onState("disconnected");
-        if (error instanceof BuildAdmissionError) {
+        if (error instanceof RelayRejectionError) {
           this.#manualClose = true;
-          this.onBuildRejected?.();
+          this.onRejected?.(error.rejection);
         } else {
           this.scheduleReconnect();
         }

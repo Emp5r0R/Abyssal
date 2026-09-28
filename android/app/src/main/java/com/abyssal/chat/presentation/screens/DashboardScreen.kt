@@ -95,6 +95,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val pendingMlsJoins by viewModel.pendingMlsJoins.collectAsState()
     val pendingMlsLeaves by viewModel.pendingMlsLeaves.collectAsState()
     val publicMlsRooms by viewModel.publicMlsRooms.collectAsState()
+    val roomActionNotice by viewModel.roomActionNotice.collectAsState()
     val showCamouflagePinPrompt = viewModel.showCamouflagePinPrompt.value
 
     DashboardContent(
@@ -121,7 +122,9 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         onRejectLeave = viewModel::rejectMlsLeave,
         onWipe = viewModel::executeClearAll,
         onLock = viewModel::lockApp,
-        onEndSession = viewModel::endSession
+        onEndSession = viewModel::endSession,
+        roomActionNotice = roomActionNotice,
+        onDismissRoomActionNotice = viewModel::dismissRoomActionNotice
     )
 
     if (showCamouflagePinPrompt) {
@@ -154,7 +157,9 @@ private fun DashboardContent(
     onRejectLeave: (String) -> Unit,
     onWipe: () -> Unit,
     onLock: () -> Unit,
-    onEndSession: () -> Unit
+    onEndSession: () -> Unit,
+    roomActionNotice: String? = null,
+    onDismissRoomActionNotice: () -> Unit = {}
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -190,6 +195,9 @@ private fun DashboardContent(
                 sessionSecurity = sessionSecurity,
                 onSettings = { showSettingsDialog = true }
             )
+            roomActionNotice?.let { notice ->
+                RoomActionNotice(notice = notice, onDismiss = onDismissRoomActionNotice)
+            }
 
             TabRow(
                 selectedTabIndex = selectedTab,
@@ -549,6 +557,29 @@ private fun DashboardHeader(
                     .padding(top = 8.dp)
             )
         }
+    }
+}
+
+@Composable
+private fun RoomActionNotice(notice: String, onDismiss: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp, vertical = 4.dp)
+            .border(1.dp, NeonCyan.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+            .clickable(onClickLabel = "Dismiss", onClick = onDismiss)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(
+            text = notice,
+            color = PureWhite,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            modifier = Modifier.weight(1f)
+        )
+        Text(text = "DISMISS", color = NeonCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
     }
 }
 

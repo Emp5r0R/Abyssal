@@ -43,6 +43,7 @@ import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -193,6 +194,28 @@ class ChatViewModelPolicyTest {
             } finally {
                 unavailableViewModel.clear()
             }
+        } finally {
+            viewModel.clear()
+        }
+    }
+
+    @Test
+    fun roomJoinReportsEveryOutcomeInsteadOfFailingSilently() = runBlocking {
+        val viewModel = verificationViewModel(
+            initialStatus = ReleaseVerificationStatus.VERIFIED,
+            updateResult = Result.failure(IllegalStateException("unused"))
+        )
+        try {
+            viewModel.requestJoinRoom("forum ops!")
+            assertEquals(
+                "Room IDs contain only letters, numbers, - and _.",
+                viewModel.roomActionNotice.value
+            )
+            viewModel.dismissRoomActionNotice()
+            assertNull(viewModel.roomActionNotice.value)
+            withTimeout(2_000L) { viewModel.serverStatus.first { it.state == "CONNECTED" } }
+            viewModel.requestJoinRoom("forum_ops")
+            assertNotNull(viewModel.roomActionNotice.value)
         } finally {
             viewModel.clear()
         }

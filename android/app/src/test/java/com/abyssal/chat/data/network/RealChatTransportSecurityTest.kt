@@ -40,6 +40,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.util.Base64
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okio.ByteString
@@ -1114,6 +1115,23 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
+    fun rejectedRelayFrameFailsTheSocketClosedAndThenReconnects() = runBlocking {
+        val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
+        val factory = CountingTicketCallFactory()
+        val transport = RealChatTransport(node, OkHttpClient(), factory, TEST_BUILD_ATTESTATION)
+        val socket = RecordingWebSocket()
+        val listener = installSocket(transport, socket)
+
+        // Control frames without transport padding are rejected by the parser.
+        listener.onMessage(socket, """{"type":"presence","users":[]}""")
+        assertEquals("DISCONNECTED", transport.getServerStatus().first().state)
+        assertTrue(factory.firstCall.await(3, TimeUnit.SECONDS))
+        Thread.sleep(RECONNECT_INITIAL_DELAY_MS + RECONNECT_JITTER_MS + 250L)
+        assertEquals(1, factory.calls.get())
+        transport.close()
+    }
+
+    @Test
     fun socketFailureSchedulesOnlyOneReconnectAttemptForCurrentSession() = runBlocking {
         val node = InMemoryNodeConfigService().apply { setActiveSession(testSession()) }
         val factory = CountingTicketCallFactory()
@@ -1129,8 +1147,23 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun ticketAdmission401And403AreTerminalAndNeverRetried() = runBlocking {
-        for (code in listOf(401, 403)) {
+    fun ticketRejectionsMapToTerminalStatesWhileTransientFailuresRetry() {
+        assertEquals("SESSION_EXPIRED", terminalTicketState(401))
+        assertEquals("SECURITY_REJECTED", terminalTicketState(403))
+        assertEquals("SECURITY_REJECTED", terminalTicketState(426))
+        assertEquals("PLATFORM_CONFLICT", terminalTicketState(409))
+        listOf(null, 429, 500, 502, 503, 504).forEach { code ->
+            assertNull(terminalTicketState(code))
+        }
+    }
+
+    @Test
+    fun ticketAdmissionRejectionsAreTerminalAndNeverRetried() = runBlocking {
+        for ((code, expectedState) in listOf(
+            401 to "SESSION_EXPIRED",
+            403 to "SECURITY_REJECTED",
+            409 to "PLATFORM_CONFLICT"
+        )) {
             val server = MockWebServer()
             server.enqueue(MockResponse().setResponseCode(code))
             server.start()
@@ -1148,7 +1181,7 @@ class RealChatTransportSecurityTest {
             try {
                 transport.connect()
                 val status = withTimeout(2_000L) {
-                    transport.getServerStatus().first { it.state == "SECURITY_REJECTED" }
+                    transport.getServerStatus().first { it.state == expectedState }
                 }
                 assertEquals("node-1", status.nodeId)
                 Thread.sleep(RECONNECT_INITIAL_DELAY_MS + RECONNECT_JITTER_MS + 100L)
@@ -1157,6 +1190,50 @@ class RealChatTransportSecurityTest {
                 transport.close()
                 server.shutdown()
             }
+        }
+    }
+
+    @Test
+    fun realSizedTicketResponseOpensTheRelaySocket() = runBlocking {
+        // Regression: the ticket body is far smaller than the read limit. An
+        // exact-length read rejected every real ticket and kept Android offline.
+        val server = MockWebServer()
+        val ticket = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 7 })
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setHeader("Cache-Control", "no-store")
+                .setBody(JSONObject().put("ticket", ticket).put("expires_in_sec", 30).toString())
+        )
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {}))
+        server.start()
+        try {
+            val base = server.url("/")
+            val endpoint = NodeEndpoint(
+                inputUrl = base.toString(),
+                apiBaseUrl = base.toString().removeSuffix("/"),
+                wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
+                displayHost = base.host
+            )
+            val node = InMemoryNodeConfigService().apply {
+                setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
+            }
+            val client = OkHttpClient.Builder().build()
+            val transport = RealChatTransport(node, client, client, TEST_BUILD_ATTESTATION)
+            try {
+                transport.connect()
+                withTimeout(3_000L) {
+                    transport.getServerStatus().first { it.state == "CONNECTED" }
+                }
+                assertEquals("/v1/ws-ticket", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+                val upgrade = server.takeRequest(2, TimeUnit.SECONDS)
+                assertEquals("/v1/ws", upgrade?.path)
+                assertEquals("abyssal-v2, ticket.$ticket", upgrade?.getHeader("Sec-WebSocket-Protocol"))
+            } finally {
+                transport.close()
+            }
+        } finally {
+            server.shutdown()
         }
     }
 

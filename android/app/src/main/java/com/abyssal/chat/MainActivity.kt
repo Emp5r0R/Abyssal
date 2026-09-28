@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import com.abyssal.chat.presentation.screens.ChatScreen
+import com.abyssal.chat.presentation.screens.ConnectionStatusCopy
 import com.abyssal.chat.presentation.screens.DashboardScreen
 import com.abyssal.chat.presentation.screens.EntranceScreen
 import com.abyssal.chat.presentation.screens.CalculatorScreen
@@ -116,6 +117,15 @@ class MainActivity : ComponentActivity() {
                                 onRetry = viewModel::onHostResumed,
                                 onEndSession = viewModel::endSession
                             )
+                        } else if (serverStatus.state == "PLATFORM_CONFLICT") {
+                            SecurityVerificationDialog(
+                                title = "Account belongs to the web app",
+                                message = requireNotNull(
+                                    ConnectionStatusCopy.rejectionNotice(serverStatus.state)
+                                ),
+                                onRetry = viewModel::onHostResumed,
+                                onEndSession = viewModel::endSession
+                            )
                         } else availableUpdate?.let { update ->
                             UpdateAvailableDialog(
                                 update = update,
@@ -175,7 +185,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         if (::viewModel.isInitialized && !isChangingConfigurations) {
-            viewModel.lockForLifecycleExit()
+            viewModel.onHostStopped()
         }
         super.onStop()
     }

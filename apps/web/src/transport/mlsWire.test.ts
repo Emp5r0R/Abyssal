@@ -28,6 +28,20 @@ const room = (): MlsRoomWire => ({
 });
 
 describe("protocol-v10 MLS wire", () => {
+  it("accepts a welcome-only membership for joiners and a commit-only one for members", () => {
+    const membership = (control: string, welcome: string) => ({
+      type: "mls_membership", protocol_version: 10, room_id: "forum_alpha", message_id: "msg-1",
+      from_epoch: "0", to_epoch: "1", revision: "0", from_membership_digest_b64: b64(32, 2),
+      group_id_b64: b64(32), membership_digest_b64: b64(32, 4),
+      roster: [{ username: "Alice", stable_identity_b64: b64(64, 3) }, { username: "Bob", stable_identity_b64: b64(64, 5) }],
+      control_b64: control, welcome_b64: welcome, authenticated_data_b64: b64(40, 6),
+    });
+    expect(parseMlsIncomingFrame(membership("", b64(200, 7)))?.type).toBe("mls_membership");
+    expect(parseMlsIncomingFrame(membership(b64(200, 7), ""))?.type).toBe("mls_membership");
+    expect(parseMlsIncomingFrame(membership("", ""))).toBeNull();
+    expect(parseMlsIncomingFrame(membership(b64(200, 7), b64(200, 7)))).toBeNull();
+  });
+
   it("accepts the full canonical catalog and converts counters without precision loss", () => {
     const frame = parseMlsIncomingFrame({ type: "mls_rooms", protocol_version: 10, rooms: [room()] });
     expect(frame?.type).toBe("mls_rooms");

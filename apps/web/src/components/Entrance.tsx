@@ -9,9 +9,11 @@ import { QrImageInput } from "./QrImageInput";
 export function Entrance({
   onLogin,
   onPreflight,
+  notice = null,
 }: {
   onLogin: (input: { invite: string; password: Uint8Array; retainWhenHidden: boolean }) => Promise<AccountSession>;
   onPreflight: () => Promise<boolean | void>;
+  notice?: string | null;
 }) {
   const [invite, setInvite] = useState("");
   const [password, setPassword] = useState("");
@@ -89,6 +91,7 @@ export function Entrance({
             <h1>Enter Abyssal</h1>
             <p>One signed invite selects and verifies your Abyssal node.</p>
           </div>
+          {notice ? <p className="entrance-notice" role="status">{notice}</p> : null}
 
           {scanning ? <QrScanner onScanned={acceptScannedInvite} onClose={stopScanning} /> : (
             <button className="secondary-button" type="button" disabled={busy || readingImage} onClick={() => {

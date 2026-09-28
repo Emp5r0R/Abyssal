@@ -11,7 +11,8 @@ internal fun directPeersForDirectory(
         user.username.equals(currentUsername, ignoreCase = true) ||
             establishedDirectPeerUsernames.any { it.equals(user.username, ignoreCase = true) }
     }
-    .sortedBy { it.username }
+    // Online peers first so reachable people are visible without scrolling.
+    .sortedWith(compareByDescending<UserPresence> { it.connected }.thenBy { it.username })
 
 internal fun peopleDirectoryEntryLabel(username: String, connected: Boolean): String =
     "Open direct conversation with $username · ${if (connected) "ONLINE" else "OFFLINE"}"

@@ -236,6 +236,17 @@ internal fun parseWsTicketResponseBody(raw: ByteArray): WsTicket? {
     }.getOrNull()
 }
 
+/**
+ * Maps a relay HTTP rejection to a terminal transport state, or null when the
+ * failure is transient and the transport should retry with backoff.
+ */
+internal fun terminalTicketState(code: Int?): String? = when (code) {
+    401 -> "SESSION_EXPIRED"
+    403, 426 -> "SECURITY_REJECTED"
+    409 -> "PLATFORM_CONFLICT"
+    else -> null
+}
+
 internal fun websocketUpgradeRequest(endpoint: NodeEndpoint, ticket: String): Request {
     require(WS_TICKET_REGEX.matches(ticket))
     return Request.Builder()
@@ -438,13 +449,13 @@ internal class RealChatTransport(
                         response.close()
                         return
                     }
-                    val securityRejected = response.code in setOf(401, 403, 426)
+                    val terminalState = terminalTicketState(response.code)
                     val ticket = response.use { parseWsTicket(it) }
                     if (ticket == null || !isCurrentTicket(call, generation, session)) {
                         val retry = failTicketConnection(
                             generation,
                             session,
-                            if (securityRejected) "SECURITY_REJECTED" else "DISCONNECTED"
+                            terminalState ?: "DISCONNECTED"
                         )
                         if (retry) scheduleReconnect(generation, session)
                         return
@@ -896,9 +907,12 @@ internal class RealChatTransport(
         }
         val body = response.body ?: return null
         if (body.contentLength() > WS_TICKET_MAX_RESPONSE_BYTES) return null
-        val raw = runCatching {
-            body.source().readByteArray((WS_TICKET_MAX_RESPONSE_BYTES + 1).toLong())
-        }.getOrNull() ?: return null
+        // Read at most the limit. Okio's readByteArray(n) demands exactly n bytes and
+        // throws on the (normal) shorter body, which rejected every relay ticket.
+        val raw = BoundedInputReader.read(
+            body.byteStream(),
+            WS_TICKET_MAX_RESPONSE_BYTES.toLong()
+        ) ?: return null
         return try {
             parseWsTicketResponseBody(raw)
         } finally {
@@ -1867,16 +1881,16 @@ internal class RealChatTransport(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val securityRejected = response?.code in setOf(401, 403, 426)
+                val terminalState = terminalTicketState(response?.code)
                 val recover = invalidateCurrentSocket(
                     socket = webSocket,
                     nodeId = nodeId,
                     closeCode = null,
                     reason = "socket failure",
-                    preserveRecoverableTransactions = !securityRejected,
-                    terminalState = if (securityRejected) "SECURITY_REJECTED" else null
+                    preserveRecoverableTransactions = terminalState == null,
+                    terminalState = terminalState
                 )
-                if (recover && !securityRejected) {
+                if (recover && terminalState == null) {
                     val active = expectedSession ?: nodeConfigService.getActiveSession()
                     if (active != null) scheduleReconnect(connectionGeneration.get(), active)
                 }
@@ -2011,7 +2025,14 @@ internal class RealChatTransport(
         reason: String,
         closeCode: Int = 1008
     ) {
+        val wasCurrent = synchronized(connectionLock) { webSocket === socket }
         invalidateCurrentSocket(socket, nodeId, closeCode, reason)
+        // The rejected frame fails this socket closed, but the account session is
+        // still valid. Reconnect with backoff so one bad frame cannot leave the app
+        // offline until restart; the new socket starts from fresh relay catalogs.
+        if (wasCurrent && !purgeSignaled.get()) {
+            nodeConfigService.getActiveSession()?.let { scheduleReconnect(connectionGeneration.get(), it) }
+        }
     }
 
     private fun invalidateCurrentSocket(

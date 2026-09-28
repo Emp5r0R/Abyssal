@@ -1,7 +1,9 @@
 import { AbyssalMarkLoader } from "./Ui";
 import type { OriginAttestationStatus } from "../security/originAttestation";
 
-const COPY: Record<Exclude<OriginAttestationStatus, "OK">, { title: string; detail: string }> = {
+type GateStatus = Exclude<OriginAttestationStatus, "OK"> | "PLATFORM_CONFLICT";
+
+const COPY: Record<GateStatus, { title: string; detail: string }> = {
   CHECKING: {
     title: "Verifying release",
     detail: "Checking this build before account access.",
@@ -22,6 +24,10 @@ const COPY: Record<Exclude<OriginAttestationStatus, "OK">, { title: string; deta
     title: "Build rejected by node",
     detail: "This node does not accept the current signed build.",
   },
+  PLATFORM_CONFLICT: {
+    title: "Account belongs to the Android app",
+    detail: "This account was first used in the Android app. Each account works on one platform; use a new invite to create a web account.",
+  },
 };
 
 export function SecurityVerificationGate({
@@ -29,7 +35,7 @@ export function SecurityVerificationGate({
   onRetry,
   onEndSession,
 }: {
-  status: Exclude<OriginAttestationStatus, "OK">;
+  status: GateStatus;
   onRetry: () => void;
   onEndSession?: () => void;
 }) {

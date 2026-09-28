@@ -24,6 +24,40 @@ internal fun applyLauncherAliasTransition(
     }
 }
 
+/**
+ * Tracks the requested launcher alias separately from the installed one.
+ *
+ * Disabling the alias that hosts the running task makes Android close that task
+ * even with DONT_KILL_APP, which would drop the user to the home screen right
+ * after choosing a PIN. Requests are therefore applied only by [flush], which the
+ * host calls once the app has left the foreground.
+ */
+internal class DeferredLauncherAlias(private val apply: (disguised: Boolean) -> Boolean) {
+    private var installed = false
+    private var pending: Boolean? = null
+
+    val isPending: Boolean get() = pending != null
+
+    fun request(disguised: Boolean) {
+        pending = disguised.takeIf { it != installed }
+    }
+
+    /** Applies a pending request; keeps it pending for a later retry on failure. */
+    fun flush(): Boolean {
+        val target = pending ?: return true
+        if (!apply(target)) return false
+        installed = target
+        pending = null
+        return true
+    }
+
+    /** Records an alias state installed out of band (startup reset or teardown). */
+    fun markInstalled(disguised: Boolean) {
+        installed = disguised
+        pending = null
+    }
+}
+
 class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
 
     // Secrets intentionally live only for the lifetime of the application process. If
@@ -31,6 +65,7 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
     // fall back to a predictable unlock code.
     private var disguiseEnabled = false
     private var credentialVerifier = InMemoryCamouflageVerifier()
+    private val launcherAlias = DeferredLauncherAlias(::applyLauncherIcon)
 
     init {
         resetStaleCamouflage()
@@ -38,29 +73,26 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
 
     override fun configure(enabled: Boolean, unlockPin: String, duressPin: String): Boolean {
         if (!enabled) {
-            // Keep the verifier material intact if PackageManager cannot complete the
-            // alias transition. This avoids turning a failed disable into a partial wipe.
-            if (!applyLauncherIcon(enabled = false)) return false
             credentialVerifier.destroy()
             credentialVerifier = InMemoryCamouflageVerifier()
             disguiseEnabled = false
+            launcherAlias.request(disguised = false)
             return true
         }
 
-        // Prepare a complete verifier before exposing the calculator alias. A failed
-        // alias transition destroys the candidate and leaves the active verifier intact.
+        // Prepare a complete verifier before requesting the calculator alias. The
+        // alias itself switches when the app is backgrounded (see DeferredLauncherAlias).
         val candidate = InMemoryCamouflageVerifier()
         if (!candidate.configure(unlockPin, duressPin)) return false
-        // Updating verifier material while already disguised does not require a
-        // package-manager transition and avoids disturbing an active alias.
-        if (!disguiseEnabled && !applyLauncherIcon(enabled = true)) {
-            candidate.destroy()
-            return false
-        }
         credentialVerifier.destroy()
         credentialVerifier = candidate
         disguiseEnabled = true
+        launcherAlias.request(disguised = true)
         return true
+    }
+
+    override fun applyPendingLauncherAlias() {
+        launcherAlias.flush()
     }
 
     override fun isDisguiseEnabled(): Boolean {
@@ -74,6 +106,7 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         credentialVerifier = InMemoryCamouflageVerifier()
         disguiseEnabled = false
         runCatching { applyLauncherIcon(enabled = false) }
+        launcherAlias.markInstalled(disguised = false)
     }
 
     override fun verifyPin(pin: String): Boolean = credentialVerifier.verifyUnlock(pin)
@@ -106,7 +139,6 @@ class AndroidDisguiseManager(private val context: Context) : IDisguiseManager {
         // Reset both aliases so a stale calculator cover can never accept a default PIN.
         applyLauncherIcon(enabled = false)
     }
-
 }
 
 internal fun isValidCamouflagePin(value: String): Boolean =

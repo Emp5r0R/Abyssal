@@ -8,6 +8,7 @@ import {
 import {
   finishOpaqueAccount,
   RelaySocket,
+  relayTicketRejection,
   revokeSession,
   startOpaqueAccount,
   streamEncryptedAttachmentRecords,
@@ -1322,10 +1323,55 @@ describe("RelaySocket", () => {
       relay.connect();
       await vi.waitFor(() => expect(rejected).toHaveBeenCalledTimes(1));
       expect(rejected).toHaveBeenCalledTimes(1);
+      expect(rejected).toHaveBeenCalledWith("build");
       expect(states).toEqual(["connecting", "disconnected"]);
       expect(timeoutSpy.mock.calls.some(([, delay]) =>
         typeof delay === "number" && delay >= 750 && delay <= 15_499,
       )).toBe(false);
+    } finally {
+      relay.close();
+    }
+  });
+
+  it("maps ws-ticket statuses to terminal rejections and leaves transient failures retryable", () => {
+    expect(relayTicketRejection(401)).toBe("session-expired");
+    expect(relayTicketRejection(403)).toBe("build");
+    expect(relayTicketRejection(426)).toBe("build");
+    expect(relayTicketRejection(409)).toBe("platform-conflict");
+    for (const status of [200, 429, 500, 502, 503, 504]) expect(relayTicketRejection(status)).toBeNull();
+  });
+
+  it.each([
+    [401, "session-expired"],
+    [409, "platform-conflict"],
+  ] as const)("reports a %i ticket response once as %s without retrying", async (status, expected) => {
+    const rejected = vi.fn();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status }));
+    const timeoutSpy = vi.spyOn(window, "setTimeout");
+    const relay = new RelaySocket(session, () => undefined, () => undefined, undefined, rejected);
+    try {
+      relay.connect();
+      await vi.waitFor(() => expect(rejected).toHaveBeenCalledTimes(1));
+      expect(rejected).toHaveBeenCalledWith(expected);
+      expect(timeoutSpy.mock.calls.some(([, delay]) =>
+        typeof delay === "number" && delay >= 750 && delay <= 15_499,
+      )).toBe(false);
+    } finally {
+      relay.close();
+    }
+  });
+
+  it("retries a relay that is temporarily without a release manifest", async () => {
+    const rejected = vi.fn();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 503 }));
+    const timeoutSpy = vi.spyOn(window, "setTimeout");
+    const relay = new RelaySocket(session, () => undefined, () => undefined, undefined, rejected);
+    try {
+      relay.connect();
+      await vi.waitFor(() => expect(timeoutSpy.mock.calls.some(([, delay]) =>
+        typeof delay === "number" && delay >= 750 && delay <= 15_499,
+      )).toBe(true));
+      expect(rejected).not.toHaveBeenCalled();
     } finally {
       relay.close();
     }

@@ -3050,7 +3050,14 @@ async fn release_admission_rejects_before_ticket_or_session_access() {
         Json(ticket_build_attestation()),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .map(|value| value.as_bytes()),
+        Some(&b"10"[..])
+    );
     assert!(state.ws_tickets.lock().await.is_empty());
 
     let response = issue_ws_ticket(
@@ -3063,8 +3070,30 @@ async fn release_admission_rejects_before_ticket_or_session_access() {
         }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(state.ws_tickets.lock().await.is_empty());
+}
+
+#[test]
+fn failed_manifest_refresh_retries_quickly_with_bounded_backoff() {
+    let interval = Duration::from_secs(15 * 60);
+    assert_eq!(next_manifest_refresh_delay(interval, 0), interval);
+    assert_eq!(
+        next_manifest_refresh_delay(interval, 1),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        next_manifest_refresh_delay(interval, 2),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        next_manifest_refresh_delay(interval, 4),
+        Duration::from_secs(40)
+    );
+    assert_eq!(next_manifest_refresh_delay(interval, 9), interval);
+    assert_eq!(next_manifest_refresh_delay(interval, u32::MAX), interval);
+    let short = Duration::from_secs(60);
+    assert_eq!(next_manifest_refresh_delay(short, 5), short);
 }
 
 #[tokio::test]
@@ -3163,11 +3192,16 @@ async fn websocket_ticket_cannot_reclassify_an_authenticated_session() {
     let response = issue_ws_ticket(
         State(state.clone()),
         ticket_auth_headers("platform-session"),
-        Json(ticket_build_attestation_for("android")),
+        Json(BuildAttestationRequest {
+            platform: "android".to_string(),
+            version: "2.1.0".to_string(),
+            build_signature_b64: URL_SAFE_NO_PAD.encode([1_u8; 64]),
+        }),
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    // An admitted Android build still cannot reuse a web-bound account.
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(state.ws_tickets.lock().await.len(), 1);
     assert_eq!(
         state

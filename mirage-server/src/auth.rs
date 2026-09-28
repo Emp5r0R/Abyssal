@@ -739,13 +739,24 @@ pub(super) async fn issue_ws_ticket(
     headers: HeaderMap,
     Json(build_attestation): Json<BuildAttestationRequest>,
 ) -> Response {
-    if state
+    match state
         .release_admission
         .admit(&build_attestation, now_ms())
         .await
-        .is_err()
     {
-        return StatusCode::UPGRADE_REQUIRED.into_response();
+        Ok(()) => {}
+        // The relay has no current manifest yet (startup or a failed mirror
+        // fetch). This is transient: clients must retry, not demand an update.
+        Err(AdmissionError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "10")],
+            )
+                .into_response();
+        }
+        Err(AdmissionError::Expired | AdmissionError::InvalidBuild) => {
+            return StatusCode::UPGRADE_REQUIRED.into_response();
+        }
     }
     let Some(client_platform) = ClientPlatform::parse(&build_attestation.platform) else {
         return StatusCode::UPGRADE_REQUIRED.into_response();
@@ -765,7 +776,9 @@ pub(super) async fn issue_ws_ticket(
         .client_platform
         .is_some_and(|bound_platform| bound_platform != client_platform)
     {
-        return StatusCode::UPGRADE_REQUIRED.into_response();
+        // Accounts are bound to the platform that first connected; identity
+        // state cannot be shared between an Android and a web client.
+        return StatusCode::CONFLICT.into_response();
     }
     drop(accounts);
 
@@ -814,7 +827,9 @@ pub(super) async fn issue_ws_ticket(
         .client_platform
         .is_some_and(|bound_platform| bound_platform != client_platform)
     {
-        return StatusCode::UPGRADE_REQUIRED.into_response();
+        // Accounts are bound to the platform that first connected; identity
+        // state cannot be shared between an Android and a web client.
+        return StatusCode::CONFLICT.into_response();
     }
     account.client_platform = Some(client_platform);
     drop(accounts);
