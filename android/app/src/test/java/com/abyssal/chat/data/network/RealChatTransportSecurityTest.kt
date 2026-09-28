@@ -1205,7 +1205,22 @@ class RealChatTransportSecurityTest {
                 .setHeader("Cache-Control", "no-store")
                 .setBody(JSONObject().put("ticket", ticket).put("expires_in_sec", 30).toString())
         )
-        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {}))
+        // Answer the client's close frame so MockWebServer.shutdown() does not
+        // wait out a half-closed socket (slow CI runners hit its give-up path).
+        val serverClosed = CountDownLatch(1)
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                webSocket.close(code, null)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                serverClosed.countDown()
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                serverClosed.countDown()
+            }
+        }))
         server.start()
         try {
             val base = server.url("/")
@@ -1231,6 +1246,7 @@ class RealChatTransportSecurityTest {
                 assertEquals("abyssal-v2, ticket.$ticket", upgrade?.getHeader("Sec-WebSocket-Protocol"))
             } finally {
                 transport.close()
+                serverClosed.await(5, TimeUnit.SECONDS)
             }
         } finally {
             server.shutdown()
