@@ -10,9 +10,10 @@ cd "$ROOT_DIR"
     Cargo.toml \
     rust-toolchain.toml \
     abyssal-invite/Cargo.toml \
+    abyssal-transport/Cargo.toml \
     rust-core/Cargo.toml \
     scripts/crypto-source-digest.sh \
     scripts/build-crypto-bindings.sh \
     uniffi-bindgen.toml
-  find abyssal-invite/src rust-core/src -type f -print0
+  find abyssal-invite/src abyssal-transport/src rust-core/src -type f -print0
 } | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'

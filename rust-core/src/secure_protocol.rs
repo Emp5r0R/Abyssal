@@ -1,4 +1,4 @@
-use crate::AbyssalError;
+use crate::{transport_protocol::derive_opaque_transport_root, AbyssalError};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{
     aead::{Aead, AeadCore, Payload},
@@ -75,6 +75,7 @@ const PROTOCOL_VERSION: u32 = 9;
 const IDENTITY_ENVELOPE_VERSION: u8 = 5;
 const KEY_VALIDATION_SCALAR: [u8; 32] = [0x42; 32];
 const MLS_ROOT_DOMAIN: &[u8] = b"ABYSSAL-MLS-V10-ACCOUNT-ROOT";
+const OPAQUE_TRANSPORT_CONTEXT: &[u8] = b"ABYSSAL-OPAQUE-RISTRETTO255-3DH-ARGON2-TRANSPORT-V11";
 
 pub struct AbyssalOpaqueSuite;
 
@@ -106,6 +107,7 @@ pub struct OpaqueRegistrationFinish {
 pub struct OpaqueLoginFinish {
     pub credential_finalization: Vec<u8>,
     pub export_key: Vec<u8>,
+    pub transport_root: Vec<u8>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, uniffi::Record)]
@@ -331,11 +333,15 @@ pub fn opaque_client_finish_login(
         .map_err(|error| AbyssalError::from(protocol_error(error)))?;
     let credential_finalization = result.message.serialize().to_vec();
     let export_key = result.export_key.to_vec();
+    let transport_root =
+        derive_opaque_transport_root(&result.session_key, OPAQUE_TRANSPORT_CONTEXT);
     result.export_key.zeroize();
     result.session_key.zeroize();
+    let transport_root = transport_root.map_err(|error| AbyssalError::from(error.to_string()))?;
     Ok(OpaqueLoginFinish {
         credential_finalization,
         export_key,
+        transport_root: transport_root.to_vec(),
     })
 }
 
@@ -779,15 +785,18 @@ pub fn opaque_server_start_login(
     ))
 }
 
-pub fn opaque_server_finish_login(state: &[u8], finalization: &[u8]) -> Result<(), String> {
+pub fn opaque_server_finish_login(state: &[u8], finalization: &[u8]) -> Result<[u8; 32], String> {
     let state = ServerLogin::<AbyssalOpaqueSuite>::deserialize(state).map_err(protocol_error)?;
     let finalization = CredentialFinalization::<AbyssalOpaqueSuite>::deserialize(finalization)
         .map_err(protocol_error)?;
     let mut result = state
         .finish(finalization, ServerLoginParameters::default())
         .map_err(protocol_error)?;
+    let transport_root =
+        derive_opaque_transport_root(&result.session_key, OPAQUE_TRANSPORT_CONTEXT);
     result.session_key.zeroize();
-    Ok(())
+    let transport_root = transport_root.map_err(|error| error.to_string())?;
+    Ok(*transport_root)
 }
 
 #[uniffi::export]
@@ -3350,7 +3359,7 @@ mod tests {
             .expect("established"));
     }
 
-    fn opaque_registration_and_login(password: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn opaque_registration_and_login(password: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>, [u8; 32]) {
         let setup = opaque_server_setup();
         let start = opaque_client_start(password.to_vec()).expect("client start");
         let response = opaque_server_registration_response(
@@ -3379,16 +3388,25 @@ mod tests {
         let login_finish =
             opaque_client_finish_login(password.to_vec(), login_start.login_state, login_response)
                 .expect("client login finish");
-        opaque_server_finish_login(&server_state, &login_finish.credential_finalization)
-            .expect("server login finish");
-        (finish.export_key, login_finish.export_key)
+        let server_transport_root =
+            opaque_server_finish_login(&server_state, &login_finish.credential_finalization)
+                .expect("server login finish");
+        (
+            finish.export_key,
+            login_finish.export_key,
+            login_finish.transport_root,
+            server_transport_root,
+        )
     }
 
     #[test]
     fn opaque_password_never_crosses_protocol_and_export_key_recovers() {
-        let (registered_export, login_export) =
+        let (registered_export, login_export, client_transport_root, server_transport_root) =
             opaque_registration_and_login(b"correct horse battery staple");
         assert_eq!(registered_export, login_export);
+        assert_eq!(client_transport_root, server_transport_root);
+        assert_eq!(client_transport_root.len(), 32);
+        assert_ne!(client_transport_root, registered_export[..32]);
     }
 
     #[test]

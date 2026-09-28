@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WASM_GENERATED_DIR="$ROOT_DIR/apps/web/src/generated/abyssal_core"
 WASM_BINDGEN_BIN="${WASM_BINDGEN_BIN:-$(command -v wasm-bindgen || true)}"
+BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ROOT_DIR/android-sdk/ndk/27.3.13750724}"
 LLVM_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
 EXPECTED_RUST_VERSION="1.97.1"
@@ -32,12 +33,14 @@ INVOCATION_DIR="$(pwd -P)"
 EFFECTIVE_CARGO_HOME="$(resolve_path "${CARGO_HOME:-${HOME:-$ROOT_DIR}/.cargo}" "$INVOCATION_DIR")"
 EFFECTIVE_RUSTUP_HOME="$(resolve_path "${RUSTUP_HOME:-${HOME:-$ROOT_DIR}/.rustup}" "$INVOCATION_DIR")"
 ANDROID_NDK_HOME="$(resolve_path "$ANDROID_NDK_HOME" "$ROOT_DIR")"
+BUILD_TARGET_DIR="$(resolve_path "$BUILD_TARGET_DIR" "$ROOT_DIR")"
 
 remap_flags=(
   "--remap-path-prefix=${ROOT_DIR}=/abyssal/src"
   "--remap-path-prefix=${EFFECTIVE_CARGO_HOME}=/abyssal/cargo"
   "--remap-path-prefix=${EFFECTIVE_RUSTUP_HOME}=/abyssal/rustup"
   "--remap-path-prefix=${ANDROID_NDK_HOME}=/abyssal/android-ndk"
+  "--remap-path-prefix=${BUILD_TARGET_DIR}=/abyssal/target"
 )
 CARGO_ENCODED_RUSTFLAGS="${remap_flags[0]}"
 for ((flag_index = 1; flag_index < ${#remap_flags[@]}; flag_index++)); do
@@ -110,8 +113,8 @@ cargo build \
   --release \
   --locked \
   --lib
-"$ROOT_DIR/target/release/uniffi-bindgen" generate \
-  "$ROOT_DIR/target/release/libabyssal_core.so" \
+"$BUILD_TARGET_DIR/release/uniffi-bindgen" generate \
+  "$BUILD_TARGET_DIR/release/libabyssal_core.so" \
   --library \
   --crate abyssal_core \
   --metadata-no-deps \
@@ -138,7 +141,7 @@ find "$WASM_GENERATED_DIR" -mindepth 1 -depth -delete
   --target web \
   --typescript \
   --out-dir "$WASM_GENERATED_DIR" \
-  "$ROOT_DIR/target/wasm32-unknown-unknown/release/abyssal_core.wasm"
+  "$BUILD_TARGET_DIR/wasm32-unknown-unknown/release/abyssal_core.wasm"
 find "$WASM_GENERATED_DIR" -type d -exec chmod 0755 {} +
 find "$WASM_GENERATED_DIR" -type f -exec chmod 0644 {} +
 
@@ -217,6 +220,35 @@ for symbol in \
   fi
 done
 
+for symbol in \
+  "class WasmAccountBootstrapExchange" \
+  "class WasmAccountBootstrapResponse" \
+  "verifyTransportNodeDescriptor" \
+  "openResponse" \
+  "requestBytes" \
+  "readonly created" \
+  "readonly maxRoomsPerUser" \
+  "readonly sessionInactivitySec"; do
+  if ! grep -Fq "$symbol" "$WASM_TYPESCRIPT"; then
+    echo "Generated WASM TypeScript API is missing $symbol" >&2
+    exit 1
+  fi
+done
+
+for symbol in \
+  "class WasmAttachmentExchange" \
+  "class WasmAttachmentResult" \
+  "class WasmAttachmentFrame" \
+  "beginUpload" \
+  "beginDownload" \
+  "openStreamFrame" \
+  "sealDataFrame"; do
+  if ! grep -Fq "$symbol" "$WASM_TYPESCRIPT"; then
+    echo "Generated WASM TypeScript API is missing $symbol" >&2
+    exit 1
+  fi
+done
+
 KOTLIN_BINDINGS="$ROOT_DIR/android/app/src/main/java/uniffi/abyssal_core/abyssal_core.kt"
 for symbol in \
   'fun `attachmentEncryptedSize`' \
@@ -230,6 +262,36 @@ for symbol in \
   'open class MlsRoom' \
   'open class MlsProcessedControl' \
   '): MlsProcessedControl'; do
+  if ! grep -Fq "$symbol" "$KOTLIN_BINDINGS"; then
+    echo "Generated Kotlin API is missing $symbol" >&2
+    exit 1
+  fi
+done
+
+for symbol in \
+  'open class AccountBootstrapExchange' \
+  'sealed class AccountBootstrapResponse' \
+  'fun `verifyTransportNodeDescriptor`' \
+  'fun `openResponse`' \
+  'fun `requestBytes`' \
+  'val `created`' \
+  'val `maxRoomsPerUser`' \
+  'val `sessionInactivitySec`'; do
+  if ! grep -Fq "$symbol" "$KOTLIN_BINDINGS"; then
+    echo "Generated Kotlin API is missing $symbol" >&2
+    exit 1
+  fi
+done
+
+
+for symbol in \
+  'open class AttachmentClientExchange' \
+  'sealed class AttachmentTransportResult' \
+  'sealed class AttachmentTransportFrame' \
+  'fun `beginUpload`' \
+  'fun `beginDownload`' \
+  'fun `openStreamFrame`' \
+  'fun `sealDataFrame`'; do
   if ! grep -Fq "$symbol" "$KOTLIN_BINDINGS"; then
     echo "Generated Kotlin API is missing $symbol" >&2
     exit 1

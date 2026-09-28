@@ -3,8 +3,8 @@
 use crate::AbyssalError;
 use abyssal_invite::{
     account_context_v1, decode_invite_text, derive_node_id, locator_from_public_url,
-    select_locator, InviteError, RuntimeLocatorPolicy, SignedNodeDescriptor, SupportedTransports,
-    DIRECT_PROTOCOL_VERSION, ROOM_PROTOCOL_VERSION,
+    select_locator, InviteError, RuntimeLocatorPolicy, SignedNodeDescriptor,
+    SignedNodeDescriptorV2, SupportedTransports, DIRECT_PROTOCOL_VERSION, ROOM_PROTOCOL_VERSION,
 };
 use zeroize::Zeroize;
 
@@ -76,8 +76,12 @@ pub fn verify_invite_node_descriptor(
     let mut expected_key = [0_u8; 32];
     expected_key.copy_from_slice(&expected_node_public_key);
     let locator = locator_from_public_url(&expected_node_url).map_err(map_error)?;
-    let result = SignedNodeDescriptor::decode_for_invite(&descriptor, &expected_key, &locator)
+    let result = SignedNodeDescriptorV2::decode_for_invite(&descriptor, &expected_key, &locator)
         .map(|_| ())
+        .or_else(|_| {
+            SignedNodeDescriptor::decode_for_invite(&descriptor, &expected_key, &locator)
+                .map(|_| ())
+        })
         .map_err(map_error);
     expected_key.zeroize();
     result
@@ -192,7 +196,8 @@ mod tests {
     use super::*;
     use abyssal_invite::{
         encode_deep_link, locator_from_public_url, node_signing_key_from_seed, InviteCapsuleV1,
-        NodeDescriptorV1, SignedInviteCapsule, SignedNodeDescriptor,
+        NodeDescriptorV1, NodeDescriptorV2, SignedInviteCapsule, SignedNodeDescriptor,
+        SignedNodeDescriptorV2,
     };
 
     fn fixture() -> (String, Vec<u8>) {
@@ -223,6 +228,26 @@ mod tests {
         assert_eq!(parsed.capability, vec![9_u8; 32]);
         assert_eq!(parsed.account_context.len(), 32);
         verify_invite_node_descriptor(descriptor, parsed.node_public_key, parsed.node_url).unwrap();
+    }
+
+    #[test]
+    fn v2_descriptor_verifies_successfully() {
+        let key = node_signing_key_from_seed(&[7_u8; 32]);
+        let locator = locator_from_public_url("https://node.example.com").unwrap();
+        let descriptor = NodeDescriptorV2::abyssal(
+            key.verifying_key().to_bytes(),
+            [8_u8; 32],
+            vec![locator.clone()],
+        )
+        .and_then(|descriptor| SignedNodeDescriptorV2::sign(descriptor, &key))
+        .and_then(|descriptor| descriptor.canonical_binary())
+        .unwrap();
+        verify_invite_node_descriptor(
+            descriptor,
+            key.verifying_key().to_bytes().to_vec(),
+            "https://node.example.com".to_owned(),
+        )
+        .unwrap();
     }
 
     #[test]
