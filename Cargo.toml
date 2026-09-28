@@ -1,5 +1,11 @@
 [workspace]
-members = ["abyssal-invite", "mirage-server", "rust-core", "tools/release-tool"]
+members = [
+    "abyssal-invite",
+    "abyssal-transport",
+    "mirage-server",
+    "rust-core",
+    "tools/release-tool",
+]
 resolver = "2"
 
 [profile.release]

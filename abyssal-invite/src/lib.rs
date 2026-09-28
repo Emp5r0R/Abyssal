@@ -19,7 +19,10 @@ pub use capsule::{
     SignedInviteCapsule, ABYSSAL_APPLICATION_ID, INVITE_CAPABILITY_BYTES, INVITE_FORMAT_VERSION,
     MAX_BINARY_INVITE_BYTES, MAX_ENCODED_INVITE_TEXT_BYTES,
 };
-pub use descriptor::{NodeDescriptorV1, SignedNodeDescriptor};
+pub use descriptor::{
+    NodeDescriptorV1, NodeDescriptorV2, SignedNodeDescriptor, SignedNodeDescriptorV2,
+    MAX_BINARY_DESCRIPTOR_BYTES,
+};
 pub use error::InviteError;
 pub use locator::{
     locator_from_public_url, select_locator, LoopbackHost, NodeLocator, RuntimeLocatorPolicy,
@@ -32,3 +35,4 @@ pub use text::{decode_invite_text, encode_deep_link, encode_manual};
 
 pub const DIRECT_PROTOCOL_VERSION: u16 = 9;
 pub const ROOM_PROTOCOL_VERSION: u16 = 10;
+pub const TRANSPORT_PROTOCOL_VERSION: u16 = 11;
