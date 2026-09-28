@@ -738,6 +738,86 @@ async fn control_failures_have_fixed_status_headers_and_body() {
 }
 
 #[tokio::test]
+async fn initial_presence_snapshot_supersedes_older_staged_live_presence() {
+    let state = test_state();
+    let client_id = Uuid::new_v4();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let _bootstrap_rx =
+        transport::begin_client_stage(&state.client_stages, client_id, Arc::clone(&queued)).await;
+    let reserve = |frame: &OutboundFrame| {
+        let bytes = outbound_queue_bytes(frame).max(1);
+        queued.fetch_add(bytes, Ordering::AcqRel);
+        state.outbound_bytes.fetch_add(bytes, Ordering::AcqRel);
+        bytes
+    };
+
+    let older_presence = OutboundFrame::Presence { users: Vec::new() };
+    let older_bytes = reserve(&older_presence);
+    assert!(matches!(
+        transport::stage_outbound_frame(&state.client_stages, client_id, older_presence).await,
+        transport::StageOutcome::Pending
+    ));
+    let other_live = OutboundFrame::AckResult {
+        message_id: "live-result".to_string(),
+        accepted: true,
+    };
+    let other_bytes = reserve(&other_live);
+    assert!(matches!(
+        transport::stage_outbound_frame(&state.client_stages, client_id, other_live).await,
+        transport::StageOutcome::Pending
+    ));
+    let global_before = state.outbound_bytes.load(Ordering::Acquire);
+
+    let snapshot = OutboundFrame::Presence { users: Vec::new() };
+    let snapshot_bytes = reserve(&snapshot);
+    assert!(matches!(
+        transport::stage_initial_outbound_frame(
+            &state.client_stages,
+            &state.outbound_bytes,
+            client_id,
+            snapshot
+        )
+        .await,
+        transport::StageOutcome::Pending
+    ));
+
+    // The older live presence is dropped and its budget released; unrelated
+    // live frames stay queued behind the snapshot.
+    assert_eq!(queued.load(Ordering::Acquire), other_bytes + snapshot_bytes);
+    assert_eq!(
+        state.outbound_bytes.load(Ordering::Acquire),
+        global_before + snapshot_bytes - older_bytes
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_body_extractor_rejection_uses_the_fixed_response_envelope() {
+    // An oversized body hits the route's DefaultBodyLimit inside the extractor;
+    // that failure must look exactly like any other rejected bootstrap record.
+    let request = Request::new(Body::from_stream(futures_util::stream::once(async {
+        Err::<Bytes, _>(std::io::Error::other("test body failure"))
+    })));
+    let extracted = Bytes::from_request(request, &()).await;
+    assert!(
+        extracted.is_err(),
+        "stream failure must reach the extractor"
+    );
+    let response =
+        relay_bootstrap::handle_bootstrap_route(State(test_state()), HeaderMap::new(), extracted)
+            .await
+            .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE),
+        Some(&HeaderValue::from_static("application/octet-stream"))
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store"))
+    );
+}
+
+#[tokio::test]
 async fn control_body_extractor_rejection_uses_the_fixed_response_envelope() {
     let request = Request::new(Body::from_stream(futures_util::stream::once(async {
         Err::<Bytes, _>(std::io::Error::other("test body failure"))
@@ -2714,7 +2794,7 @@ async fn full_data_queue_does_not_block_global_wipe_control_channel() {
 }
 
 #[tokio::test]
-async fn v11_presence_broadcast_reaches_existing_clients_and_stays_after_snapshot() {
+async fn v11_presence_broadcast_reaches_existing_clients_and_snapshot_supersedes_raced_copy() {
     let state = test_state();
     add_test_account(&state, "presence-existing", "Alice").await;
     add_test_account(&state, "presence-new", "Bob").await;
@@ -2762,16 +2842,15 @@ async fn v11_presence_broadcast_reaches_existing_clients_and_stays_after_snapsho
     else {
         panic!("new client must receive initial presence");
     };
-    let live_frame = new_rx.recv().await.expect("new client live presence");
-    let OutboundFrame::Presence { users: live_users } = &live_frame else {
-        panic!("new client must receive raced live presence");
-    };
     assert!(initial_users
         .iter()
         .any(|user| user.username == "Bob" && user.connected));
-    assert!(live_users
-        .iter()
-        .any(|user| user.username == "Bob" && user.connected));
+    // The broadcast raced before the snapshot is older than it; delivering it
+    // after the snapshot would move the directory backwards, so it is dropped.
+    assert!(matches!(
+        new_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -2866,7 +2945,13 @@ async fn staged_snapshot_commit_releases_frames_results_and_controls_after_boots
     let initial = OutboundFrame::Presence { users: Vec::new() };
     let live = OutboundFrame::Presence { users: Vec::new() };
     assert!(matches!(
-        transport::stage_initial_outbound_frame(&state.client_stages, client_id, initial).await,
+        transport::stage_initial_outbound_frame(
+            &state.client_stages,
+            &state.outbound_bytes,
+            client_id,
+            initial
+        )
+        .await,
         transport::StageOutcome::Pending
     ));
     assert!(matches!(

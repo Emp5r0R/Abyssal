@@ -215,19 +215,28 @@ pub(super) async fn stage_outbound_frame(
     client_id: Uuid,
     frame: OutboundFrame,
 ) -> StageOutcome {
-    stage_frame(registry, client_id, frame, false).await
+    stage_frame(registry, None, client_id, frame, false).await
 }
 
 pub(super) async fn stage_initial_outbound_frame(
     registry: &ClientStageRegistry,
+    global_outbound_bytes: &AtomicUsize,
     client_id: Uuid,
     frame: OutboundFrame,
 ) -> StageOutcome {
-    stage_frame(registry, client_id, frame, true).await
+    stage_frame(
+        registry,
+        Some(global_outbound_bytes),
+        client_id,
+        frame,
+        true,
+    )
+    .await
 }
 
 async fn stage_frame(
     registry: &ClientStageRegistry,
+    global_outbound_bytes: Option<&AtomicUsize>,
     client_id: Uuid,
     frame: OutboundFrame,
     initial: bool,
@@ -248,6 +257,22 @@ async fn stage_frame(
         return StageOutcome::Full(frame);
     }
     if initial {
+        // Presence is computed under presence_broadcast_ops, so any live
+        // presence staged before this snapshot is older. Initial frames are
+        // flushed before live frames; keeping the older live copy would
+        // deliver a newer directory revision followed by an older one.
+        if matches!(frame, OutboundFrame::Presence { .. }) {
+            if let Some(global) = global_outbound_bytes {
+                let queued_bytes = Arc::clone(&stage.queued_bytes);
+                stage.live_frames.retain(|staged| {
+                    let superseded = matches!(staged, OutboundFrame::Presence { .. });
+                    if superseded {
+                        release_client_outbound_bytes(global, &queued_bytes, staged);
+                    }
+                    !superseded
+                });
+            }
+        }
         stage.initial_frames.push(frame);
     } else {
         stage.live_frames.push(frame);

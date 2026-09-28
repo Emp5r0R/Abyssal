@@ -13,7 +13,10 @@ pub(super) fn router(state: AppState) -> Router {
         .route("/v1/account/logout", post(logout_account))
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT_BYTES));
     let bootstrap_routes = Router::new()
-        .route("/v1/bootstrap", post(relay_bootstrap::handle_bootstrap))
+        .route(
+            "/v1/bootstrap",
+            post(relay_bootstrap::handle_bootstrap_route),
+        )
         .layer(DefaultBodyLimit::max(
             relay_bootstrap::BOOTSTRAP_REQUEST_BYTES,
         ));

@@ -11,6 +11,7 @@ use abyssal_transport::{
     AccountBootstrapAction, AccountBootstrapResult, BootstrapContext, BootstrapServerExchange,
     ACCOUNT_BOOTSTRAP_OPERATION, MAX_BOOTSTRAP_PLAINTEXT_BYTES,
 };
+use axum::extract::rejection::BytesRejection;
 use tokio::sync::watch;
 
 pub(super) const BOOTSTRAP_PLAINTEXT_BYTES: usize = MAX_BOOTSTRAP_PLAINTEXT_BYTES;
@@ -288,6 +289,20 @@ impl BootstrapReceiptStore {
     }
 }
 
+/// Router entry point. Extraction failures (including an oversized body that
+/// hits the route's DefaultBodyLimit) must not surface axum's 413: every
+/// rejection gets the same 200 + random bytes as an invalid record.
+pub(super) async fn handle_bootstrap_route(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    match body {
+        Ok(body) => handle_bootstrap(state, headers, body).await,
+        Err(_) => fixed_bootstrap_response(random_response_bytes()),
+    }
+}
+
 pub(super) async fn handle_bootstrap(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -299,7 +314,10 @@ pub(super) async fn handle_bootstrap(
     )
     .await
     .unwrap_or_else(|_| Ok::<Vec<u8>, ()>(random_response_bytes()));
-    let body = response.unwrap_or_else(|_| random_response_bytes());
+    fixed_bootstrap_response(response.unwrap_or_else(|_| random_response_bytes()))
+}
+
+fn fixed_bootstrap_response(body: Vec<u8>) -> Response {
     (
         StatusCode::OK,
         [

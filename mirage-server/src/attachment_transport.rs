@@ -41,6 +41,9 @@ enum ReceiptState {
 struct Receipt {
     request_digest: [u8; 32],
     generation: u64,
+    /// Whether the original request streamed an upload body. A cached retry
+    /// must drain the same kind of body without re-authenticating.
+    upload_retry: bool,
     created_at_ms: u64,
     state: ReceiptState,
 }
@@ -61,8 +64,8 @@ enum Lookup {
     Missing,
     Mismatch,
     Stale,
-    InFlight(watch::Receiver<Option<Arc<Zeroizing<Vec<u8>>>>>),
-    Complete(Arc<Zeroizing<Vec<u8>>>),
+    InFlight(watch::Receiver<Option<Arc<Zeroizing<Vec<u8>>>>>, bool),
+    Complete(Arc<Zeroizing<Vec<u8>>>, bool),
     Spent,
     Saturated,
 }
@@ -148,8 +151,12 @@ impl AttachmentReceiptStore {
             return Lookup::Saturated;
         }
         match &receipt.state {
-            ReceiptState::InFlight(sender) => Lookup::InFlight(sender.subscribe()),
-            ReceiptState::Complete(response) => Lookup::Complete(response.clone()),
+            ReceiptState::InFlight(sender) => {
+                Lookup::InFlight(sender.subscribe(), receipt.upload_retry)
+            }
+            ReceiptState::Complete(response) => {
+                Lookup::Complete(response.clone(), receipt.upload_retry)
+            }
         }
     }
 
@@ -158,6 +165,7 @@ impl AttachmentReceiptStore {
         key: ReceiptKey,
         digest: [u8; 32],
         generation: u64,
+        upload_retry: bool,
         now: u64,
     ) -> Reservation {
         self.prune(now);
@@ -191,6 +199,7 @@ impl AttachmentReceiptStore {
             Receipt {
                 request_digest: digest,
                 generation,
+                upload_retry,
                 created_at_ms: now,
                 state: ReceiptState::InFlight(sender),
             },
@@ -268,15 +277,12 @@ pub(super) async fn handle_attachment(State(state): State<AppState>, request: Re
         session_id: header.session_id,
         handle: header.handle,
     };
-    let mut authenticated = match authenticate(&state, prefix.as_slice(), header, generation).await
-    {
-        Ok(value) => value,
-        Err(()) => return random_response(),
-    };
+    // A cached response is authoritative for an exact retry, even after the
+    // session expired or logout removed it (mirrors the control transport).
     let request_digest: [u8; 32] = Sha256::digest(prefix.as_slice()).into();
     match cached_response(&state, &key, request_digest, generation).await {
-        Ok(Some(record)) => {
-            if consume_cached_retry_body(body, &authenticated.action)
+        Ok(Some((record, upload_retry))) => {
+            if consume_cached_retry_body_kind(body, upload_retry)
                 .await
                 .is_err()
             {
@@ -290,6 +296,15 @@ pub(super) async fn handle_attachment(State(state): State<AppState>, request: Re
         Err(()) => return random_response(),
         Ok(None) => {}
     }
+    let mut authenticated = match authenticate(&state, prefix.as_slice(), header, generation).await
+    {
+        Ok(value) => value,
+        Err(()) => return random_response(),
+    };
+    let upload_retry = authenticated
+        .action
+        .as_ref()
+        .is_some_and(|action| matches!(action, AttachmentAction::BeginUpload { .. }));
     drop(prefix_permit);
     let worker_permit = match state.attachment_workers.clone().try_acquire_owned() {
         Ok(permit) => permit,
@@ -300,19 +315,21 @@ pub(super) async fn handle_attachment(State(state): State<AppState>, request: Re
         if state.attachment_epoch.load(Ordering::Acquire) != generation {
             Reservation::Stale
         } else {
-            receipts.reserve(key.clone(), request_digest, generation, now_ms())
+            receipts.reserve(
+                key.clone(),
+                request_digest,
+                generation,
+                upload_retry,
+                now_ms(),
+            )
         }
     };
     match reservation {
         Reservation::Owner => {}
         Reservation::Existing => {
-            let allow_upload_retry = authenticated
-                .action
-                .as_ref()
-                .is_some_and(|action| matches!(action, AttachmentAction::BeginUpload { .. }));
             drop(authenticated);
             drop(worker_permit);
-            let body_result = consume_cached_retry_body_kind(body, allow_upload_retry).await;
+            let body_result = consume_cached_retry_body_kind(body, upload_retry).await;
             if body_result.is_err() {
                 return random_response();
             }
@@ -322,7 +339,8 @@ pub(super) async fn handle_attachment(State(state): State<AppState>, request: Re
             let cached = cached_response(&state, &key, request_digest, generation)
                 .await
                 .ok()
-                .flatten();
+                .flatten()
+                .map(|(record, _)| record);
             if state.attachment_epoch.load(Ordering::Acquire) != generation {
                 return random_response();
             }
@@ -380,16 +398,6 @@ pub(super) async fn handle_attachment(State(state): State<AppState>, request: Re
         }
         _ => random_response(),
     }
-}
-
-async fn consume_cached_retry_body(
-    body: Body,
-    action: &Option<AttachmentAction>,
-) -> Result<(), ()> {
-    let allow_upload_retry = action
-        .as_ref()
-        .is_some_and(|action| matches!(action, AttachmentAction::BeginUpload { .. }));
-    consume_cached_retry_body_kind(body, allow_upload_retry).await
 }
 
 async fn consume_cached_retry_body_kind(body: Body, allow_upload_retry: bool) -> Result<(), ()> {
@@ -658,7 +666,7 @@ async fn cached_response(
     key: &ReceiptKey,
     digest: [u8; 32],
     generation: u64,
-) -> Result<Option<Vec<u8>>, ()> {
+) -> Result<Option<(Vec<u8>, bool)>, ()> {
     let lookup = state
         .attachment_receipts
         .lock()
@@ -667,17 +675,21 @@ async fn cached_response(
     match lookup {
         Lookup::Missing => Ok(None),
         Lookup::Mismatch | Lookup::Stale | Lookup::Spent | Lookup::Saturated => Err(()),
-        Lookup::Complete(response) => Ok(Some(response.as_slice().to_vec())),
-        Lookup::InFlight(mut receiver) => tokio::time::timeout(RECEIPT_WAIT_TIMEOUT, async move {
-            loop {
-                if let Some(response) = receiver.borrow().clone() {
-                    return Ok(Some(response.as_slice().to_vec()));
+        Lookup::Complete(response, upload_retry) => {
+            Ok(Some((response.as_slice().to_vec(), upload_retry)))
+        }
+        Lookup::InFlight(mut receiver, upload_retry) => {
+            tokio::time::timeout(RECEIPT_WAIT_TIMEOUT, async move {
+                loop {
+                    if let Some(response) = receiver.borrow().clone() {
+                        return Ok(Some((response.as_slice().to_vec(), upload_retry)));
+                    }
+                    receiver.changed().await.map_err(|_| ())?;
                 }
-                receiver.changed().await.map_err(|_| ())?;
-            }
-        })
-        .await
-        .map_err(|_| ())?,
+            })
+            .await
+            .map_err(|_| ())?
+        }
     }
 }
 
@@ -717,14 +729,14 @@ mod tests {
         let key = key(1);
         let digest = [2; 32];
         assert!(matches!(
-            store.reserve(key.clone(), digest, 1, 10),
+            store.reserve(key.clone(), digest, 1, false, 10),
             Reservation::Owner
         ));
         let response = vec![7; ATTACHMENT_ACTION_RECORD_BYTES];
         store.complete(&key, digest, 1, response.clone(), 20);
         assert!(matches!(
             store.lookup(&key, digest, 1, 20),
-            Lookup::Complete(value) if value.as_slice() == response.as_slice()
+            Lookup::Complete(value, false) if value.as_slice() == response.as_slice()
         ));
         assert!(matches!(store.lookup(&key, digest, 2, 20), Lookup::Stale));
         assert!(matches!(
@@ -736,8 +748,28 @@ mod tests {
             Lookup::Spent
         ));
         assert!(matches!(
-            store.reserve(key, digest, 1, 20 + RECEIPT_TTL_MS),
+            store.reserve(key, digest, 1, false, 20 + RECEIPT_TTL_MS),
             Reservation::Spent
+        ));
+    }
+
+    #[test]
+    fn receipt_remembers_upload_kind_for_session_free_retries() {
+        let mut store = AttachmentReceiptStore::new();
+        let key = key(6);
+        let digest = [7; 32];
+        assert!(matches!(
+            store.reserve(key.clone(), digest, 1, true, 10),
+            Reservation::Owner
+        ));
+        assert!(matches!(
+            store.lookup(&key, digest, 1, 10),
+            Lookup::InFlight(_, true)
+        ));
+        store.complete(&key, digest, 1, vec![1; ATTACHMENT_ACTION_RECORD_BYTES], 20);
+        assert!(matches!(
+            store.lookup(&key, digest, 1, 20),
+            Lookup::Complete(_, true)
         ));
     }
 
@@ -747,7 +779,7 @@ mod tests {
         let key = key(4);
         let digest = [5; 32];
         assert!(matches!(
-            store.reserve(key.clone(), digest, 4, 10),
+            store.reserve(key.clone(), digest, 4, false, 10),
             Reservation::Owner
         ));
         assert!(matches!(
@@ -755,7 +787,7 @@ mod tests {
             Lookup::Spent
         ));
         assert!(matches!(
-            store.reserve(key, digest, 4, 10 + RECEIPT_TTL_MS),
+            store.reserve(key, digest, 4, false, 10 + RECEIPT_TTL_MS),
             Reservation::Spent
         ));
     }
@@ -766,7 +798,7 @@ mod tests {
         let key = key(8);
         let digest = [9; 32];
         assert!(matches!(
-            store.reserve(key.clone(), digest, 11, 10),
+            store.reserve(key.clone(), digest, 11, false, 10),
             Reservation::Owner
         ));
         store.clear();
@@ -778,7 +810,7 @@ mod tests {
             20,
         );
         assert!(matches!(
-            store.reserve(key, digest, 12, 20),
+            store.reserve(key, digest, 12, false, 20),
             Reservation::Owner
         ));
     }

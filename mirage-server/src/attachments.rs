@@ -1021,47 +1021,37 @@ async fn reserve_attachment_download_inner(
         if !allow_existing_claim && existing_claim.is_some() {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if allow_existing_claim {
-            if let Some(claim_id) = existing_claim {
-                Some(claim_id)
-            } else {
-                let claim_id = loop {
-                    let candidate = Uuid::new_v4();
-                    if !record.download_claims.contains_key(&candidate) {
-                        break candidate;
-                    }
-                };
-                record.download_claims.insert(
-                    claim_id,
-                    AttachmentDownloadClaim {
-                        recipient_code_id: *requester_code_id,
-                        created_at_ms: now_ms(),
-                    },
-                );
-                Some(claim_id)
-            }
-        } else {
-            let claim_id = loop {
-                let candidate = Uuid::new_v4();
-                if !record.download_claims.contains_key(&candidate) {
-                    break candidate;
-                }
-            };
-            record.download_claims.insert(
-                claim_id,
-                AttachmentDownloadClaim {
-                    recipient_code_id: *requester_code_id,
-                    created_at_ms: now_ms(),
-                },
-            );
-            Some(claim_id)
-        }
+        // The early return above leaves an existing claim only when reuse is allowed.
+        Some(existing_claim.unwrap_or_else(|| {
+            insert_download_claim(&mut record.download_claims, *requester_code_id)
+        }))
     };
     Ok(AttachmentDownloadReservation {
         blob: Arc::clone(&record.blob),
         claim_id,
         epoch: state.attachment_epoch.load(Ordering::Acquire),
     })
+}
+
+/// Records a new download claim for `recipient_code_id` under a fresh, unused ID.
+fn insert_download_claim(
+    claims: &mut HashMap<Uuid, AttachmentDownloadClaim>,
+    recipient_code_id: CodeId,
+) -> Uuid {
+    let claim_id = loop {
+        let candidate = Uuid::new_v4();
+        if !claims.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    claims.insert(
+        claim_id,
+        AttachmentDownloadClaim {
+            recipient_code_id,
+            created_at_ms: now_ms(),
+        },
+    );
+    claim_id
 }
 
 pub(super) async fn complete_attachment_download_claim(

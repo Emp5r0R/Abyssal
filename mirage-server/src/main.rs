@@ -3701,14 +3701,21 @@ async fn send_to_client_internal(
         return;
     }
     let staged = if initial {
-        stage_initial_outbound_frame(&state.client_stages, client_id, frame.clone()).await
+        stage_initial_outbound_frame(
+            &state.client_stages,
+            &state.outbound_bytes,
+            client_id,
+            frame.clone(),
+        )
+        .await
     } else {
         stage_outbound_frame(&state.client_stages, client_id, frame.clone()).await
     };
     match staged {
         transport::StageOutcome::Pending => {}
         transport::StageOutcome::Ready(frame) => {
-            if tx.try_send(frame.clone()).is_err() {
+            if let Err(error) = tx.try_send(frame) {
+                let frame = error.into_inner();
                 release_client_outbound_bytes(&state.outbound_bytes, &queued_bytes, &frame);
                 warn!("closing slow or closed client");
                 send_control_to_client(state, client_id, ClientControl::Close).await;
