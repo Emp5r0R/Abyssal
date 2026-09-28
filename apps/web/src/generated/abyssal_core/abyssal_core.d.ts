@@ -1,6 +1,98 @@
 /* tslint:disable */
 /* eslint-disable */
 
+export class WasmAccountBootstrapExchange {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    destroy(): void;
+    static finishLogin(node_public_key: Uint8Array, bootstrap_public_key: Uint8Array, handshake_id: Uint8Array, credential_finalization: Uint8Array): WasmAccountBootstrapExchange;
+    static finishRegistration(node_public_key: Uint8Array, bootstrap_public_key: Uint8Array, handshake_id: Uint8Array, registration_upload: Uint8Array, identity_public: Uint8Array, identity_prekey_id: string, identity_envelope: Uint8Array, identity_proof: Uint8Array): WasmAccountBootstrapExchange;
+    openResponse(response: Uint8Array): WasmAccountBootstrapResponse;
+    requestBytes(): Uint8Array;
+    static start(node_public_key: Uint8Array, bootstrap_public_key: Uint8Array, capability: Uint8Array, registration_request: Uint8Array, credential_request: Uint8Array): WasmAccountBootstrapExchange;
+}
+
+export class WasmAccountBootstrapResponse {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly challenge: Uint8Array;
+    readonly created: boolean;
+    readonly handshakeId: Uint8Array;
+    readonly identityEnvelope: Uint8Array;
+    readonly identityPrekeyId: string;
+    readonly identityPublic: Uint8Array;
+    readonly kind: number;
+    readonly maxRoomsPerUser: number;
+    readonly opaqueResponse: Uint8Array;
+    readonly sessionId: Uint8Array;
+    readonly sessionInactivitySec: number;
+    readonly username: string;
+}
+
+export class WasmAttachmentExchange {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    static beginDownload(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, attachment_id: Uint8Array): WasmAttachmentExchange;
+    static beginUpload(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, chat_id: string, message_id: string, media_type: string, cipher_version: number, ciphertext_len: bigint, ciphertext_sha256: Uint8Array, one_time: boolean, delete_after_download: boolean, requested_ttl_sec: number): WasmAttachmentExchange;
+    static completeDownload(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, attachment_id: Uint8Array, claim_id: Uint8Array): WasmAttachmentExchange;
+    static deleteAttachment(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, attachment_id: Uint8Array): WasmAttachmentExchange;
+    destroy(): void;
+    openResponse(response: Uint8Array): WasmAttachmentResult;
+    openStreamFrame(frame: Uint8Array): WasmAttachmentFrame;
+    static releaseDownload(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, attachment_id: Uint8Array, claim_id: Uint8Array): WasmAttachmentExchange;
+    requestBytes(): Uint8Array;
+    sealDataFrame(payload: Uint8Array): Uint8Array;
+    sealEndFrame(): Uint8Array;
+    sealPaddingFrame(): Uint8Array;
+    streamComplete(): boolean;
+    uploadBucketFrameCount(): number;
+    uploadDataFrameCount(): number;
+}
+
+export class WasmAttachmentFrame {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly kind: number;
+    readonly payload: Uint8Array;
+}
+
+export class WasmAttachmentResult {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly attachmentId: Uint8Array;
+    readonly bucketFrameCount: number;
+    readonly ciphertextLen: bigint;
+    readonly ciphertextSha256: Uint8Array;
+    readonly claimId: Uint8Array;
+    readonly dataFrameCount: number;
+    readonly kind: number;
+}
+
+export class WasmControlExchange {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    destroy(): void;
+    static issueWsTicket(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, platform: string, version: string, build_signature: string): WasmControlExchange;
+    static logout(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array): WasmControlExchange;
+    openResponse(response: Uint8Array): WasmControlResponse;
+    requestBytes(): Uint8Array;
+}
+
+export class WasmControlResponse {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly expiresInSec: number;
+    readonly kind: number;
+    readonly ticket: string;
+}
+
 export class WasmE2eeSession {
     private constructor();
     free(): void;
@@ -113,6 +205,18 @@ export class WasmMlsRoomInfo {
     readonly roomId: string;
 }
 
+export class WasmWsClientConnection {
+    free(): void;
+    [Symbol.dispose](): void;
+    clientHelloBytes(): Uint8Array;
+    destroy(): void;
+    constructor(node_public_key: Uint8Array, session_id: Uint8Array, transport_root: Uint8Array, ticket: Uint8Array);
+    openFrame(record: Uint8Array): Uint8Array;
+    openServerHello(response: Uint8Array): void;
+    ready(): boolean;
+    sealFrame(plaintext: Uint8Array): Uint8Array;
+}
+
 export function attachmentEncryptedSize(media_type: string, total_plaintext_bytes: bigint): bigint;
 
 export function conversationSafetyNumber(first_public_key: Uint8Array, second_public_key: Uint8Array): string;
@@ -153,16 +257,26 @@ export function verifyReleaseBuildSignature(build_id: string, source_commit: str
 
 export function verifyReleaseManifest(manifest_json: Uint8Array, signature: Uint8Array, now_ms: bigint): string;
 
+export function verifyTransportNodeDescriptor(descriptor: Uint8Array, expected_node_public_key: Uint8Array, expected_node_url: string): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_wasmaccountbootstrapexchange_free: (a: number, b: number) => void;
+    readonly __wbg_wasmaccountbootstrapresponse_free: (a: number, b: number) => void;
+    readonly __wbg_wasmattachmentexchange_free: (a: number, b: number) => void;
+    readonly __wbg_wasmattachmentframe_free: (a: number, b: number) => void;
+    readonly __wbg_wasmattachmentresult_free: (a: number, b: number) => void;
+    readonly __wbg_wasmcontrolexchange_free: (a: number, b: number) => void;
+    readonly __wbg_wasmcontrolresponse_free: (a: number, b: number) => void;
     readonly __wbg_wasme2eesession_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlsapplicationmessage_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlscommit_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlsprocessedcontrol_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlsroom_free: (a: number, b: number) => void;
     readonly __wbg_wasmmlsroominfo_free: (a: number, b: number) => void;
+    readonly __wbg_wasmwsclientconnection_free: (a: number, b: number) => void;
     readonly attachmentEncryptedSize: (a: number, b: number, c: bigint) => [bigint, number, number];
     readonly conversationSafetyNumber: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly conversationVerificationToken: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
@@ -209,8 +323,19 @@ export interface InitOutput {
     readonly parseReleaseBuildId: (a: number, b: number) => [number, number, number, number];
     readonly releaseSha256: (a: number, b: number) => [number, number];
     readonly releaseTrustAnchorConfigured: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_finish_login: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_finish_registration: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_start: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_begin_download: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_begin_upload: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_complete_download: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_delete_attachment: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_release_download: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_controlclientexchange_issue_ws_ticket: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_controlclientexchange_logout: () => number;
     readonly uniffi_abyssal_core_checksum_constructor_e2eesession_create: () => number;
     readonly uniffi_abyssal_core_checksum_constructor_e2eesession_recover: () => number;
+    readonly uniffi_abyssal_core_checksum_constructor_wsclientconnection_new: () => number;
     readonly uniffi_abyssal_core_checksum_func_attachment_encrypted_size: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_safety_number: () => number;
     readonly uniffi_abyssal_core_checksum_func_conversation_verification_token: () => number;
@@ -231,6 +356,20 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_checksum_func_verify_invite_node_descriptor: () => number;
     readonly uniffi_abyssal_core_checksum_func_verify_release_build_signature: () => number;
     readonly uniffi_abyssal_core_checksum_func_verify_release_manifest: () => number;
+    readonly uniffi_abyssal_core_checksum_func_verify_transport_node_descriptor: () => number;
+    readonly uniffi_abyssal_core_checksum_method_accountbootstrapexchange_open_response: () => number;
+    readonly uniffi_abyssal_core_checksum_method_accountbootstrapexchange_request_bytes: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_open_response: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_open_stream_frame: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_request_bytes: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_data_frame: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_end_frame: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_padding_frame: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_stream_complete: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_bucket_frame_count: () => number;
+    readonly uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_data_frame_count: () => number;
+    readonly uniffi_abyssal_core_checksum_method_controlclientexchange_open_response: () => number;
+    readonly uniffi_abyssal_core_checksum_method_controlclientexchange_request_bytes: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_create_mls_room: () => number;
     readonly uniffi_abyssal_core_checksum_method_e2eesession_decrypt: () => number;
@@ -263,12 +402,32 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_checksum_method_mlsroom_rollback_outbound: () => number;
     readonly uniffi_abyssal_core_checksum_method_mlsroom_room_info: () => number;
     readonly uniffi_abyssal_core_checksum_method_mlsroom_seal_state: () => number;
-    readonly uniffi_abyssal_core_fn_clone_e2eesession: (a: bigint, b: number) => bigint;
+    readonly uniffi_abyssal_core_checksum_method_wsclientconnection_client_hello_bytes: () => number;
+    readonly uniffi_abyssal_core_checksum_method_wsclientconnection_open_frame: () => number;
+    readonly uniffi_abyssal_core_checksum_method_wsclientconnection_open_server_hello: () => number;
+    readonly uniffi_abyssal_core_checksum_method_wsclientconnection_ready: () => number;
+    readonly uniffi_abyssal_core_checksum_method_wsclientconnection_seal_frame: () => number;
+    readonly uniffi_abyssal_core_fn_clone_accountbootstrapexchange: (a: bigint, b: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_finish_login: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_finish_registration: (a: number, b: number, c: number, d: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_start: (a: number, b: number, c: number, d: number, e: number, f: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_download: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_upload: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_attachmentclientexchange_complete_download: (a: number, b: number, c: number, d: number, e: number, f: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_attachmentclientexchange_delete_attachment: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_attachmentclientexchange_release_download: (a: number, b: number, c: number, d: number, e: number, f: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_controlclientexchange_issue_ws_ticket: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_controlclientexchange_logout: (a: number, b: number, c: number, d: number) => bigint;
     readonly uniffi_abyssal_core_fn_constructor_e2eesession_create: (a: number, b: number) => bigint;
     readonly uniffi_abyssal_core_fn_constructor_e2eesession_recover: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_constructor_wsclientconnection_new: (a: number, b: number, c: number, d: number, e: number) => bigint;
+    readonly uniffi_abyssal_core_fn_free_accountbootstrapexchange: (a: bigint, b: number) => void;
+    readonly uniffi_abyssal_core_fn_free_attachmentclientexchange: (a: bigint, b: number) => void;
+    readonly uniffi_abyssal_core_fn_free_controlclientexchange: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_free_e2eesession: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_free_mlsprocessedcontrol: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_free_mlsroom: (a: bigint, b: number) => void;
+    readonly uniffi_abyssal_core_fn_free_wsclientconnection: (a: bigint, b: number) => void;
     readonly uniffi_abyssal_core_fn_func_attachment_encrypted_size: (a: number, b: bigint, c: number) => bigint;
     readonly uniffi_abyssal_core_fn_func_conversation_safety_number: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_conversation_verification_token: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
@@ -289,6 +448,20 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_func_verify_invite_node_descriptor: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_verify_release_build_signature: (a: number, b: number, c: number, d: number) => void;
     readonly uniffi_abyssal_core_fn_func_verify_release_manifest: (a: number, b: number, c: number, d: bigint, e: number) => void;
+    readonly uniffi_abyssal_core_fn_func_verify_transport_node_descriptor: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly uniffi_abyssal_core_fn_method_accountbootstrapexchange_open_response: (a: number, b: bigint, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_method_accountbootstrapexchange_request_bytes: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_open_response: (a: number, b: bigint, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_open_stream_frame: (a: number, b: bigint, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_request_bytes: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_data_frame: (a: number, b: bigint, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_end_frame: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_padding_frame: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_stream_complete: (a: bigint, b: number) => number;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_bucket_frame_count: (a: bigint, b: number) => number;
+    readonly uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_data_frame_count: (a: bigint, b: number) => number;
+    readonly uniffi_abyssal_core_fn_method_controlclientexchange_open_response: (a: number, b: bigint, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_method_controlclientexchange_request_bytes: (a: number, b: bigint, c: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_commit_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
     readonly uniffi_abyssal_core_fn_method_e2eesession_create_mls_room: (a: bigint, b: number, c: number, d: number, e: number, f: number) => bigint;
     readonly uniffi_abyssal_core_fn_method_e2eesession_decrypt: (a: number, b: bigint, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => void;
@@ -321,9 +494,65 @@ export interface InitOutput {
     readonly uniffi_abyssal_core_fn_method_mlsroom_rollback_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
     readonly uniffi_abyssal_core_fn_method_mlsroom_room_info: (a: number, b: bigint, c: number) => void;
     readonly uniffi_abyssal_core_fn_method_mlsroom_seal_state: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_wsclientconnection_client_hello_bytes: (a: number, b: bigint, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_wsclientconnection_open_frame: (a: number, b: bigint, c: number, d: number) => void;
+    readonly uniffi_abyssal_core_fn_method_wsclientconnection_open_server_hello: (a: bigint, b: number, c: number) => void;
+    readonly uniffi_abyssal_core_fn_method_wsclientconnection_ready: (a: bigint, b: number) => number;
+    readonly uniffi_abyssal_core_fn_method_wsclientconnection_seal_frame: (a: number, b: bigint, c: number, d: number) => void;
     readonly verifyInviteNodeDescriptor: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly verifyReleaseBuildSignature: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly verifyReleaseManifest: (a: number, b: number, c: number, d: number, e: bigint) => [number, number, number, number];
+    readonly verifyTransportNodeDescriptor: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly wasmaccountbootstrapexchange_destroy: (a: number) => void;
+    readonly wasmaccountbootstrapexchange_finishLogin: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+    readonly wasmaccountbootstrapexchange_finishRegistration: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number, number];
+    readonly wasmaccountbootstrapexchange_openResponse: (a: number, b: number, c: number) => [number, number, number];
+    readonly wasmaccountbootstrapexchange_requestBytes: (a: number) => [number, number, number, number];
+    readonly wasmaccountbootstrapexchange_start: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
+    readonly wasmaccountbootstrapresponse_challenge: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_created: (a: number) => number;
+    readonly wasmaccountbootstrapresponse_handshakeId: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_identityEnvelope: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_identityPrekeyId: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_identityPublic: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_kind: (a: number) => number;
+    readonly wasmaccountbootstrapresponse_maxRoomsPerUser: (a: number) => number;
+    readonly wasmaccountbootstrapresponse_opaqueResponse: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_sessionId: (a: number) => [number, number];
+    readonly wasmaccountbootstrapresponse_sessionInactivitySec: (a: number) => number;
+    readonly wasmaccountbootstrapresponse_username: (a: number) => [number, number];
+    readonly wasmattachmentexchange_beginDownload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+    readonly wasmattachmentexchange_beginUpload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: bigint, o: number, p: number, q: number, r: number, s: number) => [number, number, number];
+    readonly wasmattachmentexchange_completeDownload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
+    readonly wasmattachmentexchange_deleteAttachment: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+    readonly wasmattachmentexchange_destroy: (a: number) => void;
+    readonly wasmattachmentexchange_openResponse: (a: number, b: number, c: number) => [number, number, number];
+    readonly wasmattachmentexchange_openStreamFrame: (a: number, b: number, c: number) => [number, number, number];
+    readonly wasmattachmentexchange_releaseDownload: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
+    readonly wasmattachmentexchange_requestBytes: (a: number) => [number, number, number, number];
+    readonly wasmattachmentexchange_sealDataFrame: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmattachmentexchange_sealEndFrame: (a: number) => [number, number, number, number];
+    readonly wasmattachmentexchange_sealPaddingFrame: (a: number) => [number, number, number, number];
+    readonly wasmattachmentexchange_streamComplete: (a: number) => number;
+    readonly wasmattachmentexchange_uploadBucketFrameCount: (a: number) => [number, number, number];
+    readonly wasmattachmentexchange_uploadDataFrameCount: (a: number) => [number, number, number];
+    readonly wasmattachmentframe_kind: (a: number) => number;
+    readonly wasmattachmentframe_payload: (a: number) => [number, number];
+    readonly wasmattachmentresult_attachmentId: (a: number) => [number, number];
+    readonly wasmattachmentresult_bucketFrameCount: (a: number) => number;
+    readonly wasmattachmentresult_ciphertextLen: (a: number) => bigint;
+    readonly wasmattachmentresult_ciphertextSha256: (a: number) => [number, number];
+    readonly wasmattachmentresult_claimId: (a: number) => [number, number];
+    readonly wasmattachmentresult_dataFrameCount: (a: number) => number;
+    readonly wasmattachmentresult_kind: (a: number) => number;
+    readonly wasmcontrolexchange_destroy: (a: number) => void;
+    readonly wasmcontrolexchange_issueWsTicket: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number];
+    readonly wasmcontrolexchange_logout: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly wasmcontrolexchange_openResponse: (a: number, b: number, c: number) => [number, number, number];
+    readonly wasmcontrolexchange_requestBytes: (a: number) => [number, number, number, number];
+    readonly wasmcontrolresponse_expiresInSec: (a: number) => number;
+    readonly wasmcontrolresponse_kind: (a: number) => number;
+    readonly wasmcontrolresponse_ticket: (a: number) => [number, number];
     readonly wasme2eesession_commitOutbound: (a: number, b: number, c: number, d: bigint) => [number, number];
     readonly wasme2eesession_create: (a: number, b: number) => [number, number, number];
     readonly wasme2eesession_decrypt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => [number, number, number, number];
@@ -380,8 +609,19 @@ export interface InitOutput {
     readonly wasmmlsroominfo_groupId: (a: number) => [number, number];
     readonly wasmmlsroominfo_membershipDigest: (a: number) => [number, number];
     readonly wasmmlsroominfo_roomId: (a: number) => [number, number];
+    readonly wasmwsclientconnection_clientHelloBytes: (a: number) => [number, number, number, number];
+    readonly wasmwsclientconnection_destroy: (a: number) => void;
+    readonly wasmwsclientconnection_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
+    readonly wasmwsclientconnection_openFrame: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmwsclientconnection_openServerHello: (a: number, b: number, c: number) => [number, number];
+    readonly wasmwsclientconnection_ready: (a: number) => number;
+    readonly wasmwsclientconnection_sealFrame: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly uniffi_abyssal_core_fn_clone_attachmentclientexchange: (a: bigint, b: number) => bigint;
+    readonly uniffi_abyssal_core_fn_clone_controlclientexchange: (a: bigint, b: number) => bigint;
+    readonly uniffi_abyssal_core_fn_clone_e2eesession: (a: bigint, b: number) => bigint;
     readonly uniffi_abyssal_core_fn_clone_mlsprocessedcontrol: (a: bigint, b: number) => bigint;
     readonly uniffi_abyssal_core_fn_clone_mlsroom: (a: bigint, b: number) => bigint;
+    readonly uniffi_abyssal_core_fn_clone_wsclientconnection: (a: bigint, b: number) => bigint;
     readonly wasmmlscommit_fromEpoch: (a: number) => bigint;
     readonly wasmmlscommit_revision: (a: number) => bigint;
     readonly wasmmlsencryptedapplication_epoch: (a: number) => bigint;

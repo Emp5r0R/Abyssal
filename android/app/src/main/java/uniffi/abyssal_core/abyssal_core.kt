@@ -715,6 +715,26 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_func_opaque_client_start(
     ): Int
+    external fun uniffi_abyssal_core_checksum_func_verify_transport_node_descriptor(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_open_response(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_open_stream_frame(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_request_bytes(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_data_frame(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_end_frame(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_padding_frame(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_stream_complete(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_bucket_frame_count(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_data_frame_count(
+    ): Int
     external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_epoch(
     ): Int
     external fun uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_group_id(
@@ -779,9 +799,49 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_method_e2eesession_sign_registration_identity_proof(
     ): Int
+    external fun uniffi_abyssal_core_checksum_method_accountbootstrapexchange_open_response(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_accountbootstrapexchange_request_bytes(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_controlclientexchange_open_response(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_controlclientexchange_request_bytes(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_wsclientconnection_client_hello_bytes(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_wsclientconnection_open_frame(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_wsclientconnection_open_server_hello(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_wsclientconnection_ready(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_method_wsclientconnection_seal_frame(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_begin_download(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_begin_upload(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_complete_download(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_delete_attachment(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_release_download(
+    ): Int
     external fun uniffi_abyssal_core_checksum_constructor_e2eesession_create(
     ): Int
     external fun uniffi_abyssal_core_checksum_constructor_e2eesession_recover(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_finish_login(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_finish_registration(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_start(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_controlclientexchange_issue_ws_ticket(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_controlclientexchange_logout(
+    ): Int
+    external fun uniffi_abyssal_core_checksum_constructor_wsclientconnection_new(
     ): Int
     external fun ffi_abyssal_core_uniffi_contract_version(
     ): Int
@@ -801,6 +861,38 @@ internal object UniffiLib {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "abyssal_core"))
 
     }
+    external fun uniffi_abyssal_core_fn_clone_attachmentclientexchange(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_free_attachmentclientexchange(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_download(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`attachmentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_upload(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_attachmentclientexchange_complete_download(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`attachmentId`: RustBuffer.ByValue,`claimId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_attachmentclientexchange_delete_attachment(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`attachmentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_attachmentclientexchange_release_download(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`attachmentId`: RustBuffer.ByValue,`claimId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_open_response(`ptr`: Long,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_open_stream_frame(`ptr`: Long,`frame`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_request_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_data_frame(`ptr`: Long,`payload`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_end_frame(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_padding_frame(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_stream_complete(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_bucket_frame_count(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+    external fun uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_data_frame_count(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Int
     external fun uniffi_abyssal_core_fn_clone_mlsprocessedcontrol(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     external fun uniffi_abyssal_core_fn_free_mlsprocessedcontrol(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
@@ -881,6 +973,48 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_method_e2eesession_sign_registration_identity_proof(`ptr`: Long,`nodeId`: RustBuffer.ByValue,`handshakeId`: RustBuffer.ByValue,`challenge`: RustBuffer.ByValue,`registrationUpload`: RustBuffer.ByValue,`identityPublic`: RustBuffer.ByValue,`prekeyId`: RustBuffer.ByValue,`identityEnvelope`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_clone_accountbootstrapexchange(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_free_accountbootstrapexchange(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_finish_login(`nodePublicKey`: RustBuffer.ByValue,`bootstrapPublicKey`: RustBuffer.ByValue,`handshakeId`: RustBuffer.ByValue,`credentialFinalization`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_finish_registration(`nodePublicKey`: RustBuffer.ByValue,`bootstrapPublicKey`: RustBuffer.ByValue,`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_start(`nodePublicKey`: RustBuffer.ByValue,`bootstrapPublicKey`: RustBuffer.ByValue,`capability`: RustBuffer.ByValue,`registrationRequest`: RustBuffer.ByValue,`credentialRequest`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_accountbootstrapexchange_open_response(`ptr`: Long,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_accountbootstrapexchange_request_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_clone_controlclientexchange(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_free_controlclientexchange(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_constructor_controlclientexchange_issue_ws_ticket(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`attestation`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_constructor_controlclientexchange_logout(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_controlclientexchange_open_response(`ptr`: Long,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_controlclientexchange_request_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_clone_wsclientconnection(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_free_wsclientconnection(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_constructor_wsclientconnection_new(`nodePublicKey`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,`transportRoot`: RustBuffer.ByValue,`ticket`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_abyssal_core_fn_method_wsclientconnection_client_hello_bytes(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_wsclientconnection_open_frame(`ptr`: Long,`record`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_method_wsclientconnection_open_server_hello(`ptr`: Long,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_abyssal_core_fn_method_wsclientconnection_ready(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+    external fun uniffi_abyssal_core_fn_method_wsclientconnection_seal_frame(`ptr`: Long,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_parse_invite_capsule(`inviteText`: RustBuffer.ByValue,`nowUnixSeconds`: Long,`allowDevelopmentLoopback`: Byte,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_verify_invite_node_descriptor(`descriptor`: RustBuffer.ByValue,`expectedNodePublicKey`: RustBuffer.ByValue,`expectedNodeUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -920,6 +1054,8 @@ internal object UniffiLib {
     external fun uniffi_abyssal_core_fn_func_opaque_client_finish_registration(`password`: RustBuffer.ByValue,`registrationState`: RustBuffer.ByValue,`registrationResponse`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_opaque_client_start(`password`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_abyssal_core_fn_func_verify_transport_node_descriptor(`descriptor`: RustBuffer.ByValue,`expectedNodePublicKey`: RustBuffer.ByValue,`expectedNodeUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun ffi_abyssal_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
@@ -1100,6 +1236,36 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_func_opaque_client_start() != 26876) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_func_verify_transport_node_descriptor() != 17420) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_open_response() != 63284) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_open_stream_frame() != 10545) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_request_bytes() != 49819) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_data_frame() != 30539) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_end_frame() != 38690) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_padding_frame() != 10750) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_stream_complete() != 9367) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_bucket_frame_count() != 57939) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_data_frame_count() != 904) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_method_mlsprocessedcontrol_epoch() != 9281) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1196,10 +1362,70 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_abyssal_core_checksum_method_e2eesession_sign_registration_identity_proof() != 18860) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_abyssal_core_checksum_method_accountbootstrapexchange_open_response() != 2339) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_accountbootstrapexchange_request_bytes() != 36376) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_controlclientexchange_open_response() != 13696) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_controlclientexchange_request_bytes() != 13866) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_wsclientconnection_client_hello_bytes() != 54123) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_wsclientconnection_open_frame() != 500) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_wsclientconnection_open_server_hello() != 16323) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_wsclientconnection_ready() != 62248) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_method_wsclientconnection_seal_frame() != 40886) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_begin_download() != 35222) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_begin_upload() != 38016) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_complete_download() != 42483) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_delete_attachment() != 47991) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_release_download() != 5949) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_abyssal_core_checksum_constructor_e2eesession_create() != 62344) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_constructor_e2eesession_recover() != 44830) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_finish_login() != 39114) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_finish_registration() != 56031) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_accountbootstrapexchange_start() != 33485) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_controlclientexchange_issue_ws_ticket() != 37917) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_controlclientexchange_logout() != 9156) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_constructor_wsclientconnection_new() != 31719) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1362,6 +1588,60 @@ private class AndroidSystemCleanable(
 /**
  * @suppress
  */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    fun lift(value: Int): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUShort: FfiConverter<UShort, Short> {
+    override fun lift(value: Short): UShort {
+        return value.toUShort()
+    }
+
+    fun lift(value: Int): UShort {
+        return value.toUShort()
+    }
+
+    override fun read(buf: ByteBuffer): UShort {
+        return lift(buf.getShort())
+    }
+
+    override fun lower(value: UShort): Short {
+        return value.toShort()
+    }
+
+    override fun allocationSize(value: UShort) = 2UL
+
+    override fun write(value: UShort, buf: ByteBuffer) {
+        buf.putShort(value.toShort())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterUInt: FfiConverter<UInt, Int> {
     override fun lift(value: Int): UInt {
         return value.toUInt()
@@ -1501,6 +1781,1145 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
     override fun write(value: ByteArray, buf: ByteBuffer) {
         buf.putInt(value.size)
         buf.put(value)
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * One HPKE response key plus a retryable copy of its exact request bytes.
+ */
+public interface AccountBootstrapExchangeInterface {
+
+    /**
+     * Retains the request and opener until a response authenticates.
+     */
+    fun `openResponse`(`response`: kotlin.ByteArray): AccountBootstrapResponse
+
+    fun `requestBytes`(): kotlin.ByteArray
+
+    companion object
+}
+
+/**
+ * One HPKE response key plus a retryable copy of its exact request bytes.
+ */
+open class AccountBootstrapExchange: Disposable, AutoCloseable, AccountBootstrapExchangeInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_abyssal_core_fn_free_accountbootstrapexchange(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_abyssal_core_fn_clone_accountbootstrapexchange(handle, status)
+        }
+    }
+
+
+    /**
+     * Retains the request and opener until a response authenticates.
+     */
+    @Throws(AbyssalException::class)override fun `openResponse`(`response`: kotlin.ByteArray): AccountBootstrapResponse {
+            return FfiConverterTypeAccountBootstrapResponse.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_accountbootstrapexchange_open_response(
+        it,
+
+        FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `requestBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_accountbootstrapexchange_request_bytes(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+
+
+    companion object {
+
+    @Throws(AbyssalException::class) fun `finishLogin`(`nodePublicKey`: kotlin.ByteArray, `bootstrapPublicKey`: kotlin.ByteArray, `handshakeId`: kotlin.ByteArray, `credentialFinalization`: kotlin.ByteArray): AccountBootstrapExchange {
+            return FfiConverterTypeAccountBootstrapExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_finish_login(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`bootstrapPublicKey`),
+        FfiConverterByteArray.lower(`handshakeId`),
+        FfiConverterByteArray.lower(`credentialFinalization`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `finishRegistration`(`nodePublicKey`: kotlin.ByteArray, `bootstrapPublicKey`: kotlin.ByteArray, `input`: AccountBootstrapRegistrationFinishInput): AccountBootstrapExchange {
+            return FfiConverterTypeAccountBootstrapExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_finish_registration(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`bootstrapPublicKey`),
+        FfiConverterTypeAccountBootstrapRegistrationFinishInput.lower(`input`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `start`(`nodePublicKey`: kotlin.ByteArray, `bootstrapPublicKey`: kotlin.ByteArray, `capability`: kotlin.ByteArray, `registrationRequest`: kotlin.ByteArray, `credentialRequest`: kotlin.ByteArray): AccountBootstrapExchange {
+            return FfiConverterTypeAccountBootstrapExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_accountbootstrapexchange_start(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`bootstrapPublicKey`),
+        FfiConverterByteArray.lower(`capability`),
+        FfiConverterByteArray.lower(`registrationRequest`),
+        FfiConverterByteArray.lower(`credentialRequest`),_status)
+}
+    )
+    }
+
+
+
+    }
+
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAccountBootstrapExchange: FfiConverter<AccountBootstrapExchange, Long> {
+    override fun lower(value: AccountBootstrapExchange): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): AccountBootstrapExchange {
+        return AccountBootstrapExchange(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): AccountBootstrapExchange {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: AccountBootstrapExchange) = 8UL
+
+    override fun write(value: AccountBootstrapExchange, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Retry-safe attachment action plus its operation-bound stream state.
+ *
+ * Once any upload stream frame has been transmitted, an interrupted upload
+ * must be abandoned and restarted with a fresh exchange/handle. Reusing a
+ * handle with newly sealed stream bytes would reuse AEAD nonces. After a
+ * complete End frame, the exact cached action request may be retried while
+ * awaiting its authenticated relay receipt.
+ */
+public interface AttachmentClientExchangeInterface {
+
+    /**
+     * Unauthenticated failures preserve the exact request and operation state.
+     * The first authenticated result consumes the request before semantic decode.
+     */
+    fun `openResponse`(`response`: kotlin.ByteArray): AttachmentTransportResult
+
+    fun `openStreamFrame`(`frame`: kotlin.ByteArray): AttachmentTransportFrame
+
+    fun `requestBytes`(): kotlin.ByteArray
+
+    fun `sealDataFrame`(`payload`: kotlin.ByteArray): kotlin.ByteArray
+
+    fun `sealEndFrame`(): kotlin.ByteArray
+
+    fun `sealPaddingFrame`(): kotlin.ByteArray
+
+    fun `streamComplete`(): kotlin.Boolean
+
+    fun `uploadBucketFrameCount`(): kotlin.UShort
+
+    fun `uploadDataFrameCount`(): kotlin.UShort
+
+    companion object
+}
+
+/**
+ * Retry-safe attachment action plus its operation-bound stream state.
+ *
+ * Once any upload stream frame has been transmitted, an interrupted upload
+ * must be abandoned and restarted with a fresh exchange/handle. Reusing a
+ * handle with newly sealed stream bytes would reuse AEAD nonces. After a
+ * complete End frame, the exact cached action request may be retried while
+ * awaiting its authenticated relay receipt.
+ */
+open class AttachmentClientExchange: Disposable, AutoCloseable, AttachmentClientExchangeInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_abyssal_core_fn_free_attachmentclientexchange(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_abyssal_core_fn_clone_attachmentclientexchange(handle, status)
+        }
+    }
+
+
+    /**
+     * Unauthenticated failures preserve the exact request and operation state.
+     * The first authenticated result consumes the request before semantic decode.
+     */
+    @Throws(AbyssalException::class)override fun `openResponse`(`response`: kotlin.ByteArray): AttachmentTransportResult {
+            return FfiConverterTypeAttachmentTransportResult.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_open_response(
+        it,
+
+        FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `openStreamFrame`(`frame`: kotlin.ByteArray): AttachmentTransportFrame {
+            return FfiConverterTypeAttachmentTransportFrame.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_open_stream_frame(
+        it,
+
+        FfiConverterByteArray.lower(`frame`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `requestBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_request_bytes(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `sealDataFrame`(`payload`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_data_frame(
+        it,
+
+        FfiConverterByteArray.lower(`payload`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `sealEndFrame`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_end_frame(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `sealPaddingFrame`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_padding_frame(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+    override fun `streamComplete`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_stream_complete(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `uploadBucketFrameCount`(): kotlin.UShort {
+            return FfiConverterUShort.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_bucket_frame_count(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `uploadDataFrameCount`(): kotlin.UShort {
+            return FfiConverterUShort.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_data_frame_count(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+
+
+    companion object {
+
+    @Throws(AbyssalException::class) fun `beginDownload`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `attachmentId`: kotlin.ByteArray): AttachmentClientExchange {
+            return FfiConverterTypeAttachmentClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_download(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterByteArray.lower(`attachmentId`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `beginUpload`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `input`: AttachmentUploadInput): AttachmentClientExchange {
+            return FfiConverterTypeAttachmentClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_upload(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterTypeAttachmentUploadInput.lower(`input`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `completeDownload`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `attachmentId`: kotlin.ByteArray, `claimId`: kotlin.ByteArray?): AttachmentClientExchange {
+            return FfiConverterTypeAttachmentClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_attachmentclientexchange_complete_download(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterByteArray.lower(`attachmentId`),
+        FfiConverterOptionalByteArray.lower(`claimId`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `deleteAttachment`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `attachmentId`: kotlin.ByteArray): AttachmentClientExchange {
+            return FfiConverterTypeAttachmentClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_attachmentclientexchange_delete_attachment(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterByteArray.lower(`attachmentId`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `releaseDownload`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `attachmentId`: kotlin.ByteArray, `claimId`: kotlin.ByteArray?): AttachmentClientExchange {
+            return FfiConverterTypeAttachmentClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_attachmentclientexchange_release_download(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterByteArray.lower(`attachmentId`),
+        FfiConverterOptionalByteArray.lower(`claimId`),_status)
+}
+    )
+    }
+
+
+
+    }
+
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAttachmentClientExchange: FfiConverter<AttachmentClientExchange, Long> {
+    override fun lower(value: AttachmentClientExchange): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): AttachmentClientExchange {
+        return AttachmentClientExchange(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): AttachmentClientExchange {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: AttachmentClientExchange) = 8UL
+
+    override fun write(value: AttachmentClientExchange, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Retry-safe client exchange for the authenticated `/v1/control` record.
+ *
+ * The exact sealed request remains available after network, length, and AEAD
+ * failures.  It is consumed immediately after the first authenticated
+ * result, before semantic result decoding.
+ */
+public interface ControlClientExchangeInterface {
+
+    fun `openResponse`(`response`: kotlin.ByteArray): ControlResponse
+
+    fun `requestBytes`(): kotlin.ByteArray
+
+    companion object
+}
+
+/**
+ * Retry-safe client exchange for the authenticated `/v1/control` record.
+ *
+ * The exact sealed request remains available after network, length, and AEAD
+ * failures.  It is consumed immediately after the first authenticated
+ * result, before semantic result decoding.
+ */
+open class ControlClientExchange: Disposable, AutoCloseable, ControlClientExchangeInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_abyssal_core_fn_free_controlclientexchange(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_abyssal_core_fn_clone_controlclientexchange(handle, status)
+        }
+    }
+
+
+    @Throws(AbyssalException::class)override fun `openResponse`(`response`: kotlin.ByteArray): ControlResponse {
+            return FfiConverterTypeControlResponse.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_controlclientexchange_open_response(
+        it,
+
+        FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `requestBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_controlclientexchange_request_bytes(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+
+
+    companion object {
+
+    @Throws(AbyssalException::class) fun `issueWsTicket`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `attestation`: ControlAttestationInput): ControlClientExchange {
+            return FfiConverterTypeControlClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_controlclientexchange_issue_ws_ticket(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterTypeControlAttestationInput.lower(`attestation`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class) fun `logout`(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray): ControlClientExchange {
+            return FfiConverterTypeControlClientExchange.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_controlclientexchange_logout(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),_status)
+}
+    )
+    }
+
+
+
+    }
+
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeControlClientExchange: FfiConverter<ControlClientExchange, Long> {
+    override fun lower(value: ControlClientExchange): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): ControlClientExchange {
+        return ControlClientExchange(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): ControlClientExchange {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: ControlClientExchange) = 8UL
+
+    override fun write(value: ControlClientExchange, buf: ByteBuffer) {
+        buf.putLong(lower(value))
     }
 }
 
@@ -2932,6 +4351,405 @@ public object FfiConverterTypeMlsRoom: FfiConverter<MlsRoom, Long> {
 }
 
 
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Client-side protocol-v11 WebSocket state. The OPAQUE-derived root and
+ * directional record keys never cross the FFI boundary.
+ */
+public interface WsClientConnectionInterface {
+
+    fun `clientHelloBytes`(): kotlin.ByteArray
+
+    fun `openFrame`(`record`: kotlin.ByteArray): kotlin.ByteArray
+
+    fun `openServerHello`(`response`: kotlin.ByteArray)
+
+    fun `ready`(): kotlin.Boolean
+
+    fun `sealFrame`(`plaintext`: kotlin.ByteArray): kotlin.ByteArray
+
+    companion object
+}
+
+/**
+ * Client-side protocol-v11 WebSocket state. The OPAQUE-derived root and
+ * directional record keys never cross the FFI boundary.
+ */
+open class WsClientConnection: Disposable, AutoCloseable, WsClientConnectionInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+    constructor(`nodePublicKey`: kotlin.ByteArray, `sessionId`: kotlin.ByteArray, `transportRoot`: kotlin.ByteArray, `ticket`: kotlin.ByteArray) :
+        this(UniffiWithHandle,
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_constructor_wsclientconnection_new(
+
+
+        FfiConverterByteArray.lower(`nodePublicKey`),
+        FfiConverterByteArray.lower(`sessionId`),
+        FfiConverterByteArray.lower(`transportRoot`),
+        FfiConverterByteArray.lower(`ticket`),_status)
+}
+    )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_abyssal_core_fn_free_wsclientconnection(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_abyssal_core_fn_clone_wsclientconnection(handle, status)
+        }
+    }
+
+
+    @Throws(AbyssalException::class)override fun `clientHelloBytes`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_wsclientconnection_client_hello_bytes(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `openFrame`(`record`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_wsclientconnection_open_frame(
+        it,
+
+        FfiConverterByteArray.lower(`record`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `openServerHello`(`response`: kotlin.ByteArray)
+        =
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_wsclientconnection_open_server_hello(
+        it,
+
+        FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+
+
+
+    override fun `ready`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_wsclientconnection_ready(
+        it,
+        _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(AbyssalException::class)override fun `sealFrame`(`plaintext`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithHandle {
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_method_wsclientconnection_seal_frame(
+        it,
+
+        FfiConverterByteArray.lower(`plaintext`),_status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+
+
+
+    /**
+     * @suppress
+     */
+    companion object
+
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeWsClientConnection: FfiConverter<WsClientConnection, Long> {
+    override fun lower(value: WsClientConnection): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): WsClientConnection {
+        return WsClientConnection(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): WsClientConnection {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: WsClientConnection) = 8UL
+
+    override fun write(value: WsClientConnection, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+
+data class AccountBootstrapRegistrationFinishInput (
+    var `handshakeId`: kotlin.ByteArray
+    ,
+    var `registrationUpload`: kotlin.ByteArray
+    ,
+    var `identityPublic`: kotlin.ByteArray
+    ,
+    var `identityPrekeyId`: kotlin.String
+    ,
+    var `identityEnvelope`: kotlin.ByteArray
+    ,
+    var `identityProof`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAccountBootstrapRegistrationFinishInput: FfiConverterRustBuffer<AccountBootstrapRegistrationFinishInput> {
+    override fun read(buf: ByteBuffer): AccountBootstrapRegistrationFinishInput {
+        return AccountBootstrapRegistrationFinishInput(
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: AccountBootstrapRegistrationFinishInput) = (
+            FfiConverterByteArray.allocationSize(value.`handshakeId`) +
+            FfiConverterByteArray.allocationSize(value.`registrationUpload`) +
+            FfiConverterByteArray.allocationSize(value.`identityPublic`) +
+            FfiConverterString.allocationSize(value.`identityPrekeyId`) +
+            FfiConverterByteArray.allocationSize(value.`identityEnvelope`) +
+            FfiConverterByteArray.allocationSize(value.`identityProof`)
+    )
+
+    override fun write(value: AccountBootstrapRegistrationFinishInput, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`handshakeId`, buf)
+            FfiConverterByteArray.write(value.`registrationUpload`, buf)
+            FfiConverterByteArray.write(value.`identityPublic`, buf)
+            FfiConverterString.write(value.`identityPrekeyId`, buf)
+            FfiConverterByteArray.write(value.`identityEnvelope`, buf)
+            FfiConverterByteArray.write(value.`identityProof`, buf)
+    }
+}
+
+
 
 data class AttachmentCiphertext (
     var `version`: kotlin.UInt
@@ -2971,6 +4789,122 @@ public object FfiConverterTypeAttachmentCiphertext: FfiConverterRustBuffer<Attac
             FfiConverterUInt.write(value.`version`, buf)
             FfiConverterByteArray.write(value.`key`, buf)
             FfiConverterByteArray.write(value.`blob`, buf)
+    }
+}
+
+
+
+data class AttachmentUploadInput (
+    var `chatId`: kotlin.String
+    ,
+    var `messageId`: kotlin.String
+    ,
+    var `mediaType`: kotlin.String
+    ,
+    var `cipherVersion`: kotlin.UByte
+    ,
+    var `ciphertextLen`: kotlin.ULong
+    ,
+    var `ciphertextSha256`: kotlin.ByteArray
+    ,
+    var `oneTime`: kotlin.Boolean
+    ,
+    var `deleteAfterDownload`: kotlin.Boolean
+    ,
+    var `requestedTtlSec`: kotlin.UInt
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAttachmentUploadInput: FfiConverterRustBuffer<AttachmentUploadInput> {
+    override fun read(buf: ByteBuffer): AttachmentUploadInput {
+        return AttachmentUploadInput(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: AttachmentUploadInput) = (
+            FfiConverterString.allocationSize(value.`chatId`) +
+            FfiConverterString.allocationSize(value.`messageId`) +
+            FfiConverterString.allocationSize(value.`mediaType`) +
+            FfiConverterUByte.allocationSize(value.`cipherVersion`) +
+            FfiConverterULong.allocationSize(value.`ciphertextLen`) +
+            FfiConverterByteArray.allocationSize(value.`ciphertextSha256`) +
+            FfiConverterBoolean.allocationSize(value.`oneTime`) +
+            FfiConverterBoolean.allocationSize(value.`deleteAfterDownload`) +
+            FfiConverterUInt.allocationSize(value.`requestedTtlSec`)
+    )
+
+    override fun write(value: AttachmentUploadInput, buf: ByteBuffer) {
+            FfiConverterString.write(value.`chatId`, buf)
+            FfiConverterString.write(value.`messageId`, buf)
+            FfiConverterString.write(value.`mediaType`, buf)
+            FfiConverterUByte.write(value.`cipherVersion`, buf)
+            FfiConverterULong.write(value.`ciphertextLen`, buf)
+            FfiConverterByteArray.write(value.`ciphertextSha256`, buf)
+            FfiConverterBoolean.write(value.`oneTime`, buf)
+            FfiConverterBoolean.write(value.`deleteAfterDownload`, buf)
+            FfiConverterUInt.write(value.`requestedTtlSec`, buf)
+    }
+}
+
+
+
+data class ControlAttestationInput (
+    var `platform`: kotlin.String
+    ,
+    var `version`: kotlin.String
+    ,
+    var `buildSignature`: kotlin.String
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeControlAttestationInput: FfiConverterRustBuffer<ControlAttestationInput> {
+    override fun read(buf: ByteBuffer): ControlAttestationInput {
+        return ControlAttestationInput(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ControlAttestationInput) = (
+            FfiConverterString.allocationSize(value.`platform`) +
+            FfiConverterString.allocationSize(value.`version`) +
+            FfiConverterString.allocationSize(value.`buildSignature`)
+    )
+
+    override fun write(value: ControlAttestationInput, buf: ByteBuffer) {
+            FfiConverterString.write(value.`platform`, buf)
+            FfiConverterString.write(value.`version`, buf)
+            FfiConverterString.write(value.`buildSignature`, buf)
     }
 }
 
@@ -3494,6 +5428,8 @@ data class OpaqueLoginFinish (
     var `credentialFinalization`: kotlin.ByteArray
     ,
     var `exportKey`: kotlin.ByteArray
+    ,
+    var `transportRoot`: kotlin.ByteArray
 
 ){
 
@@ -3512,17 +5448,20 @@ public object FfiConverterTypeOpaqueLoginFinish: FfiConverterRustBuffer<OpaqueLo
         return OpaqueLoginFinish(
             FfiConverterByteArray.read(buf),
             FfiConverterByteArray.read(buf),
+            FfiConverterByteArray.read(buf),
         )
     }
 
     override fun allocationSize(value: OpaqueLoginFinish) = (
             FfiConverterByteArray.allocationSize(value.`credentialFinalization`) +
-            FfiConverterByteArray.allocationSize(value.`exportKey`)
+            FfiConverterByteArray.allocationSize(value.`exportKey`) +
+            FfiConverterByteArray.allocationSize(value.`transportRoot`)
     )
 
     override fun write(value: OpaqueLoginFinish, buf: ByteBuffer) {
             FfiConverterByteArray.write(value.`credentialFinalization`, buf)
             FfiConverterByteArray.write(value.`exportKey`, buf)
+            FfiConverterByteArray.write(value.`transportRoot`, buf)
     }
 }
 
@@ -3801,6 +5740,39 @@ public object FfiConverterTypeReleaseBuildId: FfiConverterRustBuffer<ReleaseBuil
 
 
 
+data class VerifiedTransportDescriptor (
+    var `bootstrapPublicKey`: kotlin.ByteArray
+
+){
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVerifiedTransportDescriptor: FfiConverterRustBuffer<VerifiedTransportDescriptor> {
+    override fun read(buf: ByteBuffer): VerifiedTransportDescriptor {
+        return VerifiedTransportDescriptor(
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: VerifiedTransportDescriptor) = (
+            FfiConverterByteArray.allocationSize(value.`bootstrapPublicKey`)
+    )
+
+    override fun write(value: VerifiedTransportDescriptor, buf: ByteBuffer) {
+            FfiConverterByteArray.write(value.`bootstrapPublicKey`, buf)
+    }
+}
+
+
+
 
 
 sealed class AbyssalException: kotlin.Exception() {
@@ -3863,6 +5835,512 @@ public object FfiConverterTypeAbyssalError : FfiConverterRustBuffer<AbyssalExcep
 
 
 
+sealed class AccountBootstrapResponse {
+
+    object Failure : AccountBootstrapResponse()
+
+
+    data class LoginStart(
+        val `handshakeId`: kotlin.ByteArray,
+        val `credentialResponse`: kotlin.ByteArray,
+        val `identityPublic`: kotlin.ByteArray,
+        val `identityPrekeyId`: kotlin.String,
+        val `identityEnvelope`: kotlin.ByteArray) : AccountBootstrapResponse()
+
+    {
+
+
+        companion object
+    }
+
+    data class RegistrationStart(
+        val `handshakeId`: kotlin.ByteArray,
+        val `registrationResponse`: kotlin.ByteArray,
+        val `challenge`: kotlin.ByteArray) : AccountBootstrapResponse()
+
+    {
+
+
+        companion object
+    }
+
+    data class RegistrationContinuation(
+        val `handshakeId`: kotlin.ByteArray,
+        val `credentialResponse`: kotlin.ByteArray) : AccountBootstrapResponse()
+
+    {
+
+
+        companion object
+    }
+
+    data class Session(
+        val `sessionId`: kotlin.ByteArray,
+        val `created`: kotlin.Boolean,
+        val `maxRoomsPerUser`: kotlin.UInt,
+        val `sessionInactivitySec`: kotlin.UInt,
+        val `username`: kotlin.String,
+        val `identityPublic`: kotlin.ByteArray,
+        val `identityPrekeyId`: kotlin.String,
+        val `identityEnvelope`: kotlin.ByteArray) : AccountBootstrapResponse()
+
+    {
+
+
+        companion object
+    }
+
+
+
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAccountBootstrapResponse : FfiConverterRustBuffer<AccountBootstrapResponse>{
+    override fun read(buf: ByteBuffer): AccountBootstrapResponse {
+        return when(buf.getInt()) {
+            1 -> AccountBootstrapResponse.Failure
+            2 -> AccountBootstrapResponse.LoginStart(
+                FfiConverterByteArray.read(buf),
+                FfiConverterByteArray.read(buf),
+                FfiConverterByteArray.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterByteArray.read(buf),
+                )
+            3 -> AccountBootstrapResponse.RegistrationStart(
+                FfiConverterByteArray.read(buf),
+                FfiConverterByteArray.read(buf),
+                FfiConverterByteArray.read(buf),
+                )
+            4 -> AccountBootstrapResponse.RegistrationContinuation(
+                FfiConverterByteArray.read(buf),
+                FfiConverterByteArray.read(buf),
+                )
+            5 -> AccountBootstrapResponse.Session(
+                FfiConverterByteArray.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterUInt.read(buf),
+                FfiConverterUInt.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterByteArray.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterByteArray.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: AccountBootstrapResponse): ULong = when(value) {
+        is AccountBootstrapResponse.Failure -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is AccountBootstrapResponse.LoginStart -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterByteArray.allocationSize(value.`handshakeId`)
+                + FfiConverterByteArray.allocationSize(value.`credentialResponse`)
+                + FfiConverterByteArray.allocationSize(value.`identityPublic`)
+                + FfiConverterString.allocationSize(value.`identityPrekeyId`)
+                + FfiConverterByteArray.allocationSize(value.`identityEnvelope`)
+            )
+        }
+        is AccountBootstrapResponse.RegistrationStart -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterByteArray.allocationSize(value.`handshakeId`)
+                + FfiConverterByteArray.allocationSize(value.`registrationResponse`)
+                + FfiConverterByteArray.allocationSize(value.`challenge`)
+            )
+        }
+        is AccountBootstrapResponse.RegistrationContinuation -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterByteArray.allocationSize(value.`handshakeId`)
+                + FfiConverterByteArray.allocationSize(value.`credentialResponse`)
+            )
+        }
+        is AccountBootstrapResponse.Session -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterByteArray.allocationSize(value.`sessionId`)
+                + FfiConverterBoolean.allocationSize(value.`created`)
+                + FfiConverterUInt.allocationSize(value.`maxRoomsPerUser`)
+                + FfiConverterUInt.allocationSize(value.`sessionInactivitySec`)
+                + FfiConverterString.allocationSize(value.`username`)
+                + FfiConverterByteArray.allocationSize(value.`identityPublic`)
+                + FfiConverterString.allocationSize(value.`identityPrekeyId`)
+                + FfiConverterByteArray.allocationSize(value.`identityEnvelope`)
+            )
+        }
+    }
+
+    override fun write(value: AccountBootstrapResponse, buf: ByteBuffer) {
+        when(value) {
+            is AccountBootstrapResponse.Failure -> {
+                buf.putInt(1)
+                Unit
+            }
+            is AccountBootstrapResponse.LoginStart -> {
+                buf.putInt(2)
+                FfiConverterByteArray.write(value.`handshakeId`, buf)
+                FfiConverterByteArray.write(value.`credentialResponse`, buf)
+                FfiConverterByteArray.write(value.`identityPublic`, buf)
+                FfiConverterString.write(value.`identityPrekeyId`, buf)
+                FfiConverterByteArray.write(value.`identityEnvelope`, buf)
+                Unit
+            }
+            is AccountBootstrapResponse.RegistrationStart -> {
+                buf.putInt(3)
+                FfiConverterByteArray.write(value.`handshakeId`, buf)
+                FfiConverterByteArray.write(value.`registrationResponse`, buf)
+                FfiConverterByteArray.write(value.`challenge`, buf)
+                Unit
+            }
+            is AccountBootstrapResponse.RegistrationContinuation -> {
+                buf.putInt(4)
+                FfiConverterByteArray.write(value.`handshakeId`, buf)
+                FfiConverterByteArray.write(value.`credentialResponse`, buf)
+                Unit
+            }
+            is AccountBootstrapResponse.Session -> {
+                buf.putInt(5)
+                FfiConverterByteArray.write(value.`sessionId`, buf)
+                FfiConverterBoolean.write(value.`created`, buf)
+                FfiConverterUInt.write(value.`maxRoomsPerUser`, buf)
+                FfiConverterUInt.write(value.`sessionInactivitySec`, buf)
+                FfiConverterString.write(value.`username`, buf)
+                FfiConverterByteArray.write(value.`identityPublic`, buf)
+                FfiConverterString.write(value.`identityPrekeyId`, buf)
+                FfiConverterByteArray.write(value.`identityEnvelope`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+sealed class AttachmentTransportFrame {
+
+    data class Data(
+        val `payload`: kotlin.ByteArray) : AttachmentTransportFrame()
+
+    {
+
+
+        companion object
+    }
+
+    object Padding : AttachmentTransportFrame()
+
+
+    object End : AttachmentTransportFrame()
+
+
+
+
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAttachmentTransportFrame : FfiConverterRustBuffer<AttachmentTransportFrame>{
+    override fun read(buf: ByteBuffer): AttachmentTransportFrame {
+        return when(buf.getInt()) {
+            1 -> AttachmentTransportFrame.Data(
+                FfiConverterByteArray.read(buf),
+                )
+            2 -> AttachmentTransportFrame.Padding
+            3 -> AttachmentTransportFrame.End
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: AttachmentTransportFrame): ULong = when(value) {
+        is AttachmentTransportFrame.Data -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterByteArray.allocationSize(value.`payload`)
+            )
+        }
+        is AttachmentTransportFrame.Padding -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is AttachmentTransportFrame.End -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: AttachmentTransportFrame, buf: ByteBuffer) {
+        when(value) {
+            is AttachmentTransportFrame.Data -> {
+                buf.putInt(1)
+                FfiConverterByteArray.write(value.`payload`, buf)
+                Unit
+            }
+            is AttachmentTransportFrame.Padding -> {
+                buf.putInt(2)
+                Unit
+            }
+            is AttachmentTransportFrame.End -> {
+                buf.putInt(3)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+sealed class AttachmentTransportResult {
+
+    object Failure : AttachmentTransportResult()
+
+
+    object Success : AttachmentTransportResult()
+
+
+    data class UploadAccepted(
+        val `attachmentId`: kotlin.ByteArray) : AttachmentTransportResult()
+
+    {
+
+
+        companion object
+    }
+
+    data class DownloadAccepted(
+        val `claimId`: kotlin.ByteArray?,
+        val `ciphertextLen`: kotlin.ULong,
+        val `ciphertextSha256`: kotlin.ByteArray,
+        val `dataFrameCount`: kotlin.UShort,
+        val `bucketFrameCount`: kotlin.UShort) : AttachmentTransportResult()
+
+    {
+
+
+        companion object
+    }
+
+
+
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAttachmentTransportResult : FfiConverterRustBuffer<AttachmentTransportResult>{
+    override fun read(buf: ByteBuffer): AttachmentTransportResult {
+        return when(buf.getInt()) {
+            1 -> AttachmentTransportResult.Failure
+            2 -> AttachmentTransportResult.Success
+            3 -> AttachmentTransportResult.UploadAccepted(
+                FfiConverterByteArray.read(buf),
+                )
+            4 -> AttachmentTransportResult.DownloadAccepted(
+                FfiConverterOptionalByteArray.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterByteArray.read(buf),
+                FfiConverterUShort.read(buf),
+                FfiConverterUShort.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: AttachmentTransportResult): ULong = when(value) {
+        is AttachmentTransportResult.Failure -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is AttachmentTransportResult.Success -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is AttachmentTransportResult.UploadAccepted -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterByteArray.allocationSize(value.`attachmentId`)
+            )
+        }
+        is AttachmentTransportResult.DownloadAccepted -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterOptionalByteArray.allocationSize(value.`claimId`)
+                + FfiConverterULong.allocationSize(value.`ciphertextLen`)
+                + FfiConverterByteArray.allocationSize(value.`ciphertextSha256`)
+                + FfiConverterUShort.allocationSize(value.`dataFrameCount`)
+                + FfiConverterUShort.allocationSize(value.`bucketFrameCount`)
+            )
+        }
+    }
+
+    override fun write(value: AttachmentTransportResult, buf: ByteBuffer) {
+        when(value) {
+            is AttachmentTransportResult.Failure -> {
+                buf.putInt(1)
+                Unit
+            }
+            is AttachmentTransportResult.Success -> {
+                buf.putInt(2)
+                Unit
+            }
+            is AttachmentTransportResult.UploadAccepted -> {
+                buf.putInt(3)
+                FfiConverterByteArray.write(value.`attachmentId`, buf)
+                Unit
+            }
+            is AttachmentTransportResult.DownloadAccepted -> {
+                buf.putInt(4)
+                FfiConverterOptionalByteArray.write(value.`claimId`, buf)
+                FfiConverterULong.write(value.`ciphertextLen`, buf)
+                FfiConverterByteArray.write(value.`ciphertextSha256`, buf)
+                FfiConverterUShort.write(value.`dataFrameCount`, buf)
+                FfiConverterUShort.write(value.`bucketFrameCount`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+sealed class ControlResponse {
+
+    object Failure : ControlResponse()
+
+
+    data class WsTicket(
+        val `ticket`: kotlin.String,
+        val `expiresInSec`: kotlin.UInt) : ControlResponse()
+
+    {
+
+
+        companion object
+    }
+
+    object LoggedOut : ControlResponse()
+
+
+
+
+
+
+
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeControlResponse : FfiConverterRustBuffer<ControlResponse>{
+    override fun read(buf: ByteBuffer): ControlResponse {
+        return when(buf.getInt()) {
+            1 -> ControlResponse.Failure
+            2 -> ControlResponse.WsTicket(
+                FfiConverterString.read(buf),
+                FfiConverterUInt.read(buf),
+                )
+            3 -> ControlResponse.LoggedOut
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: ControlResponse): ULong = when(value) {
+        is ControlResponse.Failure -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is ControlResponse.WsTicket -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`ticket`)
+                + FfiConverterUInt.allocationSize(value.`expiresInSec`)
+            )
+        }
+        is ControlResponse.LoggedOut -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: ControlResponse, buf: ByteBuffer) {
+        when(value) {
+            is ControlResponse.Failure -> {
+                buf.putInt(1)
+                Unit
+            }
+            is ControlResponse.WsTicket -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`ticket`, buf)
+                FfiConverterUInt.write(value.`expiresInSec`, buf)
+                Unit
+            }
+            is ControlResponse.LoggedOut -> {
+                buf.putInt(3)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
 
 /**
  * @suppress
@@ -3889,6 +6367,38 @@ public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
         } else {
             buf.put(1)
             FfiConverterULong.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteArray?> {
+    override fun read(buf: ByteBuffer): kotlin.ByteArray? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterByteArray.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ByteArray?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterByteArray.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.ByteArray?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterByteArray.write(value, buf)
         }
     }
 }
@@ -4261,6 +6771,20 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
 
 
         FfiConverterByteArray.lower(`password`),_status)
+}
+    )
+    }
+
+
+    @Throws(AbyssalException::class) fun `verifyTransportNodeDescriptor`(`descriptor`: kotlin.ByteArray, `expectedNodePublicKey`: kotlin.ByteArray, `expectedNodeUrl`: kotlin.String): VerifiedTransportDescriptor {
+            return FfiConverterTypeVerifiedTransportDescriptor.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_verify_transport_node_descriptor(
+
+
+        FfiConverterByteArray.lower(`descriptor`),
+        FfiConverterByteArray.lower(`expectedNodePublicKey`),
+        FfiConverterString.lower(`expectedNodeUrl`),_status)
 }
     )
     }
