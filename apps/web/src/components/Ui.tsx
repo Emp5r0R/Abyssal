@@ -19,12 +19,15 @@ export function Field({
   hint,
   ...props
 }: InputHTMLAttributes<HTMLInputElement> & { label: string; hint?: string }) {
+  const hintId = `${useId()}-hint`;
   return (
-    <label className="field">
-      <span className="field-label">{label}</span>
-      <input {...props} />
-      {hint ? <span className="field-hint">{hint}</span> : null}
-    </label>
+    <div className="field">
+      <label className="field-control">
+        <span className="field-label">{label}</span>
+        <input aria-describedby={hint ? hintId : undefined} {...props} />
+      </label>
+      {hint ? <span id={hintId} className="field-hint">{hint}</span> : null}
+    </div>
   );
 }
 

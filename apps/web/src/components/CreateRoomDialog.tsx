@@ -43,7 +43,7 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
     <Dialog
       className="room-dialog"
       title="Create room"
-      description="Room policy applies to every participant."
+      description="Everyone in the room follows the same message rules."
       onClose={onCancel}
       actions={
         <>
@@ -59,28 +59,45 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
         }} />
         {feedback ? <p className="form-feedback" role="status" aria-live="polite">{feedback}</p> : null}
         <fieldset className="visibility-section">
-          <legend>Room visibility</legend>
+          <legend>Who can find it</legend>
           <div className="visibility-control" role="radiogroup" aria-label="Room visibility">
-            {(["public", "private"] as const).map((visibility: RoomVisibility) => (
+            {(["private", "public"] as const).map((visibility: RoomVisibility) => (
               <label className={`visibility-option ${room.visibility === visibility ? "is-selected" : ""}`} key={visibility}>
                 <input
                   type="radio"
                   name="room-visibility"
                   value={visibility}
+                  aria-label={visibility === "public" ? "PUBLIC" : "PRIVATE"}
                   checked={room.visibility === visibility}
                   onChange={() => setRoom((current) => ({ ...current, visibility }))}
                 />
-                <span>{visibility === "public" ? "PUBLIC" : "PRIVATE"}</span>
+                <strong>{visibility === "public" ? "Public" : "Private"}</strong>
+                <small>
+                  {visibility === "public"
+                    ? "Listed for everyone on this node. You approve each join."
+                    : "Hidden. People join with the room ID you share."}
+                </small>
               </label>
             ))}
           </div>
-          <p className="field-hint">
-            {room.visibility === "public"
-              ? "Discoverable to authenticated users; the owner still approves every join."
-              : "Omitted from discovery; share the generated room ID with invitees."}
-          </p>
         </fieldset>
 
+        <label className="field retention-quick">
+          <span className="field-label">Messages disappear after reading</span>
+          <select
+            value={room.self_destruct_timer_sec}
+            onChange={(event) => number("self_destruct_timer_sec", event.target.value)}
+          >
+            {TEXT_TIMER_PRESETS.includes(room.self_destruct_timer_sec) ? null : (
+              <option value={room.self_destruct_timer_sec}>{room.self_destruct_timer_sec} seconds</option>
+            )}
+            {TEXT_TIMER_PRESETS.map((seconds) => <option key={seconds} value={seconds}>{timerLabel(seconds)}</option>)}
+          </select>
+        </label>
+
+        <details className="room-advanced">
+          <summary>Advanced: media and lifetime rules</summary>
+          <div className="room-advanced-body">
         <PolicySection title="Text" enabled>
           <NumberPair
             read={room.self_destruct_timer_sec}
@@ -124,9 +141,21 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
             onEnforce={(value) => boolean("enforce_file_absolute_expiry", value)}
           />
         </PolicySection>
+          </div>
+        </details>
       </form>
     </Dialog>
   );
+}
+
+const TEXT_TIMER_PRESETS = [0, 10, 60, 300, 3600, 86_400];
+
+function timerLabel(seconds: number): string {
+  if (seconds === 0) return "Never";
+  if (seconds < 60) return `${seconds} seconds`;
+  if (seconds < 3600) return seconds === 60 ? "1 minute" : `${seconds / 60} minutes`;
+  if (seconds < 86_400) return seconds === 3600 ? "1 hour" : `${seconds / 3600} hours`;
+  return seconds === 86_400 ? "1 day" : `${seconds / 86_400} days`;
 }
 
 function PolicySection({

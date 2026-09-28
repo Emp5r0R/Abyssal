@@ -88,8 +88,9 @@ afterEach(cleanup);
 describe("AppShell direct-message navigation", () => {
   it("shows a private own profile without replacing the routing identifier", () => {
     renderShell({ username: "acct_1234567890abcdef1234567890abcdef", displayName: "PrivateProfile" });
-    expect(screen.getByText("PrivateProfile")).toBeInTheDocument();
-    expect(screen.getByText("acct_1234567890abcdef1234567890abcdef")).toBeInTheDocument();
+    const identity = within(document.querySelector<HTMLElement>(".identity-row")!);
+    expect(identity.getByText("PrivateProfile")).toBeInTheDocument();
+    expect(identity.getByText("acct_1234567890abcdef1234567890abcdef")).toBeInTheDocument();
   });
   it("opens an existing canonical direct conversation", () => {
     const props = renderShell();
@@ -107,7 +108,7 @@ describe("AppShell direct-message navigation", () => {
 
   it("closes the mobile sidebar when identity navigation returns to the dashboard", () => {
     const props = renderShell();
-    fireEvent.click(screen.getByRole("button", { name: "Open rooms" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open menu" }));
     const sidebar = document.querySelector(".sidebar")!;
     expect(sidebar).toHaveClass("is-open");
     fireEvent.click(document.querySelector<HTMLButtonElement>(".identity-row")!);
@@ -139,15 +140,44 @@ describe("AppShell direct-message navigation", () => {
   it("guides empty dashboards according to relay connectivity", () => {
     renderShell({ rooms: [], directs: [] });
     expect(screen.getByText("Create a room or join one by ID.")).toBeInTheDocument();
-    expect(screen.getByText("Select a peer under DIRECT to start a conversation.")).toBeInTheDocument();
+    expect(screen.getByText("Select a peer under DIRECT MESSAGES in the sidebar to start a conversation.")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
     cleanup();
     renderShell({ rooms: [], connection: "disconnected" });
     expect(screen.getByText("Rooms can be created once the relay is connected.")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/relay is unreachable/u);
+    expect(screen.getByRole("button", { name: /NEW ROOM/u })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create room" })).toBeDisabled();
   });
 
-  it("does not allow messaging the current account", () => {
+  it("does not offer a conversation with the current account", () => {
     renderShell();
-    expect(screen.getByTitle("Current account")).toBeDisabled();
+    const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });
+    expect(within(directNavigation).queryByRole("button", { name: /Alice/u })).not.toBeInTheDocument();
+    expect(within(directNavigation).getByText("Start a conversation")).toBeInTheDocument();
+  });
+
+  it("lists online people before offline ones when starting a conversation", () => {
+    renderShell({
+      directs: [],
+      presence: [
+        { username: "Alice", connected: true, identity_public_b64: "AA", identity_prekey_id: "p", directory_digest: "A".repeat(43), directory_node_id: "node-one", directory_revision: 1 },
+        { username: "Aaron", connected: false, identity_public_b64: "AA", identity_prekey_id: "p", directory_digest: "A".repeat(43), directory_node_id: "node-one", directory_revision: 1 },
+        { username: "Zed", connected: true, identity_public_b64: "AA", identity_prekey_id: "p", directory_digest: "A".repeat(43), directory_node_id: "node-one", directory_revision: 1 },
+      ],
+    });
+    const names = [...document.querySelectorAll(".start-direct")].map((button) => button.textContent);
+    expect(names).toEqual(["Zed", "Aaron"]);
+  });
+
+  it("confirms a sent join request and explains private room IDs", () => {
+    const onJoinRoom = vi.fn(() => true);
+    renderShell({ onJoinRoom });
+    expect(screen.getByText(/Ask the owner for the exact room ID/u)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Join room ID"), { target: { value: " forum_private " } });
+    fireEvent.click(screen.getByRole("button", { name: "JOIN" }));
+    expect(onJoinRoom).toHaveBeenCalledWith("forum_private");
+    expect(screen.getByRole("status")).toHaveTextContent(/owner must approve/u);
   });
 
   it("exposes the full directory checkpoint for out-of-band comparison", () => {
@@ -214,7 +244,7 @@ describe("AppShell direct-message navigation", () => {
 
     expect(screen.queryByText(/ROOM SECRET PREVIEW/u)).not.toBeInTheDocument();
     expect(screen.queryByText(/DIRECT SECRET PREVIEW/u)).not.toBeInTheDocument();
-    expect(screen.getByText("OWNER Alice")).toBeInTheDocument();
+    expect(screen.getByText("OWNER You")).toBeInTheDocument();
   });
 
   it("conceals room names and peer usernames across navigation and dashboard surfaces", () => {
@@ -224,6 +254,6 @@ describe("AppShell direct-message navigation", () => {
 
     expect(concealed).toContain("Operations");
     expect(concealed).toContain("Bob");
-    expect(concealed).toContain("OWNER Alice");
+    expect(concealed).toContain("OWNER You");
   });
 });

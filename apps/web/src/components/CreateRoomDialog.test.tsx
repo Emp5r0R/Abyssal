@@ -32,6 +32,18 @@ describe("CreateRoomDialog routing identifier", () => {
     expect(onCreate.mock.calls[0]?.[0].visibility).toBe("public");
   });
 
+  it("offers a quick text timer while keeping media rules behind the advanced disclosure", () => {
+    const onCreate = vi.fn((room: RoomRecord) => room.name.length >= 0);
+    render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
+
+    expect(screen.getByText("Advanced: media and lifetime rules").closest("details")).not.toHaveAttribute("open");
+    fireEvent.change(screen.getByLabelText("Room name"), { target: { value: "Quick" } });
+    fireEvent.change(screen.getByLabelText("Messages disappear after reading"), { target: { value: "3600" } });
+    fireEvent.click(screen.getByRole("button", { name: "CREATE" }));
+
+    expect(onCreate.mock.calls[0]?.[0].self_destruct_timer_sec).toBe(3600);
+  });
+
   it("reports a failed create result without closing the dialog", () => {
     const onCreate = vi.fn((room: RoomRecord) => room.name.length < 0);
     render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
