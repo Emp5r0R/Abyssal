@@ -67,14 +67,14 @@ ABYSSAL_RELEASE_SIGNING_KEY_FILE=/secure/offline/abyssal-release-ed25519.key \
 ABYSSAL_RELEASE_SIGNING_KEY_FILE=/secure/offline/abyssal-release-ed25519.key \
 ABYSSAL_RELEASE_SEQUENCE=<strictly-increasing-sequence> \
 ABYSSAL_RELEASE_NOT_BEFORE_MS=<activation-unix-ms> \
-ABYSSAL_RELEASE_EXPIRES_AT_MS=<expiry-unix-ms-within-35-days> \
+ABYSSAL_RELEASE_EXPIRES_AT_MS=<expiry-unix-ms-up-to-366-days-after-issue> \
   ./scripts/assemble-release-manifest.sh \
   build-outputs/abyssal-android-VERSION-build-record.json \
   build-outputs/abyssal-web-VERSION-build-record.json \
   /secure/work/revocations.txt
 ```
 
-The web builder bakes the signed build identity into JavaScript and `/build-id.json`, records every served asset plus the deterministic web archive, and requires the Android/web version and source commit to agree. Each platform build is bounded to 128 authenticated assets; exceeding that limit fails before manifest creation. Manifest assembly is canonical, refuses overwrite, signs with the offline root, and supports one revoked build ID per line. At runtime the web startup audit has a 30-second aggregate deadline, a 12-second request cap, and at most four concurrent served-asset checks; the WASM core uses a same-origin `no-store` load and aborts after 30 seconds. Keep each validity window operationally short; the verifier enforces a maximum of 35 days.
+The web builder bakes the signed build identity into JavaScript and `/build-id.json`, records every served asset plus the deterministic web archive, and requires the Android/web version and source commit to agree. Each platform build is bounded to 128 authenticated assets; exceeding that limit fails before manifest creation. Manifest assembly is canonical, refuses overwrite, signs with the offline root, and supports one revoked build ID per line. At runtime the web startup audit has a 120-second aggregate deadline, fails a request after 12 seconds without progress, and runs at most four concurrent served-asset checks; reaction images are verified on first use against digests compiled into the bundle (regenerate `apps/web/src/domain/reactionDigests.generated.ts` with `node apps/web/scripts/generate-reaction-digests.mjs` after changing `public/abyssal-emojis`); the WASM core uses a same-origin `no-store` load and aborts after 30 seconds. A release stays valid until the next published sequence supersedes it: the relay mirrors the newest signed manifest and refuses builds it does not name. Sign each manifest with the full window (up to 366 days after issue, which the verifier enforces) so a release does not lapse between versions, and publish a new sequence with revocations to retire a build early.
 
 ## Publish
 

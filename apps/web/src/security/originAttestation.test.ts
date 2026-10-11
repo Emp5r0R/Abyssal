@@ -194,6 +194,56 @@ describe("origin release attestation", () => {
     }
   });
 
+  it("keeps a download that is still making progress alive past the stall timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await releaseFixture({ slow: { url: `${ORIGIN}/assets/app.js`, intervalMs: 8_000 } });
+      const verification = verifyOriginAttestation({ fetch: fixture.fetcher, origin: ORIGIN, nowMs: 1_500, identity: IDENTITY });
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(verification).resolves.toEqual({ status: "OK" });
+      expect(fixture.requested.filter((url) => url === `${ORIGIN}/assets/app.js`)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("abandons a download that stops making progress, after bounded retries", async () => {
+    vi.useFakeTimers();
+    try {
+      const assetUrl = `${ORIGIN}/assets/app.js`;
+      const fixture = await releaseFixture({ slow: { url: assetUrl, intervalMs: 1_000, stallAfterChunks: 1 } });
+      const verification = verifyOriginAttestation({ fetch: fixture.fetcher, origin: ORIGIN, nowMs: 1_500, identity: IDENTITY });
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(fixture.requested.filter((url) => url === assetUrl)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(40_000);
+      await expect(verification).resolves.toEqual({ status: "UNAVAILABLE" });
+      expect(fixture.requested.filter((url) => url === assetUrl)).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips downloading assets whose digests ship in the bundle, but requires the manifest to agree", async () => {
+    const gif = bytes("GIF89a-reaction");
+    const fixture = await releaseFixture({ deferred: { "abyssal-emojis/wave.gif": gif } });
+    const digest = { sha256Hex: await sha256(gif), size: gif.byteLength };
+    const verify = (deferredAssets: Record<string, { sha256Hex: string; size: number }>) => verifyOriginAttestation({
+      fetch: fixture.fetcher, origin: ORIGIN, nowMs: 1_500, identity: IDENTITY, deferredAssets,
+    });
+
+    await expect(verify({ "abyssal-emojis/wave.gif": digest })).resolves.toEqual({ status: "OK" });
+    expect(fixture.requested).not.toContain(`${ORIGIN}/abyssal-emojis/wave.gif`);
+
+    await expect(verify({ "abyssal-emojis/wave.gif": { ...digest, sha256Hex: "0".repeat(64) } }))
+      .resolves.toEqual({ status: "MISMATCH" });
+    await expect(verify({ "abyssal-emojis/wave.gif": { ...digest, size: digest.size + 1 } }))
+      .resolves.toEqual({ status: "MISMATCH" });
+
+    fixture.requested.length = 0;
+    await expect(verify({})).resolves.toEqual({ status: "OK" });
+    expect(fixture.requested).toContain(`${ORIGIN}/abyssal-emojis/wave.gif`);
+  });
+
   it("recovers from bounded transient body availability failures", async () => {
     const assetUrl = `${ORIGIN}/assets/app.js`;
     const fixture = await releaseFixture({
@@ -280,6 +330,8 @@ async function releaseFixture(options: {
   hang?: string;
   transientFailures?: Readonly<Record<string, number>>;
   revokedBuildIds?: string[];
+  deferred?: Readonly<Record<string, Uint8Array>>;
+  slow?: { url: string; intervalMs: number; stallAfterChunks?: number };
 } = {}): Promise<{
   fetcher: typeof fetch;
   requested: string[];
@@ -301,6 +353,7 @@ async function releaseFixture(options: {
     [`${origin}/build-id.json`, identityBytes],
     [`${origin}/index.html`, bytes("<!doctype html><main>Abyssal</main>")],
   ]);
+  for (const [name, data] of Object.entries(options.deferred ?? {})) content.set(`${origin}/${name}`, data);
   for (let index = 0; index < (options.extraAssets ?? 0); index += 1) {
     content.set(`${origin}/assets/parallel-${index}.bin`, bytes(`asset-${index}`));
   }
@@ -350,6 +403,9 @@ async function releaseFixture(options: {
       }
     }
     const body = options.corrupt === url ? bytes("changed") : expected;
+    if (options.slow?.url === url) {
+      return streamingResponse(body, url, options.slow.intervalMs, options.slow.stallAfterChunks);
+    }
     return response(body, url);
   });
   return {
@@ -365,6 +421,29 @@ function response(body: Uint8Array, url: string, status = 200): Response {
     status,
     headers: { "Content-Length": String(body.byteLength) },
   });
+  Object.defineProperty(result, "url", { value: url });
+  return result;
+}
+
+/** Delivers the body in four chunks, one per interval, optionally going silent after some chunks. */
+function streamingResponse(body: Uint8Array, url: string, intervalMs: number, stallAfterChunks?: number): Response {
+  const chunkSize = Math.max(1, Math.ceil(body.byteLength / 4));
+  let offset = 0;
+  let sent = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (stallAfterChunks !== undefined && sent >= stallAfterChunks) return new Promise<void>(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      if (offset >= body.byteLength) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(body.slice(offset, offset + chunkSize));
+      offset += chunkSize;
+      sent += 1;
+    },
+  });
+  const result = new Response(stream, { headers: { "Content-Length": String(body.byteLength) } });
   Object.defineProperty(result, "url", { value: url });
   return result;
 }

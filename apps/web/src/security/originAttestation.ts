@@ -3,6 +3,7 @@ import {
   releaseTrustAnchorConfigured,
 } from "../generated/abyssal_core/abyssal_core";
 import { RELEASE_BUILD_IDENTITY, type ReleaseBuildIdentity } from "../buildIdentity";
+import { REACTION_DIGESTS } from "../domain/reactionDigests.generated";
 
 export type OriginAttestationStatus =
   | "CHECKING"
@@ -16,16 +17,28 @@ export interface OriginAttestationResult {
   status: Exclude<OriginAttestationStatus, "CHECKING" | "ATTESTATION_REJECTED">;
 }
 
+/** Expected digest of a served file that is verified when first used rather than at startup. */
+export interface DeferredAssetDigest {
+  readonly sha256Hex: string;
+  readonly size: number;
+}
+
 export interface OriginAttestationOverrides {
   fetch: typeof globalThis.fetch;
   origin: string;
   nowMs: number;
   identity: Readonly<ReleaseBuildIdentity>;
   timeoutMs?: number;
+  /**
+   * Served assets keyed by manifest name whose digests are compiled into the verified
+   * bundle. The startup audit checks their manifest entries match without downloading them.
+   */
+  deferredAssets?: Readonly<Record<string, DeferredAssetDigest>>;
 }
 
-interface ResolvedAttestationContext extends Omit<OriginAttestationOverrides, "timeoutMs"> {
+interface ResolvedAttestationContext extends Omit<OriginAttestationOverrides, "timeoutMs" | "deferredAssets"> {
   timeoutMs: number;
+  deferredAssets: Readonly<Record<string, DeferredAssetDigest>>;
 }
 
 interface VerificationContext extends ResolvedAttestationContext {
@@ -57,14 +70,20 @@ const RELEASE_SIGNATURE_ENDPOINT = "/.well-known/abyssal-release-manifest-v1.sig
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const SIGNATURE_BYTES = 64;
 const MAX_WEB_ASSET_BYTES = 64 * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 12_000;
-const ATTESTATION_TIMEOUT_MS = 30_000;
+// A request fails only after this long without any progress, so slow links still finish.
+const REQUEST_STALL_TIMEOUT_MS = 12_000;
+// Upper bound for the whole audit, sized for roughly 40 KiB/s across the startup assets.
+const ATTESTATION_TIMEOUT_MS = 120_000;
 const REQUEST_RETRY_DELAYS_MS = [250, 750] as const;
 const REQUEST_ATTEMPTS = REQUEST_RETRY_DELAYS_MS.length + 1;
 const ASSET_VERIFICATION_CONCURRENCY = 4;
 const SAFE_ASSET_NAME = /^(?!\/)(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9._/-]{1,192}$/u;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
+
+const DEFAULT_DEFERRED_ASSETS: Readonly<Record<string, DeferredAssetDigest>> = Object.freeze(
+  Object.fromEntries(Object.entries(REACTION_DIGESTS).map(([name, digest]) => [`abyssal-emojis/${name}`, digest])),
+);
 
 class MismatchError extends Error {}
 class StaleError extends Error {}
@@ -110,6 +129,7 @@ function createContext(
     nowMs: overrides.nowMs ?? Date.now(),
     identity: overrides.identity ?? RELEASE_BUILD_IDENTITY,
     timeoutMs: overrides.timeoutMs ?? ATTESTATION_TIMEOUT_MS,
+    deferredAssets: overrides.deferredAssets ?? DEFAULT_DEFERRED_ASSETS,
   };
 }
 
@@ -231,15 +251,22 @@ async function verifyServedAssets(context: VerificationContext, build: ManifestB
     !servedAssets.some((asset) => asset.name.endsWith(".wasm"))) {
     throw new MismatchError();
   }
-  const candidates = servedAssets.map((asset) => {
+  const deferred = context.deferredAssets;
+  const candidates = servedAssets.flatMap((asset) => {
     if (!SAFE_ASSET_NAME.test(asset.name) || !LOWER_SHA256.test(asset.sha256_hex)) {
       throw new MismatchError();
     }
     const expectedSize = parseSafeDecimal(asset.size);
     if (expectedSize > MAX_WEB_ASSET_BYTES) throw new MismatchError();
+    const compiled = Object.hasOwn(deferred, asset.name) ? deferred[asset.name] : undefined;
+    if (compiled) {
+      // The verified bundle checks these bytes on first use against this same digest.
+      if (compiled.sha256Hex !== asset.sha256_hex || compiled.size !== expectedSize) throw new MismatchError();
+      return [];
+    }
     const url = new URL(`/${asset.name}`, context.origin);
     if (url.origin !== context.origin || url.pathname !== `/${asset.name}`) throw new MismatchError();
-    return { asset, expectedSize, url };
+    return [{ asset, expectedSize, url }];
   });
 
   let nextIndex = 0;
@@ -306,6 +333,7 @@ async function boundedFetch(
     throw new MismatchError();
   }
   const request = createRequestSignal(parentSignal);
+  // Any progress restarts the stall timer: headers, each body chunk.
   try {
     const response = await awaitAbortable(
       Promise.resolve().then(() => fetcher(url, {
@@ -319,6 +347,7 @@ async function boundedFetch(
       })),
       request.signal,
     );
+    request.touch();
     if (!response.ok) throw new Error("unavailable");
     const declared = response.headers.get("Content-Length");
     if (declared !== null && (!DECIMAL.test(declared) || Number(declared) > maximum)) {
@@ -340,6 +369,7 @@ async function boundedFetch(
       while (true) {
         const { done, value } = await awaitAbortable(reader.read(), request.signal);
         if (done) break;
+        request.touch();
         total += value.byteLength;
         if (total > maximum) throw new MismatchError();
         chunks.push(value);
@@ -387,15 +417,21 @@ async function boundedFetchWithRetry(
 
 function createRequestSignal(parentSignal?: AbortSignal): {
   signal: AbortSignal;
+  touch: () => void;
   dispose: () => void;
 } {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let timer = setTimeout(() => controller.abort(), REQUEST_STALL_TIMEOUT_MS);
   const abort = () => controller.abort();
   parentSignal?.addEventListener("abort", abort, { once: true });
   if (parentSignal?.aborted) controller.abort();
   return {
     signal: controller.signal,
+    touch: () => {
+      if (controller.signal.aborted) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), REQUEST_STALL_TIMEOUT_MS);
+    },
     dispose: () => {
       clearTimeout(timer);
       parentSignal?.removeEventListener("abort", abort);

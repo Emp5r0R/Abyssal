@@ -2,8 +2,10 @@
 
 Abyssal's web client performs a full signed release-origin audit during startup.
 The audit verifies the same-origin manifest, signature, build identity, and
-every served JS/CSS/WASM/HTML asset. It has a 30-second aggregate deadline, a
-12-second cap per request, and at most four concurrent asset checks. Concurrent
+every served JS/CSS/WASM/HTML asset. It has a 120-second aggregate deadline,
+fails a request after 12 seconds without progress, and runs at most four
+concurrent asset checks. Reaction images are verified on first use against
+digests compiled into the verified bundle instead of at startup. Concurrent
 default startup calls share one in-flight audit; a completed audit is not reused
 for account entry. Each account submission runs a fresh lightweight signed-
 release preflight before invoking authentication. The WASM core is loaded with

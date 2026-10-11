@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Search, X } from "lucide-react";
 import { REACTIONS, searchReactions, type ReactionAsset } from "../domain/reactions";
+import { ReactionImage } from "./ReactionImage";
 import { IconButton } from "./Ui";
 
 export function GifPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (reaction: ReactionAsset) => void }) {
@@ -25,7 +26,7 @@ export function GifPicker({ onClose, onSelect }: { onClose: () => void; onSelect
             aria-label={`Send ${reaction.shortcode}`}
           >
             <span className="gif-thumb">
-              <img src={reaction.path} alt="" loading="lazy" />
+              <ReactionImage reaction={reaction} alt="" lazy />
             </span>
             <code>{reaction.shortcode}</code>
           </button>

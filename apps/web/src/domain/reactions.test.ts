@@ -1,4 +1,5 @@
-import { readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { exactReactionShortcut, REACTIONS, reactionByShortcode, searchReactions } from "./reactions";
@@ -10,6 +11,18 @@ describe("bundled reactions", () => {
     expect(REACTIONS.map((reaction) => reaction.filename).sort()).toEqual(bundledFiles);
     expect(new Set(REACTIONS.map((reaction) => reaction.shortcode)).size).toBe(REACTIONS.length);
     expect(new Set(REACTIONS.map((reaction) => reaction.path)).size).toBe(REACTIONS.length);
+  });
+
+  it("carries the compiled digest of every bundled file (regenerate with scripts/generate-reaction-digests.mjs)", () => {
+    const directory = resolve(process.cwd(), "public/abyssal-emojis");
+    for (const reaction of REACTIONS) {
+      const bytes = readFileSync(resolve(directory, reaction.filename));
+      expect({ name: reaction.filename, sha256Hex: reaction.sha256Hex, size: reaction.size }).toEqual({
+        name: reaction.filename,
+        sha256Hex: createHash("sha256").update(bytes).digest("hex"),
+        size: bytes.byteLength,
+      });
+    }
   });
 
   it("resolves exact shortcuts case-insensitively", () => {

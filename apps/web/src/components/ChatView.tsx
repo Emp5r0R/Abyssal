@@ -30,6 +30,7 @@ import { PrivacyBlur } from "./PrivacyBlur";
 import { privacyBlurProps, usePrivacyBlur } from "./privacyBlurContext";
 import { DirectVerificationQr } from "./DirectVerificationQr";
 import { GifPicker } from "./GifPicker";
+import { ReactionImage } from "./ReactionImage";
 import { Dialog, Field, IconButton } from "./Ui";
 
 interface ChatViewProps {
@@ -353,7 +354,7 @@ export function ChatView({
           <div className="composer-suggestions reaction-suggestions" role="listbox" aria-label="Reaction shortcuts">
             {reactionSuggestions.map((reaction) => (
               <button key={reaction.shortcode} type="button" role="option" onClick={() => insertComposerToken(reaction.shortcode)}>
-                <img src={reaction.path} alt="" />
+                <ReactionImage reaction={reaction} alt="" />
                 <code>{reaction.shortcode}</code>
               </button>
             ))}
@@ -474,7 +475,7 @@ function AttachmentMessage({
           disabled={disabled}
           aria-label={disabled ? `Open ${reaction.shortcode} (offline)` : `Open ${reaction.shortcode}`}
         >
-          <img src={reaction.path} alt={reaction.label} />
+          <ReactionImage reaction={reaction} alt={reaction.label} />
         </button>
         <div className="inline-reaction-footer">
           <code>{reaction.shortcode}</code>

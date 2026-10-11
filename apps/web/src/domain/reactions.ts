@@ -1,3 +1,5 @@
+import { REACTION_DIGESTS } from "./reactionDigests.generated";
+
 const REACTION_FILENAMES = [
   "alabama.gif",
   "alert.gif",
@@ -95,6 +97,9 @@ export interface ReactionAsset {
   mimeType: "image/gif" | "image/png";
   path: string;
   shortcode: string;
+  /** Expected SHA-256 of the served file, compiled into the verified bundle. Empty fails closed. */
+  sha256Hex: string;
+  size: number;
 }
 
 export const REACTIONS: readonly ReactionAsset[] = Object.freeze(
@@ -106,6 +111,8 @@ export const REACTIONS: readonly ReactionAsset[] = Object.freeze(
       mimeType: filename.endsWith(".png") ? "image/png" as const : "image/gif" as const,
       path: `/abyssal-emojis/${filename}`,
       shortcode: `:${basename}:`,
+      sha256Hex: REACTION_DIGESTS[filename]?.sha256Hex ?? "",
+      size: REACTION_DIGESTS[filename]?.size ?? 0,
     });
   }),
 );

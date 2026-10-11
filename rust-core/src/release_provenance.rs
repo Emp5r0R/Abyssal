@@ -21,7 +21,9 @@ const MAX_BUILDS: usize = 2;
 pub const MAX_ASSETS_PER_BUILD: usize = 128;
 const MAX_REVOKED_BUILDS: usize = 128;
 const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_MANIFEST_LIFETIME_MS: u64 = 35 * 24 * 60 * 60 * 1000;
+// A release stays admissible until the next signed sequence supersedes it; this
+// ceiling only bounds how long a release can outlive an abandoned release train.
+const MAX_MANIFEST_LIFETIME_MS: u64 = 366 * 24 * 60 * 60 * 1000;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, uniffi::Record)]
@@ -851,6 +853,25 @@ mod tests {
                 &signature,
                 NOW_MS + 60_000,
             ),
+            Err(ReleaseVerificationError::ManifestExpired)
+        );
+    }
+
+    #[test]
+    fn manifest_may_stay_valid_for_the_full_release_window() {
+        let key = signing_key();
+        let mut full_window = document(&key);
+        let issued_at_ms = NOW_MS - 1_000;
+        full_window.expires_at_ms = (issued_at_ms + MAX_MANIFEST_LIFETIME_MS).to_string();
+        let manifest = canonical_manifest_bytes(&full_window).expect("manifest");
+        let signature = key.sign(&manifest_transcript(&manifest)).to_bytes();
+        let verify = |now_ms| {
+            verify_release_manifest_with_key(&key.verifying_key(), &manifest, &signature, now_ms)
+        };
+        assert!(verify(NOW_MS).is_ok());
+        assert!(verify(issued_at_ms + MAX_MANIFEST_LIFETIME_MS - 1).is_ok());
+        assert_eq!(
+            verify(issued_at_ms + MAX_MANIFEST_LIFETIME_MS),
             Err(ReleaseVerificationError::ManifestExpired)
         );
     }

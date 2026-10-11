@@ -7,8 +7,10 @@
   preflight immediately before each account submission.
 - `apps/web/src/security/originAttestation.ts` contains the signed manifest,
   build-identity, and served-asset checks. The startup audit is bounded to a
-  30-second aggregate, caps each request at 12 seconds, and checks assets with
-  at most four workers. `apps/web/src/security/runtime.ts` loads the WASM core
+  120-second aggregate, fails a request after 12 seconds without progress, and
+  checks assets with at most four workers. Reaction images are deferred to
+  `apps/web/src/security/verifiedAssets.ts`, which checks them on first use
+  against `src/domain/reactionDigests.generated.ts`. `apps/web/src/security/runtime.ts` loads the WASM core
   same-origin with `no-store` and aborts initialization at 30 seconds. Default
   concurrent startup calls are deduplicated only while the same audit is in
   flight.

@@ -1702,10 +1702,34 @@ button.list-row:hover {
   background: var(--bg);
 }
 
-.gif-grid img {
+.gif-grid img,
+.gif-grid .reaction-placeholder {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* Holds the space of a reaction image until its bytes are verified. */
+.reaction-placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.reaction-suggestions .reaction-placeholder {
+  width: 32px;
+  height: 32px;
+}
+
+.inline-reaction-preview .reaction-placeholder {
+  width: min(120px, 100%);
+  aspect-ratio: 1;
 }
 
 .gif-grid code {

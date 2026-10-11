@@ -10,6 +10,7 @@ import { MediaViewer } from "./components/MediaViewer";
 import { PrivacyBlurProvider } from "./components/PrivacyBlur";
 import { SecurityVerificationGate } from "./components/SecurityVerificationGate";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { useVerifiedAssets } from "./components/verifiedAssetContext";
 import { CalculatorCover, PinSetup } from "./components/Privacy";
 import { withCoverEnabled } from "./domain/workspacePreferences";
 import type { ReactionAsset } from "./domain/reactions";
@@ -239,14 +240,13 @@ function SecureWorkspace({
   setShowCreateRoom: (show: boolean) => void;
   resetLocal: () => Promise<void>;
 }) {
+  const verifiedAssets = useVerifiedAssets();
   const session = abyssal.session;
   if (!session) return null;
 
   const sendGif = async (reaction: ReactionAsset, replyToId?: string, retentionSec?: number): Promise<boolean> => {
     try {
-      const response = await fetch(reaction.path, { cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer" });
-      if (!response.ok) return false;
-      const blob = await response.blob();
+      const blob = await verifiedAssets.load(reaction);
       return await abyssal.sendAttachment({
         file: new File([blob], reaction.filename, { type: reaction.mimeType }),
         options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0, readSec: retentionSec },
