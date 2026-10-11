@@ -49,7 +49,6 @@ const mocks = vi.hoisted(() => {
     upload: { active: false, name: "", loaded: 0, total: 0 },
     media: null,
     notice: null as string | null,
-    retainWhenHiddenRef: { current: true },
     login: vi.fn(),
     logout: vi.fn(async () => undefined),
     clearMemory: vi.fn(),
@@ -79,7 +78,6 @@ const mocks = vi.hoisted(() => {
       controller.session = session;
       controller.securityWarning = null;
       controller.notice = null;
-      controller.retainWhenHiddenRef.current = true;
       mocks.gates.length = 0;
       preflight.mockResolvedValue({ status: "OK" });
     },
@@ -114,7 +112,18 @@ vi.mock("./components/Entrance", () => ({
 }));
 
 vi.mock("./components/AppShell", () => ({
-  AppShell: ({ children }: { children?: ReactNode }) => <div data-testid="workspace">{children}</div>,
+  AppShell: ({ children, canLock, onLock, onOpenSettings }: {
+    children?: ReactNode;
+    canLock: boolean;
+    onLock: () => void;
+    onOpenSettings: () => void;
+  }) => (
+    <div data-testid="workspace">
+      <button type="button" onClick={onOpenSettings}>Open settings</button>
+      {canLock ? <button type="button" onClick={onLock}>Lock workspace</button> : null}
+      {children}
+    </div>
+  ),
 }));
 
 vi.mock("./components/ChatView", () => ({
@@ -134,8 +143,11 @@ vi.mock("./components/MediaViewer", () => ({
 }));
 
 vi.mock("./components/Privacy", () => ({
-  PinSetup: ({ onComplete }: { onComplete: (pin: string, duress: string) => Promise<void> }) => (
-    <button type="button" onClick={() => void onComplete("123456", "")}>Configure cover</button>
+  PinSetup: ({ onComplete, onSkip }: { onComplete: (pin: string, duress: string) => Promise<void>; onSkip?: () => void }) => (
+    <div>
+      <button type="button" onClick={() => void onComplete("123456", "")}>Configure cover</button>
+      <button type="button" onClick={onSkip}>Skip cover</button>
+    </div>
   ),
   CalculatorCover: ({ onUnlock, onDuress }: { onUnlock: () => void; onDuress: () => void }) => (
     <div data-testid="calculator-cover">
@@ -183,16 +195,68 @@ describe("App privacy lifecycle policy", () => {
     expect(mocks.controller.logout).not.toHaveBeenCalled();
   });
 
-  it("logs out when hidden-session retention is disabled", async () => {
-    mocks.controller.retainWhenHiddenRef.current = false;
+  it("signs out when hidden after the cover is skipped", async () => {
     render(<App />);
-    await configureCover();
+    fireEvent.click(await screen.findByRole("button", { name: "Skip cover" }));
+    expect(screen.queryByRole("button", { name: "Configure cover" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Lock workspace" })).not.toBeInTheDocument();
 
     setVisibility("hidden");
     act(() => document.dispatchEvent(new Event("visibilitychange")));
 
     expect(mocks.controller.logout).toHaveBeenCalledOnce();
-    expect(mocks.controller.clearPrivateView).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("calculator-cover")).not.toBeInTheDocument();
+  });
+
+  it("keeps the session open when the hidden-tab setting is stay signed in", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Skip cover" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open settings" }));
+    expect(screen.getByRole("radio", { name: /Lock behind the calculator/u })).toBeDisabled();
+    fireEvent.click(screen.getByRole("radio", { name: /Stay signed in/u }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    setVisibility("hidden");
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+
+    expect(mocks.controller.logout).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("calculator-cover")).not.toBeInTheDocument();
+  });
+
+  it("destroys the PIN verifier when the cover is turned off and asks for a new PIN when it returns", async () => {
+    render(<App />);
+    await configureCover();
+    const gate = mocks.gates[0];
+    fireEvent.click(screen.getByRole("button", { name: "Open settings" }));
+    const coverSwitch = screen.getByRole("switch", { name: /Calculator privacy cover/u });
+    expect(coverSwitch).toBeChecked();
+
+    fireEvent.click(coverSwitch);
+    expect(gate.destroyed).toBe(true);
+    expect(screen.queryByRole("button", { name: "Lock workspace" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("switch", { name: /Calculator privacy cover/u }));
+    expect(await screen.findByRole("button", { name: "Configure cover" })).toBeInTheDocument();
+  });
+
+  it("locks on demand from the workspace once a PIN exists", async () => {
+    render(<App />);
+    await configureCover();
+    fireEvent.click(screen.getByRole("button", { name: "Lock workspace" }));
+    expect(screen.getByTestId("calculator-cover")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+    expect(screen.getByTestId("workspace")).toBeInTheDocument();
+  });
+
+  it("wipes the relay from settings only after explicit confirmation", async () => {
+    render(<App />);
+    await configureCover();
+    fireEvent.click(screen.getByRole("button", { name: "Open settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Wipe relay…" }));
+    expect(mocks.controller.wipeRelay).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Wipe now" }));
+    expect(mocks.controller.wipeRelay).toHaveBeenCalledOnce();
+    await waitFor(() => expect(mocks.controller.logout).toHaveBeenCalledOnce());
   });
 
   it("destroys the in-memory verifier and transient view on pagehide", async () => {
@@ -232,7 +296,7 @@ describe("App privacy lifecycle policy", () => {
 
     expect(await screen.findByRole("heading", { name: "Build rejected by node" })).toBeInTheDocument();
     expect(screen.queryByTestId("workspace")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "END SESSION" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
   });
 
   it("announces notices and exposes a separate dismiss action", async () => {

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage, RoomRecord } from "../domain/types";
 import type { PublicRoomSummary } from "../transport/mlsWire";
 import { AppShell } from "./AppShell";
+import { PrivacyBlurProvider } from "./PrivacyBlur";
 
 const room: RoomRecord = {
   id: "forum_ops",
@@ -40,10 +41,9 @@ function message(chatId: string, content: string): ChatMessage {
   };
 }
 
-function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> = {}) {
+function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> = {}, blur = false) {
   const props: React.ComponentProps<typeof AppShell> = {
     username: "Alice",
-    nodeId: "node-one",
     connection: "connected",
     rooms: [room],
     directs: [{ id: "dm_random", peer_username: "Bob" }],
@@ -56,17 +56,17 @@ function renderShell(overrides: Partial<React.ComponentProps<typeof AppShell>> =
     activeRoomId: null,
     maxRooms: 2,
     remainingSessionSec: 100,
-    sessionTimeoutSec: 900,
+    canLock: true,
     onOpenRoom: vi.fn(),
     onOpenDirect: vi.fn(),
     onCreateRoom: vi.fn(),
     onDeleteRoom: vi.fn(),
     onLock: vi.fn(),
+    onOpenSettings: vi.fn(),
     onLogout: vi.fn(),
-    onWipe: vi.fn(),
     ...overrides,
   };
-  render(<AppShell {...props} />);
+  render(<PrivacyBlurProvider enabled={blur}><AppShell {...props} /></PrivacyBlurProvider>);
   return props;
 }
 
@@ -85,45 +85,57 @@ const publicRoom = (roomId: string): PublicRoomSummary => ({
 
 afterEach(cleanup);
 
-describe("AppShell direct-message navigation", () => {
-  it("shows a private own profile without replacing the routing identifier", () => {
+describe("AppShell navigation and home", () => {
+  it("shows the private own profile and keeps the full account ID available", () => {
     renderShell({ username: "acct_1234567890abcdef1234567890abcdef", displayName: "PrivateProfile" });
-    const identity = within(document.querySelector<HTMLElement>(".identity-row")!);
-    expect(identity.getByText("PrivateProfile")).toBeInTheDocument();
-    expect(identity.getByText("acct_1234567890abcdef1234567890abcdef")).toBeInTheDocument();
+    const account = document.querySelector<HTMLElement>(".account-card")!;
+    expect(within(account).getByText("PrivateProfile")).toBeInTheDocument();
+    expect(account).toHaveAttribute("title", "acct_1234567890abcdef1234567890abcdef");
   });
+
   it("opens an existing canonical direct conversation", () => {
     const props = renderShell();
     const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });
-    fireEvent.click(within(directNavigation).getByRole("button", { name: /Bob/i }));
+    fireEvent.click(within(directNavigation).getByRole("button", { name: /Bob/u }));
     expect(props.onOpenRoom).toHaveBeenCalledWith("dm_random");
   });
 
-  it("starts a new DM from the peer list", () => {
+  it("starts a new DM from the people list", () => {
     const props = renderShell();
-    const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });
-    fireEvent.click(within(directNavigation).getByRole("button", { name: /Carol/i }));
+    const people = screen.getByRole("navigation", { name: "People" });
+    fireEvent.click(within(people).getByRole("button", { name: "Message Carol" }));
     expect(props.onOpenDirect).toHaveBeenCalledWith("Carol");
   });
 
-  it("closes the mobile sidebar when identity navigation returns to the dashboard", () => {
+  it("closes the mobile sidebar when navigating home", () => {
     const props = renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Open menu" }));
     const sidebar = document.querySelector(".sidebar")!;
     expect(sidebar).toHaveClass("is-open");
-    fireEvent.click(document.querySelector<HTMLButtonElement>(".identity-row")!);
+    fireEvent.click(within(sidebar as HTMLElement).getByRole("button", { name: "Home" }));
     expect(sidebar).not.toHaveClass("is-open");
     expect(props.onOpenRoom).toHaveBeenCalledWith(null);
   });
 
+  it("opens settings and offers lock only when the cover is ready", () => {
+    const props = renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(props.onOpenSettings).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Lock now" }));
+    expect(props.onLock).toHaveBeenCalledOnce();
+    cleanup();
+    renderShell({ canLock: false });
+    expect(screen.queryByRole("button", { name: "Lock now" })).not.toBeInTheDocument();
+  });
+
   it("reports a failed room join request", () => {
     renderShell({ onJoinRoom: vi.fn(() => false) });
-    fireEvent.change(screen.getByLabelText("Join room ID"), { target: { value: "forum_ops" } });
-    fireEvent.click(screen.getByRole("button", { name: "JOIN" }));
+    fireEvent.change(screen.getByLabelText("Room ID"), { target: { value: "forum_ops" } });
+    fireEvent.click(screen.getByRole("button", { name: "Join by ID" }));
     expect(screen.getByRole("status")).toHaveTextContent(/could not be sent/u);
   });
 
-  it("lists only unjoined public rooms and joins by the opaque exact room ID", () => {
+  it("lists only unjoined public rooms, joins by the exact room ID, and says admission is automatic", () => {
     const onJoinRoom = vi.fn(() => true);
     renderShell({
       onJoinRoom,
@@ -132,29 +144,30 @@ describe("AppShell direct-message navigation", () => {
 
     expect(screen.queryByRole("button", { name: "Join public room forum_ops" })).not.toBeInTheDocument();
     const join = screen.getByRole("button", { name: "Join public room forum_public_abc" });
-    expect(join.closest(".public-room-row")).not.toHaveTextContent(/Public Secret/u);
     fireEvent.click(join);
     expect(onJoinRoom).toHaveBeenCalledWith("forum_public_abc");
+    expect(screen.getByRole("status")).toHaveTextContent(/automatically/u);
+    expect(join).toBeDisabled();
+    expect(join).toHaveTextContent("Joining…");
   });
 
   it("guides empty dashboards according to relay connectivity", () => {
     renderShell({ rooms: [], directs: [] });
-    expect(screen.getByText("Create a room or join one by ID.")).toBeInTheDocument();
-    expect(screen.getByText("Select a peer under DIRECT MESSAGES in the sidebar to start a conversation.")).toBeInTheDocument();
+    expect(screen.getByText("Create a room, or join a public one below.")).toBeInTheDocument();
+    expect(screen.getByText("Pick someone under People in the sidebar to start one.")).toBeInTheDocument();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     cleanup();
     renderShell({ rooms: [], connection: "disconnected" });
     expect(screen.getByText("Rooms can be created once the relay is connected.")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(/relay is unreachable/u);
-    expect(screen.getByRole("button", { name: /NEW ROOM/u })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /New room/u })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Create room" })).toBeDisabled();
   });
 
   it("does not offer a conversation with the current account", () => {
     renderShell();
-    const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });
-    expect(within(directNavigation).queryByRole("button", { name: /Alice/u })).not.toBeInTheDocument();
-    expect(within(directNavigation).getByText("Start a conversation")).toBeInTheDocument();
+    const people = screen.getByRole("navigation", { name: "People" });
+    expect(within(people).queryByRole("button", { name: /Alice/u })).not.toBeInTheDocument();
   });
 
   it("lists online people before offline ones when starting a conversation", () => {
@@ -170,31 +183,17 @@ describe("AppShell direct-message navigation", () => {
     expect(names).toEqual(["Zed", "Aaron"]);
   });
 
-  it("confirms a sent join request and explains private room IDs", () => {
+  it("explains that private rooms need the owner's approval", () => {
     const onJoinRoom = vi.fn(() => true);
     renderShell({ onJoinRoom });
-    expect(screen.getByText(/Ask the owner for the exact room ID/u)).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Join room ID"), { target: { value: " forum_private " } });
-    fireEvent.click(screen.getByRole("button", { name: "JOIN" }));
+    expect(screen.getByText(/Ask the owner for the room ID/u)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Room ID"), { target: { value: " forum_private " } });
+    fireEvent.click(screen.getByRole("button", { name: "Join by ID" }));
     expect(onJoinRoom).toHaveBeenCalledWith("forum_private");
     expect(screen.getByRole("status")).toHaveTextContent(/owner must approve/u);
   });
 
-  it("exposes the full directory checkpoint for out-of-band comparison", () => {
-    renderShell();
-    expect(screen.getByTitle(`Directory checkpoint ${"A".repeat(43)}`)).toBeInTheDocument();
-  });
-
-  it("requires explicit confirmation before wiping relay RAM", () => {
-    const props = renderShell();
-    fireEvent.click(screen.getByRole("button", { name: "Wipe relay" }));
-    expect(screen.getByText("Wipe relay memory?")).toBeInTheDocument();
-    expect(props.onWipe).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "WIPE NOW" }));
-    expect(props.onWipe).toHaveBeenCalledOnce();
-  });
-
-  it("keeps room navigation and destructive actions as separate controls", () => {
+  it("asks for confirmation before deleting a room and keeps navigation separate", () => {
     const props = renderShell();
     expect(document.querySelector("button button")).toBeNull();
 
@@ -202,7 +201,11 @@ describe("AppShell direct-message navigation", () => {
     expect(props.onOpenRoom).toHaveBeenCalledWith(room.id);
 
     fireEvent.click(screen.getByRole("button", { name: "Delete room" }));
+    expect(screen.getByRole("heading", { name: "Delete this room?" })).toBeInTheDocument();
+    expect(props.onDeleteRoom).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete room" }));
     expect(props.onDeleteRoom).toHaveBeenCalledWith(room.id);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("exposes a member leave action without merging it into room navigation", () => {
@@ -212,15 +215,27 @@ describe("AppShell direct-message navigation", () => {
     expect(onLeaveRoom).toHaveBeenCalledWith(room.id);
   });
 
-  it("shows owner leave requests without exposing stable identity material", () => {
+  it("shows owner join and leave requests by room name without exposing identity material", () => {
     const props = renderShell({
+      pendingRoomJoins: [{ roomId: room.id, requestId: "join-request", username: "Carol" }],
       pendingRoomLeaves: [{ roomId: room.id, requestId: "leave-request", username: "Bob" }],
+      onAcceptRoomJoin: vi.fn(async () => true),
+      onRejectRoomJoin: vi.fn(() => true),
       onAcceptRoomLeave: vi.fn(async () => true),
       onRejectRoomLeave: vi.fn(() => true),
     });
-    expect(screen.getByLabelText("Pending room leaves")).toHaveTextContent("Bob");
-    expect(screen.getByLabelText("Pending room leaves")).not.toHaveTextContent("stable_identity");
-    fireEvent.click(screen.getByRole("button", { name: "REMOVE" }));
+    const joinRequest = screen.getByLabelText("Join request");
+    expect(joinRequest).toHaveTextContent("Carol");
+    expect(joinRequest).toHaveTextContent("wants to join Operations");
+    fireEvent.click(within(joinRequest).getByRole("button", { name: "Accept" }));
+    expect(props.onAcceptRoomJoin).toHaveBeenCalledWith("join-request");
+    fireEvent.click(within(joinRequest).getByRole("button", { name: "Decline" }));
+    expect(props.onRejectRoomJoin).toHaveBeenCalledWith("join-request");
+
+    const leaveRequest = screen.getByLabelText("Leave request");
+    expect(leaveRequest).toHaveTextContent("Bob");
+    expect(leaveRequest).not.toHaveTextContent("stable_identity");
+    fireEvent.click(within(leaveRequest).getByRole("button", { name: "Remove" }));
     expect(props.onAcceptRoomLeave).toHaveBeenCalledWith("leave-request");
   });
 
@@ -229,9 +244,9 @@ describe("AppShell direct-message navigation", () => {
       username: "Bob",
       pendingRoomLeaves: [{ roomId: room.id, requestId: "leave-request", username: "Bob" }],
     });
-    expect(screen.getByLabelText("Leave requests pending")).toHaveTextContent("LEAVE REQUEST PENDING");
-    expect(screen.queryByRole("button", { name: "REMOVE" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "KEEP" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Your leave request")).toHaveTextContent("Leaving Operations");
+    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Keep" })).not.toBeInTheDocument();
   });
 
   it("never renders room or direct message plaintext on the dashboard", () => {
@@ -244,16 +259,25 @@ describe("AppShell direct-message navigation", () => {
 
     expect(screen.queryByText(/ROOM SECRET PREVIEW/u)).not.toBeInTheDocument();
     expect(screen.queryByText(/DIRECT SECRET PREVIEW/u)).not.toBeInTheDocument();
-    expect(screen.getByText("OWNER You")).toBeInTheDocument();
+    expect(screen.getByText("You own this room")).toBeInTheDocument();
   });
 
-  it("conceals room names and peer usernames across navigation and dashboard surfaces", () => {
+  it("shows names plainly by default and conceals them when blur is turned on", () => {
     renderShell();
+    expect(document.querySelectorAll("[data-privacy-blur='true']")).toHaveLength(0);
+    cleanup();
+
+    renderShell({ username: "Bob" }, true);
     const concealed = [...document.querySelectorAll<HTMLElement>("[data-privacy-blur='true']")]
       .map((element) => element.textContent);
-
     expect(concealed).toContain("Operations");
-    expect(concealed).toContain("Bob");
-    expect(concealed).toContain("OWNER You");
+    expect(concealed).toContain("Owner Alice");
+  });
+
+  it("labels peers by their latest display name while keeping the account ID as the accessible name", () => {
+    renderShell({ messages: { dm_random: [{ ...message("dm_random", "hi"), senderDisplayName: "SilverComet" }] } });
+    const directNavigation = screen.getByRole("navigation", { name: "Direct messages" });
+    const button = within(directNavigation).getByRole("button", { name: /^Bob/u });
+    expect(button).toHaveTextContent("SilverComet");
   });
 });

@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from "react";
 import { readQrImage } from "../security/qrImage";
 import { AbyssalMarkLoader } from "./Ui";
 
-export function QrImageInput({ disabled, onScanned, onBusyChange, resetKey = "" }: {
+export function QrImageInput({ disabled, onScanned, onBusyChange, resetKey = "", compact = false }: {
   disabled?: boolean;
+  compact?: boolean;
   onScanned: (value: string, signal: AbortSignal) => Promise<boolean>;
   onBusyChange?: (busy: boolean) => void;
   resetKey?: string;
@@ -55,8 +56,8 @@ export function QrImageInput({ disabled, onScanned, onBusyChange, resetKey = "" 
           }
         })();
       }} />
-      <button type="button" className="secondary-button" disabled={disabled || busy} onClick={() => input.current?.click()}>
-        {busy ? <AbyssalMarkLoader size="compact" /> : <ImageUp size={16} />} {busy ? "READING IMAGE" : "OPEN QR IMAGE"}
+      <button type="button" className={`secondary-button ${compact ? "is-compact" : ""}`} disabled={disabled || busy} onClick={() => input.current?.click()}>
+        {busy ? <AbyssalMarkLoader size="compact" /> : <ImageUp size={15} aria-hidden="true" />}{busy ? "Reading image…" : "Open QR image"}
       </button>
       {failed?.key === resetKey ? <p className="field-error" role="status">QR image not accepted.</p> : null}
     </div>

@@ -16,7 +16,7 @@ describe("account entrance secret lifetime", () => {
     vi.stubGlobal("navigator", { clipboard: { readText } });
     const onLogin = vi.fn(async () => ({}) as never);
     render(<Entrance onLogin={onLogin} onPreflight={async () => true} />);
-    fireEvent.click(screen.getByRole("button", { name: "PASTE INVITE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Paste invite" }));
     fireEvent.change(screen.getByLabelText("Abyssal invite"), { target: { value: "newer-secret" } });
     await act(async () => { resolvePaste?.("stale-secret"); });
     expect(screen.getByLabelText("Abyssal invite")).toHaveValue("newer-secret");
@@ -37,9 +37,6 @@ describe("account entrance secret lifetime", () => {
 
     const onPreflight = vi.fn(async () => true);
     render(<Entrance onLogin={onLogin} onPreflight={onPreflight} />);
-    const signal = document.querySelector(".entrance-signal");
-    expect(signal).toHaveClass("abyssal-mark-loader", "abyssal-mark-loader-large");
-    expect(signal?.querySelectorAll(":scope > span")).toHaveLength(4);
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("maxlength", "2048");
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("autocomplete", "off");
@@ -50,19 +47,19 @@ describe("account entrance secret lifetime", () => {
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(screen.getByLabelText("Password")).toHaveValue("");
     expect(screen.getByLabelText("Abyssal invite")).toBeDisabled();
     await waitFor(() => expect(onLogin).toHaveBeenCalledOnce());
     expect(onPreflight).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: "ENTERING" })).toContainElement(
+    expect(screen.getByRole("button", { name: "Signing in…" })).toContainElement(
       document.querySelector(".abyssal-mark-loader-compact"),
     );
     expect(new TextDecoder().decode(submittedPassword)).toBe("correct horse battery staple");
 
     rejectLogin?.(new Error("rejected"));
-    await waitFor(() => expect(screen.getByText("Wrong information.")).toBeVisible());
+    await waitFor(() => expect(screen.getByText("Sign-in failed. Check the invite and password.")).toBeVisible());
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
     expect(document.body.textContent).not.toContain("fixture-invite");
     expect(submittedPassword?.every((byte) => byte === 0)).toBe(true);
@@ -79,11 +76,11 @@ describe("account entrance secret lifetime", () => {
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     await waitFor(() => expect(onPreflight).toHaveBeenCalledOnce());
     expect(onLogin).not.toHaveBeenCalled();
-    expect(screen.getByText("Wrong information.")).toBeVisible();
+    expect(screen.getByText("Sign-in failed. Check the invite and password.")).toBeVisible();
   });
 
   it("runs authentication only after the fresh release preflight passes", async () => {
@@ -97,7 +94,7 @@ describe("account entrance secret lifetime", () => {
     fireEvent.change(screen.getByLabelText("Password"), {
       target: { value: "correct horse battery staple" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     await waitFor(() => expect(onLogin).toHaveBeenCalledOnce());
     expect(onPreflight).toHaveBeenCalledOnce();

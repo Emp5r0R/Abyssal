@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage, RoomRecord } from "../domain/types";
 import { ChatView } from "./ChatView";
+import { PrivacyBlurProvider } from "./PrivacyBlur";
 
 const direct: RoomRecord = {
   id: "dm_direct",
@@ -48,7 +49,8 @@ describe("direct message retention", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "NEVER" }));
+    fireEvent.click(screen.getByRole("button", { name: "Never" }));
+    expect(screen.getByRole("button", { name: "Never" })).toHaveAttribute("aria-pressed", "true");
     fireEvent.change(screen.getByLabelText("Message"), { target: { value: "kept in session" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -80,28 +82,30 @@ describe("direct message retention", () => {
     );
 
     const verifyButton = screen.getAllByRole("button", { name: "Verify peer identity (recommended)" }).find((button) => !(button as HTMLButtonElement).disabled);
-    expect(verifyButton).toHaveTextContent("VERIFICATION RECOMMENDED");
+    expect(verifyButton).toHaveTextContent("Not verified");
     verifyButton!.focus();
     fireEvent.click(verifyButton!);
     expect(screen.getByRole("heading", { name: "Verify peer identity" })).toBeInTheDocument();
     expect(screen.getByText(/trusted channel/i)).toBeInTheDocument();
     expect(screen.getByText(/recommended but optional/i)).toBeInTheDocument();
-    const qrImageButton = screen.getByRole("button", { name: /OPEN QR IMAGE/u });
-    const scanButton = screen.getByRole("button", { name: /SCAN PEER QR/u });
-    const cancelAction = screen.getByRole("button", { name: "CANCEL" });
-    await waitFor(() => expect(scanButton).toHaveFocus());
+    expect(screen.getByText("abyssal:verify:v1:test-token")).toBeInTheDocument();
+    const copyButton = screen.getByRole("button", { name: "Copy verification code" });
+    const qrImageButton = screen.getByRole("button", { name: /Open QR image/u });
+    expect(screen.getByRole("button", { name: /Scan peer QR/u })).toBeEnabled();
+    const cancelAction = screen.getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(copyButton).toHaveFocus());
     qrImageButton.focus();
     expect(qrImageButton).toHaveFocus();
-    scanButton.focus();
-    fireEvent.keyDown(scanButton, { key: "Tab", shiftKey: true });
+    copyButton.focus();
+    fireEvent.keyDown(copyButton, { key: "Tab", shiftKey: true });
     expect(cancelAction).toHaveFocus();
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() => expect(verifyButton).toHaveFocus());
     fireEvent.click(verifyButton!);
-    fireEvent.change(screen.getByLabelText("Peer verification token"), {
+    fireEvent.change(screen.getByLabelText("Peer verification code"), {
       target: { value: "abyssal:verify:v1:test-token" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "VERIFY TOKEN" }));
+    fireEvent.click(screen.getByRole("button", { name: "Verify code" }));
     await waitFor(() => expect(verify).toHaveBeenCalledWith("abyssal:verify:v1:test-token"));
   });
 });
@@ -239,9 +243,9 @@ describe("sender-client origin badges", () => {
     expect(screen.queryByRole("img", { name: /sent from/i })).toBeNull();
   });
 
-  it("conceals the chat label, sender, and complete message surface by default", () => {
+  it("conceals the chat label, sender, and complete message surface when blur is on", () => {
     render(
-      <ChatView
+      <PrivacyBlurProvider enabled><ChatView
         room={direct}
         username="Self"
         connected
@@ -257,7 +261,7 @@ describe("sender-client origin badges", () => {
         onViewAttachment={vi.fn()}
         onExportAttachment={vi.fn()}
         onSendGif={vi.fn()}
-      />,
+      /></PrivacyBlurProvider>,
     );
 
     expect(screen.getByRole("heading", { name: direct.name }).querySelector("[data-privacy-blur='true']")).not.toBeNull();

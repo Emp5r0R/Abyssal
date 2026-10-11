@@ -59,7 +59,7 @@ with sync_playwright() as p:
             page.goto(BASE)
             page.wait_for_load_state("networkidle")
             assert not errors, errors
-            expect(page.get_by_role("heading", name="Enter Abyssal")).to_be_visible()
+            expect(page.get_by_role("heading", name="Sign in")).to_be_visible()
             for filename, mime in [("invite-v1.png", "image/png"), ("invite-v1.jpeg", "image/jpeg"), ("invite-qrencode.png", "image/png")]:
                 page.get_by_label("QR image", exact=True).set_input_files({
                     "name": "../../" + filename,
@@ -69,19 +69,19 @@ with sync_playwright() as p:
                 page.wait_for_function("document.getElementById('abyssal-invite').value.startsWith('abyssal:invite:')")
                 expect(page.get_by_label("Abyssal invite", exact=True)).to_have_attribute("type", "password")
                 assert "abyssal:invite:" not in page.locator("body").inner_text()
-                expect(page.get_by_role("button", name="OPEN QR IMAGE")).to_be_enabled()
+                expect(page.get_by_role("button", name="Open QR image")).to_be_enabled()
                 assert page.evaluate("window.testLoginCalls") == 0
                 page.get_by_label("Abyssal invite", exact=True).fill("")
             for buffer, mime in [(b"<svg><image href='file:///etc/passwd'/></svg>", "image/png"), (PNG, "image/jpeg")]:
                 page.get_by_label("QR image", exact=True).set_input_files({"name": "image.png", "mimeType": mime, "buffer": buffer})
                 expect(page.get_by_text("QR image not accepted.")).to_be_visible()
                 expect(page.get_by_label("Abyssal invite", exact=True)).to_have_value("")
-                expect(page.get_by_role("button", name="OPEN QR IMAGE")).to_be_enabled()
-            page.get_by_role("button", name="SCAN INVITE", exact=True).click()
+                expect(page.get_by_role("button", name="Open QR image")).to_be_enabled()
+            page.get_by_role("button", name="Scan invite", exact=True).click()
             page.wait_for_function("document.getElementById('abyssal-invite').value.startsWith('abyssal:invite:')")
             expect(page.get_by_label("Abyssal invite", exact=True)).to_have_attribute("type", "password")
             assert "abyssal:invite:" not in page.locator("body").inner_text()
-            expect(page.get_by_role("button", name="SCAN INVITE", exact=True)).to_be_visible()
+            expect(page.get_by_role("button", name="Scan invite", exact=True)).to_be_visible()
             expect(page.get_by_label("Abyssal invite", exact=True)).to_be_focused()
             expect(page.get_by_label("Abyssal invite", exact=True)).to_be_in_viewport()
             assert page.evaluate("window.testCameraTracks.length > 0 && window.testCameraTracks.every(t => t.readyState === 'ended')")
@@ -98,8 +98,8 @@ with sync_playwright() as p:
             assert not any("/v1/" in url for url in requests), requests
             assert not errors, errors
             page.screenshot(path=f"/tmp/abyssal-invite-qr-{width}.png", full_page=True)
-            page.get_by_role("button", name="ENTER", exact=True).scroll_into_view_if_needed()
-            expect(page.get_by_role("button", name="ENTER", exact=True)).to_be_in_viewport()
+            page.get_by_role("button", name="Sign in", exact=True).scroll_into_view_if_needed()
+            expect(page.get_by_role("button", name="Sign in", exact=True)).to_be_in_viewport()
             context.close()
             print(f"QR browser checks passed: {width}x{height}, PNG/JPEG/camera, rejects, no authentication or external request")
     finally:

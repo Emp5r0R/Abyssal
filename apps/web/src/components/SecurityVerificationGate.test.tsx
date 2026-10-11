@@ -14,7 +14,7 @@ describe("security verification admission", () => {
     expect(screen.getByRole("main")).toHaveAttribute("aria-busy", "true");
     expect(screen.getByRole("main")).not.toHaveAttribute("aria-modal");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "RETRY" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
     const loader = document.querySelector(".abyssal-mark-loader");
     expect(loader).not.toHaveClass("is-static");
     expect(loader?.querySelectorAll(":scope > span")).toHaveLength(4);
@@ -28,9 +28,9 @@ describe("security verification admission", () => {
 
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
       expect(screen.getByRole("status")).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "RETRY" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
       expect(document.querySelector(".abyssal-mark-loader")).toHaveClass("is-static");
-      fireEvent.click(screen.getByRole("button", { name: "RETRY" }));
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
       expect(onRetry).toHaveBeenCalledOnce();
     },
   );
@@ -47,8 +47,8 @@ describe("security verification admission", () => {
     );
 
     expect(screen.getByRole("heading", { name: "Build rejected by node" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "END SESSION" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "END SESSION" }));
+    expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
     expect(onEndSession).toHaveBeenCalledOnce();
   });
 });

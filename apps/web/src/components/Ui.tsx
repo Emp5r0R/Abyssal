@@ -17,14 +17,16 @@ export const IconButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HTM
 export function Field({
   label,
   hint,
+  "aria-describedby": describedBy,
   ...props
 }: InputHTMLAttributes<HTMLInputElement> & { label: string; hint?: string }) {
   const hintId = `${useId()}-hint`;
+  const description = [hint ? hintId : undefined, describedBy].filter(Boolean).join(" ") || undefined;
   return (
     <div className="field">
       <label className="field-control">
         <span className="field-label">{label}</span>
-        <input aria-describedby={hint ? hintId : undefined} {...props} />
+        <input aria-describedby={description} {...props} />
       </label>
       {hint ? <span id={hintId} className="field-hint">{hint}</span> : null}
     </div>
@@ -35,20 +37,28 @@ export function Toggle({
   checked,
   onChange,
   label,
+  description,
   disabled = false,
 }: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   label: string;
+  description?: string;
   disabled?: boolean;
 }) {
+  const descriptionId = `${useId()}-description`;
   return (
     <label className={`toggle-row ${disabled ? "is-disabled" : ""}`}>
-      <span>{label}</span>
+      <span className="toggle-text">
+        <span className="toggle-label">{label}</span>
+        {description ? <span id={descriptionId} className="toggle-description">{description}</span> : null}
+      </span>
       <input
         type="checkbox"
+        role="switch"
         checked={checked}
         disabled={disabled}
+        aria-describedby={description ? descriptionId : undefined}
         onChange={(event) => onChange(event.target.checked)}
       />
       <span className="toggle-track" aria-hidden="true"><span /></span>
@@ -124,10 +134,10 @@ export function Dialog({
 export function Brand({ compact = false }: { compact?: boolean }) {
   return (
     <div className={`brand ${compact ? "brand-compact" : ""}`}>
-      <img src="/abyssal-mark.svg" alt="" width={compact ? 34 : 48} height={compact ? 34 : 48} />
+      <img src="/abyssal-mark.svg" alt="" width={compact ? 26 : 40} height={compact ? 26 : 40} />
       <div>
-        <strong>ABYSSAL</strong>
-        {!compact ? <span>EPHEMERAL RELAY</span> : null}
+        <strong>Abyssal</strong>
+        {!compact ? <span>Ephemeral encrypted chat</span> : null}
       </div>
     </div>
   );

@@ -334,6 +334,19 @@ export class MlsRoomManager {
     }
   }
 
+  /** Join requests this owner admits without a prompt: public rooms that are idle and still admissible. */
+  autoAdmittableJoins(): string[] {
+    if (this.#closed) return [];
+    return [...this.#pendingJoins.values()].filter((request) => {
+      const slot = this.#rooms.get(request.roomId);
+      if (!slot || slot.visibility !== "public" || slot.pendingMessageId) return false;
+      try {
+        this.assertPendingJoin(this.ownerSlot(request.roomId), request);
+        return true;
+      } catch { return false; }
+    }).map((request) => request.requestId);
+  }
+
   pendingJoins(): PendingMlsJoinSummary[] {
     return [...this.#pendingJoins.values()].map(({ roomId, requestId, username }) => ({ roomId, requestId, username }));
   }

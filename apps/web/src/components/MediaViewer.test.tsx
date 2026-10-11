@@ -2,11 +2,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MediaViewer } from "./MediaViewer";
+import { PrivacyBlurProvider } from "./PrivacyBlur";
 
 describe("MediaViewer privacy boundary", () => {
   afterEach(cleanup);
 
-  it("conceals decrypted media and its filename until pointer or keyboard reveal", () => {
+  it("shows media plainly while blur is off", () => {
     render(<MediaViewer media={{
       messageId: "message-one",
       name: "private-image.png",
@@ -16,6 +17,20 @@ describe("MediaViewer privacy boundary", () => {
       oneTime: false,
     }} onClose={vi.fn()} />);
 
+    expect(document.querySelector("[data-privacy-blur='true']")).toBeNull();
+    expect(screen.getByRole("img", { name: "Decrypted attachment" }).closest(".media-stage")).not.toHaveAttribute("tabindex");
+  });
+
+  it("conceals decrypted media and its filename until pointer or keyboard reveal when blur is on", () => {
+    render(<PrivacyBlurProvider enabled><MediaViewer media={{
+      messageId: "message-one",
+      name: "private-image.png",
+      mediaType: "IMAGE",
+      mimeType: "image/png",
+      objectUrl: "blob:test",
+      oneTime: false,
+    }} onClose={vi.fn()} /></PrivacyBlurProvider>);
+
     expect(screen.getByText("private-image.png").closest("[data-privacy-blur='true']")).not.toBeNull();
     const stage = screen.getByRole("img", { name: "Decrypted attachment" }).closest(".media-stage");
     expect(stage).toHaveClass("privacy-blur");
@@ -24,14 +39,14 @@ describe("MediaViewer privacy boundary", () => {
 
   it("associates the title and description, traps focus, and closes on Escape", async () => {
     const onClose = vi.fn();
-    render(<MediaViewer media={{
+    render(<PrivacyBlurProvider enabled><MediaViewer media={{
       messageId: "message-one",
       name: "private-image.png",
       mediaType: "IMAGE",
       mimeType: "image/png",
       objectUrl: "blob:test",
       oneTime: false,
-    }} onClose={onClose} />);
+    }} onClose={onClose} /></PrivacyBlurProvider>);
 
     const dialog = screen.getByRole("dialog");
     const titleId = dialog.getAttribute("aria-labelledby");

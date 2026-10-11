@@ -119,6 +119,14 @@ class ChatViewModelPolicyTest {
     }
 
     @Test
+    fun joinNoticeExplainsWhetherTheOwnerMustApprove() {
+        assertEquals(ChatViewModel.PUBLIC_JOIN_SENT_NOTICE, ChatViewModel.joinRequestSentNotice(publicRoom = true))
+        assertEquals(ChatViewModel.PRIVATE_JOIN_SENT_NOTICE, ChatViewModel.joinRequestSentNotice(publicRoom = false))
+        assertTrue(ChatViewModel.PUBLIC_JOIN_SENT_NOTICE.contains("automatically"))
+        assertTrue(ChatViewModel.PRIVATE_JOIN_SENT_NOTICE.contains("approve"))
+    }
+
+    @Test
     fun soloForumCanStoreTextLocallyWithoutCryptoRecipients() {
         assertTrue(isLocalOnlyForum("forum_general", emptyList()))
         assertFalse(isLocalOnlyForum("forum_general", listOf(recipient("Bob"))))

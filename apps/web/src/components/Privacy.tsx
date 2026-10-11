@@ -6,8 +6,11 @@ import { Dialog, Field } from "./Ui";
 
 export function PinSetup({
   onComplete,
+  onSkip,
 }: {
   onComplete: (pin: string, duressPin: string) => Promise<void>;
+  /** Continue without the calculator cover. */
+  onSkip?: () => void;
 }) {
   const [pin, setPin] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -29,7 +32,7 @@ export function PinSetup({
     ? "Duress PIN must differ from the cover PIN."
     : !validDuress
     ? "Duress PIN must be 6-12 digits or left blank."
-    : "Ready to enable privacy cover.";
+    : "Ready. Press Turn on cover.";
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -53,12 +56,17 @@ export function PinSetup({
 
   return (
     <Dialog
-      title="Set privacy cover PIN"
-      description="PIN exists only in this browser tab. Remember it. Reloading clears session."
+      className="pin-dialog"
+      title="Set a calculator PIN"
+      description="Abyssal can hide behind a working calculator. To come back, type your PIN and press =. The PIN lives only in this tab; reloading the page signs you out."
+      onClose={onSkip}
       actions={
-        <button className="primary-button" form="pin-setup-form" disabled={!valid || busy} type="submit">
-          {busy ? "SECURING" : "ENABLE COVER"}
-        </button>
+        <>
+          {onSkip ? <button className="secondary-button" type="button" disabled={busy} onClick={onSkip}>Not now</button> : null}
+          <button className="primary-button" form="pin-setup-form" disabled={!valid || busy} type="submit">
+            {busy ? "Securing…" : "Turn on cover"}
+          </button>
+        </>
       }
     >
       <form id="pin-setup-form" className="stack-form" onSubmit={submit}>
@@ -96,6 +104,7 @@ export function PinSetup({
         />
         <Field
           label="Duress PIN (optional)"
+          hint="Entering this PIN on the calculator wipes the relay and ends the session."
           name="privacy-duress-pin"
           type="password"
           inputMode="numeric"
@@ -111,7 +120,7 @@ export function PinSetup({
           onChange={(event) => { setError(false); setDuress(digits(event.target.value)); }}
         />
         <p id="pin-setup-guidance" className="field-hint pin-setup-guidance" role="status" aria-live="polite">
-          {error ? "Could not enable privacy cover." : guidance}
+          {error ? "Could not turn on the privacy cover." : guidance}
         </p>
       </form>
     </Dialog>

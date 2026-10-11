@@ -973,9 +973,9 @@ private fun CreateForumDialog(
         }
         Text(
             text = if (visibility == MlsRoomVisibility.PUBLIC) {
-                "Listed by opaque room ID; access still requires owner approval."
+                "Listed for everyone on this node. Anyone can join while you are online; no approval needed."
             } else {
-                "Hidden from discovery; share the exact room ID with trusted people."
+                "Not listed. Share the exact room ID, and approve each join request."
             },
             color = SteelMuted,
             fontSize = 11.sp,

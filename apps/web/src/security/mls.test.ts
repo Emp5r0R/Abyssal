@@ -173,6 +173,24 @@ describe("MlsRoomManager", () => {
     manager.finishTransaction(prepared, "ACCEPTED"); expect(manager.pendingJoins()).toHaveLength(0);
   });
 
+  it("admits join requests automatically only for idle public rooms this account owns", () => {
+    const fake = sessionWith(); const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
+    manager.createRoom({ ...roomRecord, visibility: "public" });
+    const join = { type: "mls_join_requested", protocol_version: 10, room_id: roomRecord.id, request_id: "request", username: "Bob", stable_identity_b64: encodeBase64Url(bytes(64, 6)), key_package_b64: encodeBase64Url(bytes(100, 8)) } as const;
+    manager.rememberJoin(join);
+    expect(manager.autoAdmittableJoins()).toEqual(["request"]);
+    const prepared = manager.acceptJoin("request", "membership");
+    expect(manager.autoAdmittableJoins()).toEqual([]);
+    manager.finishTransaction(prepared, "ACCEPTED");
+    expect(manager.autoAdmittableJoins()).toEqual([]);
+
+    const privateFake = sessionWith(); const privateOwner = new MlsRoomManager(privateFake.session, "Alice", "node", bytes(608, 7));
+    privateOwner.createRoom(roomRecord);
+    privateOwner.rememberJoin(join);
+    expect(privateOwner.autoAdmittableJoins()).toEqual([]);
+    expect(privateOwner.pendingJoins()).toHaveLength(1);
+  });
+
   it("accepts only exact duplicate join context and wipes it with the room", () => {
     const fake = sessionWith(); const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7)); manager.createRoom(roomRecord);
     const join = { type: "mls_join_requested", protocol_version: 10, room_id: roomRecord.id, request_id: "request", username: "Bob", stable_identity_b64: encodeBase64Url(bytes(64, 6)), key_package_b64: encodeBase64Url(bytes(100, 8)) } as const;

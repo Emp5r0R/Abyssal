@@ -17,6 +17,7 @@ import {
   wipeMessageAttachmentKey as wipeMessageAttachment,
 } from "../domain/messageMemoryPolicy";
 import { reactionByShortcode } from "../domain/reactions";
+import { JoinAdmissionQueue } from "../domain/joinAdmission";
 import type {
   AccountSession,
   AttachmentOptions,
@@ -122,11 +123,11 @@ const DIRECT_KEYS = new Set(["id", "peer_username"]);
 // Keep the explicit-download Blob URL alive briefly enough to avoid truncation,
 // then release it so an export cannot pin plaintext indefinitely.
 const DOWNLOAD_URL_CLEANUP_DELAY_MS = 60_000;
+const JOIN_ADMISSION_RETRY_MS = 1_500;
 
 interface LoginInput {
   invite: string;
   password: Uint8Array;
-  retainWhenHidden: boolean;
 }
 
 interface AttachmentInput {
@@ -268,7 +269,6 @@ export function useAbyssalSession() {
   const mlsRef = useRef<MlsRoomManager | null>(null);
   const lastActivityRef = useRef(0);
   const lastActivitySignalRef = useRef(0);
-  const retainWhenHiddenRef = useRef(false);
   const sessionRef = useRef<AccountSession | null>(null);
   const roomsRef = useRef<RoomRecord[]>([]);
   const publicRoomsRef = useRef<PublicRoomSummary[]>([]);
@@ -296,6 +296,9 @@ export function useAbyssalSession() {
   const cryptoGateRef = useRef(new AsyncCryptoGate());
   const attachmentOperationsRef = useRef(new Set<AttachmentOperation>());
   const exportUrlsRef = useRef(new Map<string, number | null>());
+  const joinAdmissionRef = useRef(new JoinAdmissionQueue());
+  const joinAdmissionTimerRef = useRef<number | undefined>(undefined);
+  const [joinAdmissionTick, setJoinAdmissionTick] = useState(0);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -486,6 +489,8 @@ export function useAbyssalSession() {
     setSecurityWarning(null);
     setPendingMlsJoins([]);
     setPendingMlsLeaves([]);
+    joinAdmissionRef.current = new JoinAdmissionQueue();
+    window.clearTimeout(joinAdmissionTimerRef.current);
     ownMessageIdsRef.current.clear();
     receivedFrameIdsRef.current.clear();
     identityPinsRef.current.clear();
@@ -504,7 +509,6 @@ export function useAbyssalSession() {
     presenceRef.current = [];
     activeRoomRef.current = null;
     requestedDirectRef.current = null;
-    retainWhenHiddenRef.current = false;
     lastActivityRef.current = 0;
     lastActivitySignalRef.current = 0;
   }, [cancelAttachmentOperations, clearDirectTrust, clearExportUrls, clearMedia]);
@@ -1300,7 +1304,6 @@ export function useAbyssalSession() {
       }
       mlsRef.current?.close();
       mlsRef.current = cipherRef.current.createMlsManager(nextSession.username, nextSession.nodeId);
-      retainWhenHiddenRef.current = input.retainWhenHidden;
       const relayGeneration = sessionGenerationRef.current;
       lastActivityRef.current = Date.now();
       lastActivitySignalRef.current = Date.now();
@@ -1376,7 +1379,6 @@ export function useAbyssalSession() {
       mlsRef.current?.close();
       mlsRef.current = null;
       cipherRef.current.clear();
-      retainWhenHiddenRef.current = false;
       lastActivityRef.current = 0;
       lastActivitySignalRef.current = 0;
       setRemainingSessionSec(0);
@@ -2165,6 +2167,26 @@ export function useAbyssalSession() {
     } catch { return false; }
   }, [connection, runMlsTransaction]);
 
+  // Public rooms need no owner decision. The owner's client still commits each admission itself,
+  // one at a time; a failed admission is retried briefly and then left for a manual decision.
+  useEffect(() => {
+    if (connection !== "connected" || pendingMlsJoins.length === 0) return;
+    const queue = joinAdmissionRef.current;
+    const requestId = queue.next(mlsRef.current?.autoAdmittableJoins() ?? []);
+    if (!requestId) return;
+    void acceptRoomJoin(requestId).then((admitted) => {
+      if (joinAdmissionRef.current !== queue) return;
+      const retry = queue.settle(requestId, admitted);
+      window.clearTimeout(joinAdmissionTimerRef.current);
+      joinAdmissionTimerRef.current = window.setTimeout(
+        () => setJoinAdmissionTick((tick) => tick + 1),
+        retry ? JOIN_ADMISSION_RETRY_MS : 0,
+      );
+    });
+  }, [acceptRoomJoin, connection, joinAdmissionTick, pendingMlsJoins]);
+
+  useEffect(() => () => window.clearTimeout(joinAdmissionTimerRef.current), []);
+
   const rejectRoomJoin = useCallback((requestId: string): boolean => {
     try {
       const frame = mlsRef.current?.rejectJoin(requestId);
@@ -2257,7 +2279,6 @@ export function useAbyssalSession() {
     entryNotice,
     pendingMlsJoins,
     pendingMlsLeaves,
-    retainWhenHiddenRef,
     login,
     logout,
     clearMemory,

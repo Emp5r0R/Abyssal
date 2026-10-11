@@ -1,15 +1,12 @@
 import type { ReactNode } from "react";
+import { PrivacyBlurContext, privacyBlurProps, usePrivacyBlur } from "./privacyBlurContext";
 
-export const PRIVACY_BLUR_CLASS = "privacy-blur";
+export function PrivacyBlurProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
+  return <PrivacyBlurContext.Provider value={enabled}>{children}</PrivacyBlurContext.Provider>;
+}
 
-export function PrivacyBlur({ children, className = "" }: { children: ReactNode; className?: string }) {
-  return (
-    <span
-      className={`${PRIVACY_BLUR_CLASS} ${className}`.trim()}
-      data-privacy-blur="true"
-      tabIndex={0}
-    >
-      {children}
-    </span>
-  );
+/** Wraps a sensitive label so it blurs when the privacy blur preference is on. */
+export function PrivacyBlur({ children, className = "", title }: { children: ReactNode; className?: string; title?: string }) {
+  const props = privacyBlurProps(usePrivacyBlur(), className);
+  return <span {...props} className={props.className || undefined} title={title}>{children}</span>;
 }

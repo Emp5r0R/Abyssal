@@ -56,7 +56,8 @@ internal class MlsRoomManager(
         var pendingMessageId: String? = null,
         var pendingRevision: ULong? = null,
         var pendingRoster: List<MlsRosterMemberWire>? = null,
-        var localLabel: String? = null
+        var localLabel: String? = null,
+        val visibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE
     )
     private data class PendingJoin(
         val roomId: String,
@@ -100,7 +101,7 @@ internal class MlsRoomManager(
                 infoGroup.contentEquals(group) && digest.size == 32)
             state = handle.sealState()
             val roster = listOf(MlsRosterMemberWire(username, MlsWireCodec.encode(stableIdentity)))
-            rooms[room.id] = RoomSlot(handle, group.clone(), username, roster, true, true, localLabel = localLabel)
+            rooms[room.id] = RoomSlot(handle, group.clone(), username, roster, true, true, localLabel = localLabel, visibility = room.roomVisibility)
             handle = null
             JSONObject().put("type", "mls_create_room").put("protocol_version", MLS_PROTOCOL_VERSION)
                 .put("room_id", room.id).put("visibility", MlsRoomVisibility.toWire(room.roomVisibility)).put("group_id_b64", MlsWireCodec.encode(group))
@@ -187,7 +188,7 @@ internal class MlsRoomManager(
                         require(info.epoch == recovery.epoch && info.revision == recovery.revision &&
                             info.groupId.contentEquals(group) && info.membershipDigest.contentEquals(digest))
                     } finally { info.groupId.fill(0); info.membershipDigest.fill(0) }
-                    rooms[wire.roomId] = RoomSlot(handle, group.clone(), wire.ownerUsername, recovery.roster.map { it.copy() }, recovery.active, wire.synchronized)
+                    rooms[wire.roomId] = RoomSlot(handle, group.clone(), wire.ownerUsername, recovery.roster.map { it.copy() }, recovery.active, wire.synchronized, visibility = wire.visibility)
                     if (wire.active) output += MlsWireCodec.roomSession(wire)
                     handle = null
                 } finally { handle?.close(); group.fill(0); envelope.fill(0); digest.fill(0) }
@@ -239,6 +240,17 @@ internal class MlsRoomManager(
             joins[frame.requestId] = PendingJoin(frame.roomId, frame.requestId, frame.username, stable, key)
             stable = ByteArray(0); key = ByteArray(0)
         } finally { stable.fill(0); key.fill(0) }
+    }
+
+    /** Join requests this owner admits without a prompt: public rooms that are idle and still admissible. */
+    @Synchronized
+    fun autoAdmittableJoins(): List<String> {
+        if (closed) return emptyList()
+        return joins.values.filter { join ->
+            val slot = rooms[join.roomId] ?: return@filter false
+            slot.visibility == MlsRoomVisibility.PUBLIC && slot.active && slot.synchronized && slot.pendingMessageId == null &&
+                sameUsername(slot.ownerUsername, username) && slot.roster.none { sameUsername(it.username, join.username) }
+        }.map { it.requestId }
     }
 
     @Synchronized

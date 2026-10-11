@@ -11,7 +11,7 @@ describe("CreateRoomDialog routing identifier", () => {
     render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
 
     fireEvent.change(screen.getByLabelText("Room name"), { target: { value: "Private Operations" } });
-    fireEvent.click(screen.getByRole("button", { name: "CREATE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create room" }));
 
     const room = onCreate.mock.calls[0]?.[0];
     expect(room?.name).toBe("Private Operations");
@@ -24,10 +24,10 @@ describe("CreateRoomDialog routing identifier", () => {
     const onCreate = vi.fn((room: RoomRecord) => room.name.length >= 0);
     render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
 
-    expect(screen.getByRole("radio", { name: "PRIVATE" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Private" })).toBeChecked();
     fireEvent.change(screen.getByLabelText("Room name"), { target: { value: "Discoverable" } });
-    fireEvent.click(screen.getByRole("radio", { name: "PUBLIC" }));
-    fireEvent.click(screen.getByRole("button", { name: "CREATE" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Public" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create room" }));
 
     expect(onCreate.mock.calls[0]?.[0].visibility).toBe("public");
   });
@@ -36,10 +36,10 @@ describe("CreateRoomDialog routing identifier", () => {
     const onCreate = vi.fn((room: RoomRecord) => room.name.length >= 0);
     render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
 
-    expect(screen.getByText("Advanced: media and lifetime rules").closest("details")).not.toHaveAttribute("open");
+    expect(screen.getByText("Advanced: attachments and message lifetime").closest("details")).not.toHaveAttribute("open");
     fireEvent.change(screen.getByLabelText("Room name"), { target: { value: "Quick" } });
     fireEvent.change(screen.getByLabelText("Messages disappear after reading"), { target: { value: "3600" } });
-    fireEvent.click(screen.getByRole("button", { name: "CREATE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create room" }));
 
     expect(onCreate.mock.calls[0]?.[0].self_destruct_timer_sec).toBe(3600);
   });
@@ -49,10 +49,10 @@ describe("CreateRoomDialog routing identifier", () => {
     render(<CreateRoomDialog onCancel={vi.fn()} onCreate={onCreate} />);
 
     fireEvent.change(screen.getByLabelText("Room name"), { target: { value: "Private Operations" } });
-    fireEvent.click(screen.getByRole("button", { name: "CREATE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create room" }));
 
     expect(screen.getByRole("status")).toHaveTextContent("Room could not be created. Try again.");
-    expect(screen.getByRole("heading", { name: "Create room" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Create a room" })).toBeInTheDocument();
   });
 
   it("closes on Escape and focuses the room name field first", async () => {

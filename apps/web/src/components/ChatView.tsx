@@ -11,19 +11,23 @@ import {
   Play,
   Send,
   ShieldCheck,
+  ShieldAlert,
   Smartphone,
   SmilePlus,
   TriangleAlert,
+  WifiOff,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { remainingSeconds } from "../domain/messagePolicy";
 import { formatBytes } from "../domain/format";
 import { splitMentionText } from "../domain/messageAttention";
 import { isWebSender, senderOriginNotice } from "../domain/senderClient";
 import { exactReactionShortcut, reactionByShortcode, searchReactions, type ReactionAsset } from "../domain/reactions";
 import type { ChatMessage, PresenceUser, RoomRecord, UploadProgress } from "../domain/types";
-import { PRIVACY_BLUR_CLASS, PrivacyBlur } from "./PrivacyBlur";
+import { accountInitials, displayNamesBySender, roomLabel, shortAccountId } from "../domain/displayLabels";
+import { PrivacyBlur } from "./PrivacyBlur";
+import { privacyBlurProps, usePrivacyBlur } from "./privacyBlurContext";
 import { DirectVerificationQr } from "./DirectVerificationQr";
 import { GifPicker } from "./GifPicker";
 import { Dialog, Field, IconButton } from "./Ui";
@@ -68,6 +72,8 @@ export function ChatView({
   onVerifyToken,
 }: ChatViewProps) {
   const isDirect = room.conversation_type === "direct";
+  const blur = usePrivacyBlur();
+  const retentionLabelId = useId();
   const [draft, setDraft] = useState("");
   const [showGifs, setShowGifs] = useState(false);
   const [directRetentionSec, setDirectRetentionSec] = useState(5);
@@ -163,37 +169,45 @@ export function ChatView({
     setShowTrustDialog(false);
   };
   const effectiveRetentionSec = isDirect ? directRetentionSec : room.self_destruct_timer_sec;
+  const senderNames = displayNamesBySender({ [room.id]: messages });
+  const peer = isDirect ? room.peer_username ?? room.name : null;
+  const title = peer ? senderNames.get(peer.toLowerCase()) ?? shortAccountId(peer) : roomLabel(room);
+  const peerOnline = peer ? users.find((user) => user.username === peer)?.connected === true : false;
+  const canVerify = !!safetyNumber && !!directTrust.verificationToken && !!onVerifyToken;
 
   return (
     <section className="chat-view">
       <header className="chat-header">
         <IconButton className="mobile-only" label="Back to conversations" onClick={onBack}><ArrowLeft size={20} /></IconButton>
-        <div className={`room-avatar ${isDirect ? "is-direct" : ""}`}>{isDirect ? "@" : "#"}</div>
+        <span className={`avatar ${isDirect ? "" : "is-room"}`} aria-hidden="true">{isDirect ? accountInitials(title) : "#"}</span>
         <div className="chat-title">
-          <h1><PrivacyBlur>{room.name}</PrivacyBlur></h1>
+          <h1 title={peer ?? room.id}><PrivacyBlur>{title}</PrivacyBlur></h1>
           {isDirect ? (
-            <button
-              type="button"
-              className={`trust-status ${directTrust.verified ? "is-verified" : "is-unverified"}`}
-              onClick={() => setShowTrustDialog(true)}
-              disabled={!safetyNumber || !directTrust.verificationToken || !onVerifyToken}
-              aria-label={directTrust.verified
-                ? "Peer identity verified"
-                : "Verify peer identity (recommended)"}
-            >
-              <ShieldCheck size={13} />
-              {directTrust.verified ? "IDENTITY VERIFIED" : "VERIFICATION RECOMMENDED"}
-              {safetyNumber ? ` · Safety number ${safetyNumber}` : " · Safety number unavailable"}
-            </button>
+            <div className="chat-subtitle">
+              <span className={`presence-dot ${peerOnline ? "is-online" : ""}`} aria-hidden="true" />
+              <span>{peerOnline ? "Online" : "Offline"}</span>
+              <span aria-hidden="true">·</span>
+              <button
+                type="button"
+                className={`trust-status ${directTrust.verified ? "is-verified" : "is-unverified"}`}
+                onClick={() => setShowTrustDialog(true)}
+                disabled={!canVerify}
+                aria-label={directTrust.verified ? "Peer identity verified" : "Verify peer identity (recommended)"}
+                title={safetyNumber ? `Safety number ${safetyNumber}` : "Safety number unavailable"}
+              >
+                {directTrust.verified ? <ShieldCheck size={14} aria-hidden="true" /> : <ShieldAlert size={14} aria-hidden="true" />}
+                {directTrust.verified ? "Verified" : "Not verified"}
+              </button>
+            </div>
           ) : (
-            <span>
-              <ShieldCheck size={13} /> {retentionLabel(room.self_destruct_timer_sec)}
-            </span>
+            <div className="chat-subtitle">
+              <span>{room.visibility === "public" ? "Public room" : "Private room"}</span>
+              <span aria-hidden="true">·</span>
+              <span>{retentionLabel(room.self_destruct_timer_sec)}</span>
+            </div>
           )}
         </div>
-        <div className={`connection-pill state-${connected ? "connected" : "disconnected"}`}>
-          <span />{connected ? "LIVE" : "OFFLINE"}
-        </div>
+        {connected ? null : <span className="offline-badge"><WifiOff size={14} aria-hidden="true" />Offline</span>}
       </header>
 
       <div
@@ -206,16 +220,16 @@ export function ChatView({
       >
         {messages.length === 0 ? (
           <div className="empty-chat">
-            <LockKeyhole size={28} />
-            <strong>{isDirect ? "DIRECT EMPTY" : "ROOM EMPTY"}</strong>
-            <span>{isDirect ? "Send the first private message" : "Waiting for encrypted traffic"}</span>
+            <LockKeyhole size={26} aria-hidden="true" />
+            <strong>No messages yet</strong>
+            <span>{isDirect ? "Messages are end-to-end encrypted. Say hello." : "Messages in this room are end-to-end encrypted."}</span>
           </div>
         ) : messages.map((message) => {
           const original = message.replyToId ? byId.get(message.replyToId) : undefined;
           const attention = !message.mine && (message.mentionsCurrentUser || message.repliesToCurrentUser);
           const attentionLabel = message.mentionsCurrentUser && message.repliesToCurrentUser
-            ? "MENTIONED + REPLIED"
-            : message.repliesToCurrentUser ? "REPLIED TO YOU" : "MENTIONED YOU";
+            ? "Mentioned and replied"
+            : message.repliesToCurrentUser ? "Replied to you" : "Mentioned you";
           return (
             <article
               className={`message-row ${message.mine ? "is-mine" : ""} ${attention ? "is-attention" : ""} ${flashTargetId === message.id ? "is-targeted" : ""}`}
@@ -223,10 +237,16 @@ export function ChatView({
               id={`message-${message.id}`}
             >
               <div className="message-meta">
-                {message.mine ? <PrivacyBlur>{message.senderDisplayName ?? username}</PrivacyBlur> : (
-                  <button type="button" className={`message-author ${PRIVACY_BLUR_CLASS}`} aria-label={message.senderDisplayName ? `${message.senderDisplayName} (${message.sender})` : message.sender} onClick={() => insertComposerToken(`@${message.sender}`)}>
-                    {message.senderDisplayName ?? message.sender}
-                    {message.senderDisplayName && <small className="message-account-id">{message.sender}</small>}
+                {message.mine ? <PrivacyBlur className="message-self">You</PrivacyBlur> : (
+                  <button
+                    type="button"
+                    {...privacyBlurProps(blur, "message-author")}
+                    aria-label={message.senderDisplayName ? `${message.senderDisplayName} (${message.sender})` : message.sender}
+                    title={`Mention ${message.sender}`}
+                    onClick={() => insertComposerToken(`@${message.sender}`)}
+                  >
+                    {message.senderDisplayName ?? shortAccountId(message.sender)}
+                    {message.senderDisplayName ? <small className="message-account-id">{shortAccountId(message.sender)}</small> : null}
                   </button>
                 )}
                 <time>{formatTime(message.createdAtMs)}</time>
@@ -248,7 +268,7 @@ export function ChatView({
                 ) : null}
               </div>
               <div className="message-line">
-                <div className={`message-bubble ${PRIVACY_BLUR_CLASS}`} tabIndex={0} data-privacy-blur="true">
+                <div {...privacyBlurProps(blur, "message-bubble")}>
                   {message.replyToId ? (
                     <button
                       className="reply-preview"
@@ -256,7 +276,7 @@ export function ChatView({
                       onClick={() => message.replyToId && focusMessage(message.replyToId)}
                     >
                       <MessageSquareReply size={14} />
-                      <span>{original ? `${original.sender}: ${original.content}` : "Original message unavailable"}</span>
+                      <span>{original ? `${original.mine ? "You" : original.senderDisplayName ?? shortAccountId(original.sender)}: ${original.content}` : "Original message unavailable"}</span>
                     </button>
                   ) : null}
                   {message.kind === "text" ? (
@@ -289,26 +309,32 @@ export function ChatView({
             <strong>{upload.total ? Math.round(upload.loaded / upload.total * 100) : 0}%</strong>
           </div>
         ) : null}
-        <div className="composer-retention" aria-label="Message retention">
-          <span><Clock3 size={13} />{isDirect ? "MESSAGE RETENTION" : "ROOM RETENTION"}</span>
-          <div role="group" aria-label="Disappearing message timer">
-            {(isDirect ? [0, 5, 10, 30, 60] : [room.self_destruct_timer_sec]).map((seconds) => (
-              <button
-                type="button"
-                key={seconds}
-                className={effectiveRetentionSec === seconds ? "is-active" : ""}
-                disabled={!isDirect}
-                onClick={() => setDirectRetentionSec(seconds)}
-              >
-                {seconds === 0 ? "NEVER" : seconds === 60 ? "1M" : `${seconds}S`}
-              </button>
-            ))}
+        {isDirect ? (
+          <div className="composer-retention">
+            <span id={retentionLabelId}><Clock3 size={13} aria-hidden="true" />Disappear after reading</span>
+            <div className="segmented" role="group" aria-labelledby={retentionLabelId}>
+              {DIRECT_RETENTION_OPTIONS.map((seconds) => (
+                <button
+                  type="button"
+                  key={seconds}
+                  className={effectiveRetentionSec === seconds ? "is-active" : ""}
+                  aria-pressed={effectiveRetentionSec === seconds}
+                  aria-label={seconds === 0 ? "Never" : `${retentionChip(seconds)} after reading`}
+                  onClick={() => setDirectRetentionSec(seconds)}
+                >
+                  {retentionChip(seconds)}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        ) : null}
         {replyTarget ? (
           <div className="composer-reply">
             <MessageSquareReply size={16} />
-            <PrivacyBlur><strong>{replyTarget.sender}</strong>{replyTarget.content}</PrivacyBlur>
+            <span className="composer-reply-text">
+              <span className="composer-reply-label">Replying to {replyTarget.mine ? "yourself" : replyTarget.senderDisplayName ?? shortAccountId(replyTarget.sender)}</span>
+              <PrivacyBlur>{replyTarget.content}</PrivacyBlur>
+            </span>
             <IconButton label="Cancel reply" onClick={() => onReply(null)}><X size={17} /></IconButton>
           </div>
         ) : null}
@@ -319,7 +345,7 @@ export function ChatView({
               <button key={user.username} type="button" role="option" onClick={() => insertComposerToken(`@${user.username}`)}>
                 <AtSign size={14} />
                 <PrivacyBlur><strong>{user.username}</strong></PrivacyBlur>
-                <span className={user.connected ? "is-online" : ""}>{user.connected ? "ONLINE" : "OFFLINE"}</span>
+                <span className={user.connected ? "is-online" : ""}>{user.connected ? "Online" : "Offline"}</span>
               </button>
             ))}
           </div>
@@ -339,7 +365,7 @@ export function ChatView({
           <textarea
             ref={textareaRef}
             aria-label="Message"
-            placeholder={connected ? "Message" : "Reconnecting"}
+            placeholder={connected ? (isDirect ? "Write a message" : "Message the room") : "Offline — waiting for the relay"}
             rows={1}
             maxLength={8000}
             value={draft}
@@ -369,12 +395,13 @@ export function ChatView({
       </footer>
       {showTrustDialog && isDirect && safetyNumber && directTrust.verificationToken && onVerifyToken ? (
         <Dialog
+          className="verify-dialog"
           title="Verify peer identity"
-          description="Compare this safety number with your peer through a trusted channel. Verification is recommended but optional."
+          description="Compare the safety number or verification code with your peer through a trusted channel, such as in person. Verification is recommended but optional."
           onClose={closeTrustDialog}
           actions={
             <>
-              <button className="secondary-button" type="button" onClick={closeTrustDialog}>CANCEL</button>
+              <button className="secondary-button" type="button" onClick={closeTrustDialog}>Cancel</button>
               <button
                 className="primary-button"
                 type="button"
@@ -388,7 +415,7 @@ export function ChatView({
                   }
                 }}
               >
-                VERIFY TOKEN
+                Verify code
               </button>
             </>
           }
@@ -400,9 +427,13 @@ export function ChatView({
               setVerificationRejected(false);
             }}
           />
-          <p className="safety-number-value" aria-label={`Safety number ${safetyNumber}`}>{safetyNumber}</p>
+          <div className="safety-number">
+            <span className="copyable-label">Safety number</span>
+            <p className="safety-number-value" aria-label={`Safety number ${safetyNumber}`}>{safetyNumber}</p>
+          </div>
           <Field
-            label="Peer verification token"
+            label="Peer verification code"
+            placeholder="abyssal:verify:v1:…"
             value={presentedVerificationToken}
             autoComplete="off"
             spellCheck={false}
@@ -411,8 +442,8 @@ export function ChatView({
               setVerificationRejected(false);
             }}
           />
-          {verificationRejected ? <p className="field-error" role="alert">Verification did not match.</p> : null}
-          <p>The QR and safety number are derived locally. Verification stays in RAM and clears after reconnect, identity change, logout, wipe, or expiry.</p>
+          {verificationRejected ? <p className="field-error" role="alert">That code does not match. Make sure you are comparing with the right person.</p> : null}
+          <p className="dialog-note">The QR code and safety number are computed on this device. Verification is kept in memory and clears after a reconnect, identity change, sign-out, wipe, or expiry.</p>
         </Dialog>
       ) : null}
     </section>
@@ -458,7 +489,7 @@ function AttachmentMessage({
       <div className={`attachment-icon type-${attachment.mediaType.toLowerCase()}`}><Icon size={22} /></div>
       <div className="attachment-info">
         <strong>{attachment.name}</strong>
-        <span>{attachment.mediaType} · {formatBytes(attachment.sizeBytes)}{attachment.oneTime ? " · ONE-TIME" : ""}</span>
+        <span>{MEDIA_LABEL[attachment.mediaType]} · {formatBytes(attachment.sizeBytes)}{attachment.oneTime ? " · View once" : ""}</span>
       </div>
       <IconButton label={disabled ? "View attachment (offline)" : "View attachment"} disabled={disabled} onClick={onView}><Play size={17} /></IconButton>
       {!attachment.oneTime ? <IconButton label={disabled ? "Save attachment (offline)" : "Save attachment"} disabled={disabled} onClick={onExport}><ArrowDownToLine size={17} /></IconButton> : null}
@@ -473,8 +504,9 @@ function MessageText({ content, currentUsername }: { content: string; currentUse
         <span
           className={`mention-token ${part.username.toLowerCase() === currentUsername.toLowerCase() ? "is-self" : ""}`}
           key={`${part.text}-${index}`}
+          title={part.text}
         >
-          {part.text}
+          @{part.username.toLowerCase() === currentUsername.toLowerCase() ? "you" : shortAccountId(part.username)}
         </span>
       ) : part.text)}
     </p>
@@ -506,6 +538,18 @@ function expiryLabel(message: ChatMessage, now: number): string {
   return `${remaining}s`;
 }
 
+const DIRECT_RETENTION_OPTIONS = [0, 5, 10, 30, 60];
+const MEDIA_LABEL = { IMAGE: "Image", VIDEO: "Video", FILE: "File" } as const;
+
+function retentionChip(seconds: number): string {
+  if (seconds === 0) return "Off";
+  return seconds % 60 === 0 ? `${seconds / 60}m` : `${seconds}s`;
+}
+
 function retentionLabel(seconds: number): string {
-  return seconds === 0 ? "No read expiry" : `${seconds}s after read`;
+  if (seconds === 0) return "Messages stay for the session";
+  if (seconds < 60) return `Messages vanish ${seconds}s after reading`;
+  if (seconds < 3600) return `Messages vanish ${Math.round(seconds / 60)} min after reading`;
+  if (seconds < 86_400) return `Messages vanish ${Math.round(seconds / 3600)} h after reading`;
+  return `Messages vanish ${Math.round(seconds / 86_400)} d after reading`;
 }

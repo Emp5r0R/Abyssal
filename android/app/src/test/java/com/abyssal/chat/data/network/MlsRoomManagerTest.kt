@@ -4,6 +4,7 @@ import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.MlsIncomingFrame
 import com.abyssal.chat.domain.model.MlsRecoverySnapshotWire
 import com.abyssal.chat.domain.model.MlsRoomPolicyWire
+import com.abyssal.chat.domain.model.MlsRoomVisibility
 import com.abyssal.chat.domain.model.MlsRoomWire
 import com.abyssal.chat.domain.model.MlsRosterMemberWire
 import com.abyssal.chat.domain.repository.OutboundSendResult
@@ -285,6 +286,31 @@ class MlsRoomManagerTest {
             manager.close()
             cipher.clear()
         }
+    }
+
+    @Test
+    fun onlyIdlePublicOwnedRoomsAdmitJoinRequestsAutomatically() {
+        val cipher = identity(7)
+        val publicKey = cipher.publicKey()
+        val manager = MlsRoomManager(cipher, "Alice", "node-1", publicKey)
+        publicKey.fill(0)
+        try {
+            manager.createRoom(room("room_public").copy(roomVisibility = MlsRoomVisibility.PUBLIC))
+            manager.createRoom(room("room_private"))
+            val key = MlsWireCodec.encode(ByteArray(32) { 9 })
+            manager.rememberJoin(MlsIncomingFrame.JoinRequested("room_public", "join-public", "Bob", MlsWireCodec.encode(ByteArray(64) { 8 }), key))
+            manager.rememberJoin(MlsIncomingFrame.JoinRequested("room_private", "join-private", "Carol", MlsWireCodec.encode(ByteArray(64) { 6 }), key))
+            assertEquals(listOf("join-public"), manager.autoAdmittableJoins())
+
+            val staged = manager.prepareApplication("room_public", "busy", "Alice", ByteArray(8) { 1 })
+            assertTrue("a room with a change in flight waits", manager.autoAdmittableJoins().isEmpty())
+            manager.finishTransaction(staged, OutboundSendResult.REJECTED)
+            assertEquals(listOf("join-public"), manager.autoAdmittableJoins())
+        } finally {
+            manager.close()
+            cipher.clear()
+        }
+        assertTrue("a closed manager admits nobody", manager.autoAdmittableJoins().isEmpty())
     }
 
     @Test

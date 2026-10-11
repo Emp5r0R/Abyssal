@@ -17,7 +17,7 @@ describe("invite QR entry", () => {
     const onLogin = vi.fn(async () => ({}) as never);
     const onPreflight = vi.fn(async () => true);
     render(<Entrance onLogin={onLogin} onPreflight={onPreflight} />);
-    fireEvent.click(screen.getByRole("button", { name: "SCAN INVITE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Scan invite" }));
     await act(async () => {
       for (const value of ["file:///etc/passwd", "https://evil.example", QR_TEST_INVITE.slice(0, -1) + "A"]) {
         expect(await camera.accept!(value, new AbortController().signal)).toBe(false);
@@ -32,14 +32,14 @@ describe("invite QR entry", () => {
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
     expect(document.body.textContent).not.toContain(QR_TEST_INVITE);
     expect(onLogin).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
     await waitFor(() => expect(onLogin).toHaveBeenCalledOnce());
     expect(onLogin).toHaveBeenCalledWith(expect.objectContaining({ invite: QR_TEST_INVITE }));
   });
 
   it("rejects late verification after closing the camera", async () => {
     render(<Entrance onLogin={vi.fn()} onPreflight={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "SCAN INVITE" }));
+    fireEvent.click(screen.getByRole("button", { name: "Scan invite" }));
     let result: Promise<boolean>;
     await act(async () => {
       result = camera.accept!(QR_TEST_INVITE, new AbortController().signal);
@@ -58,8 +58,8 @@ describe("invite QR entry", () => {
     fireEvent.change(screen.getByLabelText("Abyssal invite"), { target: { value: QR_TEST_INVITE } });
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password123" } });
     fireEvent.change(screen.getByLabelText("QR image"), { target: { files: [new File(["bytes"], "../qr.png", { type: "image/png" })] } });
-    expect(screen.getByRole("button", { name: "READING IMAGE" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "READING IMAGE" }).querySelector(".abyssal-mark-loader")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Reading image…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Reading image…" }).querySelector(".abyssal-mark-loader")).not.toBeNull();
     fireEvent.submit(document.querySelector("form")!);
     expect(preflight).not.toHaveBeenCalled();
     fireEvent(window, new Event("pagehide"));
@@ -67,7 +67,7 @@ describe("invite QR entry", () => {
     await act(async () => { finish("replacement"); });
     expect(screen.getByLabelText("Abyssal invite")).toHaveValue(QR_TEST_INVITE);
     expect(login).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "OPEN QR IMAGE" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open QR image" })).toBeEnabled();
   });
 
   it("reports invalid image data without changing invite or navigating", async () => {
@@ -90,8 +90,8 @@ describe("invite QR entry", () => {
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
     expect(onLogin).not.toHaveBeenCalled();
     fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password123" } });
-    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
-    await waitFor(() => expect(screen.getByText("Wrong information.")).toBeVisible());
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await waitFor(() => expect(screen.getByText("Sign-in failed. Check the invite and password.")).toBeVisible());
     expect(screen.getByLabelText("Abyssal invite")).toHaveAttribute("type", "password");
     expect(document.body.textContent).not.toContain(QR_TEST_INVITE);
   });

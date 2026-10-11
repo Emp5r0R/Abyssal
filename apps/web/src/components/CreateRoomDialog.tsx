@@ -42,24 +42,24 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
   return (
     <Dialog
       className="room-dialog"
-      title="Create room"
+      title="Create a room"
       description="Everyone in the room follows the same message rules."
       onClose={onCancel}
       actions={
         <>
-          <button className="secondary-button" type="button" onClick={onCancel}>CANCEL</button>
-          <button className="primary-button" type="submit" form="create-room-form" disabled={!room.name.trim()}>CREATE</button>
+          <button className="secondary-button" type="button" onClick={onCancel}>Cancel</button>
+          <button className="primary-button" type="submit" form="create-room-form" disabled={!room.name.trim()}>Create room</button>
         </>
       }
     >
       <form id="create-room-form" className="room-form" onSubmit={submit}>
-        <Field label="Room name" autoFocus maxLength={36} value={room.name} onChange={(event) => {
+        <Field label="Room name" autoFocus maxLength={36} placeholder="e.g. Night shift" hint="The name is end-to-end encrypted. The relay never sees it." value={room.name} onChange={(event) => {
           setFeedback(null);
           setRoom((current) => ({ ...current, name: event.target.value }));
         }} />
         {feedback ? <p className="form-feedback" role="status" aria-live="polite">{feedback}</p> : null}
         <fieldset className="visibility-section">
-          <legend>Who can find it</legend>
+          <legend>Who can join</legend>
           <div className="visibility-control" role="radiogroup" aria-label="Room visibility">
             {(["private", "public"] as const).map((visibility: RoomVisibility) => (
               <label className={`visibility-option ${room.visibility === visibility ? "is-selected" : ""}`} key={visibility}>
@@ -67,15 +67,15 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
                   type="radio"
                   name="room-visibility"
                   value={visibility}
-                  aria-label={visibility === "public" ? "PUBLIC" : "PRIVATE"}
+                  aria-label={visibility === "public" ? "Public" : "Private"}
                   checked={room.visibility === visibility}
                   onChange={() => setRoom((current) => ({ ...current, visibility }))}
                 />
                 <strong>{visibility === "public" ? "Public" : "Private"}</strong>
                 <small>
                   {visibility === "public"
-                    ? "Listed for everyone on this node. You approve each join."
-                    : "Hidden. People join with the room ID you share."}
+                    ? "Listed for everyone on this node. Anyone can join right away."
+                    : "Not listed. People ask to join with the room ID, and you approve each request."}
                 </small>
               </label>
             ))}
@@ -96,7 +96,7 @@ export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void;
         </label>
 
         <details className="room-advanced">
-          <summary>Advanced: media and lifetime rules</summary>
+          <summary>Advanced: attachments and message lifetime</summary>
           <div className="room-advanced-body">
         <PolicySection title="Text" enabled>
           <NumberPair
@@ -195,9 +195,9 @@ function NumberPair({
 }) {
   return (
     <>
-      <Field label="After read (seconds, 0 = never)" type="number" inputMode="numeric" min={0} max={86400} value={read} onChange={(event) => onRead(event.target.value)} />
-      <Field label="Absolute lifetime (seconds)" type="number" inputMode="numeric" min={0} max={86400} value={absolute} disabled={!enforce} onChange={(event) => onAbsolute(event.target.value)} />
-      <Toggle checked={enforce} onChange={onEnforce} label="Enforce absolute lifetime" />
+      <Field label="Disappear after reading (seconds, 0 = never)" type="number" inputMode="numeric" min={0} max={86400} value={read} onChange={(event) => onRead(event.target.value)} />
+      <Field label="Maximum lifetime (seconds)" type="number" inputMode="numeric" min={0} max={86400} value={absolute} disabled={!enforce} onChange={(event) => onAbsolute(event.target.value)} />
+      <Toggle checked={enforce} onChange={onEnforce} label="Delete at maximum lifetime even if unread" />
     </>
   );
 }

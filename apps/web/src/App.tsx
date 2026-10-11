@@ -7,12 +7,15 @@ import { ChatView } from "./components/ChatView";
 import { CreateRoomDialog } from "./components/CreateRoomDialog";
 import { Entrance } from "./components/Entrance";
 import { MediaViewer } from "./components/MediaViewer";
+import { PrivacyBlurProvider } from "./components/PrivacyBlur";
 import { SecurityVerificationGate } from "./components/SecurityVerificationGate";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { CalculatorCover, PinSetup } from "./components/Privacy";
+import { withCoverEnabled } from "./domain/workspacePreferences";
 import type { ReactionAsset } from "./domain/reactions";
 import type { ChatMessage } from "./domain/types";
 import { useAbyssalSession } from "./hooks/useAbyssalSession";
-import { PrivacyPinGate } from "./security/privacyPin";
+import { usePrivacyCover } from "./hooks/usePrivacyCover";
 import {
   verifyOriginAttestation,
   verifyOriginPreflight,
@@ -21,16 +24,16 @@ import {
 
 export default function App() {
   const abyssal = useAbyssalSession();
+  const cover = usePrivacyCover();
   const clearPrivateView = abyssal.clearPrivateView;
-  const [pinGate, setPinGate] = useState<PrivacyPinGate | null>(null);
-  const [locked, setLocked] = useState(false);
+  const { destroyPinGate, lock, respondToHiddenTab } = cover;
   const [showCreateRoom, setShowCreateRoom] = useState(false);
   const [showAttachment, setShowAttachment] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [attachmentRetentionSec, setAttachmentRetentionSec] = useState(5);
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [originStatus, setOriginStatus] = useState<OriginAttestationStatus>("CHECKING");
   const externalPickerRef = useRef(false);
-  const pinGateRef = useRef<PrivacyPinGate | null>(null);
   const attestationGenerationRef = useRef(0);
 
   const checkOrigin = useCallback(() => {
@@ -55,30 +58,26 @@ export default function App() {
     return () => { attestationGenerationRef.current += 1; };
   }, []);
 
-  const destroyPinGate = useCallback(() => {
-    pinGateRef.current?.destroy();
-    pinGateRef.current = null;
-    setPinGate(null);
-  }, []);
-
   const clearTransientUi = useCallback(() => {
     externalPickerRef.current = false;
     setReplyTarget(null);
     setShowAttachment(false);
     setShowCreateRoom(false);
+    setShowSettings(false);
     clearPrivateView();
   }, [clearPrivateView]);
 
   const lockWorkspace = useCallback(() => {
     clearTransientUi();
-    setLocked(true);
-  }, [clearTransientUi]);
+    lock();
+  }, [clearTransientUi, lock]);
 
   useEffect(() => {
     const visibility = () => {
       if (!abyssal.session || document.visibilityState !== "hidden" || externalPickerRef.current) return;
-      if (abyssal.retainWhenHiddenRef.current && pinGateRef.current) lockWorkspace();
-      else void abyssal.logout();
+      const response = respondToHiddenTab();
+      if (response === "lock") lockWorkspace();
+      else if (response === "sign-out") void abyssal.logout();
     };
     const focus = () => window.setTimeout(() => { externalPickerRef.current = false; }, 500);
     document.addEventListener("visibilitychange", visibility);
@@ -87,13 +86,12 @@ export default function App() {
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("focus", focus);
     };
-  }, [abyssal, lockWorkspace]);
+  }, [abyssal, lockWorkspace, respondToHiddenTab]);
 
   useEffect(() => {
     const pageHide = () => {
       flushSync(() => {
         clearTransientUi();
-        setLocked(false);
         destroyPinGate();
       });
     };
@@ -102,17 +100,12 @@ export default function App() {
   }, [clearTransientUi, destroyPinGate]);
 
   useEffect(() => {
-    if (!abyssal.session) {
-      pinGateRef.current?.destroy();
-      pinGateRef.current = null;
-    }
-  }, [abyssal.session]);
+    if (!abyssal.session) destroyPinGate();
+  }, [abyssal.session, destroyPinGate]);
 
   const resetLocal = async () => {
-    setLocked(false);
     clearTransientUi();
     destroyPinGate();
-    setReplyTarget(null);
     await abyssal.logout();
   };
 
@@ -131,73 +124,93 @@ export default function App() {
   }
 
   if (!abyssal.session) {
-    return <Entrance onLogin={abyssal.login} onPreflight={preflightOrigin} notice={abyssal.entryNotice} />;
-  }
-
-  if (!pinGate || pinGate.destroyed) {
     return (
-      <div className="secure-root" onPointerDownCapture={abyssal.touchActivity} onKeyDownCapture={abyssal.touchActivity}>
-        <SecureWorkspace abyssal={abyssal} replyTarget={replyTarget} setReplyTarget={setReplyTarget} onLock={lockWorkspace} setAttachmentRetentionSec={setAttachmentRetentionSec} setShowAttachment={setShowAttachment} setShowCreateRoom={setShowCreateRoom} resetLocal={resetLocal} />
-        <PinSetup onComplete={async (pin, duress) => {
-          const nextGate = await PrivacyPinGate.create(pin, duress);
-          pinGateRef.current?.destroy();
-          pinGateRef.current = nextGate;
-          setPinGate(nextGate);
-        }} />
-      </div>
+      <Entrance
+        onLogin={abyssal.login}
+        onPreflight={preflightOrigin}
+        notice={abyssal.entryNotice}
+        coverEnabled={cover.preferences.coverEnabled}
+        onCoverEnabledChange={(enabled) => cover.updatePreferences(withCoverEnabled(cover.preferences, enabled))}
+      />
     );
   }
 
-  if (locked) {
+  if (cover.locked && cover.pinGate) {
     return (
       <CalculatorCover
-        pinGate={pinGate}
-        onUnlock={() => { abyssal.touchActivity(); setLocked(false); }}
+        pinGate={cover.pinGate}
+        onUnlock={() => { abyssal.touchActivity(); cover.unlock(); }}
         onDuress={() => {
           abyssal.wipeRelay();
           clearTransientUi();
           destroyPinGate();
           abyssal.clearMemory();
-          setLocked(false);
         }}
       />
     );
   }
 
-  return (
-    <div className="secure-root" onPointerDownCapture={abyssal.touchActivity} onKeyDownCapture={abyssal.touchActivity}>
-      <SecureWorkspace abyssal={abyssal} replyTarget={replyTarget} setReplyTarget={setReplyTarget} onLock={lockWorkspace} setAttachmentRetentionSec={setAttachmentRetentionSec} setShowAttachment={setShowAttachment} setShowCreateRoom={setShowCreateRoom} resetLocal={resetLocal} />
+  const dialogsAllowed = !cover.needsPinSetup;
 
-      {showCreateRoom ? <CreateRoomDialog onCancel={() => setShowCreateRoom(false)} onCreate={abyssal.createRoom} /> : null}
-      {showAttachment && abyssal.activeRoom ? (
-        <AttachmentDialog
-          room={abyssal.activeRoom}
-          retentionSec={attachmentRetentionSec}
-          onCancel={() => { externalPickerRef.current = false; setShowAttachment(false); }}
-          onPickerState={(active) => { externalPickerRef.current = active; }}
-          onSend={(file, options) => abyssal.sendAttachment({
-            file,
-            options: { ...options, readSec: attachmentRetentionSec },
-            replyToId: replyTarget?.id,
-          })}
+  return (
+    <PrivacyBlurProvider enabled={cover.preferences.blurEnabled}>
+      <div className="secure-root" onPointerDownCapture={abyssal.touchActivity} onKeyDownCapture={abyssal.touchActivity}>
+        <SecureWorkspace
+          abyssal={abyssal}
+          replyTarget={replyTarget}
+          setReplyTarget={setReplyTarget}
+          canLock={cover.coverReady}
+          onLock={lockWorkspace}
+          onOpenSettings={() => setShowSettings(true)}
+          setAttachmentRetentionSec={setAttachmentRetentionSec}
+          setShowAttachment={setShowAttachment}
+          setShowCreateRoom={setShowCreateRoom}
+          resetLocal={resetLocal}
         />
-      ) : null}
-      {abyssal.media ? <MediaViewer media={abyssal.media} onClose={abyssal.clearMedia} /> : null}
-      {abyssal.notice ? (
-        <div className="notice" role="status" aria-live="polite">
-          <span>{abyssal.notice}</span>
-          <button
-            className="notice-dismiss"
-            type="button"
-            aria-label="Dismiss notice"
-            title="Dismiss notice"
-            onClick={abyssal.clearNotice}
-          >
-            <X size={16} />
-          </button>
-        </div>
-      ) : null}
-    </div>
+
+        {cover.needsPinSetup ? <PinSetup onComplete={cover.installPin} onSkip={cover.skipPinSetup} /> : null}
+        {dialogsAllowed && showSettings ? (
+          <SettingsDialog
+            preferences={cover.preferences}
+            username={abyssal.session.username}
+            nodeId={abyssal.session.nodeId}
+            directoryCheckpoint={abyssal.presence[0]?.directory_digest}
+            onChange={cover.updatePreferences}
+            onWipe={() => { abyssal.wipeRelay(); void resetLocal(); }}
+            onClose={() => setShowSettings(false)}
+          />
+        ) : null}
+        {dialogsAllowed && showCreateRoom ? <CreateRoomDialog onCancel={() => setShowCreateRoom(false)} onCreate={abyssal.createRoom} /> : null}
+        {dialogsAllowed && showAttachment && abyssal.activeRoom ? (
+          <AttachmentDialog
+            room={abyssal.activeRoom}
+            retentionSec={attachmentRetentionSec}
+            onCancel={() => { externalPickerRef.current = false; setShowAttachment(false); }}
+            onPickerState={(active) => { externalPickerRef.current = active; }}
+            onSend={(file, options) => abyssal.sendAttachment({
+              file,
+              options: { ...options, readSec: attachmentRetentionSec },
+              replyToId: replyTarget?.id,
+            })}
+          />
+        ) : null}
+        {dialogsAllowed && abyssal.media ? <MediaViewer media={abyssal.media} onClose={abyssal.clearMedia} /> : null}
+        {dialogsAllowed && abyssal.notice ? (
+          <div className="toast" role="status" aria-live="polite">
+            <span>{abyssal.notice}</span>
+            <button
+              className="toast-dismiss"
+              type="button"
+              aria-label="Dismiss notice"
+              title="Dismiss notice"
+              onClick={abyssal.clearNotice}
+            >
+              <X size={16} />
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </PrivacyBlurProvider>
   );
 }
 
@@ -207,7 +220,9 @@ function SecureWorkspace({
   abyssal,
   replyTarget,
   setReplyTarget,
+  canLock,
   onLock,
+  onOpenSettings,
   setAttachmentRetentionSec,
   setShowAttachment,
   setShowCreateRoom,
@@ -216,7 +231,9 @@ function SecureWorkspace({
   abyssal: AbyssalController;
   replyTarget: ChatMessage | null;
   setReplyTarget: (message: ChatMessage | null) => void;
+  canLock: boolean;
   onLock: () => void;
+  onOpenSettings: () => void;
   setAttachmentRetentionSec: (seconds: number) => void;
   setShowAttachment: (show: boolean) => void;
   setShowCreateRoom: (show: boolean) => void;
@@ -252,7 +269,6 @@ function SecureWorkspace({
     <AppShell
       username={session.username}
       displayName={session.displayName}
-      nodeId={session.nodeId}
       connection={abyssal.connection}
       rooms={abyssal.rooms}
       publicRooms={abyssal.publicRooms}
@@ -262,7 +278,7 @@ function SecureWorkspace({
       activeRoomId={abyssal.activeRoomId}
       maxRooms={session.maxRoomsPerUser}
       remainingSessionSec={abyssal.remainingSessionSec}
-      sessionTimeoutSec={session.sessionInactivitySec}
+      canLock={canLock}
       onOpenRoom={openRoom}
       onOpenDirect={(username) => { setReplyTarget(null); setShowAttachment(false); abyssal.openDirect(username); }}
       onCreateRoom={() => setShowCreateRoom(true)}
@@ -276,8 +292,8 @@ function SecureWorkspace({
       onAcceptRoomLeave={abyssal.acceptRoomLeave}
       onRejectRoomLeave={abyssal.rejectRoomLeave}
       onLock={onLock}
+      onOpenSettings={onOpenSettings}
       onLogout={() => void resetLocal()}
-      onWipe={() => { abyssal.wipeRelay(); void resetLocal(); }}
     >
       {abyssal.activeRoom ? (
         <ChatView

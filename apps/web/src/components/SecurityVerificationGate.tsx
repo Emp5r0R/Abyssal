@@ -54,7 +54,7 @@ export function SecurityVerificationGate({
           size="medium"
         />
         <div className="security-verification-copy">
-          <p className="eyebrow">SECURITY ADMISSION</p>
+          <p className="eyebrow">Security check</p>
           <h1 id="security-verification-title">{copy.title}</h1>
           <p
             id="security-verification-detail"
@@ -68,9 +68,9 @@ export function SecurityVerificationGate({
         {status === "CHECKING" ? null : (
           <div className="security-verification-actions">
             {onEndSession ? (
-              <button className="secondary-button" type="button" onClick={onEndSession}>END SESSION</button>
+              <button className="secondary-button" type="button" onClick={onEndSession}>Sign out</button>
             ) : null}
-            <button className="primary-button" type="button" onClick={onRetry}>RETRY</button>
+            <button className="primary-button" type="button" onClick={onRetry}>Try again</button>
           </div>
         )}
       </section>

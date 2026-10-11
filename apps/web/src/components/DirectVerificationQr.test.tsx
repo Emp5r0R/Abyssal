@@ -19,17 +19,18 @@ describe("DirectVerificationQr", () => {
     const scanned = vi.fn();
     render(<DirectVerificationQr token={token} onScanned={scanned} />);
     expect(screen.getByRole("img", { name: "Direct chat verification QR code" })).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "SCAN PEER QR" }));
+    expect(screen.getByText(token)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Scan peer QR" }));
     fireEvent.click(screen.getByText("invalid"));
     expect(scanned).not.toHaveBeenCalled();
     fireEvent.click(screen.getByText("valid"));
     await waitFor(() => expect(scanned).toHaveBeenCalledWith(token));
-    expect(screen.getByRole("button", { name: "SCAN PEER QR" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Scan peer QR" })).toBeVisible();
   });
   it("cancels camera UI without a verification callback", () => {
     const scanned = vi.fn();
     render(<DirectVerificationQr token={token} onScanned={scanned} />);
-    fireEvent.click(screen.getByRole("button", { name: "SCAN PEER QR" }));
+    fireEvent.click(screen.getByRole("button", { name: "Scan peer QR" }));
     fireEvent.click(screen.getByText("close"));
     expect(scanned).not.toHaveBeenCalled();
   });

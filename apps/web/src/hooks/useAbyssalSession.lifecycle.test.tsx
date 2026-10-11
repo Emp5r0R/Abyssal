@@ -66,6 +66,18 @@ const mocks = vi.hoisted(() => {
       if (!existing) this.pendingJoinItems.push({ roomId: frame.room_id, requestId: frame.request_id, username: frame.username });
     }
     pendingJoins() { return this.pendingJoinItems.map((join) => ({ ...join })); }
+    publicRoomIds = new Set<string>();
+    autoAdmittableJoins() {
+      return this.pendingJoinItems.filter((join) => this.publicRoomIds.has(join.roomId)).map((join) => join.requestId);
+    }
+    acceptJoin(requestId: string) {
+      const request = this.pendingJoinItems.find((join) => join.requestId === requestId);
+      if (!request) throw new Error("Room unavailable");
+      return {
+        roomId: request.roomId, messageId: `join-${requestId}`, revision: 2n, requestId, requestType: "join",
+        frame: { type: "mls_membership_commit", room_id: request.roomId, message_id: `join-${requestId}`, revision: "2", request_id: requestId },
+      };
+    }
     rejectJoin(requestId: string) {
       const request = this.pendingJoinItems.find((join) => join.requestId === requestId);
       if (!request) throw new Error("Room unavailable");
@@ -125,6 +137,9 @@ const mocks = vi.hoisted(() => {
       this.finishOutcomes.push(outcome);
       if (outcome === "ACCEPTED" && prepared.requestType === "leave" && prepared.requestId && prepared.roomId) {
         this.forgetLeave(prepared.roomId, prepared.requestId);
+      }
+      if (outcome === "ACCEPTED" && prepared.requestType === "join" && prepared.requestId) {
+        this.pendingJoinItems = this.pendingJoinItems.filter((join) => join.requestId !== prepared.requestId);
       }
     }
     receiveApplication(frame: { room_id: string; message_id: string; sender_username?: string }) {
@@ -699,7 +714,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     expect(result.current.session).not.toBeNull();
@@ -716,7 +730,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     await act(async () => { mocks.getLastRelay()?.reject("platform-conflict"); });
@@ -730,7 +743,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -782,7 +794,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -805,7 +816,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -826,7 +836,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -843,7 +852,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -885,7 +893,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -934,7 +941,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         await result.current.login({
           invite: "fixture-invite",
           password: new TextEncoder().encode("password"),
-          retainWhenHidden: true,
         });
       });
       const oldRelay = mocks.getLastRelay();
@@ -947,7 +953,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
         await result.current.login({
           invite: "fixture-invite",
           password: new TextEncoder().encode("password"),
-          retainWhenHidden: true,
         });
       });
       const replacementRelay = mocks.getLastRelay();
@@ -969,7 +974,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1017,7 +1021,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1061,7 +1064,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1126,7 +1128,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1172,7 +1173,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1240,7 +1240,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1297,7 +1296,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1355,7 +1353,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1413,7 +1410,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1459,7 +1455,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1496,7 +1491,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1541,7 +1535,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1595,7 +1588,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1665,7 +1657,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1694,7 +1685,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1769,7 +1759,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1826,7 +1815,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1866,7 +1854,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1892,7 +1879,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1925,7 +1911,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -1991,7 +1976,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const secondRelay = mocks.getLastRelay();
@@ -2025,7 +2009,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await expect(result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       })).rejects.toThrow("Node identity mismatch");
     });
 
@@ -2047,7 +2030,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await expect(result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       })).rejects.toThrow("Wrong information");
     });
 
@@ -2063,7 +2045,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -2103,7 +2084,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -2132,7 +2112,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -2222,7 +2201,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -2260,7 +2238,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -2295,7 +2272,6 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       await result.current.login({
         invite: "fixture-invite",
         password: new TextEncoder().encode("password"),
-        retainWhenHidden: true,
       });
     });
     const relay = mocks.getLastRelay();
@@ -2337,7 +2313,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("routes protocol-v10 room sends through MLS and fails closed on ambiguous admission", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2372,7 +2348,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("replays an accepted MLS snapshot transaction without decrypting or republishing the message", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0];
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2401,7 +2377,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     ["revision", (frame: IncomingFrame) => ({ ...frame, revision: "4" })],
   ] as const)("fails closed on an MLS replay with changed %s evidence", async (_label, alter) => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2435,7 +2411,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     }],
   ] as const)("discards authenticated MLS application with %s without logout and replays its accepted snapshot", async (_label, prepare) => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2461,7 +2437,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("fails closed on native MLS application rejection before snapshot admission", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     manager.receiveApplicationError = new Error("native rejection");
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
@@ -2477,7 +2453,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("publishes a valid MLS message only with the current directory checkpoint", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2502,7 +2478,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     ["different directory digest", (payload: Record<string, unknown>) => { payload.directory_digest = presenceCatalog(["Alice", "Carol"]).stamp.directory_digest; }],
   ] as const)("drops an MLS message with %s without accepting its snapshot as application evidence", async (_label, alter) => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2526,7 +2502,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("applies only a valid MLS read receipt for an own message and current directory", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
     await act(async () => {
@@ -2565,14 +2541,14 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     let resolveSnapshot!: (outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
     mocks.FakeRelay.mlsSnapshotResult = new Promise((resolve) => { resolveSnapshot = resolve; });
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const oldRelay = mocks.getLastRelay(); const oldManager = mocks.FakeMlsManager.instances[0]!;
     await act(async () => relayEmitMlsApplication(oldRelay, "stale-snapshot"));
     await waitFor(() => expect(oldRelay?.sent.some((frame) => (frame as { type?: string }).type === "mls_state_snapshot")).toBe(true));
 
     await act(async () => {
       await result.current.logout();
-      await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true });
+      await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") });
     });
     const replacementRelay = mocks.getLastRelay();
     expect(replacementRelay).not.toBe(oldRelay);
@@ -2587,7 +2563,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     let resolveTransaction!: (outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
     mocks.FakeRelay.mlsTransactionResult = new Promise((resolve) => { resolveTransaction = resolve; });
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const oldRelay = mocks.getLastRelay();
     const oldManager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
@@ -2604,7 +2580,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
     await act(async () => {
       await result.current.logout();
-      await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true });
+      await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") });
     });
     const replacementManager = mocks.FakeMlsManager.instances.at(-1)!;
     resolveTransaction("ACCEPTED");
@@ -2620,7 +2596,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     let resolveTransaction!: (outcome: "ACCEPTED" | "REJECTED" | "NOT_SENT" | "AMBIGUOUS") => void;
     mocks.FakeRelay.mlsTransactionResult = new Promise((resolve) => { resolveTransaction = resolve; });
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     const manager = mocks.FakeMlsManager.instances[0]!;
     const catalog = presenceCatalog(["Alice", "Bob"]);
@@ -2650,7 +2626,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
   it.each(["ACCEPTED", "REJECTED", "AMBIGUOUS"] as const)("publishes encrypted room names only after accepted delivery: %s", async (outcome) => {
     const wipe = vi.spyOn(messageMemory, "wipeEvictedMessage");
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay(); const manager = mocks.FakeMlsManager.instances[0]!;
     manager.profile = { version: 1, name: "Private incident response" };
     manager.incomingAttachment = true;
@@ -2685,7 +2661,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("accepts generic protocol-safe room ids and retains join rejection state when send fails", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     expect(result.current.joinRoom("general-room_1")).toBe(true);
     expect(relay?.sent.at(-1)).toMatchObject({ type: "mls_discover_room", room_id: "general-room_1" });
@@ -2705,9 +2681,29 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
+  it("admits public-room join requests automatically and leaves private ones for the owner", async () => {
+    const { result, unmount } = renderHook(() => useAbyssalSession());
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
+    const relay = mocks.getLastRelay();
+    const manager = mocks.FakeMlsManager.instances.at(-1)!;
+    manager.publicRoomIds.add("forum_public");
+    const join = (roomId: string, requestId: string, username: string) => relay?.emit({
+      type: "mls_join_requested", protocol_version: 10, room_id: roomId, request_id: requestId,
+      username, stable_identity_b64: "AA", key_package_b64: "AA",
+    } as unknown as IncomingFrame);
+
+    await act(async () => join("forum_private", "private-request", "Carol"));
+    await act(async () => join("forum_public", "public-request", "Bob"));
+
+    await waitFor(() => expect(result.current.pendingMlsJoins).toEqual([{ roomId: "forum_private", requestId: "private-request", username: "Carol" }]));
+    const commits = relay?.sent.filter((frame) => (frame as { type?: string }).type === "mls_membership_commit") ?? [];
+    expect(commits).toEqual([expect.objectContaining({ room_id: "forum_public", request_id: "public-request" })]);
+    unmount();
+  });
+
   it("accepts only an exact rejection for this client's pending join", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({
       type: "mls_room_discovered", protocol_version: 10, room_id: "general-room", group_id_b64: "AA", owner_username: "Bob",
@@ -2721,7 +2717,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
 
     const second = renderHook(() => useAbyssalSession());
-    await act(async () => { await second.result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await second.result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const secondRelay = mocks.getLastRelay();
     await act(async () => secondRelay?.emit({
       type: "mls_room_discovered", protocol_version: 10, room_id: "other-room", group_id_b64: "AA", owner_username: "Bob",
@@ -2735,7 +2731,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("routes owner leave approval and retains the request when rejection send fails", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     const request = { type: "mls_leave_requested", protocol_version: 10, room_id: "forum_mls", request_id: "leave-request", username: "Bob", stable_identity_b64: "AA" } as unknown as IncomingFrame;
@@ -2759,7 +2755,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("fails closed when a member leave acknowledgement is not bound to its pending request", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     act(() => result.current.leaveRoom("forum_mls"));
@@ -2773,7 +2769,7 @@ describe("useAbyssalSession lifecycle cleanup", () => {
 
   it("removes MLS room state and plaintext messages after the relay confirms the member left", async () => {
     const { result, unmount } = renderHook(() => useAbyssalSession());
-    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password"), retainWhenHidden: true }); });
+    await act(async () => { await result.current.login({ invite: "fixture-invite", password: new TextEncoder().encode("password") }); });
     const relay = mocks.getLastRelay();
     await act(async () => relay?.emit({ type: "mls_rooms", protocol_version: 10, rooms: [{ room_id: "forum_mls", owner_username: "Alice", active: true }] } as unknown as IncomingFrame));
     act(() => result.current.openRoom("forum_mls"));

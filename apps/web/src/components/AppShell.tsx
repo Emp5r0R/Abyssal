@@ -1,16 +1,18 @@
-import { Menu, ShieldAlert } from "lucide-react";
-import { useState } from "react";
+import { Menu } from "lucide-react";
+import { useMemo, useState } from "react";
+import { displayNamesBySender } from "../domain/displayLabels";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
 import type { PublicRoomSummary } from "../transport/mlsWire";
 import { connectionLabel } from "./connectionCopy";
 import { HomeDashboard } from "./HomeDashboard";
 import { Sidebar } from "./Sidebar";
-import { Brand, Dialog, IconButton } from "./Ui";
+import { Brand, IconButton } from "./Ui";
+
+type RoomRequest = { requestId: string; roomId: string; username: string };
 
 interface AppShellProps {
   username: string;
   displayName?: string;
-  nodeId: string;
   connection: ConnectionState;
   rooms: RoomRecord[];
   publicRooms?: PublicRoomSummary[];
@@ -20,13 +22,13 @@ interface AppShellProps {
   activeRoomId: string | null;
   maxRooms: number;
   remainingSessionSec: number;
-  sessionTimeoutSec: number;
+  canLock: boolean;
   onOpenRoom: (chatId: string | null) => void;
   onOpenDirect: (username: string) => void;
   onCreateRoom: () => void;
   onDeleteRoom: (chatId: string) => void;
-  pendingRoomJoins?: Array<{ requestId: string; roomId: string; username: string }>;
-  pendingRoomLeaves?: Array<{ requestId: string; roomId: string; username: string }>;
+  pendingRoomJoins?: RoomRequest[];
+  pendingRoomLeaves?: RoomRequest[];
   onJoinRoom?: (roomId: string) => boolean;
   onAcceptRoomJoin?: (requestId: string) => Promise<boolean>;
   onRejectRoomJoin?: (requestId: string) => boolean;
@@ -34,15 +36,15 @@ interface AppShellProps {
   onAcceptRoomLeave?: (requestId: string) => Promise<boolean>;
   onRejectRoomLeave?: (requestId: string) => boolean;
   onLock: () => void;
+  onOpenSettings: () => void;
   onLogout: () => void;
-  onWipe: () => void;
   children?: React.ReactNode;
 }
 
+/** Two-pane workspace: navigation on the left, the open conversation or Home on the right. */
 export function AppShell({
   username,
   displayName,
-  nodeId,
   connection,
   rooms,
   publicRooms = [],
@@ -52,7 +54,7 @@ export function AppShell({
   activeRoomId,
   maxRooms,
   remainingSessionSec,
-  sessionTimeoutSec,
+  canLock,
   onOpenRoom,
   onOpenDirect,
   onCreateRoom,
@@ -66,42 +68,42 @@ export function AppShell({
   onAcceptRoomLeave = async () => false,
   onRejectRoomLeave = () => false,
   onLock,
+  onOpenSettings,
   onLogout,
-  onWipe,
   children,
 }: AppShellProps) {
   const [mobileMenu, setMobileMenu] = useState(false);
-  const [confirmWipe, setConfirmWipe] = useState(false);
+  const displayNames = useMemo(() => displayNamesBySender(messages), [messages]);
 
   return (
     <main className={`app-shell ${activeRoomId ? "has-active-room" : ""}`}>
       <header className="mobile-topbar">
-        <IconButton label="Open menu" onClick={() => setMobileMenu(true)}><Menu size={21} /></IconButton>
+        <IconButton label="Open menu" onClick={() => setMobileMenu(true)}><Menu size={20} /></IconButton>
         <Brand compact />
-        <span className={`status-chip state-${connection}`}><i />{connectionLabel(connection)}</span>
+        <span className={`status-dot-label state-${connection}`}><i aria-hidden="true" />{connectionLabel(connection)}</span>
       </header>
 
       <Sidebar
         username={username}
         displayName={displayName}
-        nodeId={nodeId}
         connection={connection}
         rooms={rooms}
         directs={directs}
         messages={messages}
         presence={presence}
+        displayNames={displayNames}
         activeRoomId={activeRoomId}
         maxRooms={maxRooms}
         remainingSessionSec={remainingSessionSec}
-        sessionTimeoutSec={sessionTimeoutSec}
+        canLock={canLock}
         open={mobileMenu}
         onClose={() => setMobileMenu(false)}
         onNavigate={onOpenRoom}
         onOpenDirect={onOpenDirect}
         onCreateRoom={onCreateRoom}
         onLock={onLock}
+        onOpenSettings={onOpenSettings}
         onLogout={onLogout}
-        onRequestWipe={() => setConfirmWipe(true)}
       />
       {mobileMenu ? <button className="sidebar-scrim" type="button" aria-label="Close menu" onClick={() => setMobileMenu(false)} /> : null}
 
@@ -114,6 +116,7 @@ export function AppShell({
             publicRooms={publicRooms}
             directs={directs}
             presence={presence}
+            displayNames={displayNames}
             maxRooms={maxRooms}
             connection={connection}
             onOpenRoom={onOpenRoom}
@@ -130,22 +133,6 @@ export function AppShell({
           />
         )}
       </section>
-
-      {confirmWipe ? (
-        <Dialog
-          title="Wipe relay memory?"
-          description="Accounts, sessions, rooms, pending frames, and attachments disappear immediately."
-          onClose={() => setConfirmWipe(false)}
-          actions={
-            <>
-              <button className="secondary-button" type="button" onClick={() => setConfirmWipe(false)}>CANCEL</button>
-              <button className="danger-button" type="button" onClick={() => { setConfirmWipe(false); onWipe(); }}>WIPE NOW</button>
-            </>
-          }
-        >
-          <div className="destructive-summary"><ShieldAlert size={26} /><span>Relay restart and new invite capsules are required after wipe.</span></div>
-        </Dialog>
-      ) : null}
     </main>
   );
 }

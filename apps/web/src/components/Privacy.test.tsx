@@ -48,7 +48,7 @@ describe("privacy cover PIN setup", () => {
     const cover = screen.getByLabelText("Cover PIN");
     const confirm = screen.getByLabelText("Confirm PIN");
     const duress = screen.getByLabelText("Duress PIN (optional)");
-    const submit = screen.getByRole("button", { name: "ENABLE COVER" });
+    const submit = screen.getByRole("button", { name: "Turn on cover" });
 
     expect(submit).toBeDisabled();
     fireEvent.change(cover, { target: { value: "12345" } });
@@ -82,9 +82,9 @@ describe("privacy cover PIN setup", () => {
     expect(cover).toHaveAttribute("autocomplete", "new-password");
     expect(confirm).toHaveAttribute("autocomplete", "new-password");
     expect(cover).toHaveAttribute("name", "privacy-cover-pin");
-    fireEvent.click(screen.getByRole("button", { name: "ENABLE COVER" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on cover" }));
 
-    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Could not enable privacy cover."));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Could not turn on the privacy cover."));
     expect(onComplete).toHaveBeenCalledWith("123456", "");
   });
 });

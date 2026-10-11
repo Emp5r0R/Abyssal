@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MEDIA_LIMIT_BYTES } from "../domain/messagePolicy";
 import type { RoomRecord } from "../domain/types";
 import { AttachmentDialog } from "./AttachmentDialog";
+import { PrivacyBlurProvider } from "./PrivacyBlur";
 
 const room: RoomRecord = {
   id: "forum_private",
@@ -27,15 +28,17 @@ const room: RoomRecord = {
 describe("AttachmentDialog privacy boundary", () => {
   afterEach(cleanup);
 
-  it("conceals the selected attachment name and metadata", () => {
+  it("conceals the selected attachment name and metadata when blur is on", () => {
     const { container } = render(
-      <AttachmentDialog
-        room={room}
-        retentionSec={0}
-        onCancel={vi.fn()}
-        onPickerState={vi.fn()}
-        onSend={vi.fn(async () => true)}
-      />,
+      <PrivacyBlurProvider enabled>
+        <AttachmentDialog
+          room={room}
+          retentionSec={0}
+          onCancel={vi.fn()}
+          onPickerState={vi.fn()}
+          onSend={vi.fn(async () => true)}
+        />
+      </PrivacyBlurProvider>,
     );
     const input = container.querySelector<HTMLInputElement>("input[type='file']");
     expect(input).not.toBeNull();
@@ -44,7 +47,7 @@ describe("AttachmentDialog privacy boundary", () => {
     });
 
     expect(screen.getByText("private-notes.txt").closest("[data-privacy-blur='true']")).not.toBeNull();
-    expect(screen.getByText(/FILE/u).closest("[data-privacy-blur='true']")).not.toBeNull();
+    expect(screen.getByText(/· File/u).closest("[data-privacy-blur='true']")).not.toBeNull();
   });
 
   it("reports invalid selections and resets the picker for the same file", async () => {
@@ -69,7 +72,7 @@ describe("AttachmentDialog privacy boundary", () => {
     fireEvent.change(input, { target: { files: [valid] } });
     expect(screen.getByText("private-notes.txt")).toBeInTheDocument();
     expect(input.value).toBe("");
-    fireEvent.click(screen.getByRole("button", { name: "SEND" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(onSend).toHaveBeenCalledOnce());
   });
 
@@ -124,7 +127,7 @@ describe("AttachmentDialog privacy boundary", () => {
         onSend={vi.fn(async () => true)}
       />,
     );
-    await waitFor(() => expect(screen.getByRole("button", { name: /CHOOSE FILE/u })).toHaveFocus());
+    await waitFor(() => expect(screen.getByRole("button", { name: /Choose a file/u })).toHaveFocus());
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onCancel).toHaveBeenCalledOnce();
   });

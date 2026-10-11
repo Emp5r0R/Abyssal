@@ -775,6 +775,8 @@ class ChatViewModel(
                     is MlsIncomingFrame.JoinRequested -> {
                         runCatching { manager.rememberJoin(frame) }.onFailure { failClosedAfterAmbiguous() }
                         _pendingMlsJoins.value = manager.pendingJoins()
+                        // Public rooms need no owner decision; admission still runs through the owner's commit.
+                        manager.autoAdmittableJoins().forEach(::acceptMlsJoin)
                     }
                     is MlsIncomingFrame.JoinRejected -> {
                         if (!manager.joinRejected(frame.roomId, frame.requestId)) failClosedAfterAmbiguous()
@@ -1945,7 +1947,7 @@ class ChatViewModel(
         viewModelScope.launch {
             val frame = JSONObject().put("type", "mls_discover_room").put("protocol_version", 10).put("room_id", normalized)
             if (transport.sendMlsControl(frame, generation)) {
-                _roomActionNotice.value = "Join request sent. The room owner must approve it."
+                _roomActionNotice.value = joinRequestSentNotice(_publicMlsRooms.value.any { it.roomId == normalized })
             } else {
                 requestedMlsRooms.remove(normalized)
                 _roomActionNotice.value = "Room join request could not be sent."
@@ -3308,6 +3310,12 @@ class ChatViewModel(
         internal const val ROOM_OFFLINE_NOTICE =
             "You are offline. Rooms can be created and joined once the relay reconnects."
         internal const val ROOM_CREATE_FAILED_NOTICE = "The room could not be created. Try again."
+        internal const val PUBLIC_JOIN_SENT_NOTICE =
+            "Joining. Public rooms admit you automatically as soon as the owner is online."
+        internal const val PRIVATE_JOIN_SENT_NOTICE = "Join request sent. The room owner must approve it."
+
+        internal fun joinRequestSentNotice(publicRoom: Boolean): String =
+            if (publicRoom) PUBLIC_JOIN_SENT_NOTICE else PRIVATE_JOIN_SENT_NOTICE
         internal const val SESSION_EXPIRED_NOTICE =
             "Your session ended because the relay restarted or you were inactive. Sign in again; after a relay restart you need a new invite."
         private const val IDENTITY_PUBLIC_KEY_BYTES = 608

@@ -88,14 +88,14 @@ export function AttachmentDialog({
 
   return (
     <Dialog
-      title="Encrypted attachment"
-      description={`Plaintext stays in current browser process. ${retentionSec === 0 ? "No read expiry." : `Expires ${retentionSec}s after read.`}`}
+      title="Send an attachment"
+      description={`Files are encrypted on this device before upload. ${retentionSec === 0 ? "They stay until the session ends." : `They disappear ${retentionSec}s after the recipient opens them.`}`}
       onClose={onCancel}
       actions={
         <>
-          <button className="secondary-button" type="button" onClick={onCancel}>CANCEL</button>
+          <button className="secondary-button" type="button" onClick={onCancel}>Cancel</button>
           <button className="primary-button" type="submit" form="attachment-form" disabled={!file || busy}>
-            <Upload size={17} /> {busy ? "UPLOADING" : "SEND"}
+            <Upload size={17} aria-hidden="true" />{busy ? "Uploading…" : "Send"}
           </button>
         </>
       }
@@ -113,15 +113,15 @@ export function AttachmentDialog({
             <div className={`file-type-mark type-${mediaType?.toLowerCase()}`}>{mediaIcon(mediaType)}</div>
             <div>
               <PrivacyBlur><strong>{file.name}</strong></PrivacyBlur>
-              <PrivacyBlur><span>{formatBytes(file.size)} · {mediaType}</span></PrivacyBlur>
+              <PrivacyBlur>{formatBytes(file.size)} · {mediaType ? MEDIA_LABEL[mediaType] : "File"}</PrivacyBlur>
             </div>
             <IconButton label="Remove attachment" onClick={() => { setFile(null); setFeedback(null); }}><X size={18} /></IconButton>
           </div>
         ) : (
           <button className="file-drop" type="button" onClick={choose}>
-            <Upload size={24} />
-            <strong>CHOOSE FILE</strong>
-            <span>Images 20 MB · Videos 100 MB · Files 200 MB</span>
+            <Upload size={24} aria-hidden="true" />
+            <strong>Choose a file</strong>
+            <span>Images up to 20 MB · videos 100 MB · other files 200 MB</span>
           </button>
         )}
         {feedback ? <p className="form-feedback" role="status" aria-live="polite">{feedback}</p> : null}
@@ -130,19 +130,21 @@ export function AttachmentDialog({
             checked={oneTime}
             onChange={setOneTime}
             disabled={mediaType === "FILE" || !file}
-            label="One-time view"
+            label="View once"
           />
           <Toggle
             checked={deleteAfterDownload || oneTime}
             onChange={setDeleteAfterDownload}
             disabled={oneTime || !file}
-            label="Delete after recipient download"
+            label="Delete after the recipient downloads it"
           />
         </div>
       </form>
     </Dialog>
   );
 }
+
+const MEDIA_LABEL = { IMAGE: "Image", VIDEO: "Video", FILE: "File" } as const;
 
 function mediaIcon(type: ReturnType<typeof classifyMedia> | null) {
   if (type === "IMAGE") return <Image size={22} />;

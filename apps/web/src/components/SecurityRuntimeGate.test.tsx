@@ -25,7 +25,7 @@ describe("security runtime gate", () => {
 
     expect(await screen.findByText("Verification unavailable")).toBeInTheDocument();
     expect(screen.queryByText("Account entry")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "RETRY" }));
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(await screen.findByText("Account entry")).toBeInTheDocument();
     expect(initialize).toHaveBeenCalledTimes(2);

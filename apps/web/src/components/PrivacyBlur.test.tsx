@@ -1,10 +1,23 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
-import { PRIVACY_BLUR_CLASS, PrivacyBlur } from "./PrivacyBlur";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+import { PrivacyBlur, PrivacyBlurProvider } from "./PrivacyBlur";
+import { PRIVACY_BLUR_CLASS } from "./privacyBlurContext";
+
+afterEach(cleanup);
 
 describe("PrivacyBlur", () => {
-  it("marks sensitive content and keeps it keyboard-revealable", () => {
+  it("renders plain text while blur is off", () => {
     render(<PrivacyBlur className="custom">Sensitive label</PrivacyBlur>);
+
+    const boundary = screen.getByText("Sensitive label");
+    expect(boundary).toHaveClass("custom");
+    expect(boundary).not.toHaveClass(PRIVACY_BLUR_CLASS);
+    expect(boundary).not.toHaveAttribute("data-privacy-blur");
+    expect(boundary).not.toHaveAttribute("tabindex");
+  });
+
+  it("marks sensitive content and keeps it keyboard-revealable when blur is on", () => {
+    render(<PrivacyBlurProvider enabled><PrivacyBlur className="custom">Sensitive label</PrivacyBlur></PrivacyBlurProvider>);
 
     const boundary = screen.getByText("Sensitive label");
     expect(boundary).toHaveClass(PRIVACY_BLUR_CLASS, "custom");
