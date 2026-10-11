@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WasmE2eeSession } from "../generated/abyssal_core/abyssal_core";
+
+// The test setup already initialized the WASM core synchronously; skip the
+// network loader, whose download behaviour runtime.test.ts covers.
+vi.mock("./runtime", () => ({ initializeSecurityRuntime: vi.fn(async () => undefined) }));
 import {
   base64ToBytes,
   base64NoPaddingLength,

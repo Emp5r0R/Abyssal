@@ -8,7 +8,11 @@ export interface SecurityRuntimeOptions {
   timeoutMs?: number;
 }
 
-const DEFAULT_RUNTIME_TIMEOUT_MS = 30_000;
+// Backstop for the whole initialization. The download itself fails sooner, as
+// soon as it stops making progress, so slow links finish and dead ones do not hang.
+const DEFAULT_RUNTIME_TIMEOUT_MS = 180_000;
+const WASM_STALL_TIMEOUT_MS = 15_000;
+const MAX_WASM_BYTES = 32 * 1024 * 1024;
 const WASM_ASSET_URL = new URL(
   "../generated/abyssal_core/abyssal_core_bg.wasm",
   import.meta.url,
@@ -65,7 +69,10 @@ function runWithDeadline(
   });
 }
 
-export async function loadSecurityWasm(signal?: AbortSignal): Promise<unknown> {
+export async function loadSecurityWasm(
+  signal?: AbortSignal,
+  fetcher: typeof fetch = (input, init) => globalThis.fetch(input, init),
+): Promise<unknown> {
   const origin = window.location.origin;
   const url = new URL(WASM_ASSET_URL.pathname, origin);
   if (url.origin !== origin || url.search || url.hash) {
@@ -78,9 +85,67 @@ export async function loadSecurityWasm(signal?: AbortSignal): Promise<unknown> {
     credentials: "omit",
     referrerPolicy: "no-referrer",
     redirect: "error",
-    signal,
   });
-  return initWasm({ module_or_path: request });
+  // Compile from downloaded bytes: streaming compilation throttles the download
+  // on slow links, and the bytes let the stall timer see real progress.
+  const bytes = await downloadWithStallTimeout(request, fetcher, signal);
+  return initWasm({ module_or_path: bytes });
+}
+
+/**
+ * Downloads `request`, aborting only when no bytes arrive for `stallMs`, so a slow
+ * but working connection completes. The body is bounded by `maxBytes`.
+ */
+export async function downloadWithStallTimeout(
+  request: Request,
+  fetcher: typeof fetch,
+  parent?: AbortSignal,
+  stallMs = WASM_STALL_TIMEOUT_MS,
+  maxBytes = MAX_WASM_BYTES,
+): Promise<Uint8Array> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  parent?.addEventListener("abort", abort, { once: true });
+  if (parent?.aborted) abort();
+  let timer = setTimeout(abort, stallMs);
+  const progress = () => {
+    clearTimeout(timer);
+    timer = setTimeout(abort, stallMs);
+  };
+  try {
+    const response = await fetcher(new Request(request, { signal: controller.signal }));
+    if (!response.ok) throw new Error("Security runtime asset unavailable");
+    progress();
+    const reader = response.body?.getReader();
+    if (!reader) {
+      const buffer = new Uint8Array(await response.arrayBuffer());
+      if (buffer.byteLength > maxBytes) throw new Error("Security runtime asset too large");
+      return buffer;
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      progress();
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("Security runtime asset too large");
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  } finally {
+    clearTimeout(timer);
+    parent?.removeEventListener("abort", abort);
+  }
 }
 
 const runtime = createSecurityRuntime(loadSecurityWasm);

@@ -9,7 +9,8 @@ digests compiled into the verified bundle instead of at startup. Concurrent
 default startup calls share one in-flight audit; a completed audit is not reused
 for account entry. Each account submission runs a fresh lightweight signed-
 release preflight before invoking authentication. The WASM core is loaded with
-a same-origin `no-store` request and its initialization aborts after 30 seconds.
+a same-origin `no-store` download that fails after 15 seconds without progress,
+under a 180-second initialization cap.
 
 Android account access uses a separate local admission path: the baked build ID,
 source commit, and signature are checked through the compiled offline Ed25519

@@ -4,10 +4,6 @@ import { createSecurityRuntime } from "./runtime";
 const { initWasm } = vi.hoisted(() => ({ initWasm: vi.fn() }));
 vi.mock("../generated/abyssal_core/abyssal_core", () => ({ default: initWasm }));
 
-interface WasmInitRequest {
-  module_or_path: Request;
-}
-
 describe("security runtime", () => {
   it("shares one in-flight initialization across callers", async () => {
     const loader = vi.fn(async () => ({ initialized: true }));
@@ -57,75 +53,84 @@ describe("security runtime", () => {
     }
   });
 
-  it("aborts the production WASM fetch and retries it with a fresh signal", async () => {
+  it("abandons a WASM download that stops making progress, and retries with a fresh signal", async () => {
     vi.useFakeTimers();
     initWasm.mockReset();
-    const fetchAborted = vi.fn();
+    const requests: Request[] = [];
     const fetcher = vi.fn<typeof fetch>((input) => new Promise<Response>((_, reject) => {
-      expect(input).toBeInstanceOf(Request);
-      const signal = (input as Request).signal;
-      if (signal?.aborted) {
-        fetchAborted();
-        reject(new DOMException("The operation was aborted", "AbortError"));
-        return;
-      }
-      signal?.addEventListener("abort", () => {
-        fetchAborted();
-        reject(new DOMException("The operation was aborted", "AbortError"));
-      }, { once: true });
+      const request = input as Request;
+      requests.push(request);
+      request.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
     }));
-    initWasm.mockImplementation(({ module_or_path }: WasmInitRequest) => fetch(module_or_path));
-    vi.stubGlobal("fetch", fetcher);
     try {
-      const { initializeSecurityRuntime } = await import("./runtime");
-      const first = initializeSecurityRuntime();
-      const firstFailure = expect(first).rejects.toThrow("timed out");
-      await vi.advanceTimersByTimeAsync(30_000);
+      const { loadSecurityWasm } = await import("./runtime");
+      const first = loadSecurityWasm(undefined, fetcher);
+      const firstFailure = expect(first).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(requests[0].signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
       await firstFailure;
-      expect(fetcher).toHaveBeenCalledTimes(1);
-      expect(fetchAborted).toHaveBeenCalledTimes(1);
-      const firstRequest = fetcher.mock.calls[0]?.[0] as Request | undefined;
-      const firstSignal = firstRequest?.signal;
-      expect(firstSignal).toBeInstanceOf(AbortSignal);
-      expect(firstSignal?.aborted).toBe(true);
+      expect(requests[0].signal.aborted).toBe(true);
 
-      const second = initializeSecurityRuntime();
-      const secondFailure = expect(second).rejects.toThrow("timed out");
-      await vi.advanceTimersByTimeAsync(30_000);
+      const second = loadSecurityWasm(undefined, fetcher);
+      const secondFailure = expect(second).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(15_000);
       await secondFailure;
-      expect(fetcher).toHaveBeenCalledTimes(2);
-      expect((fetcher.mock.calls[1]?.[0] as Request | undefined)?.signal).not.toBe(firstSignal);
-      expect(fetchAborted).toHaveBeenCalledTimes(2);
+      expect(requests[1].signal).not.toBe(requests[0].signal);
+      expect(initWasm).not.toHaveBeenCalled();
     } finally {
-      vi.unstubAllGlobals();
       vi.useRealTimers();
     }
   });
 
-  it("passes a same-origin no-store Request to the generated initializer", async () => {
+  it("finishes a slow download that keeps making progress, then compiles the bytes", async () => {
+    vi.useFakeTimers();
     initWasm.mockReset();
     initWasm.mockResolvedValue({ initialized: true });
+    const body = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+    let sent = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 10_000));
+        if (sent >= body.length) { controller.close(); return; }
+        controller.enqueue(body.slice(sent, sent + 2));
+        sent += 2;
+      },
+    })));
     try {
       const { loadSecurityWasm } = await import("./runtime");
-      const signal = new AbortController().signal;
-
-      await expect(loadSecurityWasm(signal)).resolves.toEqual({ initialized: true });
-
-      expect(initWasm).toHaveBeenCalledTimes(1);
-      const input = initWasm.mock.calls[0]?.[0] as WasmInitRequest | undefined;
-      const request = input?.module_or_path;
-      expect(request).toBeInstanceOf(Request);
-      expect(new URL(request?.url ?? "").origin).toBe(window.location.origin);
-      expect(request).toEqual(expect.objectContaining({
-        method: "GET",
-        mode: "same-origin",
-        cache: "no-store",
-        credentials: "omit",
-        redirect: "error",
-      }));
-      expect(request?.signal.aborted).toBe(false);
+      const loaded = loadSecurityWasm(undefined, fetcher);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(loaded).resolves.toEqual({ initialized: true });
+      const input = initWasm.mock.calls[0]?.[0] as { module_or_path: Uint8Array };
+      expect(Array.from(input.module_or_path)).toEqual(Array.from(body));
     } finally {
+      vi.useRealTimers();
       initWasm.mockReset();
     }
+  });
+
+  it("requests the WASM same-origin, no-store, and stops at the size bound", async () => {
+    initWasm.mockReset();
+    initWasm.mockResolvedValue({ initialized: true });
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new Uint8Array([0, 97, 115, 109])));
+    const { downloadWithStallTimeout, loadSecurityWasm } = await import("./runtime");
+    await expect(loadSecurityWasm(new AbortController().signal, fetcher)).resolves.toEqual({ initialized: true });
+    const request = fetcher.mock.calls[0]?.[0] as Request;
+    expect(new URL(request.url).origin).toBe(window.location.origin);
+    expect(request).toEqual(expect.objectContaining({
+      method: "GET",
+      mode: "same-origin",
+      cache: "no-store",
+      credentials: "omit",
+      redirect: "error",
+    }));
+
+    const oversized = vi.fn<typeof fetch>(async () => new Response(new Uint8Array(10)));
+    await expect(downloadWithStallTimeout(new Request(window.location.origin), oversized, undefined, 1_000, 4))
+      .rejects.toThrow("too large");
+    const missing = vi.fn<typeof fetch>(async () => new Response("", { status: 404 }));
+    await expect(downloadWithStallTimeout(new Request(window.location.origin), missing)).rejects.toThrow("unavailable");
+    initWasm.mockReset();
   });
 });

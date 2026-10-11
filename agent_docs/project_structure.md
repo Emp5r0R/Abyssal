@@ -11,7 +11,8 @@
   checks assets with at most four workers. Reaction images are deferred to
   `apps/web/src/security/verifiedAssets.ts`, which checks them on first use
   against `src/domain/reactionDigests.generated.ts`. `apps/web/src/security/runtime.ts` loads the WASM core
-  same-origin with `no-store` and aborts initialization at 30 seconds. Default
+  same-origin with `no-store`, failing after 15 seconds without progress
+  (180-second initialization cap). Default
   concurrent startup calls are deduplicated only while the same audit is in
   flight.
 - `android/.../BuildAttestationProvider.kt` performs local baked build ID,
