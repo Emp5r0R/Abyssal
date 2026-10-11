@@ -575,10 +575,18 @@ if PATH="$FAKE_BIN:$PATH" bash "$ROOT_DIR/deploy/server-status.sh" >/dev/null 2>
 fi
 
 DOCKERFILE="$ROOT_DIR/mirage-server/Dockerfile"
-grep -Fq 'COPY tools/release-tool ./tools/release-tool' "$DOCKERFILE" || {
-  echo 'Docker rust workspace is missing the release-tool member.' >&2
+# cargo --locked needs every workspace member in the image, not only the relay's dependencies.
+WORKSPACE_MEMBERS="$(sed -n '/^members = \[/,/^\]/{s/^[[:space:]]*"\([^"]*\)",\{0,1\}$/\1/p}' "$ROOT_DIR/Cargo.toml")"
+[[ -n "$WORKSPACE_MEMBERS" ]] || {
+  echo 'Could not read the Cargo workspace members.' >&2
   exit 1
 }
+while IFS= read -r member; do
+  grep -Fxq "COPY $member ./$member" "$DOCKERFILE" || {
+    echo "Docker rust workspace is missing the $member member." >&2
+    exit 1
+  }
+done <<<"$WORKSPACE_MEMBERS"
 grep -Fq 'ADD .web-release/abyssal-web-*.tar.gz /opt/abyssal/web/' "$DOCKERFILE" || {
   echo 'Docker build does not consume the staged web archive.' >&2
   exit 1
