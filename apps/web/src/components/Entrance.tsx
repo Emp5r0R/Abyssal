@@ -145,6 +145,7 @@ export function Entrance({
               )}
               <QrImageInput compact disabled={busy || scanning} onScanned={acceptScannedInvite} onBusyChange={setReadingImage} resetKey={invite} />
             </div>
+            <p className="field-hint">Or paste a screenshot of the QR (Ctrl+V) or drop the image here.</p>
           </div>
           {scanning ? <QrScanner onScanned={acceptScannedInvite} onClose={stopScanning} /> : null}
 

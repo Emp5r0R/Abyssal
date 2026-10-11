@@ -44,6 +44,7 @@ run_shell() {
   bash "$ROOT_DIR/scripts/test-crypto-source-digest.sh"
   "$ROOT_DIR/scripts/test-release-env-parser.sh"
   "$ROOT_DIR/scripts/test-deployment-inputs.sh"
+  "$ROOT_DIR/scripts/test-installer.sh"
   "$ROOT_DIR/scripts/test-web-release-archive.sh"
   "$ROOT_DIR/scripts/test-invite-qr-renderer.sh"
   "$ROOT_DIR/scripts/test-cargo-audit-check.sh"

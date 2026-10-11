@@ -1,4 +1,5 @@
-//! One-shot invite presentation. QR output never falls back to disclosing text.
+//! One-shot invite presentation. QR output never falls back to disclosing text,
+//! and text appears only when its own setting allows it.
 
 use qrcode::{Color, EcLevel, QrCode};
 use std::{
@@ -7,32 +8,70 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+/// Which presentations of each boot invite reach the terminal. Both by default,
+/// so an operator can scan the QR or copy the code from the same output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InviteOutputMode {
-    Qr,
-    Text,
+pub(super) struct InviteOutputMode {
+    pub(super) qr: bool,
+    pub(super) text: bool,
 }
 
 impl InviteOutputMode {
+    #[cfg(test)]
+    pub(super) const QR_AND_TEXT: Self = Self {
+        qr: true,
+        text: true,
+    };
+    #[cfg(test)]
+    pub(super) const QR_ONLY: Self = Self {
+        qr: true,
+        text: false,
+    };
+    #[cfg(test)]
+    pub(super) const TEXT_ONLY: Self = Self {
+        qr: false,
+        text: true,
+    };
+
     pub(super) fn from_env() -> Result<Self, String> {
-        match env::var("ABYSSAL_INVITE_QR_ENABLED") {
-            Ok(value) => Self::parse(Some(&value)),
-            Err(env::VarError::NotPresent) => Self::parse(None),
-            Err(env::VarError::NotUnicode(_)) => Err(Self::invalid_setting()),
-        }
+        let qr = read_setting("ABYSSAL_INVITE_QR_ENABLED")?;
+        let text = read_setting("ABYSSAL_INVITE_TEXT_ENABLED")?;
+        Self::parse(qr.as_deref(), text.as_deref())
     }
 
-    fn parse(value: Option<&str>) -> Result<Self, String> {
-        match value {
-            None | Some("true") => Ok(Self::Qr),
-            Some("false") => Ok(Self::Text),
-            _ => Err(Self::invalid_setting()),
+    fn parse(qr: Option<&str>, text: Option<&str>) -> Result<Self, String> {
+        let mode = Self {
+            qr: parse_flag("ABYSSAL_INVITE_QR_ENABLED", qr)?,
+            text: parse_flag("ABYSSAL_INVITE_TEXT_ENABLED", text)?,
+        };
+        if !mode.qr && !mode.text {
+            return Err(
+                "ABYSSAL_INVITE_QR_ENABLED and ABYSSAL_INVITE_TEXT_ENABLED cannot both be false"
+                    .to_owned(),
+            );
         }
+        Ok(mode)
     }
+}
 
-    fn invalid_setting() -> String {
-        "ABYSSAL_INVITE_QR_ENABLED must be exactly true or false".to_owned()
+fn read_setting(key: &str) -> Result<Option<String>, String> {
+    match env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(invalid_setting(key)),
     }
+}
+
+fn parse_flag(key: &str, value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => Err(invalid_setting(key)),
+    }
+}
+
+fn invalid_setting(key: &str) -> String {
+    format!("{key} must be exactly true or false")
 }
 
 pub(super) fn write_qr<W: Write>(output: &mut W, deep_link: &str) -> io::Result<()> {
@@ -80,19 +119,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_qr_and_only_explicit_false_discloses_text() {
-        assert_eq!(InviteOutputMode::parse(None).unwrap(), InviteOutputMode::Qr);
+    fn default_prints_qr_and_text_and_each_can_be_turned_off() {
         assert_eq!(
-            InviteOutputMode::parse(Some("true")).unwrap(),
-            InviteOutputMode::Qr
+            InviteOutputMode::parse(None, None).unwrap(),
+            InviteOutputMode::QR_AND_TEXT
         );
         assert_eq!(
-            InviteOutputMode::parse(Some("false")).unwrap(),
-            InviteOutputMode::Text
+            InviteOutputMode::parse(Some("true"), Some("false")).unwrap(),
+            InviteOutputMode::QR_ONLY
+        );
+        assert_eq!(
+            InviteOutputMode::parse(Some("false"), None).unwrap(),
+            InviteOutputMode::TEXT_ONLY
+        );
+        assert_eq!(
+            InviteOutputMode::parse(Some("false"), Some("false")).unwrap_err(),
+            "ABYSSAL_INVITE_QR_ENABLED and ABYSSAL_INVITE_TEXT_ENABLED cannot both be false"
         );
         for input in ["", "1", "0", "TRUE", "False", " false", "true\n", "secret"] {
-            let error = InviteOutputMode::parse(Some(input)).unwrap_err();
-            assert_eq!(error, InviteOutputMode::invalid_setting());
+            assert_eq!(
+                InviteOutputMode::parse(Some(input), None).unwrap_err(),
+                invalid_setting("ABYSSAL_INVITE_QR_ENABLED")
+            );
+            assert_eq!(
+                InviteOutputMode::parse(None, Some(input)).unwrap_err(),
+                invalid_setting("ABYSSAL_INVITE_TEXT_ENABLED")
+            );
         }
     }
 

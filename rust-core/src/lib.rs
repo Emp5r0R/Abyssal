@@ -1,6 +1,7 @@
 pub mod attachment_transport;
 pub mod invite_protocol;
 pub mod mls_protocol;
+pub mod qr_decode;
 pub mod qr_image;
 pub mod release_provenance;
 mod release_root;

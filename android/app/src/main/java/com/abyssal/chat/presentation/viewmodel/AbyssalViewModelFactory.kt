@@ -1,5 +1,6 @@
 package com.abyssal.chat.presentation.viewmodel
 
+import com.abyssal.chat.data.notifications.AndroidMessageNotifier
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -101,7 +102,8 @@ class AbyssalViewModelFactory(
             initialReleaseVerificationStatus = initialReleaseVerificationStatus(
                 localBuildAttestation != null
             ),
-            payloadCipher = payloadCipher
+            payloadCipher = payloadCipher,
+            messageNotifier = AndroidMessageNotifier(appContext)
         ) as T
     }
 }

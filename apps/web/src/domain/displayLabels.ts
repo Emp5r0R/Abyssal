@@ -1,4 +1,4 @@
-import type { ChatMessage } from "./types";
+import type { ChatMessage, DirectRecord, RoomRecord } from "./types";
 
 const ACCOUNT_ID = /^acct_([0-9a-f]{8,})$/iu;
 
@@ -47,4 +47,36 @@ export function displayNamesBySender(messages: Readonly<Record<string, readonly 
     }
   }
   return new Map([...names].map(([key, value]) => [key, value.name]));
+}
+
+export interface ConversationEntry {
+  id: string;
+  kind: "room" | "direct";
+  label: string;
+  /** Extra text a search may match, such as the full account or room ID. */
+  searchText: string;
+}
+
+/** Every open conversation in sidebar order: rooms first, then direct messages. */
+export function conversationEntries(
+  rooms: readonly RoomRecord[],
+  directs: readonly DirectRecord[],
+  displayNames: ReadonlyMap<string, string>,
+): ConversationEntry[] {
+  return [
+    ...rooms.map((room) => ({ id: room.id, kind: "room" as const, label: roomLabel(room), searchText: room.id })),
+    ...directs.map((direct) => ({
+      id: direct.id,
+      kind: "direct" as const,
+      label: displayNames.get(direct.peer_username.toLowerCase()) ?? shortAccountId(direct.peer_username),
+      searchText: direct.peer_username,
+    })),
+  ];
+}
+
+/** Case-insensitive match on the label or the underlying ID. */
+export function filterConversations(entries: readonly ConversationEntry[], query: string): ConversationEntry[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [...entries];
+  return entries.filter((entry) => entry.label.toLowerCase().includes(needle) || entry.searchText.toLowerCase().includes(needle));
 }

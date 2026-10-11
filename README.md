@@ -119,6 +119,9 @@ current process. Development relays issue a typed loopback invite for
 - Direct headers display a symmetric safety number derived from both identity keys. Both participants should compare it through a separate trusted channel. Confirmation is advisory and explicit rather than a prerequisite for encrypted sends, attachment access/export, or network read receipts.
 - Direct composers choose retention for each text, GIF, or attachment: `Never`, `5s`, `10s`, `30s`, or `1m`. `Never` means retained only for the current client/relay RAM lifetime; restart, wipe, logout, or process loss still removes it.
 - Room creators may set any after-read timer to `0` for no read-triggered expiry. Room policy is locked for participants, including text and media-specific timers; a sender cannot extend it from the composer.
+- QR codes for invites and peer verification can be scanned with the camera, opened from an image, pasted from the clipboard (web: Ctrl/⌘+V anywhere, or drop the image; Android: "Paste copied QR image"). One shared Rust decoder on both clients reads cropped codes with no quiet zone, terminal screenshots with blank lines between rows, light-on-dark codes and noisy photos; the decoded text is still verified as a signed invite or verification token.
+- Settings on both clients offer the calculator cover, what happens when you leave (lock behind the calculator, sign out, or stay signed in), blur for names and messages (off by default; hover or focus to reveal on web, tap to reveal for a few seconds on Android), and message notifications at four privacy levels: off (default), private ("New message" only), sender, or sender and preview. Notifications never appear while the workspace is locked behind the calculator; Android hides their text on the lock screen.
+- Web keyboard shortcuts: Ctrl/⌘+K jumps to any conversation, Alt+↑/↓ steps between conversations, `/` focuses the composer, `?` lists every shortcut, and Alt+Shift+H/N/S/L/B go home, create a room, open settings, lock, and toggle blur.
 - Android checks the latest stable GitHub release after launch without caching metadata to disk. A newer signed universal APK opens in the system browser only after explicit confirmation; users can cancel for the process lifetime or request an in-memory reminder two hours later. The prompt never appears over the calculator cover.
 
 ### Signed release build
@@ -242,11 +245,12 @@ Health check:
 curl http://127.0.0.1:4020/health
 ```
 
-The server prints each signed Invite Capsule once as a terminal QR by default,
-without an accompanying visible code. Scan it from a private, sufficiently wide
-ANSI/UTF-8 terminal. Set `ABYSSAL_INVITE_QR_ENABLED=false` explicitly to print
-the `ABY1-...` and `abyssal:invite:...` text forms instead. QR encoding errors
-never fall back to text. Both presentations encode the same 256-bit account-bootstrap
+The server prints each signed Invite Capsule once by default as a terminal QR
+followed by its `ABY1-...` manual code and `abyssal:invite:...` deep link, so you
+can scan it or copy it. Use a private, sufficiently wide ANSI/UTF-8 terminal. Set
+`ABYSSAL_INVITE_TEXT_ENABLED=false` for QR-only output or
+`ABYSSAL_INVITE_QR_ENABLED=false` for text-only output. QR encoding errors never
+fall back to text. Both presentations encode the same 256-bit account-bootstrap
 capability, authenticated node identity, typed locator, protocol range, flags,
 and optional expiry. The relay never writes capsules to a file or Docker log;
 after printing, plaintext capability buffers are zeroized and only
@@ -278,7 +282,8 @@ Security-related relay knobs:
 - `ABYSSAL_NODE_SIGNING_KEY_FILE`: required path to an exact 32-byte raw Ed25519 seed owned by the relay user with mode `0600`. This infrastructure identity is never printed.
 - `ABYSSAL_PUBLIC_URL`: required advertised locator embedded in signed capsules and the signed node descriptor. Production accepts HTTPS DNS hosts; HTTP is limited to typed loopback development hosts.
 - `ABYSSAL_INVITE_COUNT`: number of fresh account-bootstrap capsules emitted once at startup. Default: `5`; accepted range: `0` to `256` (the tracked production template uses `8`).
-- `ABYSSAL_INVITE_QR_ENABLED`: `true` by default for QR-only terminal output; exact `false` enables one-shot text output. Other values abort startup. No extra executable or runtime package is required for server QR rendering.
+- `ABYSSAL_INVITE_QR_ENABLED`: `true` by default; prints each boot invite as a terminal QR. Exact `false` omits the QR.
+- `ABYSSAL_INVITE_TEXT_ENABLED`: `true` by default; prints each boot invite's `ABY1-...` code and `abyssal:invite:...` deep link after its QR. Exact `false` gives QR-only output. Other values for either setting, or both `false`, abort startup. No extra executable or runtime package is required for server QR rendering.
 - `ABYSSAL_INVITE_EXPIRY_HOURS`: optional registration deadline. `0` disables wall-clock expiry; values up to `8760` hours are enforced by both clients and relay.
 - `ABYSSAL_INVITE_PRINT_DELAY_MS`: brief attached-terminal delay before one-shot output. It is not a persistence or retrieval window.
 - `ABYSSAL_ATTACHMENT_RAM_LIMIT_MB`: total in-memory encrypted attachment budget. Default: `512`.
@@ -311,6 +316,46 @@ Plaintexts use authenticated 256-byte length buckets, while complete direct encr
 Protocol-v10 rooms use RFC 9420 MLS through exact `mls-rs 0.55.4` and `mls-rs-crypto-rustcrypto 0.22.1`. Owner-committed key-package joins (approved by the owner for private rooms, automatic for public rooms) produce Welcome messages; additions and removals advance the MLS epoch and authenticated roster. Sender state commits only after an exact accepted `mls_room_result`, and recipient application/control state commits only after an exact accepted `mls_snapshot_result`. Reconnecting members recover sealed RAM-only snapshots and queued ciphertext, remain blocked from sending while `synchronized=false`, and resume only after exact acknowledgements plus a fresh current catalog. Relay and clients bound rooms, members, replay IDs, state, queued deliveries, and offline lifetime. A delivery gap beyond the MLS implementation's 1,024-generation back-history drops the undecryptable queued tail and requires a membership epoch refresh. Relay never receives MLS group secrets or room plaintext.
 
 This room protocol is not a Signal-grade claim. The selected RustCrypto MLS provider is marked experimental, `mls-rs` and Abyssal have no independent cryptographic audit, and external key transparency, multi-device coordination, and persistent rollback anchors remain absent. See [SECURITY.md](SECURITY.md).
+
+## Install on a VPS (one command)
+
+`abyssal-install.sh`, attached to every release, installs the relay and the web
+app on a Linux server, fresh or already in use (Debian, Ubuntu, Fedora, RHEL
+family and others; x86_64 or arm64). Point a DNS name at the server, then:
+
+```bash
+curl -fsSLO https://github.com/Emp5r0R/Abyssal/releases/latest/download/abyssal-install.sh
+sudo bash abyssal-install.sh --domain chat.example.com
+```
+
+The installer:
+
+- installs Docker Engine with the Compose and Buildx plugins when missing;
+- downloads `abyssal-server-VERSION.tar.gz` and checks its published SHA-256;
+- builds the relay image, and the build refuses a web bundle the offline release
+  key did not sign for that exact source commit;
+- generates the node signing key once in `/var/lib/abyssal` (or imports one with
+  `--node-key FILE`) and keeps it across upgrades;
+- serves HTTPS with Caddy and Let's Encrypt when ports 80 and 443 are free, and
+  otherwise leaves the relay on `127.0.0.1:4020` and prints nginx and Cloudflare
+  Tunnel examples (`--proxy caddy|none` chooses explicitly);
+- adds temporary swap only while compiling on small servers, removed before the
+  relay starts, so relay memory never pages to disk;
+- starts the relay and prints the one-time invites (QR and code) to your terminal.
+
+Afterwards the same script is installed as `abyssal`:
+
+```bash
+sudo abyssal status      # containers, health, public reachability
+sudo abyssal restart     # wipes RAM state and prints new invites
+sudo abyssal upgrade     # latest release (or --version X.Y.Z)
+sudo abyssal uninstall   # add --purge to delete the node key and settings
+```
+
+Settings live in `/etc/abyssal/relay.env`; the node key in
+`/var/lib/abyssal/node-signing.key`. Another container already holding the relay
+port, such as an earlier manual deployment, is stopped only with
+`--replace-existing`. Run `bash abyssal-install.sh --help` for every option.
 
 ## Docker
 

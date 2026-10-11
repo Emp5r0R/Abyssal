@@ -1,5 +1,9 @@
 package com.abyssal.chat.presentation.screens
 
+import com.abyssal.chat.data.qr.ClipboardQrImage
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.foundation.text.selection.SelectionContainer
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
@@ -543,14 +547,16 @@ private fun ChatHeader(
             Spacer(modifier = Modifier.width(12.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = if (session?.isForum == true) "#${session.name}" else session?.name ?: "Secure chat",
-                    color = PureWhite,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                PrivacyBlurred {
+                    Text(
+                        text = if (session?.isForum == true) "#${session.name}" else session?.name ?: "Secure chat",
+                        color = PureWhite,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     LockIcon(modifier = Modifier.size(10.dp), color = NeonGreen)
                     if (session?.isForum != false) {
@@ -629,11 +635,10 @@ private fun DirectTrustDialog(
             imagePickerToken = null
         }
     }
-    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        val token = imagePickerToken
-        imagePickerToken = null
-        val accepted = token != null && onExternalSystemUiEnd(token)
-        if (accepted && uri != null && !readingImage) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember(verificationToken) { mutableStateOf(false) }
+    val readImage: (android.net.Uri) -> Unit = { uri ->
+        if (!readingImage) {
             readingImage = true
             imageError = false
             imageJob = scope.launch {
@@ -651,6 +656,12 @@ private fun DirectTrustDialog(
                 }
             }
         }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val token = imagePickerToken
+        imagePickerToken = null
+        val accepted = token != null && onExternalSystemUiEnd(token)
+        if (accepted && uri != null) readImage(uri)
     }
     if (scanning) {
         DirectVerificationQrScanner(
@@ -674,6 +685,37 @@ private fun DirectTrustDialog(
         Box(modifier = Modifier.fillMaxWidth().padding(top = 16.dp), contentAlignment = Alignment.Center) {
             DirectVerificationQr(verificationToken)
         }
+        Text(
+            text = "YOUR VERIFICATION CODE",
+            color = SteelMuted,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(top = 14.dp)
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SelectionContainer(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = verificationToken,
+                    color = PureWhite,
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+            TextButton(onClick = {
+                clipboard.setText(AnnotatedString(verificationToken))
+                copied = true
+            }) { Text(if (copied) "COPIED" else "COPY", color = NeonCyan) }
+        }
+        Text(
+            text = "You and your peer see the same code. It is derived from public keys and is safe to share.",
+            color = SteelMuted,
+            fontSize = 12.sp,
+            lineHeight = 17.sp
+        )
         Text(
             text = safetyNumber,
             color = NeonGreen,
@@ -703,9 +745,17 @@ private fun DirectTrustDialog(
                 modifier = Modifier.weight(1f)
             ) { Text(if (readingImage) "READING..." else "OPEN QR IMAGE") }
         }
+        TextButton(
+            onClick = {
+                val uri = ClipboardQrImage.imageUri(context)
+                if (uri == null) imageError = true else readImage(uri)
+            },
+            enabled = !readingImage,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("PASTE COPIED QR IMAGE") }
         if (imageError) {
             Text(
-                text = "QR image not accepted.",
+                text = "No valid QR code found. Copy a screenshot of your peer's QR, then paste it.",
                 color = SelfDestructAmber,
                 fontSize = 12.sp,
                 modifier = Modifier.padding(top = 6.dp)
@@ -1582,16 +1632,15 @@ private fun MessageBubbleItem(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(bottom = 4.dp)
             ) {
-                Text(
-                    text = message.senderDisplayName?.let { "$it\n${message.sender}" } ?: message.sender,
-                    color = SteelMuted,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier
-                        .weight(1f, fill = false)
-                        .padding(start = 8.dp)
-                        .clickable(role = Role.Button) { onMentionSender(message.sender) }
-                )
+                PrivacyBlurred(modifier = Modifier.weight(1f, fill = false).padding(start = 8.dp)) {
+                    Text(
+                        text = message.senderDisplayName?.let { "$it\n${message.sender}" } ?: message.sender,
+                        color = SteelMuted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable(role = Role.Button) { onMentionSender(message.sender) }
+                    )
+                }
                 if (message.senderClient == SenderClient.WEB) {
                     WebOriginBadge(notice = message.senderClient.originNotice())
                 }
@@ -1650,10 +1699,12 @@ private fun MessageBubbleItem(
                                 onSaveAttachment = onSaveAttachment
                             )
                         } else {
-                            MessageText(
-                                content = message.content,
-                                currentUsername = currentUsername
-                            )
+                            PrivacyBlurred {
+                                MessageText(
+                                    content = message.content,
+                                    currentUsername = currentUsername
+                                )
+                            }
                         }
 
                         if (message.readTimestampMs != null && message.selfDestructDurationSec > 0) {
@@ -1868,14 +1919,16 @@ private fun MediaMessageContent(
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace
                 )
-                Text(
-                    text = message.attachmentName ?: message.content,
-                    color = PureWhite,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                PrivacyBlurred {
+                    Text(
+                        text = message.attachmentName ?: message.content,
+                        color = PureWhite,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 Text(
                     text = "${message.mediaSizeMb} MB  |  ${if (message.oneTimeView) "one-time view" else "RAM encrypted"}",
                     color = SteelMuted,

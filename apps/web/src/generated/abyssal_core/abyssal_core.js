@@ -2055,6 +2055,28 @@ export function decodeQrImage(bytes, mime) {
 }
 
 /**
+ * @param {Uint8Array} luminance
+ * @param {number} width
+ * @param {number} height
+ * @param {boolean} thorough
+ * @returns {string | undefined}
+ */
+export function decodeQrLuminance(luminance, width, height, thorough) {
+    const ptr0 = passArray8ToWasm0(luminance, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decodeQrLuminance(ptr0, len0, width, height, thorough);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    let v2;
+    if (ret[0] !== 0) {
+        v2 = getStringFromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    }
+    return v2;
+}
+
+/**
  * @param {string} chat_id
  * @param {string} message_id
  * @param {string} sender_username

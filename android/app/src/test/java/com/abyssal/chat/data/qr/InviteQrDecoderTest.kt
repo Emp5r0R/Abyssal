@@ -1,5 +1,8 @@
 package com.abyssal.chat.data.qr
 
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
@@ -7,6 +10,34 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class InviteQrDecoderTest {
+    /** Renders [text] as greyscale with blank rows between module rows, inverted or borderless. */
+    private fun render(text: String, scale: Int, margin: Int, gapRows: Int = 0, invert: Boolean = false): Triple<ByteArray, Int, Int> {
+        val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, 0, 0, mapOf(EncodeHintType.MARGIN to margin))
+        val side = matrix.width * scale
+        val pixels = ByteArray(side * side) { index ->
+            val x = index % side
+            val y = index / side
+            val inGap = gapRows > 0 && y % scale >= scale - gapRows
+            val dark = !inGap && matrix[x / scale, y / scale]
+            if (dark != invert) 0 else 255.toByte()
+        }
+        return Triple(pixels, side, side)
+    }
+
+    @Test fun stillImagesReadThroughTerminalGapsInversionAndMissingBorders() {
+        val text = "abyssal:invite:" + "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z".repeat(10)
+        val cases = listOf(
+            render(text, scale = 8, margin = 2, gapRows = 3),
+            render(text, scale = 4, margin = 4, invert = true),
+            render(text, scale = 4, margin = 0),
+        )
+        for ((pixels, width, height) in cases) {
+            assertEquals(text, InviteQrDecoder.decodeLuminance(pixels, width, height, thorough = true))
+        }
+        val (blank, side, _) = Triple(ByteArray(300 * 300) { 255.toByte() }, 300, 300)
+        assertNull(InviteQrDecoder.decodeLuminance(blank, side, side, thorough = true))
+    }
+
     @Test fun cameraPlaneStridesAndOffsetsAreBounded() {
         val buffer = ByteBuffer.wrap(byteArrayOf(99, 0, 9, 1, 9, 88, 2, 9, 3))
         buffer.position(1)

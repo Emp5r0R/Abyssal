@@ -34,6 +34,7 @@ export function DirectVerificationQr({ token, onScanned }: {
         )}
         <QrImageInput disabled={scanning} onScanned={accept} />
       </div>
+      <p className="field-hint">You can also paste a screenshot of your peer's QR (Ctrl+V).</p>
       {scanning ? <QrScanner onScanned={accept} onClose={() => setScanning(false)} /> : null}
     </div>
   );

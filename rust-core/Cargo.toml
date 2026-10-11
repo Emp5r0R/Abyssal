@@ -21,6 +21,8 @@ abyssal-invite = { path = "../abyssal-invite" }
 abyssal-transport = { path = "../abyssal-transport" }
 # Local QR import only; no other image formats or filesystem inputs are enabled.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+# Offline QR detection shared by web (WASM) and Android (UniFFI).
+rqrr = "=0.11.0"
 # Secure memory wiping on drop
 zeroize = { version = "1.7", features = ["derive"] }
 
@@ -65,3 +67,7 @@ wasm-bindgen = "=0.2.126"
 
 [build-dependencies]
 uniffi = { version = "0.32", default-features = false, features = ["build"] }
+
+[dev-dependencies]
+# Renders QR fixtures for the decoder tests; same pinned encoder as the relay.
+qrcode = { version = "=0.14.1", default-features = false }

@@ -12,13 +12,29 @@ COPY tools/release-tool ./tools/release-tool
 RUN --mount=type=cache,id=abyssal-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=abyssal-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=abyssal-rust-target,target=/repo/target,sharing=locked \
-    cargo build --release --locked --package mirage-server \
+    cargo build --release --locked --package mirage-server --package abyssal-release-tool \
     && mkdir -p /out \
-    && cp /repo/target/release/mirage-server /out/mirage-server
+    && cp /repo/target/release/mirage-server /repo/target/release/abyssal-release-tool /out/
+
+# The relay serves only a web build that the offline release key signed for this
+# exact source commit. Every deployment path stages the archive, its signed
+# manifest and detached signature, and the commit; the image cannot build without them.
+COPY .web-release/ /web-release/
+RUN set -eu; \
+    cd /web-release; \
+    set -- abyssal-web-*.tar.gz; \
+    test "$#" -eq 1 && test -f "$1" && test ! -L "$1"; \
+    /out/abyssal-release-tool verify-web-archive \
+      --manifest release-manifest-v1.json \
+      --signature release-manifest-v1.sig \
+      --archive "$1" \
+      --source-commit "$(cat source-commit)"; \
+    mkdir -p /verified/web; \
+    tar -xzf "$1" -C /verified/web --no-same-owner --no-same-permissions
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS web-runtime
 
-ADD .web-release/abyssal-web-*.tar.gz /opt/abyssal/web/
+COPY --from=rust-builder /verified/web /opt/abyssal/web
 RUN set -eux; \
     test -f /opt/abyssal/web/index.html; \
     test ! -L /opt/abyssal/web/index.html; \

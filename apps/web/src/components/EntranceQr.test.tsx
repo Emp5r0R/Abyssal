@@ -74,11 +74,36 @@ describe("invite QR entry", () => {
     image.read.mockResolvedValue("intent://arbitrary");
     const view = render(<Entrance onLogin={vi.fn()} onPreflight={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("QR image"), { target: { files: [new File(["data"], "qr.png")] } });
-    await waitFor(() => expect(screen.getByText("QR image not accepted.")).toBeVisible());
+    await waitFor(() => expect(screen.getByText("No valid QR code found in that image.")).toBeVisible());
     expect(screen.getByLabelText("Abyssal invite")).toHaveValue("");
     expect(document.body.textContent).not.toContain("intent://arbitrary");
     view.unmount();
     expect(image.read.mock.calls[0][1].aborted).toBe(false);
+  });
+
+  it("scans a pasted screenshot but leaves text pasted into a field alone", async () => {
+    image.read.mockResolvedValue(QR_TEST_INVITE);
+    render(<Entrance onLogin={vi.fn()} onPreflight={vi.fn()} />);
+    const screenshot = new File(["png"], "image.png", { type: "image/png" });
+
+    fireEvent.paste(screen.getByLabelText("Password"), { clipboardData: { files: [screenshot], getData: () => "hunter2" } });
+    expect(image.read).not.toHaveBeenCalled();
+
+    fireEvent.paste(document.body, { clipboardData: { files: [new File(["gif"], "a.gif", { type: "image/gif" })], getData: () => "" } });
+    expect(await screen.findByText("Paste a PNG or JPEG image of the QR code.")).toBeVisible();
+    expect(image.read).not.toHaveBeenCalled();
+
+    fireEvent.paste(document.body, { clipboardData: { files: [screenshot], getData: () => "" } });
+    await waitFor(() => expect(screen.getByLabelText("Abyssal invite")).toHaveValue(QR_TEST_INVITE));
+    expect(image.read).toHaveBeenCalledWith(screenshot, expect.any(AbortSignal));
+  });
+
+  it("scans an image dropped onto the QR image control", async () => {
+    image.read.mockResolvedValue(QR_TEST_INVITE);
+    render(<Entrance onLogin={vi.fn()} onPreflight={vi.fn()} />);
+    const dropped = new File(["jpg"], "photo.jpg", { type: "image/jpeg" });
+    fireEvent.drop(document.querySelector(".qr-image-input")!, { dataTransfer: { files: [dropped], types: ["Files"] } });
+    await waitFor(() => expect(screen.getByLabelText("Abyssal invite")).toHaveValue(QR_TEST_INVITE));
   });
 
   it("keeps a successful image invite masked, including after a login error", async () => {

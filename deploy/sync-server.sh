@@ -223,9 +223,13 @@ WEB_STAGE_DIR="$SYNC_DIR/.web-release"
 mkdir -p "$WEB_STAGE_DIR"
 STAGED_ARCHIVE="$WEB_STAGE_DIR/$ARCHIVE_NAME"
 cp --reflink=auto -- "$WEB_ARCHIVE" "$STAGED_ARCHIVE"
+# The image build verifies these again with the release root compiled into it.
+cp -- "$RELEASE_MANIFEST" "$WEB_STAGE_DIR/release-manifest-v1.json"
+cp -- "$RELEASE_SIGNATURE" "$WEB_STAGE_DIR/release-manifest-v1.sig"
+printf '%s\n' "$SOURCE_COMMIT" > "$WEB_STAGE_DIR/source-commit"
 run_release_tool verify-web-archive \
-  --manifest "$RELEASE_MANIFEST" \
-  --signature "$RELEASE_SIGNATURE" \
+  --manifest "$WEB_STAGE_DIR/release-manifest-v1.json" \
+  --signature "$WEB_STAGE_DIR/release-manifest-v1.sig" \
   --archive "$STAGED_ARCHIVE" \
   --source-commit "$SOURCE_COMMIT"
 

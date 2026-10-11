@@ -1,5 +1,12 @@
 package com.abyssal.chat.presentation.viewmodel
 
+import com.abyssal.chat.data.notifications.MessageNotifier
+import com.abyssal.chat.domain.model.BackgroundAction
+import com.abyssal.chat.domain.model.BackgroundResponse
+import com.abyssal.chat.domain.model.NotificationLevel
+import com.abyssal.chat.domain.model.WorkspacePreferencePolicy
+import com.abyssal.chat.domain.model.WorkspacePreferences
+import com.abyssal.chat.domain.model.shortAccountId
 import android.net.Uri
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
@@ -411,7 +418,8 @@ class ChatViewModel(
     private val appUpdateService: IAppUpdateService,
     initialReleaseVerificationStatus: ReleaseVerificationStatus = ReleaseVerificationStatus.CHECKING,
     private val payloadCipher: InMemoryPayloadCipher = InMemoryPayloadCipher(),
-    private val mlsTransport: IMlsTransport? = chatTransport as? IMlsTransport
+    private val mlsTransport: IMlsTransport? = chatTransport as? IMlsTransport,
+    private val messageNotifier: MessageNotifier? = null
 ) : ViewModel() {
 
     private data class SessionStamp(
@@ -482,6 +490,13 @@ class ChatViewModel(
     private val _disguiseSettings = MutableStateFlow(DisguiseSettings())
     val disguiseSettings: StateFlow<DisguiseSettings> = _disguiseSettings.asStateFlow()
 
+    private val _workspacePreferences = MutableStateFlow(WorkspacePreferences())
+    /** Blur, background and notification choices; in memory only, like the web client's. */
+    val workspacePreferences: StateFlow<WorkspacePreferences> = _workspacePreferences.asStateFlow()
+    private val _notificationsAllowed = MutableStateFlow(false)
+    val notificationsAllowed: StateFlow<Boolean> = _notificationsAllowed.asStateFlow()
+    private var hostInForeground = true
+
     private val _calculatorDisplay = MutableStateFlow("0")
     val calculatorDisplay: StateFlow<String> = _calculatorDisplay.asStateFlow()
 
@@ -514,7 +529,6 @@ class ChatViewModel(
     private data class CachedMlsSnapshot(val evidence: ByteArray, val snapshot: PreparedMlsSnapshot)
     private val mlsSnapshotCache = LinkedHashMap<String, CachedMlsSnapshot>()
 
-    private var retainSessionInBackground = false
     private var sessionInactivityTimeoutSec = DEFAULT_SESSION_INACTIVITY_SEC
     private val externalSystemUiTokens = ExternalSystemUiTokenGate()
     private var externalSystemUiTimeoutJob: Job? = null
@@ -722,6 +736,7 @@ class ChatViewModel(
                         return@withLock
                     }
                     rememberReceivedFrame(replayKey, directoryEvidenceKey)
+                    notifyIncoming(incoming.chatId, message)
                 } finally {
                     plainBytes.fill(0)
                 }
@@ -849,7 +864,11 @@ class ChatViewModel(
                                     mutateRepositoryIfAccountCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, room.copy(name = label)) }
                                 }
                             }
-                            if (!mutateRepositoryIfAccountCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) wipeMessageSecrets(message)
+                            if (mutateRepositoryIfAccountCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) {
+                                notifyIncoming(frame.roomId, message)
+                            } else {
+                                wipeMessageSecrets(message)
+                            }
                         } finally { decrypted.plaintext.fill(0); evidence.fill(0) }
                     }
                     is MlsIncomingFrame.RoomDeleted, is MlsIncomingFrame.Left -> {
@@ -1131,7 +1150,9 @@ class ChatViewModel(
                     installedSession = true
                     _currentUser.value = identity
                     _roomCreationLimit.value = result.maxRoomsPerUser
-                    retainSessionInBackground = rememberSession
+                    _workspacePreferences.value = _workspacePreferences.value.copy(
+                        backgroundAction = WorkspacePreferencePolicy.fromSignInChoice(rememberSession)
+                    )
                     sessionInactivityTimeoutSec = result.sessionInactivitySec
                     sessionInactivityPolicy.start(sessionInactivityTimeoutSec * 1000L)
                     updateSessionSecurityState()
@@ -2080,12 +2101,13 @@ class ChatViewModel(
 
     /** Host left the foreground: safe point to swap launcher aliases. */
     fun onHostStopped() {
+        hostInForeground = false
         lockForLifecycleExit()
         disguiseManager.applyPendingLauncherAlias()
     }
 
     fun lockApp() {
-        if (disguiseSettings.value.isDisguised) _isLocked.value = true
+        if (disguiseSettings.value.isDisguised) lockWorkspace()
     }
 
     fun beginExternalSystemUi(): Long {
@@ -2122,8 +2144,52 @@ class ChatViewModel(
         _calculatorDisplay.value = "0"
         if (externalSystemUiTokens.activeToken() != null) return
         if (!sessionInactivityPolicy.isActive()) return
-        if (disguiseSettings.value.isDisguised) _isLocked.value = true
-        if (!retainSessionInBackground) endSession(lockBehindDisguise = true)
+        val disguised = disguiseSettings.value.isDisguised
+        when (WorkspacePreferencePolicy.backgroundResponse(_workspacePreferences.value.backgroundAction, disguised)) {
+            BackgroundResponse.LOCK -> lockWorkspace()
+            BackgroundResponse.SIGN_OUT -> {
+                if (disguised) lockWorkspace()
+                endSession(lockBehindDisguise = true)
+            }
+            BackgroundResponse.NONE -> Unit
+        }
+    }
+
+    private fun lockWorkspace() {
+        _isLocked.value = true
+        messageNotifier?.cancelAll()
+    }
+
+    fun setBlurEnabled(enabled: Boolean) {
+        _workspacePreferences.value = _workspacePreferences.value.copy(blurEnabled = enabled)
+    }
+
+    fun setBackgroundAction(action: BackgroundAction) {
+        _workspacePreferences.value = _workspacePreferences.value.copy(backgroundAction = action)
+        updateSessionSecurityState()
+    }
+
+    /** The screen asks for the system permission first; levels other than OFF need it. */
+    fun setNotificationLevel(level: NotificationLevel) {
+        refreshNotificationPermission()
+        if (level != NotificationLevel.OFF && !_notificationsAllowed.value) return
+        _workspacePreferences.value = _workspacePreferences.value.copy(notificationLevel = level)
+        if (level == NotificationLevel.OFF) messageNotifier?.cancelAll()
+    }
+
+    fun refreshNotificationPermission() {
+        _notificationsAllowed.value = messageNotifier?.canNotify() == true
+    }
+
+    /** Raises a notification for a stored incoming message, per the chosen privacy level. */
+    private fun notifyIncoming(chatId: String, message: Message) {
+        val notifier = messageNotifier ?: return
+        val level = _workspacePreferences.value.notificationLevel
+        val mine = message.sender.equals(currentUser.value?.username, ignoreCase = true)
+        if (!WorkspacePreferencePolicy.shouldNotify(level, mine, _isLocked.value, hostInForeground, chatId, _activeChatId.value)) return
+        val room = sessions.value.firstOrNull { it.id == chatId && it.isForum }
+        val sender = message.senderDisplayName?.takeIf { it.isNotBlank() } ?: shortAccountId(message.sender)
+        notifier.show(chatId, WorkspacePreferencePolicy.content(level, message, sender, room?.name))
     }
 
     fun onHostTrimMemory(level: Int) {
@@ -2136,6 +2202,9 @@ class ChatViewModel(
     }
 
     fun onHostResumed() {
+        hostInForeground = true
+        refreshNotificationPermission()
+        messageNotifier?.cancelAll()
         val pickerToken = externalSystemUiTokens.activeToken()
         if (pickerToken != null) {
             // ActivityResult callbacks normally follow onResume. Give that callback
@@ -2343,7 +2412,7 @@ class ChatViewModel(
         externalSystemUiTokens.clear()
         val remoteSession = nodeConfigService.getActiveSession()
         sessionInactivityPolicy.clear()
-        retainSessionInBackground = false
+        messageNotifier?.cancelAll()
         lastRemoteActivitySignalMs = 0L
         requestedDirectUsername = null
         directTrustStore.clear()
@@ -2412,7 +2481,8 @@ class ChatViewModel(
         }
         _sessionSecurity.value = SessionSecurityState(
             active = active,
-            retainedInBackground = active && retainSessionInBackground,
+            retainedInBackground = active &&
+                _workspacePreferences.value.backgroundAction != BackgroundAction.SIGN_OUT,
             inactivityTimeoutSec = sessionInactivityTimeoutSec,
             remainingSec = remainingSec
         )

@@ -33,8 +33,12 @@ set -euo pipefail
       if [[ -n "${EXPECTED_ARCHIVE_NAME:-}" && -d "$source_dir/.web-release" ]]; then
         [[ -f "$source_dir/.web-release/.gitignore" ]] || exit 1
         [[ -f "$source_dir/.web-release/$EXPECTED_ARCHIVE_NAME" ]] || exit 1
+        [[ -f "$source_dir/.web-release/release-manifest-v1.json" ]] || exit 1
+        [[ -f "$source_dir/.web-release/release-manifest-v1.sig" ]] || exit 1
+        [[ "$(cat "$source_dir/.web-release/source-commit")" =~ ^[0-9a-f]{40}$ ]] || exit 1
         [[ -z "$(find "$source_dir/.web-release" -mindepth 1 -maxdepth 1 \
-          ! -name .gitignore ! -name "$EXPECTED_ARCHIVE_NAME" -print -quit)" ]] || exit 1
+          ! -name .gitignore ! -name "$EXPECTED_ARCHIVE_NAME" ! -name release-manifest-v1.json \
+          ! -name release-manifest-v1.sig ! -name source-commit -print -quit)" ]] || exit 1
         [[ -z "$(find "$source_dir" -mindepth 2 -type d -name .web-release -print -quit)" ]] || exit 1
       fi
     fi
@@ -587,12 +591,24 @@ while IFS= read -r member; do
     exit 1
   }
 done <<<"$WORKSPACE_MEMBERS"
-grep -Fq 'ADD .web-release/abyssal-web-*.tar.gz /opt/abyssal/web/' "$DOCKERFILE" || {
-  echo 'Docker build does not consume the staged web archive.' >&2
+grep -Fq 'COPY .web-release/ /web-release/' "$DOCKERFILE" || {
+  echo 'Docker build does not consume the staged web release.' >&2
   exit 1
 }
-if grep -Eq 'deploy/scripts/\.web-release|(^|[[:space:]])(tar|gzip)([[:space:]]|$)' "$DOCKERFILE"; then
-  echo 'Dockerfile relies on the excluded deployment tree or a runtime archive tool.' >&2
+grep -Fq '/out/abyssal-release-tool verify-web-archive' "$DOCKERFILE" || {
+  echo 'Docker build does not verify the staged web archive against the signed manifest.' >&2
+  exit 1
+}
+grep -Fq 'COPY --from=rust-builder /verified/web /opt/abyssal/web' "$DOCKERFILE" || {
+  echo 'Docker runtime does not take the web files from the verified stage.' >&2
+  exit 1
+}
+if grep -Eq 'deploy/scripts/\.web-release' "$DOCKERFILE"; then
+  echo 'Dockerfile relies on the excluded deployment tree.' >&2
+  exit 1
+fi
+if sed -n '/ AS runtime$/,$p' "$DOCKERFILE" | grep -Eq '(^|[[:space:]])(tar|gzip)([[:space:]]|$)'; then
+  echo 'Docker runtime stage relies on an archive tool.' >&2
   exit 1
 fi
 if grep -Fxq '.web-release' "$ROOT_DIR/.dockerignore"; then

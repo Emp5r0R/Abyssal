@@ -1,4 +1,5 @@
-// Disposable-relay qualification: decode terminal output with the client QR reader.
+// Disposable-relay qualification: decode terminal output with the client QR reader
+// and check the default text codes printed beside each QR.
 // Node's built-in type stripping keeps this test on the exact source decoder
 // without adding a runtime TypeScript loader or writing a cache to disk.
 import assert from "node:assert/strict";
@@ -19,6 +20,7 @@ const expectedPublicKey = createPublicKey(createPrivateKey({ key: privateDer, fo
 seed.fill(0); privateDer.fill(0);
 const env = { ...process.env, ABYSSAL_INVITE_COUNT: "2", ABYSSAL_INVITE_PRINT_DELAY_MS: "0", RUST_LOG: "off" };
 delete env.ABYSSAL_INVITE_QR_ENABLED; // Prove the real startup default, not an explicit override.
+delete env.ABYSSAL_INVITE_TEXT_ENABLED;
 const relay = spawn(fileURLToPath(new URL("../target/debug/mirage-server", import.meta.url)), [], { env, stdio: ["ignore", "pipe", "pipe"] });
 let output = "";
 let tooLarge = false;
@@ -43,9 +45,11 @@ try {
   assert.equal(health.status, 200);
   await delay(50);
   assert.equal(tooLarge, false);
-  assert.equal(output.includes("ABYSSAL_INVITE invite="), false);
-  assert.equal(output.includes("abyssal:invite:"), false);
-  assert.equal(output.includes("ABY1-"), false);
+  // By default each QR is followed by its manual code and deep link.
+  const deepLinks = [...output.matchAll(/^ABYSSAL_INVITE_DEEP_LINK invite=(abyssal:invite:\S+)$/gm)].map((match) => match[1]);
+  const manualCodes = [...output.matchAll(/^ABYSSAL_INVITE invite=(ABY1-\S+)$/gm)].map((match) => match[1]);
+  assert.equal(deepLinks.length, 2);
+  assert.equal(manualCodes.length, 2);
   const blocks = output.split(/Invite \d+ of 2 \(QR\)\n/).slice(1);
   assert.equal(blocks.length, 2);
   const capabilities = [];
@@ -69,6 +73,7 @@ try {
       }
       const text = decodeQrLuminance(pixels, width, height);
       assert.ok(text, "terminal QR must decode with the actual client decoder");
+      assert.equal(text, deepLinks[capabilities.length], "printed deep link must match its QR");
       const invite = parseInviteCapsule(text, BigInt(Math.floor(Date.now() / 1000)), true);
       try {
         assert.deepEqual(Buffer.from(invite.node_public_key), expectedPublicKey);
@@ -81,7 +86,12 @@ try {
   }
   try { assert.notDeepEqual(capabilities[0], capabilities[1]); }
   finally { capabilities.forEach(value => value.fill(0)); }
-  console.log("Default startup QR-only output decoded and signature-verified; distinct capabilities; no text disclosure");
+  for (const code of manualCodes) {
+    const manual = parseInviteCapsule(code, BigInt(Math.floor(Date.now() / 1000)), true);
+    try { assert.deepEqual(Buffer.from(manual.node_public_key), expectedPublicKey); }
+    finally { manual.capability.fill(0); manual.account_context.fill(0); manual.node_public_key.fill(0); }
+  }
+  console.log("Default startup output: each QR decodes, matches its printed deep link, and the manual codes verify; distinct capabilities");
 } finally {
   if (relay.exitCode === null && relay.signalCode === null) relay.kill("SIGTERM");
   await exited;

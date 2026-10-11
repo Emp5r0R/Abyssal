@@ -10487,7 +10487,7 @@ fn test_state() -> AppState {
         registration_credential_requests: Arc::new(Mutex::new(HashMap::new())),
         invite_code_pepper: Arc::new(Zeroizing::new([7_u8; 32])),
         boot_invites: Arc::new(Mutex::new(None)),
-        boot_invite_output: invite_output::InviteOutputMode::Qr,
+        boot_invite_output: invite_output::InviteOutputMode::QR_ONLY,
         available_codes: Arc::new(Mutex::new(HashSet::new())),
         capability_expiries: Arc::new(Mutex::new(HashMap::new())),
         accounts: Arc::new(Mutex::new(HashMap::new())),

@@ -32,6 +32,11 @@ export function usePrivacyCover() {
     setPreferences(next);
   }, [destroyPinGate]);
 
+  /** Applies `update` to the latest preferences, for changes that finish after an await. */
+  const updatePreferencesWith = useCallback((update: (current: WorkspacePreferences) => WorkspacePreferences) => {
+    updatePreferences(update(preferencesRef.current));
+  }, [updatePreferences]);
+
   const installPin = useCallback(async (pin: string, duressPin: string) => {
     const nextGate = await PrivacyPinGate.create(pin, duressPin);
     if (!preferencesRef.current.coverEnabled) {
@@ -64,6 +69,7 @@ export function usePrivacyCover() {
   return {
     preferences,
     updatePreferences,
+    updatePreferencesWith,
     pinGate: coverReady ? pinGate : null,
     coverReady,
     needsPinSetup: preferences.coverEnabled && !coverReady,

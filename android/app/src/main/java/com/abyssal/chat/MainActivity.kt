@@ -1,5 +1,7 @@
 package com.abyssal.chat
 
+import androidx.compose.runtime.CompositionLocalProvider
+import com.abyssal.chat.presentation.screens.LocalPrivacyBlur
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
@@ -72,6 +74,7 @@ class MainActivity : ComponentActivity() {
                     val availableUpdate by viewModel.availableUpdate.collectAsState()
                     val serverStatus by viewModel.serverStatus.collectAsState()
                     val releaseStatus by viewModel.releaseVerificationStatus.collectAsState()
+                    val preferences by viewModel.workspacePreferences.collectAsState()
                     var updatePreparing by remember { mutableStateOf(false) }
                     var updateFailure by remember { mutableStateOf<String?>(null) }
 
@@ -86,10 +89,12 @@ class MainActivity : ComponentActivity() {
                             },
                             label = "screen_routing"
                         ) { screen ->
-                            when (screen) {
-                                is Screen.Entrance -> EntranceScreen(viewModel)
-                                is Screen.Dashboard -> DashboardScreen(viewModel)
-                                is Screen.Chat -> ChatScreen(viewModel, screen.sessionId)
+                            CompositionLocalProvider(LocalPrivacyBlur provides preferences.blurEnabled) {
+                                when (screen) {
+                                    is Screen.Entrance -> EntranceScreen(viewModel)
+                                    is Screen.Dashboard -> DashboardScreen(viewModel)
+                                    is Screen.Chat -> ChatScreen(viewModel, screen.sessionId)
+                                }
                             }
                         }
                     }

@@ -1,3 +1,5 @@
+import type { NotificationLevel } from "./notificationPolicy";
+
 /** What the workspace does when the browser tab is hidden. */
 export type HiddenTabAction = "cover" | "sign-out" | "stay";
 
@@ -14,12 +16,15 @@ export interface WorkspacePreferences {
   /** Blur names and message text until hovered or focused. */
   readonly blurEnabled: boolean;
   readonly hiddenTabAction: HiddenTabAction;
+  /** How much a message notification reveals; off until the user opts in. */
+  readonly notificationLevel: NotificationLevel;
 }
 
 export const DEFAULT_WORKSPACE_PREFERENCES: WorkspacePreferences = Object.freeze({
   coverEnabled: true,
   blurEnabled: false,
   hiddenTabAction: "cover",
+  notificationLevel: "off",
 });
 
 /** Turning the cover off never leaves a hidden tab unprotected by default: it signs out instead. */
@@ -41,6 +46,10 @@ export function withBlurEnabled(preferences: WorkspacePreferences, blurEnabled: 
 export function withHiddenTabAction(preferences: WorkspacePreferences, hiddenTabAction: HiddenTabAction): WorkspacePreferences {
   if (hiddenTabAction === "cover" && !preferences.coverEnabled) return preferences;
   return preferences.hiddenTabAction === hiddenTabAction ? preferences : { ...preferences, hiddenTabAction };
+}
+
+export function withNotificationLevel(preferences: WorkspacePreferences, notificationLevel: NotificationLevel): WorkspacePreferences {
+  return preferences.notificationLevel === notificationLevel ? preferences : { ...preferences, notificationLevel };
 }
 
 /** A cover whose PIN is not set yet cannot lock, so the session ends instead. */

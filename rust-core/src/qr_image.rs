@@ -69,26 +69,24 @@ fn decode_inner(bytes: &[u8], declared_mime: &str) -> Result<QrImage, ()> {
     let out_width = (width * OUTPUT_SIDE / longest).max(1);
     let out_height = (height * OUTPUT_SIDE / longest).max(1);
     let mut luminance = vec![0; (out_width * out_height) as usize];
+    // Area-average every source pixel into its output cell. Point sampling aliased
+    // dense screenshots and thin terminal line gaps into broken modules.
     for y in 0..out_height {
+        let top = y * height / out_height;
+        let bottom = ((y + 1) * height / out_height).max(top + 1);
         for x in 0..out_width {
-            let source = ((u64::from(y * height / out_height) * u64::from(width)
-                + u64::from(x * width / out_width))
-                * channels) as usize;
-            let luma = if channels <= 2 {
-                u32::from(decoded[source])
-            } else {
-                (u32::from(decoded[source])
-                    + 2 * u32::from(decoded[source + 1])
-                    + u32::from(decoded[source + 2]))
-                    / 4
-            };
-            let alpha = if channels == 2 || channels == 4 {
-                u32::from(decoded[source + channels as usize - 1])
-            } else {
-                255
-            };
-            luminance[(y * out_width + x) as usize] =
-                ((luma * alpha + 255 * (255 - alpha)) / 255) as u8;
+            let left = x * width / out_width;
+            let right = ((x + 1) * width / out_width).max(left + 1);
+            let mut sum = 0_u64;
+            for source_y in top..bottom {
+                for source_x in left..right {
+                    let source = ((u64::from(source_y) * u64::from(width) + u64::from(source_x))
+                        * channels) as usize;
+                    sum += u64::from(composited_luma(&decoded[source..], channels as usize));
+                }
+            }
+            let count = u64::from(bottom - top) * u64::from(right - left);
+            luminance[(y * out_width + x) as usize] = (sum / count) as u8;
         }
     }
     Ok(QrImage {
@@ -96,6 +94,21 @@ fn decode_inner(bytes: &[u8], declared_mime: &str) -> Result<QrImage, ()> {
         height: out_height,
         luminance,
     })
+}
+
+/// Grey level of one pixel, composited over white so transparent areas read as quiet zone.
+fn composited_luma(pixel: &[u8], channels: usize) -> u32 {
+    let luma = if channels <= 2 {
+        u32::from(pixel[0])
+    } else {
+        (u32::from(pixel[0]) + 2 * u32::from(pixel[1]) + u32::from(pixel[2])) / 4
+    };
+    let alpha = if channels == 2 || channels == 4 {
+        u32::from(pixel[channels - 1])
+    } else {
+        255
+    };
+    (luma * alpha + 255 * (255 - alpha)) / 255
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -206,6 +219,26 @@ mod tests {
             (expected.width, expected.height)
         );
         assert_eq!(result.luminance, expected.luminance);
+    }
+
+    #[test]
+    fn large_images_are_area_averaged_rather_than_point_sampled() {
+        // A 1-pixel checkerboard at 2x the output side must average to mid grey;
+        // point sampling would have returned only black or only white.
+        let side = OUTPUT_SIDE * 2;
+        let image = ImageBuffer::<Luma<u8>, _>::from_fn(side, side, |x, y| {
+            Luma([if (x + y) % 2 == 0 { 0 } else { 255 }])
+        });
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(image.as_raw(), side, side, ColorType::L8.into())
+            .unwrap();
+        let decoded = decode_qr_image(bytes, "image/png".into()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (OUTPUT_SIDE, OUTPUT_SIDE));
+        assert!(decoded
+            .luminance
+            .iter()
+            .all(|value| (126..=128).contains(value)));
     }
 
     #[test]

@@ -135,19 +135,17 @@ pub(super) fn write_boot_invites<W: Write>(
         "ABYSSAL RAM-ONLY INVITES - keep these private; they cannot be recovered"
     )?;
     for (index, invite) in invites.iter().enumerate() {
-        match mode {
-            InviteOutputMode::Qr => {
-                writeln!(output, "Invite {} of {} (QR)", index + 1, invites.len())?;
-                write_qr(output, invite.deep_link.as_str())?;
-            }
-            InviteOutputMode::Text => {
-                writeln!(output, "ABYSSAL_INVITE invite={}", invite.manual.as_str())?;
-                writeln!(
-                    output,
-                    "ABYSSAL_INVITE_DEEP_LINK invite={}",
-                    invite.deep_link.as_str()
-                )?;
-            }
+        if mode.qr {
+            writeln!(output, "Invite {} of {} (QR)", index + 1, invites.len())?;
+            write_qr(output, invite.deep_link.as_str())?;
+        }
+        if mode.text {
+            writeln!(output, "ABYSSAL_INVITE invite={}", invite.manual.as_str())?;
+            writeln!(
+                output,
+                "ABYSSAL_INVITE_DEEP_LINK invite={}",
+                invite.deep_link.as_str()
+            )?;
         }
     }
     output.flush()
@@ -285,11 +283,26 @@ mod tests {
             deep_link: Zeroizing::new(encode_deep_link(&signed).unwrap()),
             manual: Zeroizing::new(encode_manual(&signed).unwrap()),
         };
-        let mut output = Vec::new();
-        write_boot_invites(&mut output, &[invite], InviteOutputMode::Text).unwrap();
-        let text = String::from_utf8(output).unwrap();
+        let render = |mode| {
+            let mut output = Vec::new();
+            write_boot_invites(&mut output, std::slice::from_ref(&invite), mode).unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        let text = render(InviteOutputMode::TEXT_ONLY);
         assert!(text.contains("ABYSSAL_INVITE invite=ABY1-"));
         assert!(text.contains("ABYSSAL_INVITE_DEEP_LINK invite=abyssal:invite:"));
+        assert!(!text.contains("(QR)"));
         assert!(!text.contains("05050505"));
+
+        let both = render(InviteOutputMode::QR_AND_TEXT);
+        let qr_at = both.find("Invite 1 of 1 (QR)").unwrap();
+        let code_at = both.find("ABYSSAL_INVITE invite=ABY1-").unwrap();
+        assert!(qr_at < code_at, "the code follows its QR");
+        assert!(both.contains('\u{2588}'));
+
+        let qr_only = render(InviteOutputMode::QR_ONLY);
+        assert!(qr_only.contains("Invite 1 of 1 (QR)"));
+        assert!(!qr_only.contains("ABY1-"));
+        assert!(!qr_only.contains("abyssal:invite:"));
     }
 }

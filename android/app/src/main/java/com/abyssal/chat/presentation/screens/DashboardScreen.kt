@@ -97,6 +97,8 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val publicMlsRooms by viewModel.publicMlsRooms.collectAsState()
     val roomActionNotice by viewModel.roomActionNotice.collectAsState()
     val showCamouflagePinPrompt = viewModel.showCamouflagePinPrompt.value
+    val preferences by viewModel.workspacePreferences.collectAsState()
+    val notificationsAllowed by viewModel.notificationsAllowed.collectAsState()
 
     DashboardContent(
         currentUser = currentUser,
@@ -124,7 +126,17 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         onLock = viewModel::lockApp,
         onEndSession = viewModel::endSession,
         roomActionNotice = roomActionNotice,
-        onDismissRoomActionNotice = viewModel::dismissRoomActionNotice
+        onDismissRoomActionNotice = viewModel::dismissRoomActionNotice,
+        preferenceControls = WorkspacePreferenceControls(
+            preferences = preferences,
+            notificationsAllowed = notificationsAllowed,
+            onBlurChange = viewModel::setBlurEnabled,
+            onBackgroundActionChange = viewModel::setBackgroundAction,
+            onNotificationLevelChange = viewModel::setNotificationLevel,
+            onNotificationPermissionResult = viewModel::refreshNotificationPermission,
+            onExternalSystemUiStart = viewModel::beginExternalSystemUi,
+            onExternalSystemUiEnd = viewModel::endExternalSystemUi
+        )
     )
 
     if (showCamouflagePinPrompt) {
@@ -159,7 +171,8 @@ private fun DashboardContent(
     onLock: () -> Unit,
     onEndSession: () -> Unit,
     roomActionNotice: String? = null,
-    onDismissRoomActionNotice: () -> Unit = {}
+    onDismissRoomActionNotice: () -> Unit = {},
+    preferenceControls: WorkspacePreferenceControls = WorkspacePreferenceControls()
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -408,6 +421,7 @@ private fun DashboardContent(
                 initialSettings = disguiseSettings,
                 sessionSecurity = sessionSecurity,
                 directoryCheckpoint = presence.firstOrNull()?.directoryDigest,
+                preferenceControls = preferenceControls,
                 onDismiss = { showSettingsDialog = false },
                 onSave = { enabled, pin, duressPin ->
                     onUpdateDisguise(enabled, pin, duressPin)
@@ -509,14 +523,16 @@ private fun DashboardHeader(
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold
                 )
-                Text(
-                    text = currentUser?.displayName ?: currentUser?.username ?: "Anonymous",
-                    color = NeonGreen,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                PrivacyBlurred {
+                    Text(
+                        text = currentUser?.displayName ?: currentUser?.username ?: "Anonymous",
+                        color = NeonGreen,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 if (currentUser?.displayName != null) {
                     Text(text = currentUser.username, color = SteelMuted, fontSize = 10.sp)
                 }
@@ -633,13 +649,15 @@ private fun PeopleDirectory(
                                 .clip(CircleShape)
                                 .background(if (user.connected) NeonGreen else SteelMuted)
                         )
-                        Text(
-                            text = user.username,
-                            color = PureWhite,
-                            fontSize = 12.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        PrivacyBlurred(revealOnTap = false) {
+                            Text(
+                                text = user.username,
+                                color = PureWhite,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                         Text(
                             text = presenceStatusLabel(false, user.connected),
                             color = if (user.connected) NeonGreen else SteelMuted,
@@ -658,6 +676,7 @@ private fun SettingsDialog(
     initialSettings: DisguiseSettings,
     sessionSecurity: SessionSecurityState,
     directoryCheckpoint: String?,
+    preferenceControls: WorkspacePreferenceControls,
     onDismiss: () -> Unit,
     onSave: (Boolean, String, String) -> Unit,
     onLock: () -> Unit,
@@ -672,7 +691,7 @@ private fun SettingsDialog(
         duressPin = duressPin.trim()
     )
 
-    MirageDialog(title = "Security", onDismiss = onDismiss) {
+    MirageDialog(title = "Settings", onDismiss = onDismiss) {
         SectionLabel(
             text = "ACTIVE SESSION",
             modifier = Modifier.fillMaxWidth(),
@@ -730,6 +749,13 @@ private fun SettingsDialog(
             )
         }
 
+        WorkspacePreferenceSections(preferenceControls, disguised = initialSettings.isDisguised)
+
+        SectionLabel(
+            text = "CALCULATOR DISGUISE",
+            modifier = Modifier.fillMaxWidth().padding(top = 22.dp, bottom = 8.dp),
+            color = NeonCyan
+        )
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1262,22 +1288,25 @@ private fun ChatSessionItem(
                 Spacer(modifier = Modifier.width(12.dp))
 
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = if (session.isForum) "#${session.name}" else session.name,
-                        color = PureWhite,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = session.lastMessage?.content ?: "No active messages.",
-                        color = SteelMuted,
-                        fontSize = 13.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 3.dp)
-                    )
+                    PrivacyBlurred(revealOnTap = false) {
+                        Text(
+                            text = if (session.isForum) "#${session.name}" else session.name,
+                            color = PureWhite,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    PrivacyBlurred(modifier = Modifier.padding(top = 3.dp), revealOnTap = false) {
+                        Text(
+                            text = session.lastMessage?.content ?: "No active messages.",
+                            color = SteelMuted,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                     session.roomPolicySummary()?.let { summary ->
                         Text(
                             text = summary,

@@ -679,6 +679,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_abyssal_core_checksum_func_verify_invite_node_descriptor(
     ): Int
+    external fun uniffi_abyssal_core_checksum_func_decode_qr_luminance(
+    ): Int
     external fun uniffi_abyssal_core_checksum_func_decode_qr_image(
     ): Int
     external fun uniffi_abyssal_core_checksum_func_inspect_release_manifest(
@@ -1019,6 +1021,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_verify_invite_node_descriptor(`descriptor`: RustBuffer.ByValue,`expectedNodePublicKey`: RustBuffer.ByValue,`expectedNodeUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
+    external fun uniffi_abyssal_core_fn_func_decode_qr_luminance(`luminance`: RustBuffer.ByValue,`width`: Int,`height`: Int,`thorough`: Byte,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_decode_qr_image(`bytes`: RustBuffer.ByValue,`declaredMime`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
     external fun uniffi_abyssal_core_fn_func_inspect_release_manifest(`manifestJson`: RustBuffer.ByValue,`signature`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1180,6 +1184,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_func_verify_invite_node_descriptor() != 40877) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_abyssal_core_checksum_func_decode_qr_luminance() != 2654) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_abyssal_core_checksum_func_decode_qr_image() != 10558) {
@@ -6377,6 +6384,38 @@ public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
 /**
  * @suppress
  */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteArray?> {
     override fun read(buf: ByteBuffer): kotlin.ByteArray? {
         if (buf.get().toInt() == 0) {
@@ -6511,6 +6550,21 @@ public object FfiConverterSequenceTypeRecipientPublicKey: FfiConverterRustBuffer
         FfiConverterString.lower(`expectedNodeUrl`),_status)
 }
 
+
+
+    @Throws(AbyssalException::class) fun `decodeQrLuminance`(`luminance`: kotlin.ByteArray, `width`: kotlin.UInt, `height`: kotlin.UInt, `thorough`: kotlin.Boolean): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    uniffiRustCallWithError(AbyssalException) { _status ->
+    UniffiLib.uniffi_abyssal_core_fn_func_decode_qr_luminance(
+
+
+        FfiConverterByteArray.lower(`luminance`),
+        FfiConverterUInt.lower(`width`),
+        FfiConverterUInt.lower(`height`),
+        FfiConverterBoolean.lower(`thorough`),_status)
+}
+    )
+    }
 
 
     @Throws(AbyssalException::class) fun `decodeQrImage`(`bytes`: kotlin.ByteArray, `declaredMime`: kotlin.String): QrImage {

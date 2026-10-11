@@ -328,6 +328,67 @@ class ChatViewModelPolicyTest {
     }
 
     @Test
+    fun notificationsFollowThePrivacyLevelAndLeavingFollowsTheBackgroundChoice() = runBlocking {
+        val sender = nativeIdentity(31)
+        val user = User("Alice", sender.publicKey(), sender.prekeyId())
+        val forum = ChatSession(
+            id = "forum_ops",
+            name = "Operations",
+            isForum = true,
+            lastMessage = null,
+            unreadCount = 0,
+            selfDestructTimerSec = 5
+        )
+        val probe = TransactionTransportProbe(cipher = sender, leases = emptyList(), sendResult = OutboundSendResult.ACCEPTED)
+        val shown = mutableListOf<Pair<String, com.abyssal.chat.domain.model.NotificationContent>>()
+        var cancels = 0
+        val notifier = object : com.abyssal.chat.data.notifications.MessageNotifier {
+            override fun canNotify() = true
+            override fun show(chatId: String, content: com.abyssal.chat.domain.model.NotificationContent) { shown += chatId to content }
+            override fun cancelAll() { cancels++ }
+        }
+        val viewModel = transactionViewModel(payloadCipher = sender, user = user, probe = probe, sessions = listOf(forum), notifier = notifier)
+        val notifyIncoming = ChatViewModel::class.java
+            .getDeclaredMethod("notifyIncoming", String::class.java, Message::class.java)
+            .apply { isAccessible = true }
+        val incoming = Message(
+            id = "m1",
+            sender = "acct_10bae1a3659440688930a460dd27ce30",
+            receiver = null,
+            content = "Hello",
+            timestampMs = 1L,
+            selfDestructDurationSec = 0
+        )
+        try {
+            viewModel.sessions.first { it.size == 1 }
+            notifyIncoming.invoke(viewModel, "forum_ops", incoming)
+            assertTrue("notifications start off", shown.isEmpty())
+
+            viewModel.setNotificationLevel(com.abyssal.chat.domain.model.NotificationLevel.SENDER)
+            notifyIncoming.invoke(viewModel, "forum_ops", incoming)
+            notifyIncoming.invoke(viewModel, "forum_ops", incoming.copy(id = "m2", sender = "Alice"))
+            assertEquals(
+                listOf("forum_ops" to com.abyssal.chat.domain.model.NotificationContent("10ba…ce30 in Operations", "New message")),
+                shown
+            )
+
+            viewModel.setBackgroundAction(com.abyssal.chat.domain.model.BackgroundAction.STAY)
+            viewModel.lockForLifecycleExit()
+            assertEquals(user.username, viewModel.currentUser.value?.username)
+            assertFalse(viewModel.isLocked.value)
+
+            viewModel.setBackgroundAction(com.abyssal.chat.domain.model.BackgroundAction.SIGN_OUT)
+            viewModel.lockForLifecycleExit()
+            assertNull(viewModel.currentUser.value)
+            assertTrue("signing out clears notifications", cancels > 0)
+        } finally {
+            viewModel.clear()
+            user.publicKey.fill(0)
+            sender.clear()
+        }
+    }
+
+    @Test
     fun sameAccountRecoveryCommitsAcceptedTransportResultAcrossReconnect() = runBlocking {
         val sender = nativeIdentity(15)
         val bob = nativeIdentity(16)
@@ -1278,7 +1339,8 @@ class ChatViewModelPolicyTest {
         updateResult: Result<com.abyssal.chat.domain.model.AppUpdateCheckResult> = Result.success(
             com.abyssal.chat.domain.model.AppUpdateCheckResult(ReleaseVerificationStatus.VERIFIED)
         ),
-        updateServiceCalled: CompletableDeferred<Unit>? = null
+        updateServiceCalled: CompletableDeferred<Unit>? = null,
+        notifier: com.abyssal.chat.data.notifications.MessageNotifier? = null
     ): ChatViewModel {
         val identityService = proxy(IIdentityService::class.java) { method ->
             when (method.name) {
@@ -1343,7 +1405,8 @@ class ChatViewModelPolicyTest {
             disguiseManager = disguiseManager,
             appUpdateService = updateService,
             initialReleaseVerificationStatus = initialStatus,
-            payloadCipher = payloadCipher
+            payloadCipher = payloadCipher,
+            messageNotifier = notifier
         )
         setCurrentUser(viewModel, user)
         setSessionGeneration(viewModel, 1L)

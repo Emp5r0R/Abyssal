@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { flushSync } from "react-dom";
 import { AppShell } from "./components/AppShell";
@@ -9,13 +9,21 @@ import { Entrance } from "./components/Entrance";
 import { MediaViewer } from "./components/MediaViewer";
 import { PrivacyBlurProvider } from "./components/PrivacyBlur";
 import { SecurityVerificationGate } from "./components/SecurityVerificationGate";
+import { QuickSwitcher } from "./components/QuickSwitcher";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { ShortcutsDialog } from "./components/ShortcutsDialog";
 import { useVerifiedAssets } from "./components/verifiedAssetContext";
 import { CalculatorCover, PinSetup } from "./components/Privacy";
-import { withCoverEnabled } from "./domain/workspacePreferences";
+import { conversationEntries, displayNamesBySender, roomLabel, shortAccountId } from "./domain/displayLabels";
+import type { NotificationLevel } from "./domain/notificationPolicy";
+import { adjacentConversation } from "./domain/keyboardShortcuts";
+import { withBlurEnabled, withCoverEnabled, withNotificationLevel } from "./domain/workspacePreferences";
 import type { ReactionAsset } from "./domain/reactions";
 import type { ChatMessage } from "./domain/types";
 import { useAbyssalSession } from "./hooks/useAbyssalSession";
+import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useMessageNotifications } from "./hooks/useMessageNotifications";
+import { createBrowserNotifier } from "./platform/notifier";
 import { usePrivacyCover } from "./hooks/usePrivacyCover";
 import {
   verifyOriginAttestation,
@@ -31,6 +39,8 @@ export default function App() {
   const [showCreateRoom, setShowCreateRoom] = useState(false);
   const [showAttachment, setShowAttachment] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [showSwitcher, setShowSwitcher] = useState(false);
   const [attachmentRetentionSec, setAttachmentRetentionSec] = useState(5);
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [originStatus, setOriginStatus] = useState<OriginAttestationStatus>("CHECKING");
@@ -65,6 +75,8 @@ export default function App() {
     setShowAttachment(false);
     setShowCreateRoom(false);
     setShowSettings(false);
+    setShowShortcuts(false);
+    setShowSwitcher(false);
     clearPrivateView();
   }, [clearPrivateView]);
 
@@ -103,6 +115,61 @@ export default function App() {
   useEffect(() => {
     if (!abyssal.session) destroyPinGate();
   }, [abyssal.session, destroyPinGate]);
+
+  const navigateTo = useCallback((chatId: string | null) => {
+    setReplyTarget(null);
+    setShowAttachment(false);
+    abyssal.openRoom(chatId);
+  }, [abyssal]);
+
+  const displayNames = useMemo(() => displayNamesBySender(abyssal.messages), [abyssal.messages]);
+  const conversations = useMemo(
+    () => conversationEntries(abyssal.rooms, abyssal.directs, displayNames),
+    [abyssal.directs, abyssal.rooms, displayNames],
+  );
+  const workspaceOpen = originStatus === "OK" && !abyssal.securityWarning && Boolean(abyssal.session) &&
+    !(cover.locked && cover.pinGate) && !cover.needsPinSetup;
+  const step = (direction: 1 | -1) => {
+    const next = adjacentConversation(conversations.map((entry) => entry.id), abyssal.activeRoomId, direction);
+    if (next) navigateTo(next);
+  };
+  useKeyboardShortcuts({
+    "quick-switcher": () => setShowSwitcher(true),
+    "previous-conversation": () => step(-1),
+    "next-conversation": () => step(1),
+    "go-home": () => navigateTo(null),
+    "focus-composer": () => document.querySelector<HTMLTextAreaElement>("textarea[data-composer='true']")?.focus(),
+    "create-room": () => setShowCreateRoom(true),
+    "open-settings": () => setShowSettings(true),
+    lock: cover.coverReady ? lockWorkspace : undefined,
+    "toggle-blur": () => cover.updatePreferences(withBlurEnabled(cover.preferences, !cover.preferences.blurEnabled)),
+    "show-shortcuts": () => setShowShortcuts(true),
+  }, workspaceOpen);
+
+  const [notifier] = useState(createBrowserNotifier);
+  const [notificationPermission, setNotificationPermission] = useState(notifier.permission);
+  const { updatePreferencesWith } = cover;
+  const changeNotificationLevel = useCallback(async (level: NotificationLevel) => {
+    const allowed = level === "off" || await notifier.requestPermission();
+    setNotificationPermission(notifier.permission());
+    if (allowed) updatePreferencesWith((current) => withNotificationLevel(current, level));
+  }, [notifier, updatePreferencesWith]);
+  useMessageNotifications({
+    notifier,
+    enabled: Boolean(abyssal.session),
+    level: notificationPermission === "granted" ? cover.preferences.notificationLevel : "off",
+    locked: cover.locked,
+    activeChatId: abyssal.activeRoomId,
+    messages: abyssal.messages,
+    labelsFor: (message) => {
+      const room = abyssal.rooms.find((candidate) => candidate.id === message.chatId);
+      return {
+        sender: displayNames.get(message.sender.toLowerCase()) ?? shortAccountId(message.sender),
+        conversation: room ? roomLabel(room) : null,
+      };
+    },
+    onOpen: navigateTo,
+  });
 
   const resetLocal = async () => {
     clearTransientUi();
@@ -177,9 +244,16 @@ export default function App() {
             nodeId={abyssal.session.nodeId}
             directoryCheckpoint={abyssal.presence[0]?.directory_digest}
             onChange={cover.updatePreferences}
+            notificationPermission={notificationPermission}
+            onNotificationLevelChange={(level) => { void changeNotificationLevel(level); }}
+            onShowShortcuts={() => { setShowSettings(false); setShowShortcuts(true); }}
             onWipe={() => { abyssal.wipeRelay(); void resetLocal(); }}
             onClose={() => setShowSettings(false)}
           />
+        ) : null}
+        {dialogsAllowed && showShortcuts ? <ShortcutsDialog onClose={() => setShowShortcuts(false)} /> : null}
+        {dialogsAllowed && showSwitcher ? (
+          <QuickSwitcher conversations={conversations} onOpen={navigateTo} onClose={() => setShowSwitcher(false)} />
         ) : null}
         {dialogsAllowed && showCreateRoom ? <CreateRoomDialog onCancel={() => setShowCreateRoom(false)} onCreate={abyssal.createRoom} /> : null}
         {dialogsAllowed && showAttachment && abyssal.activeRoom ? (

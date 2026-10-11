@@ -9,15 +9,31 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
 import java.nio.ByteBuffer
 import uniffi.abyssal_core.decodeQrImage
+import uniffi.abyssal_core.decodeQrLuminance
 import uniffi.abyssal_core.parseInviteCapsule
 
 internal object InviteQrDecoder {
     const val MAX_TEXT = 2048
     const val MAX_SIDE = 1280
 
-    fun decodeLuminance(bytes: ByteArray, width: Int, height: Int): String? {
+    /**
+     * The shared Rust decoder runs first: it repairs cropped borders, terminal line
+     * gaps, inverted colours and sensor noise exactly as the web client does. ZXing
+     * remains a fallback. A camera frame gets the cheap passes; a still image all of them.
+     */
+    fun decodeLuminance(bytes: ByteArray, width: Int, height: Int, thorough: Boolean = false): String? {
         require(width in 1..MAX_SIDE && height in 1..MAX_SIDE)
         require(bytes.size == width * height)
+        return decodeShared(bytes, width, height, thorough) ?: decodeWithZxing(bytes, width, height)
+    }
+
+    private fun decodeShared(bytes: ByteArray, width: Int, height: Int, thorough: Boolean): String? = try {
+        decodeQrLuminance(bytes, width.toUInt(), height.toUInt(), thorough)?.takeIf { it.length in 1..MAX_TEXT }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun decodeWithZxing(bytes: ByteArray, width: Int, height: Int): String? {
         val reader = QRCodeReader()
         return try {
             val source = PlanarYUVLuminanceSource(bytes, width, height, 0, 0, width, height, false)
@@ -50,7 +66,7 @@ internal object InviteQrDecoder {
 
     fun decodeImage(bytes: ByteArray, mime: String): String? {
         val raster = decodeQrImage(bytes, mime)
-        return try { decodeLuminance(raster.luminance, raster.width.toInt(), raster.height.toInt()) }
+        return try { decodeLuminance(raster.luminance, raster.width.toInt(), raster.height.toInt(), thorough = true) }
         finally { raster.luminance.fill(0) }
     }
 

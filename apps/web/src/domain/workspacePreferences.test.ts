@@ -5,17 +5,18 @@ import {
   withBlurEnabled,
   withCoverEnabled,
   withHiddenTabAction,
+  withNotificationLevel,
 } from "./workspacePreferences";
 
 describe("workspace preferences", () => {
   it("defaults to the calculator cover with blur off", () => {
-    expect(DEFAULT_WORKSPACE_PREFERENCES).toEqual({ coverEnabled: true, blurEnabled: false, hiddenTabAction: "cover" });
+    expect(DEFAULT_WORKSPACE_PREFERENCES).toEqual({ coverEnabled: true, blurEnabled: false, hiddenTabAction: "cover", notificationLevel: "off" });
     expect(Object.isFrozen(DEFAULT_WORKSPACE_PREFERENCES)).toBe(true);
   });
 
   it("signs out instead of locking once the cover is turned off, and restores locking when it returns", () => {
     const off = withCoverEnabled(DEFAULT_WORKSPACE_PREFERENCES, false);
-    expect(off).toEqual({ coverEnabled: false, blurEnabled: false, hiddenTabAction: "sign-out" });
+    expect(off).toEqual({ coverEnabled: false, blurEnabled: false, hiddenTabAction: "sign-out", notificationLevel: "off" });
     expect(withCoverEnabled(off, true).hiddenTabAction).toBe("cover");
   });
 
@@ -34,6 +35,8 @@ describe("workspace preferences", () => {
     expect(withCoverEnabled(DEFAULT_WORKSPACE_PREFERENCES, true)).toBe(DEFAULT_WORKSPACE_PREFERENCES);
     expect(withBlurEnabled(DEFAULT_WORKSPACE_PREFERENCES, false)).toBe(DEFAULT_WORKSPACE_PREFERENCES);
     expect(withBlurEnabled(DEFAULT_WORKSPACE_PREFERENCES, true).blurEnabled).toBe(true);
+    expect(withNotificationLevel(DEFAULT_WORKSPACE_PREFERENCES, "off")).toBe(DEFAULT_WORKSPACE_PREFERENCES);
+    expect(withNotificationLevel(DEFAULT_WORKSPACE_PREFERENCES, "sender").notificationLevel).toBe("sender");
   });
 
   it("maps the hidden-tab choice to a response", () => {

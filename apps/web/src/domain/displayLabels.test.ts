@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { accountInitials, displayNamesBySender, roomLabel, shortAccountId, shortRoomId } from "./displayLabels";
+import { accountInitials, conversationEntries, displayNamesBySender, filterConversations, roomLabel, shortAccountId, shortRoomId } from "./displayLabels";
 import type { ChatMessage } from "./types";
 
 const message = (sender: string, createdAtMs: number, senderDisplayName?: string, mine = false): ChatMessage => ({
@@ -39,5 +39,19 @@ describe("account labels", () => {
     expect(names.get("bob")).toBe("NewName");
     expect(names.has("me")).toBe(false);
     expect(names.has("carol")).toBe(false);
+  });
+
+  it("lists conversations in sidebar order and filters by label or ID", () => {
+    const rooms = [{ id: "forum_ops", name: "Operations" }] as never[];
+    const directs = [{ id: "dm_1", peer_username: "acct_10bae1a3659440688930a460dd27ce30" }, { id: "dm_2", peer_username: "acct_334a5379dff34f23bbfe27a7b09e9f94" }];
+    const entries = conversationEntries(rooms, directs, new Map([["acct_10bae1a3659440688930a460dd27ce30", "SilverComet"]]));
+    expect(entries.map((entry) => [entry.id, entry.kind, entry.label])).toEqual([
+      ["forum_ops", "room", "Operations"],
+      ["dm_1", "direct", "SilverComet"],
+      ["dm_2", "direct", "334a…9f94"],
+    ]);
+    expect(filterConversations(entries, " silver ").map((entry) => entry.id)).toEqual(["dm_1"]);
+    expect(filterConversations(entries, "334a5379").map((entry) => entry.id)).toEqual(["dm_2"]);
+    expect(filterConversations(entries, "")).toHaveLength(3);
   });
 });

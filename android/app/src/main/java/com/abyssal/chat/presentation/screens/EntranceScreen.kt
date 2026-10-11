@@ -1,5 +1,6 @@
 package com.abyssal.chat.presentation.screens
 
+import com.abyssal.chat.data.qr.ClipboardQrImage
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -106,8 +107,8 @@ private fun EntranceContent(
         lifecycle.lifecycle.addObserver(observer)
         onDispose { lifecycle.lifecycle.removeObserver(observer); imageJob?.cancel() }
     }
-    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null && !readingImage && !isVerifying) {
+    val readImage: (android.net.Uri) -> Unit = { uri ->
+        if (!readingImage && !isVerifying) {
             readingImage = true
             imageError = false
             imageJob = scope.launch {
@@ -125,6 +126,9 @@ private fun EntranceContent(
                 }
             }
         }
+    }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) readImage(uri)
     }
     val passwordFocusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
@@ -211,7 +215,20 @@ private fun EntranceContent(
                                 Text(if (readingImage) "Reading image" else "Open QR image")
                             }
                         }
-                        if (imageError) Text("QR image not accepted.", color = SelfDestructAmber)
+                        TextButton(
+                            onClick = {
+                                val uri = ClipboardQrImage.imageUri(context)
+                                if (uri == null) imageError = true else readImage(uri)
+                            },
+                            enabled = !isVerifying && !readingImage
+                        ) { Text("Paste copied QR image") }
+                        if (imageError) {
+                            Text(
+                                "No valid invite QR found. Copy a screenshot of the QR, then paste it.",
+                                color = SelfDestructAmber,
+                                fontSize = 12.sp
+                            )
+                        }
                         InviteEntryField(
                             value = invite,
                             onValueChange = {

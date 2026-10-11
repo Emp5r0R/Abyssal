@@ -365,6 +365,7 @@ export function ChatView({
           <IconButton label="Send GIF" disabled={!connected || !room.allow_images || submitting || upload.active} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>
           <textarea
             ref={textareaRef}
+            data-composer="true"
             aria-label="Message"
             placeholder={connected ? (isDirect ? "Write a message" : "Message the room") : "Offline — waiting for the relay"}
             rows={1}
