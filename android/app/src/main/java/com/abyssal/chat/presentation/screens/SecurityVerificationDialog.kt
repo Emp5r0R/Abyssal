@@ -9,12 +9,12 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.abyssal.chat.theme.PureWhite
-import com.abyssal.chat.theme.SelfDestructAmber
-import com.abyssal.chat.theme.SteelMuted
+import com.abyssal.chat.theme.TextPrimary
+import com.abyssal.chat.theme.Danger
+import com.abyssal.chat.theme.TextMuted
 
 @Composable
 fun SecurityVerificationDialog(
@@ -27,7 +27,7 @@ fun SecurityVerificationDialog(
     MirageDialog(
         title = title,
         onDismiss = {},
-        accent = SelfDestructAmber,
+        accent = if (isChecking) com.abyssal.chat.theme.Accent else Danger,
         icon = {
             AbyssalMarkLoader(
                 size = AbyssalMarkLoaderSize.Medium,
@@ -39,17 +39,16 @@ fun SecurityVerificationDialog(
     ) {
         Text(
             text = message,
-            color = PureWhite,
+            color = TextPrimary,
             fontSize = 14.sp,
-            lineHeight = 20.sp,
-            textAlign = TextAlign.Center
+            lineHeight = 20.sp
         )
         Text(
-            text = "Account traffic remains blocked.",
-            color = SteelMuted,
-            fontSize = 12.sp,
-            lineHeight = 17.sp,
-            textAlign = TextAlign.Center
+            text = "Messaging stays paused until this check passes.",
+            color = TextMuted,
+            fontSize = 13.sp,
+            lineHeight = 18.sp,
+            modifier = Modifier.padding(top = 6.dp)
         )
         Spacer(modifier = Modifier.height(12.dp))
         Row(
@@ -62,7 +61,7 @@ fun SecurityVerificationDialog(
                 modifier = Modifier.weight(1f)
             )
             MiragePrimaryButton(
-                text = if (isChecking) "CHECKING..." else "Check again",
+                text = if (isChecking) "Checking…" else "Check again",
                 onClick = onRetry,
                 enabled = !isChecking,
                 modifier = Modifier.weight(1f)

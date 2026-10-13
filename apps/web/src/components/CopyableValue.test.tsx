@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CopyableValue } from "./CopyableValue";
+import { CopyableValue, CopyIconButton } from "./CopyableValue";
 
 afterEach(() => {
   cleanup();
@@ -28,5 +28,23 @@ describe("CopyableValue", () => {
     render(<CopyableValue label="Node" value="node" />);
     fireEvent.click(screen.getByRole("button", { name: "Copy node" }));
     expect(await screen.findByText(/copy it manually/u)).toBeInTheDocument();
+  });
+});
+
+describe("CopyIconButton", () => {
+  it("copies the value and confirms in its accessible name", async () => {
+    const writeText = vi.fn(async () => undefined);
+    stubClipboard(writeText);
+    render(<CopyIconButton label="Copy room ID" value="forum_ops" />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy room ID" }));
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+    expect(writeText).toHaveBeenCalledWith("forum_ops");
+  });
+
+  it("reports a failed copy", async () => {
+    stubClipboard(vi.fn(async () => { throw new Error("denied"); }));
+    render(<CopyIconButton label="Copy room ID" value="forum_ops" />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy room ID" }));
+    expect(await screen.findByRole("button", { name: "Copy failed" })).toBeInTheDocument();
   });
 });

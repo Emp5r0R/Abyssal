@@ -1,40 +1,29 @@
 package com.abyssal.chat.presentation.screens
 
-import androidx.compose.foundation.BorderStroke
+import android.os.Build
+import android.widget.Toast
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
-import androidx.compose.material3.TabRowDefaults
-import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -42,26 +31,30 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.MlsPublicRoomSummary
 import com.abyssal.chat.domain.model.MlsRoomVisibility
 import com.abyssal.chat.domain.model.PendingMlsJoinSummary
@@ -70,18 +63,23 @@ import com.abyssal.chat.domain.model.ServerStatus
 import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
 import com.abyssal.chat.domain.model.UserPresence
-import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
+import com.abyssal.chat.domain.model.conversationEntries
+import com.abyssal.chat.domain.model.filterConversations
+import com.abyssal.chat.domain.model.peerLabel
+import com.abyssal.chat.domain.model.roomLabel
+import com.abyssal.chat.domain.model.shortAccountId
+import com.abyssal.chat.domain.model.shortRoomId
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
-import com.abyssal.chat.theme.BorderCyan
-import com.abyssal.chat.theme.DeepBlack
-import com.abyssal.chat.theme.GlassBorder
-import com.abyssal.chat.theme.MutedWhite
-import com.abyssal.chat.theme.NeonCyan
-import com.abyssal.chat.theme.NeonGreen
-import com.abyssal.chat.theme.PureWhite
-import com.abyssal.chat.theme.SelfDestructAmber
-import com.abyssal.chat.theme.SteelMuted
+import com.abyssal.chat.theme.Accent
+import com.abyssal.chat.theme.Danger
+import com.abyssal.chat.theme.Outline
+import com.abyssal.chat.theme.Success
+import com.abyssal.chat.theme.SurfaceRaised
+import com.abyssal.chat.theme.TextMuted
+import com.abyssal.chat.theme.TextPrimary
+import com.abyssal.chat.theme.TextSubtle
+import com.abyssal.chat.theme.Warning
 
 @Composable
 fun DashboardScreen(viewModel: ChatViewModel) {
@@ -96,6 +94,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val pendingMlsLeaves by viewModel.pendingMlsLeaves.collectAsState()
     val publicMlsRooms by viewModel.publicMlsRooms.collectAsState()
     val roomActionNotice by viewModel.roomActionNotice.collectAsState()
+    val displayNames by viewModel.knownDisplayNames.collectAsState()
     val showCamouflagePinPrompt = viewModel.showCamouflagePinPrompt.value
     val preferences by viewModel.workspacePreferences.collectAsState()
     val notificationsAllowed by viewModel.notificationsAllowed.collectAsState()
@@ -127,6 +126,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
         onEndSession = viewModel::endSession,
         roomActionNotice = roomActionNotice,
         onDismissRoomActionNotice = viewModel::dismissRoomActionNotice,
+        displayNames = displayNames,
         preferenceControls = WorkspacePreferenceControls(
             preferences = preferences,
             notificationsAllowed = notificationsAllowed,
@@ -144,8 +144,11 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     }
 }
 
+/** A room waiting for a delete or leave confirmation. */
+private data class RoomRemoval(val session: ChatSession, val isOwner: Boolean)
+
 @Composable
-private fun DashboardContent(
+internal fun DashboardContent(
     currentUser: User?,
     sessions: List<ChatSession>,
     status: ServerStatus,
@@ -172,1197 +175,611 @@ private fun DashboardContent(
     onEndSession: () -> Unit,
     roomActionNotice: String? = null,
     onDismissRoomActionNotice: () -> Unit = {},
+    displayNames: Map<String, String> = emptyMap(),
     preferenceControls: WorkspacePreferenceControls = WorkspacePreferenceControls()
 ) {
-    var selectedTab by remember { mutableIntStateOf(0) }
-    var showSettingsDialog by remember { mutableStateOf(false) }
-    var showCreateForumDialog by remember { mutableStateOf(false) }
-    var showWipeDialog by remember { mutableStateOf(false) }
-    var showJoinDialog by remember { mutableStateOf(false) }
-    var showPendingJoins by remember { mutableStateOf(false) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var showSettings by remember { mutableStateOf(false) }
+    var showCreateRoom by remember { mutableStateOf(false) }
+    var showJoinRoom by remember { mutableStateOf(false) }
+    var pendingRemoval by remember { mutableStateOf<RoomRemoval?>(null) }
 
-    val filteredSessions = remember(sessions, selectedTab) {
-        sessions.filter { it.isForum == (selectedTab == 0) }
+    val username = currentUser?.username
+    val rooms = remember(sessions) { sessions.filter { it.isForum } }
+    val directs = remember(sessions) { sessions.filterNot { it.isForum } }
+    val matchingIds = remember(sessions, displayNames, query) {
+        filterConversations(conversationEntries(sessions, displayNames), query).mapTo(mutableSetOf()) { it.id }
     }
-    val ownedRoomCount = remember(sessions, currentUser?.username) {
-        sessions.count { it.isForum && it.ownerUsername == currentUser?.username }
-    }
+    val ownedRoomCount = rooms.count { it.ownerUsername == username }
     val canCreateRoom = ownedRoomCount < roomCreationLimit
-    val establishedDirectPeerUsernames = remember(sessions) {
-        sessions.filterNot { it.isForum }.mapTo(mutableSetOf()) { it.name }
+    val joinedRoomIds = remember(rooms) { rooms.mapTo(mutableSetOf()) { it.id } }
+    val listedRooms = remember(publicMlsRooms, joinedRoomIds, query) {
+        publicMlsRooms.filter { it.roomId !in joinedRoomIds && it.roomId.contains(query.trim(), ignoreCase = true) }.take(32)
     }
-    val directPeers = remember(presence, currentUser?.username, establishedDirectPeerUsernames) {
-        directPeersForDirectory(presence, currentUser?.username, establishedDirectPeerUsernames)
+    val directPeers = remember(presence, username, directs) {
+        directPeersForDirectory(presence, username, directs.mapTo(mutableSetOf()) { it.name })
     }
+    val visiblePeers = remember(directPeers, displayNames, query) {
+        val needle = query.trim()
+        if (needle.isEmpty()) {
+            directPeers
+        } else {
+            directPeers.filter {
+                it.username.contains(needle, ignoreCase = true) ||
+                    peerLabel(it.username, displayNames).contains(needle, ignoreCase = true)
+            }
+        }
+    }
+    val onlineCount = presence.count { it.connected && !it.username.equals(username, ignoreCase = true) }
+    val connecting = status.state == "CONNECTING" && sessions.isEmpty()
 
     MirageBackground {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding()
-        ) {
-            DashboardHeader(
-                currentUser = currentUser,
+        Column(modifier = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
+            DashboardTopBar(
                 status = status,
-                sessionSecurity = sessionSecurity,
-                onSettings = { showSettingsDialog = true }
+                canLock = disguiseSettings.isDisguised,
+                onLock = onLock,
+                onSettings = { showSettings = true }
             )
-            roomActionNotice?.let { notice ->
-                RoomActionNotice(notice = notice, onDismiss = onDismissRoomActionNotice)
-            }
-
-            TabRow(
-                selectedTabIndex = selectedTab,
-                containerColor = Color.Transparent,
-                contentColor = NeonCyan,
-                indicator = { tabPositions ->
-                    TabRowDefaults.SecondaryIndicator(
-                        modifier = Modifier.tabIndicatorOffset(tabPositions[selectedTab]),
-                        color = NeonCyan,
-                        height = 2.dp
-                    )
-                },
-                divider = {
-                    Spacer(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(1.dp)
-                            .background(SteelMuted.copy(alpha = 0.12f))
-                    )
-                }
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Tab(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    text = {
-                        Text(
-                            "Rooms ${sessions.count { it.isForum }}",
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                )
-                Tab(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    text = {
-                        Text(
-                            "Direct ${sessions.count { !it.isForum }}",
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                )
-            }
-
-            if (selectedTab == 0) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 9.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    SectionLabel("YOUR ROOMS", color = NeonGreen)
-                    Text(
-                        text = "$ownedRoomCount / $roomCreationLimit",
-                        color = if (canCreateRoom) NeonGreen else SelfDestructAmber,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
+                item(key = "greeting") { Greeting(currentUser, onlineCount, sessionSecurity) }
+                ConnectionStatusCopy.rejectionNotice(status.state)?.let { notice ->
+                    item(key = "rejection") { NoticeBanner(notice, Tone.Danger, icon = AppIcons.Alert) }
+                }
+                roomActionNotice?.let { notice ->
+                    item(key = "notice") { NoticeBanner(notice, Tone.Accent, onDismiss = onDismissRoomActionNotice) }
+                }
+                item(key = "search") { SearchField(query = query, onQueryChange = { query = it.take(64) }) }
+                item(key = "tabs") {
+                    SegmentedControl(
+                        options = listOf(
+                            "Rooms" + if (rooms.isEmpty()) "" else " · ${rooms.size}",
+                            "Direct" + if (directs.isEmpty()) "" else " · ${directs.size}"
+                        ),
+                        selectedIndex = selectedTab,
+                        onSelect = { selectedTab = it },
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
-                if (publicMlsRooms.isNotEmpty()) {
-                    PublicRoomsSection(
-                        rooms = publicMlsRooms,
-                        onJoin = onJoinRoom,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp)
-                    )
-                }
-            }
-
-            if (selectedTab == 1) {
-                PeopleDirectory(
-                    users = directPeers,
-                    onOpenDirect = onOpenDirect,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 10.dp)
-                )
-                SectionLabel(
-                    text = "DIRECT CONVERSATIONS",
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
-                    color = NeonGreen
-                )
-            }
-
-            if (status.state == "CONNECTING" && sessions.isEmpty()) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .padding(24.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    AbyssalMarkLoader(
-                        size = AbyssalMarkLoaderSize.Large,
-                        description = "Connecting to relay"
-                    )
-                    Text(
-                        text = "Connecting to relay",
-                        color = PureWhite,
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 18.dp)
-                    )
-                    Text(
-                        text = "Loading active rooms and conversations.",
-                        color = SteelMuted,
-                        fontSize = 13.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                }
-            } else if (filteredSessions.isEmpty()) {
-                EmptyState(
-                    title = if (selectedTab == 0) "No active rooms" else directConversationEmptyStateTitle(),
-                    detail = if (selectedTab == 0) {
-                        "Rooms created on this relay appear here."
-                    } else {
-                        directConversationEmptyStateDetail(directPeers.size)
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    actionLabel = if (selectedTab == 0 && canCreateRoom) "Create room" else null,
-                    onAction = if (selectedTab == 0 && canCreateRoom) {
-                        { showCreateForumDialog = true }
-                    } else {
-                        null
-                    }
-                )
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    contentPadding = PaddingValues(bottom = if (selectedTab == 0) 280.dp else 104.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    items(filteredSessions, key = { it.id }) { session ->
-                        val isOwner = session.ownerUsername == currentUser?.username
-                        ChatSessionItem(
-                            session = session,
-                            canDelete = session.isForum,
-                            actionContentDescription = roomActionContentDescription(isOwner, session.name),
-                            onClick = { onOpenChat(session.id) },
-                            onDelete = {
-                                if (isOwner) onDeleteForum(session.id)
-                                else onLeaveForum(session.id)
-                            }
+                if (pendingMlsJoins.isNotEmpty() || pendingMlsLeaves.isNotEmpty()) {
+                    item(key = "attention") {
+                        AttentionCard(
+                            joins = pendingMlsJoins,
+                            leaves = pendingMlsLeaves,
+                            rooms = rooms,
+                            displayNames = displayNames,
+                            onAcceptJoin = onAcceptJoin,
+                            onRejectJoin = onRejectJoin,
+                            onAcceptLeave = onAcceptLeave,
+                            onRejectLeave = onRejectLeave
                         )
                     }
+                }
+                if (connecting) {
+                    item(key = "connecting") { ConnectingState() }
+                } else if (selectedTab == 0) {
+                    item(key = "rooms") {
+                        RoomsCard(
+                            rooms = rooms.filter { it.id in matchingIds },
+                            hasRooms = rooms.isNotEmpty(),
+                            username = username,
+                            displayNames = displayNames,
+                            ownedRoomCount = ownedRoomCount,
+                            roomCreationLimit = roomCreationLimit,
+                            canCreateRoom = canCreateRoom,
+                            onOpen = onOpenChat,
+                            onCreate = { showCreateRoom = true },
+                            onJoinById = { showJoinRoom = true },
+                            onRemove = { session -> pendingRemoval = RoomRemoval(session, session.ownerUsername == username) }
+                        )
+                    }
+                    if (listedRooms.isNotEmpty()) {
+                        item(key = "public") { PublicRoomsCard(listedRooms, onJoinRoom) }
+                    }
+                } else {
+                    item(key = "directs") {
+                        DirectsCard(
+                            directs = directs.filter { it.id in matchingIds },
+                            username = username,
+                            presence = presence,
+                            hasDirects = directs.isNotEmpty(),
+                            peerCount = directPeers.size,
+                            displayNames = displayNames,
+                            onOpen = onOpenChat
+                        )
+                    }
+                    item(key = "people") { PeopleCard(visiblePeers, onlineCount, displayNames, onOpenDirect) }
                 }
             }
         }
 
-        Column(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .navigationBarsPadding()
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-            horizontalAlignment = Alignment.End
-        ) {
-            if (selectedTab == 0 && (pendingMlsJoins.isNotEmpty() || pendingMlsLeaves.isNotEmpty())) {
-                ExtendedFloatingActionButton(
-                    onClick = { showPendingJoins = true },
-                    containerColor = NeonGreen,
-                    contentColor = DeepBlack,
-                    shape = RoundedCornerShape(8.dp)
-                ) { Text("Requests ${pendingMlsJoins.size + pendingMlsLeaves.size}", fontWeight = FontWeight.Bold) }
-            }
-            if (selectedTab == 0) {
-                ExtendedFloatingActionButton(
-                    onClick = { showJoinDialog = true },
-                    containerColor = GlassBorder,
-                    contentColor = PureWhite,
-                    shape = RoundedCornerShape(8.dp)
-                ) { Text("Join room", fontWeight = FontWeight.Bold) }
-            }
-            if (selectedTab == 0 && filteredSessions.isNotEmpty() && canCreateRoom) {
-                ExtendedFloatingActionButton(
-                    onClick = { showCreateForumDialog = true },
-                    containerColor = NeonCyan,
-                    contentColor = DeepBlack,
-                    shape = RoundedCornerShape(8.dp),
-                    icon = { PlusIcon(modifier = Modifier.size(20.dp), color = DeepBlack) },
-                    text = { Text("New room $ownedRoomCount/$roomCreationLimit", fontWeight = FontWeight.Bold) }
-                )
-            }
-            ExtendedFloatingActionButton(
-                onClick = { showWipeDialog = true },
-                containerColor = SelfDestructAmber,
-                contentColor = PureWhite,
-                shape = RoundedCornerShape(8.dp),
-                icon = { HazardIcon(modifier = Modifier.size(20.dp), color = PureWhite) },
-                text = { Text("Wipe relay", fontWeight = FontWeight.Bold) }
-            )
-        }
-
-        if (showSettingsDialog) {
-            SettingsDialog(
-                initialSettings = disguiseSettings,
+        if (showSettings) {
+            SettingsScreen(
+                currentUser = currentUser,
+                disguiseSettings = disguiseSettings,
                 sessionSecurity = sessionSecurity,
                 directoryCheckpoint = presence.firstOrNull()?.directoryDigest,
                 preferenceControls = preferenceControls,
-                onDismiss = { showSettingsDialog = false },
-                onSave = { enabled, pin, duressPin ->
-                    onUpdateDisguise(enabled, pin, duressPin)
-                    showSettingsDialog = false
-                },
-                onLock = {
-                    showSettingsDialog = false
-                    onLock()
-                },
-                onEndSession = {
-                    showSettingsDialog = false
-                    onEndSession()
-                }
+                onDismiss = { showSettings = false },
+                onSaveDisguise = onUpdateDisguise,
+                onLock = { showSettings = false; onLock() },
+                onEndSession = { showSettings = false; onEndSession() },
+                onWipe = { showSettings = false; onWipe() }
             )
         }
-        if (showJoinDialog) {
-            JoinRoomDialog(
-                onDismiss = { showJoinDialog = false },
-                onJoin = { onJoinRoom(it); showJoinDialog = false }
-            )
+        if (showJoinRoom) {
+            JoinRoomDialog(onDismiss = { showJoinRoom = false }, onJoin = { onJoinRoom(it); showJoinRoom = false })
         }
-        if (showPendingJoins) {
-            PendingJoinDialog(
-                joins = pendingMlsJoins,
-                leaves = pendingMlsLeaves,
-                onDismiss = { showPendingJoins = false },
-                onAccept = onAcceptJoin,
-                onReject = onRejectJoin,
-                onAcceptLeave = onAcceptLeave,
-                onRejectLeave = onRejectLeave
-            )
-        }
-
-        if (showCreateForumDialog) {
+        if (showCreateRoom) {
             CreateForumDialog(
-                onDismiss = { showCreateForumDialog = false },
+                onDismiss = { showCreateRoom = false },
                 onCreate = { name, readExpiry, overallExpiry, textAbsolute, images, videos, files, imageRead, imageAbsolute, imageEnforce, videoRead, videoAbsolute, videoEnforce, fileRead, fileAbsolute, fileEnforce, visibility ->
                     onCreateForum(
-                        name,
-                        readExpiry,
-                        overallExpiry,
-                        textAbsolute,
-                        images,
-                        videos,
-                        files,
-                        imageRead,
-                        imageAbsolute,
-                        imageEnforce,
-                        videoRead,
-                        videoAbsolute,
-                        videoEnforce,
-                        fileRead,
-                        fileAbsolute,
-                        fileEnforce,
-                        visibility
+                        name, readExpiry, overallExpiry, textAbsolute, images, videos, files,
+                        imageRead, imageAbsolute, imageEnforce, videoRead, videoAbsolute, videoEnforce,
+                        fileRead, fileAbsolute, fileEnforce, visibility
                     )
-                    showCreateForumDialog = false
+                    showCreateRoom = false
                 }
             )
         }
-
-        if (showWipeDialog) {
-            ConfirmWipeDialog(
-                onDismiss = { showWipeDialog = false },
+        pendingRemoval?.let { removal ->
+            val label = roomLabel(removal.session.id, removal.session.name)
+            ConfirmDialog(
+                title = if (removal.isOwner) "Delete $label?" else "Leave $label?",
+                message = if (removal.isOwner) {
+                    "The room is deleted for everyone and its messages are removed from the relay. This cannot be undone."
+                } else {
+                    "You stop receiving this room's messages. To come back, ask to join again."
+                },
+                confirmLabel = if (removal.isOwner) "Delete room" else "Leave room",
                 onConfirm = {
-                    showWipeDialog = false
-                    onWipe()
-                }
+                    pendingRemoval = null
+                    if (removal.isOwner) onDeleteForum(removal.session.id) else onLeaveForum(removal.session.id)
+                },
+                onDismiss = { pendingRemoval = null }
             )
         }
     }
 }
 
 @Composable
-private fun DashboardHeader(
-    currentUser: User?,
-    status: ServerStatus,
-    sessionSecurity: SessionSecurityState,
-    onSettings: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 16.dp)
+private fun DashboardTopBar(status: ServerStatus, canLock: Boolean, onLock: () -> Unit, onSettings: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            MirageLogo(modifier = Modifier.size(38.dp))
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(start = 12.dp)
-            ) {
-                Text(
-                    text = "Abyssal",
-                    color = PureWhite,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                PrivacyBlurred {
-                    Text(
-                        text = currentUser?.displayName ?: currentUser?.username ?: "Anonymous",
-                        color = NeonGreen,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                if (currentUser?.displayName != null) {
-                    Text(text = currentUser.username, color = SteelMuted, fontSize = 10.sp)
-                }
+        MirageLogo(modifier = Modifier.size(28.dp))
+        Text(
+            "Abyssal",
+            color = TextPrimary,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(start = 10.dp).weight(1f)
+        )
+        StatusPill(
+            label = ConnectionStatusCopy.statusLabel(status.state),
+            color = when {
+                ConnectionStatusCopy.isLive(status.state) -> Success
+                status.state == "CONNECTING" -> Warning
+                else -> Danger
             }
-            MirageIconButton(
-                contentDescription = "Open security settings",
-                onClick = onSettings
-            ) {
-                SettingsIcon(modifier = Modifier.size(18.dp), color = SteelMuted)
-            }
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            StatusPill(
-                label = ConnectionStatusCopy.pillLabel(status.state),
-                color = if (ConnectionStatusCopy.isLive(status.state)) NeonGreen else SelfDestructAmber,
-                modifier = Modifier.weight(1f)
-            )
-            StatusPill(
-                label = sessionStatusLabel(sessionSecurity),
-                color = NeonCyan,
-                modifier = Modifier.weight(1f)
-            )
-        }
-        ConnectionStatusCopy.rejectionNotice(status.state)?.let { notice ->
-            Text(
-                text = notice,
-                color = SelfDestructAmber,
-                fontSize = 12.sp,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp)
-            )
-        }
+        )
+        if (canLock) IconAction(AppIcons.Lock, "Lock now", onLock)
+        IconAction(AppIcons.Settings, "Open settings", onSettings)
     }
 }
 
 @Composable
-private fun RoomActionNotice(notice: String, onDismiss: () -> Unit) {
+private fun Greeting(currentUser: User?, onlineCount: Int, sessionSecurity: SessionSecurityState) {
+    Column(modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Signed in as ", color = TextMuted, fontSize = 14.sp)
+            PrivacyBlurred(modifier = Modifier.weight(1f, fill = false)) {
+                Text(
+                    currentUser?.displayName ?: currentUser?.username?.let(::shortAccountId) ?: "—",
+                    color = TextPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        Text(
+            text = "${if (onlineCount == 1) "1 person" else "$onlineCount people"} online · " +
+                "idle sign-out in ${formatDuration(sessionSecurity.remainingSec)}",
+            color = TextSubtle,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(top = 2.dp)
+        )
+    }
+}
+
+@Composable
+private fun SearchField(query: String, onQueryChange: (String) -> Unit) {
+    val focusManager = LocalFocusManager.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 4.dp)
-            .border(1.dp, NeonCyan.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
-            .clickable(onClickLabel = "Dismiss", onClick = onDismiss)
-            .padding(horizontal = 14.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+            .height(46.dp)
+            .clip(RoundedCornerShape(100.dp))
+            .background(SurfaceRaised)
+            .padding(start = 14.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            text = notice,
-            color = PureWhite,
-            fontSize = 13.sp,
-            lineHeight = 18.sp,
-            modifier = Modifier.weight(1f)
-        )
-        Text(text = "DISMISS", color = NeonCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-private fun PeopleDirectory(
-    users: List<UserPresence>,
-    onOpenDirect: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier) {
-        SectionLabel(
-            text = "PEOPLE",
-            modifier = Modifier.fillMaxWidth(),
-            color = NeonCyan
-        )
-        if (users.isEmpty()) {
-            Text(
-                text = peopleDirectoryEmptyStateLabel(),
-                color = SteelMuted,
-                fontSize = 12.sp,
-                modifier = Modifier.padding(top = 6.dp)
-            )
-        } else {
-            LazyRow(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(end = 8.dp)
-            ) {
-                items(users, key = { it.username }) { user ->
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color.White.copy(alpha = 0.04f))
-                            .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
-                            .clickable(
-                                role = Role.Button,
-                                onClick = { onOpenDirect(user.username) }
-                            )
-                            .semantics(mergeDescendants = true) {
-                                contentDescription = peopleDirectoryEntryLabel(user.username, user.connected)
-                            }
-                            .padding(horizontal = 10.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(7.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(if (user.connected) NeonGreen else SteelMuted)
-                        )
-                        PrivacyBlurred(revealOnTap = false) {
-                            Text(
-                                text = user.username,
-                                color = PureWhite,
-                                fontSize = 12.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        Text(
-                            text = presenceStatusLabel(false, user.connected),
-                            color = if (user.connected) NeonGreen else SteelMuted,
-                            fontSize = 11.sp,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsDialog(
-    initialSettings: DisguiseSettings,
-    sessionSecurity: SessionSecurityState,
-    directoryCheckpoint: String?,
-    preferenceControls: WorkspacePreferenceControls,
-    onDismiss: () -> Unit,
-    onSave: (Boolean, String, String) -> Unit,
-    onLock: () -> Unit,
-    onEndSession: () -> Unit
-) {
-    var disguiseEnabled by remember(initialSettings) { mutableStateOf(initialSettings.isDisguised) }
-    var pinCode by remember(initialSettings) { mutableStateOf("") }
-    var duressPin by remember(initialSettings) { mutableStateOf("") }
-    val canSaveDisguise = isValidCamouflageConfiguration(
-        enabled = disguiseEnabled,
-        unlockPin = pinCode.trim(),
-        duressPin = duressPin.trim()
-    )
-
-    MirageDialog(title = "Settings", onDismiss = onDismiss) {
-        SectionLabel(
-            text = "ACTIVE SESSION",
-            modifier = Modifier.fillMaxWidth(),
-            color = NeonGreen
-        )
-        Text(
-            text = if (sessionSecurity.retainedInBackground) {
-                "Remembered in RAM · ${formatDuration(sessionSecurity.remainingSec)} idle time left"
-            } else {
-                "Foreground only · ${formatDuration(sessionSecurity.remainingSec)} idle time left"
-            },
-            color = PureWhite,
-            fontSize = 13.sp,
-            lineHeight = 18.sp,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp)
-        )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 14.dp, bottom = 22.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            if (initialSettings.isDisguised) {
-                MirageSecondaryButton(
-                    text = "Lock now",
-                    onClick = onLock,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            MiragePrimaryButton(
-                text = "End session",
-                onClick = onEndSession,
-                danger = true,
-                modifier = Modifier.weight(1f)
-            )
-        }
-
-        if (!directoryCheckpoint.isNullOrBlank()) {
-            SectionLabel(
-                text = "DIRECTORY CHECKPOINT",
-                modifier = Modifier.fillMaxWidth(),
-                color = NeonCyan
-            )
-            Text(
-                text = directoryCheckpoint.chunked(4).joinToString(" "),
-                color = PureWhite,
-                fontSize = 11.sp,
-                lineHeight = 17.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 8.dp, bottom = 22.dp)
-            )
-        }
-
-        WorkspacePreferenceSections(preferenceControls, disguised = initialSettings.isDisguised)
-
-        SectionLabel(
-            text = "CALCULATOR DISGUISE",
-            modifier = Modifier.fillMaxWidth().padding(top = 22.dp, bottom = 8.dp),
-            color = NeonCyan
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Calculator disguise", color = PureWhite, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                Text("Show a calculator cover when the app locks.", color = SteelMuted, fontSize = 12.sp)
-            }
-            Switch(
-                checked = disguiseEnabled,
-                onCheckedChange = { disguiseEnabled = it },
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = NeonCyan,
-                    checkedTrackColor = NeonCyan.copy(alpha = 0.28f),
-                    uncheckedThumbColor = SteelMuted,
-                    uncheckedTrackColor = SteelMuted.copy(alpha = 0.2f)
-                )
-            )
-        }
-
-        if (disguiseEnabled) {
-            OutlinedTextField(
-                value = pinCode,
-                onValueChange = { pinCode = it.filter(::isCamouflageInput).take(32) },
-                label = { Text("Unlock PIN or expression") },
-                colors = mirageTextFieldColors(),
+        AppIcon(AppIcons.Search, tint = TextSubtle, size = 18.dp)
+        Box(modifier = Modifier.weight(1f).padding(horizontal = 10.dp), contentAlignment = Alignment.CenterStart) {
+            if (query.isEmpty()) Text("Search conversations and people", color = TextSubtle, fontSize = 14.sp, maxLines = 1)
+            BasicTextField(
+                value = query,
+                onValueChange = onQueryChange,
                 singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 16.dp)
-            )
-            Text(
-                text = "Enter this sequence and tap = on the calculator cover to unlock Abyssal.",
-                color = SteelMuted,
-                fontSize = 12.sp,
-                lineHeight = 17.sp,
-                modifier = Modifier.padding(top = 8.dp)
-            )
-            OutlinedTextField(
-                value = duressPin,
-                onValueChange = { duressPin = it.filter(::isCamouflageInput).take(32) },
-                label = { Text("Duress PIN") },
-                colors = mirageTextFieldColors(),
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 14.dp)
-            )
-            Text(
-                text = "Entering the duress sequence on the calculator cover wipes local memory and attempts a relay wipe.",
-                color = SelfDestructAmber,
-                fontSize = 12.sp,
-                lineHeight = 17.sp,
-                modifier = Modifier.padding(top = 8.dp)
+                textStyle = TextStyle(color = TextPrimary, fontSize = 15.sp),
+                cursorBrush = SolidColor(Accent),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Search conversations" }
             )
         }
-
-        DialogButtons(
-            cancel = "Cancel",
-            confirm = "Save",
-            onCancel = onDismiss,
-            onConfirm = { onSave(disguiseEnabled, pinCode.trim(), duressPin.trim()) },
-            confirmEnabled = canSaveDisguise
-        )
+        if (query.isNotEmpty()) {
+            IconAction(AppIcons.Close, "Clear search", { onQueryChange("") }, size = 36.dp, iconSize = 16.dp)
+        }
     }
 }
 
-@Composable
-private fun CamouflagePinSetupDialog(
-    onSave: (String, String) -> Unit
-) {
-    var pinCode by remember { mutableStateOf("") }
-    var duressPin by remember { mutableStateOf("") }
-    val canSave = isValidCamouflageConfiguration(
-        enabled = true,
-        unlockPin = pinCode.trim(),
-        duressPin = duressPin.trim()
-    )
-
-    MirageDialog(title = "Calculator PIN", onDismiss = {}) {
-        Text(
-            text = "Choose a calculator cover PIN for this device session. Remember it; Abyssal will not save it to disk.",
-            color = SteelMuted,
-            fontSize = 13.sp,
-            lineHeight = 18.sp
-        )
-        OutlinedTextField(
-            value = pinCode,
-            onValueChange = { pinCode = it.filter(::isCamouflageInput).take(32) },
-            label = { Text("Camouflage PIN") },
-            colors = mirageTextFieldColors(),
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 16.dp)
-        )
-        OutlinedTextField(
-            value = duressPin,
-            onValueChange = { duressPin = it.filter(::isCamouflageInput).take(32) },
-            label = { Text("Duress PIN") },
-            colors = mirageTextFieldColors(),
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 12.dp)
-        )
-        Text(
-            text = "Optional. This sequence performs a silent memory wipe from the calculator cover.",
-            color = SelfDestructAmber,
-            fontSize = 12.sp,
-            lineHeight = 17.sp,
-            modifier = Modifier.padding(top = 8.dp)
-        )
-        MiragePrimaryButton(
-            text = "Remember and continue",
-            onClick = { onSave(pinCode, duressPin) },
-            enabled = canSave,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 18.dp)
-        )
-    }
-}
+private data class PendingRequest(val requestId: String, val username: String, val detail: String, val isJoin: Boolean)
 
 @Composable
-private fun JoinRoomDialog(onDismiss: () -> Unit, onJoin: (String) -> Unit) {
-    var roomId by remember { mutableStateOf("") }
-    val valid = Regex("^[A-Za-z0-9_-]{1,128}$").matches(roomId)
-    MirageDialog(title = "Join encrypted room", onDismiss = onDismiss) {
-        OutlinedTextField(
-            value = roomId,
-            onValueChange = { roomId = it.trim().take(128) },
-            label = { Text("Room ID") },
-            colors = mirageTextFieldColors(),
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-        DialogButtons("Cancel", "Request access", onDismiss, { onJoin(roomId) }, valid)
-    }
-}
-
-@Composable
-private fun PendingJoinDialog(
+private fun AttentionCard(
     joins: List<PendingMlsJoinSummary>,
     leaves: List<PendingMlsLeaveSummary>,
-    onDismiss: () -> Unit,
-    onAccept: (String) -> Unit,
-    onReject: (String) -> Unit,
+    rooms: List<ChatSession>,
+    displayNames: Map<String, String>,
+    onAcceptJoin: (String) -> Unit,
+    onRejectJoin: (String) -> Unit,
     onAcceptLeave: (String) -> Unit,
     onRejectLeave: (String) -> Unit
 ) {
-    MirageDialog(title = "Room join requests", onDismiss = onDismiss) {
-        joins.forEach { join ->
-            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                Text(join.username, color = PureWhite, fontWeight = FontWeight.Bold)
-                Text(join.roomId, color = SteelMuted, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                DialogButtons("Reject", "Accept", { onReject(join.requestId) }, { onAccept(join.requestId) })
-            }
-        }
-        leaves.forEach { leave ->
-            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                Text("${leave.username} wants to leave", color = PureWhite, fontWeight = FontWeight.Bold)
-                Text(leave.roomId, color = SteelMuted, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                DialogButtons("Reject", "Approve", { onRejectLeave(leave.requestId) }, { onAcceptLeave(leave.requestId) })
-            }
-        }
-    }
-}
-
-@Composable
-private fun CreateForumDialog(
-    onDismiss: () -> Unit,
-    onCreate: (String, Int, Int, Boolean, Boolean, Boolean, Boolean, Int, Int, Boolean, Int, Int, Boolean, Int, Int, Boolean, MlsRoomVisibility) -> Unit
-) {
-    var forumName by remember { mutableStateOf("") }
-    var visibility by remember { mutableStateOf(MlsRoomVisibility.PRIVATE) }
-    var readExpiryText by remember { mutableStateOf("5") }
-    var overallExpiryText by remember { mutableStateOf("0") }
-    var textAbsoluteEnforced by remember { mutableStateOf(false) }
-    var imagesAllowed by remember { mutableStateOf(true) }
-    var videosAllowed by remember { mutableStateOf(true) }
-    var filesAllowed by remember { mutableStateOf(true) }
-    var imageReadText by remember { mutableStateOf("5") }
-    var imageAbsoluteText by remember { mutableStateOf("0") }
-    var imageAbsoluteEnforced by remember { mutableStateOf(false) }
-    var videoReadText by remember { mutableStateOf("5") }
-    var videoAbsoluteText by remember { mutableStateOf("0") }
-    var videoAbsoluteEnforced by remember { mutableStateOf(false) }
-    var fileReadText by remember { mutableStateOf("5") }
-    var fileAbsoluteText by remember { mutableStateOf("0") }
-    var fileAbsoluteEnforced by remember { mutableStateOf(false) }
-
-    MirageDialog(title = "Create room", onDismiss = onDismiss) {
-        OutlinedTextField(
-            value = forumName,
-            onValueChange = { forumName = it.take(36) },
-            label = { Text("Room name") },
-            colors = mirageTextFieldColors(),
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Text(
-            text = "Room access",
-            color = SteelMuted,
-            fontSize = 12.sp,
-            modifier = Modifier.padding(top = 12.dp)
-        )
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            listOf(MlsRoomVisibility.PRIVATE, MlsRoomVisibility.PUBLIC).forEach { option ->
-                val selected = visibility == option
-                Text(
-                    text = if (option == MlsRoomVisibility.PUBLIC) "PUBLIC" else "PRIVATE",
-                    color = if (selected) DeepBlack else PureWhite,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp,
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(7.dp))
-                        .background(if (selected) NeonCyan else Color.White.copy(alpha = 0.04f))
-                        .border(BorderStroke(1.dp, if (selected) NeonCyan else GlassBorder), RoundedCornerShape(7.dp))
-                        .clickable { visibility = option }
-                        .padding(vertical = 10.dp),
-                    textAlign = TextAlign.Center
-                )
-            }
-        }
-        Text(
-            text = if (visibility == MlsRoomVisibility.PUBLIC) {
-                "Listed for everyone on this node. Anyone can join while you are online; no approval needed."
-            } else {
-                "Not listed. Share the exact room ID, and approve each join request."
-            },
-            color = SteelMuted,
-            fontSize = 11.sp,
-            modifier = Modifier.padding(top = 6.dp)
-        )
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            OutlinedTextField(
-                value = readExpiryText,
-                onValueChange = { readExpiryText = it.filter(Char::isDigit).take(4) },
-                label = { Text("Read timer") },
-                colors = mirageTextFieldColors(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
-            OutlinedTextField(
-                value = overallExpiryText,
-                onValueChange = { overallExpiryText = it.filter(Char::isDigit).take(4) },
-                label = { Text("Absolute timer") },
-                colors = mirageTextFieldColors(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
-        }
-
-        Text(
-            text = "Read timer 0 means never. Absolute timers use seconds after send and cannot be overridden in the room.",
-            color = SteelMuted,
-            fontSize = 12.sp,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp)
-        )
-        PayloadCheckbox("Enforce text absolute timer", textAbsoluteEnforced) { textAbsoluteEnforced = it }
-
-        Column(modifier = Modifier.padding(top = 16.dp)) {
-            SectionLabel("ALLOWED PAYLOADS")
-            MediaRuleEditor(
-                label = "Images and GIFs",
-                allowed = imagesAllowed,
-                onAllowedChange = { imagesAllowed = it },
-                readText = imageReadText,
-                onReadTextChange = { imageReadText = it },
-                absoluteText = imageAbsoluteText,
-                onAbsoluteTextChange = { imageAbsoluteText = it },
-                absoluteEnforced = imageAbsoluteEnforced,
-                onAbsoluteEnforcedChange = { imageAbsoluteEnforced = it }
-            )
-            MediaRuleEditor(
-                label = "Video files",
-                allowed = videosAllowed,
-                onAllowedChange = { videosAllowed = it },
-                readText = videoReadText,
-                onReadTextChange = { videoReadText = it },
-                absoluteText = videoAbsoluteText,
-                onAbsoluteTextChange = { videoAbsoluteText = it },
-                absoluteEnforced = videoAbsoluteEnforced,
-                onAbsoluteEnforcedChange = { videoAbsoluteEnforced = it }
-            )
-            MediaRuleEditor(
-                label = "Documents up to 200 MB",
-                allowed = filesAllowed,
-                onAllowedChange = { filesAllowed = it },
-                readText = fileReadText,
-                onReadTextChange = { fileReadText = it },
-                absoluteText = fileAbsoluteText,
-                onAbsoluteTextChange = { fileAbsoluteText = it },
-                absoluteEnforced = fileAbsoluteEnforced,
-                onAbsoluteEnforcedChange = { fileAbsoluteEnforced = it }
-            )
-        }
-
-        DialogButtons(
-            cancel = "Cancel",
-            confirm = "Create",
-            confirmEnabled = forumName.isNotBlank(),
-            onCancel = onDismiss,
-            onConfirm = {
-                onCreate(
-                    forumName.trim(),
-                    readExpiryText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
-                    overallExpiryText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
-                    textAbsoluteEnforced,
-                    imagesAllowed,
-                    videosAllowed,
-                    filesAllowed,
-                    imageReadText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
-                    imageAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
-                    imageAbsoluteEnforced,
-                    videoReadText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
-                    videoAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
-                    videoAbsoluteEnforced,
-                    fileReadText.toIntOrNull()?.coerceIn(0, 86_400) ?: 5,
-                    fileAbsoluteText.toIntOrNull()?.coerceAtLeast(0) ?: 0,
-                    fileAbsoluteEnforced,
-                    visibility
-                )
-            }
-        )
-    }
-}
-
-@Composable
-private fun MediaRuleEditor(
-    label: String,
-    allowed: Boolean,
-    onAllowedChange: (Boolean) -> Unit,
-    readText: String,
-    onReadTextChange: (String) -> Unit,
-    absoluteText: String,
-    onAbsoluteTextChange: (String) -> Unit,
-    absoluteEnforced: Boolean,
-    onAbsoluteEnforcedChange: (Boolean) -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 8.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(Color.White.copy(alpha = 0.035f))
-            .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
-            .padding(10.dp)
+    fun roomName(roomId: String) =
+        rooms.firstOrNull { it.id == roomId }?.let { roomLabel(it.id, it.name) } ?: "Room ${shortRoomId(roomId)}"
+    val requests = joins.map { PendingRequest(it.requestId, it.username, "wants to join ${roomName(it.roomId)}", true) } +
+        leaves.map { PendingRequest(it.requestId, it.username, "wants to leave ${roomName(it.roomId)}", false) }
+    SectionCard(
+        title = "Needs your attention",
+        icon = AppIcons.Bell,
+        titleColor = Warning,
+        borderColor = Warning.copy(alpha = 0.4f),
+        trailing = "${requests.size}"
     ) {
-        PayloadCheckbox(label, allowed, onAllowedChange)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            OutlinedTextField(
-                value = readText,
-                onValueChange = { onReadTextChange(it.filter(Char::isDigit).take(4)) },
-                label = { Text("Read sec") },
-                colors = mirageTextFieldColors(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                singleLine = true,
-                enabled = allowed,
-                modifier = Modifier.weight(1f)
-            )
-            OutlinedTextField(
-                value = absoluteText,
-                onValueChange = { onAbsoluteTextChange(it.filter(Char::isDigit).take(4)) },
-                label = { Text("Abs sec") },
-                colors = mirageTextFieldColors(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                singleLine = true,
-                enabled = allowed,
-                modifier = Modifier.weight(1f)
-            )
-        }
-        PayloadCheckbox("Enforce absolute timer", absoluteEnforced && allowed) {
-            onAbsoluteEnforcedChange(it && allowed)
-        }
-    }
-}
-
-@Composable
-private fun ConfirmWipeDialog(
-    onDismiss: () -> Unit,
-    onConfirm: () -> Unit
-) {
-    MirageDialog(
-        title = "Wipe relay memory",
-        onDismiss = onDismiss,
-        accent = SelfDestructAmber,
-        icon = { HazardIcon(modifier = Modifier.size(34.dp), color = SelfDestructAmber) }
-    ) {
-        Text(
-            text = "This clears relay accounts, codes, rooms, queued messages, and attachments, then asks connected clients to clear local memory. This cannot force deletion on modified clients.",
-            color = MutedWhite,
-            fontSize = 14.sp,
-            lineHeight = 20.sp,
-            textAlign = TextAlign.Center
-        )
-        DialogButtons(
-            cancel = "Cancel",
-            confirm = "Wipe relay",
-            danger = true,
-            onCancel = onDismiss,
-            onConfirm = onConfirm
-        )
-    }
-}
-
-@Composable
-private fun PayloadCheckbox(
-    label: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
-    ) {
-        Checkbox(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = CheckboxDefaults.colors(checkedColor = NeonCyan, uncheckedColor = SteelMuted)
-        )
-        Text(label, color = PureWhite, fontSize = 14.sp)
-    }
-}
-
-@Composable
-private fun DialogButtons(
-    cancel: String,
-    confirm: String,
-    onCancel: () -> Unit,
-    onConfirm: () -> Unit,
-    confirmEnabled: Boolean = true,
-    danger: Boolean = false
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 24.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        MirageSecondaryButton(text = cancel, onClick = onCancel, modifier = Modifier.weight(1f))
-        MiragePrimaryButton(
-            text = confirm,
-            onClick = onConfirm,
-            enabled = confirmEnabled,
-            danger = danger,
-            modifier = Modifier.weight(1f)
-        )
-    }
-}
-
-@Composable
-private fun ChatSessionItem(
-    session: ChatSession,
-    canDelete: Boolean,
-    actionContentDescription: String,
-    onClick: () -> Unit,
-    onDelete: () -> Unit
-) {
-    val accent = if (session.isForum) NeonCyan else NeonGreen
-
-    GlassSurface(
-        modifier = Modifier.fillMaxWidth(),
-        borderColor = accent.copy(alpha = 0.26f)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .clickable(onClick = onClick),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(CircleShape)
-                        .background(DeepBlack.copy(alpha = 0.78f))
-                        .border(BorderStroke(1.dp, accent.copy(alpha = 0.38f)), CircleShape)
-                ) {
-                    Text(
-                        text = if (session.isForum) "#" else session.name.take(2).uppercase(),
-                        color = accent,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(12.dp))
-
-                Column(modifier = Modifier.weight(1f)) {
-                    PrivacyBlurred(revealOnTap = false) {
-                        Text(
-                            text = if (session.isForum) "#${session.name}" else session.name,
-                            color = PureWhite,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    PrivacyBlurred(modifier = Modifier.padding(top = 3.dp), revealOnTap = false) {
-                        Text(
-                            text = session.lastMessage?.content ?: "No active messages.",
-                            color = SteelMuted,
-                            fontSize = 13.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                    session.roomPolicySummary()?.let { summary ->
-                        Text(
-                            text = summary,
-                            color = SteelMuted,
-                            fontSize = 11.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(top = 3.dp)
-                        )
-                    }
-                }
-            }
-
-            Column(horizontalAlignment = Alignment.End) {
+        requests.forEachIndexed { index, request ->
+            if (index > 0) RowDivider()
+            val label = peerLabel(request.username, displayNames)
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    TimerIcon(modifier = Modifier.size(12.dp), color = SelfDestructAmber)
-                    Text(
-                        text = session.retentionSecondsLabel(),
-                        color = SelfDestructAmber,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.padding(start = 4.dp)
+                    Avatar(label, size = 36.dp, tone = Tone.Warning)
+                    Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                        PrivacyBlurred(revealOnTap = false) { RowTitle(label) }
+                        RowSubtitle(request.detail)
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)
+                ) {
+                    MirageSecondaryButton(
+                        text = "Decline",
+                        onClick = { if (request.isJoin) onRejectJoin(request.requestId) else onRejectLeave(request.requestId) },
+                        compact = true
                     )
-                }
-                if (session.unreadCount > 0) {
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .padding(top = 8.dp)
-                            .size(20.dp)
-                            .clip(CircleShape)
-                            .background(NeonCyan)
-                    ) {
-                        Text(
-                            text = session.unreadCount.toString(),
-                            color = DeepBlack,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-                if (canDelete) {
-                    MirageIconButton(
-                        contentDescription = actionContentDescription,
-                        onClick = onDelete,
-                        accent = SelfDestructAmber.copy(alpha = 0.45f),
-                        size = 34.dp,
-                        modifier = Modifier.padding(top = 8.dp)
-                    ) {
-                        DeleteIcon(modifier = Modifier.size(16.dp))
-                    }
+                    MiragePrimaryButton(
+                        text = if (request.isJoin) "Accept" else "Approve",
+                        onClick = { if (request.isJoin) onAcceptJoin(request.requestId) else onAcceptLeave(request.requestId) },
+                        compact = true
+                    )
                 }
             }
         }
     }
+}
+
+@Composable
+private fun ConnectingState() {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        AbyssalMarkLoader(size = AbyssalMarkLoaderSize.Large, description = "Connecting to relay")
+        Text(
+            "Connecting to the relay",
+            color = TextPrimary,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 18.dp)
+        )
+        Text("Loading your rooms and conversations.", color = TextMuted, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
+    }
+}
+
+@Composable
+private fun RoomsCard(
+    rooms: List<ChatSession>,
+    hasRooms: Boolean,
+    username: String?,
+    displayNames: Map<String, String>,
+    ownedRoomCount: Int,
+    roomCreationLimit: Int,
+    canCreateRoom: Boolean,
+    onOpen: (String) -> Unit,
+    onCreate: () -> Unit,
+    onJoinById: () -> Unit,
+    onRemove: (ChatSession) -> Unit
+) {
+    SectionCard(title = "Your rooms", icon = AppIcons.Hash, trailing = "$ownedRoomCount of $roomCreationLimit owned") {
+        when {
+            !hasRooms -> EmptyState(
+                title = "No rooms yet",
+                detail = "Create a room, join a public one, or ask an owner for a room ID.",
+                modifier = Modifier.fillMaxWidth()
+            )
+            rooms.isEmpty() -> Text("No rooms match your search.", color = TextMuted, fontSize = 14.sp, modifier = Modifier.padding(16.dp))
+            else -> rooms.forEachIndexed { index, room ->
+                if (index > 0) RowDivider(inset = 68.dp)
+                RoomRow(room, username, isOwner = room.ownerUsername == username, displayNames, onOpen, onRemove)
+            }
+        }
+        HorizontalDivider(color = Outline)
+        Row(modifier = Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            MiragePrimaryButton(
+                text = if (canCreateRoom) "New room" else "Limit reached",
+                onClick = onCreate,
+                enabled = canCreateRoom,
+                icon = AppIcons.Plus,
+                modifier = Modifier.weight(1f)
+            )
+            MirageSecondaryButton("Join by ID", onJoinById, icon = AppIcons.LogIn, modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun RoomRow(
+    room: ChatSession,
+    username: String?,
+    isOwner: Boolean,
+    displayNames: Map<String, String>,
+    onOpen: (String) -> Unit,
+    onRemove: (ChatSession) -> Unit
+) {
+    val isPublic = room.roomVisibility == MlsRoomVisibility.PUBLIC
+    val owner = when {
+        isOwner -> "You own this"
+        room.ownerUsername != null -> "Owner ${peerLabel(room.ownerUsername, displayNames)}"
+        else -> null
+    }
+    ListRow(
+        onClick = { onOpen(room.id) },
+        onClickLabel = "Open room",
+        leading = {
+            Avatar(
+                "",
+                tone = if (isPublic) Tone.Success else Tone.Accent,
+                icon = if (isPublic) AppIcons.Globe else AppIcons.Hash
+            )
+        },
+        title = { PrivacyBlurred(revealOnTap = false) { RowTitle(roomLabel(room.id, room.name)) } },
+        subtitle = {
+            room.lastMessage?.let { conversationPreview(it, username) }?.let { preview ->
+                PrivacyBlurred(revealOnTap = false) {
+                    RowSubtitle(preview, color = if (room.unreadCount > 0) TextPrimary else TextMuted)
+                }
+            }
+            RowSubtitle(
+                listOfNotNull(owner, if (isPublic) "Public" else "Private").joinToString(" · "),
+                color = TextSubtle
+            )
+            if (room.lastMessage == null) room.roomPolicySummary()?.let { RowSubtitle(it, color = TextSubtle) }
+        },
+        trailing = {
+            if (room.unreadCount > 0) CountBadge(room.unreadCount)
+            RoomMenu(room, isOwner, onRemove)
+        }
+    )
+}
+
+@Composable
+private fun RoomMenu(room: ChatSession, isOwner: Boolean, onRemove: (ChatSession) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    val label = roomLabel(room.id, room.name)
+    Box {
+        IconAction(AppIcons.MoreVertical, "Options for $label", { expanded = true }, size = 40.dp, iconSize = 18.dp)
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }, modifier = Modifier.background(SurfaceRaised)) {
+            DropdownMenuItem(
+                text = { Text("Copy room ID", color = TextPrimary) },
+                leadingIcon = { AppIcon(AppIcons.Copy, size = 18.dp) },
+                onClick = {
+                    expanded = false
+                    clipboard.setText(AnnotatedString(room.id))
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                        Toast.makeText(context, "Room ID copied", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
+            DropdownMenuItem(
+                text = { Text(if (isOwner) "Delete room" else "Leave room", color = Danger) },
+                leadingIcon = { AppIcon(if (isOwner) AppIcons.Trash else AppIcons.LogOut, tint = Danger, size = 18.dp) },
+                modifier = Modifier.semantics { contentDescription = roomActionContentDescription(isOwner, label) },
+                onClick = { expanded = false; onRemove(room) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun PublicRoomsCard(rooms: List<MlsPublicRoomSummary>, onJoin: (String) -> Unit) {
+    SectionCard(title = "Public rooms", icon = AppIcons.Globe, trailing = "${rooms.size} listed") {
+        rooms.forEachIndexed { index, room ->
+            if (index > 0) RowDivider(inset = 68.dp)
+            ListRow(
+                leading = { Avatar("", tone = Tone.Success, icon = AppIcons.Users) },
+                title = { RowTitle("Room ${shortRoomId(room.roomId)}") },
+                subtitle = { RowSubtitle("Owner ${shortAccountId(room.ownerUsername)}", color = TextSubtle) },
+                trailing = {
+                    MirageSecondaryButton(
+                        text = "Join",
+                        onClick = { onJoin(room.roomId) },
+                        compact = true,
+                        modifier = Modifier.semantics { contentDescription = "Join public room ${room.roomId}" }
+                    )
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun DirectsCard(
+    directs: List<ChatSession>,
+    username: String?,
+    presence: List<UserPresence>,
+    hasDirects: Boolean,
+    peerCount: Int,
+    displayNames: Map<String, String>,
+    onOpen: (String) -> Unit
+) {
+    SectionCard(title = "Direct messages", icon = AppIcons.Message, trailing = if (hasDirects) "${directs.size}" else null) {
+        when {
+            !hasDirects -> EmptyState(
+                title = directConversationEmptyStateTitle(),
+                detail = directConversationEmptyStateDetail(peerCount),
+                modifier = Modifier.fillMaxWidth()
+            )
+            directs.isEmpty() -> Text(
+                "No conversations match your search.",
+                color = TextMuted,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(16.dp)
+            )
+            else -> directs.forEachIndexed { index, direct ->
+                if (index > 0) RowDivider(inset = 68.dp)
+                val label = peerLabel(direct.name, displayNames)
+                ListRow(
+                    onClick = { onOpen(direct.id) },
+                    onClickLabel = "Open conversation",
+                    leading = { Avatar(label) },
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            PrivacyBlurred(revealOnTap = false, modifier = Modifier.weight(1f, fill = false)) { RowTitle(label) }
+                            if (label != shortAccountId(direct.name)) {
+                                Text(
+                                    shortAccountId(direct.name),
+                                    color = TextSubtle,
+                                    fontSize = 12.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    maxLines = 1,
+                                    modifier = Modifier.padding(start = 6.dp)
+                                )
+                            }
+                        }
+                    },
+                    subtitle = {
+                        // The dashboard never sees message content; show reachability instead.
+                        val preview = direct.lastMessage?.let { conversationPreview(it, username) }
+                        val online = presence.any { it.connected && it.username.equals(direct.name, ignoreCase = true) }
+                        if (preview != null) {
+                            PrivacyBlurred(revealOnTap = false) {
+                                RowSubtitle(preview, color = if (direct.unreadCount > 0) TextPrimary else TextMuted)
+                            }
+                        } else {
+                            RowSubtitle(
+                                when {
+                                    direct.unreadCount > 0 -> "New messages"
+                                    online -> "Online"
+                                    else -> "Offline"
+                                },
+                                color = when {
+                                    direct.unreadCount > 0 -> Accent
+                                    online -> Success
+                                    else -> TextSubtle
+                                }
+                            )
+                        }
+                    },
+                    trailing = { if (direct.unreadCount > 0) CountBadge(direct.unreadCount) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PeopleCard(
+    people: List<UserPresence>,
+    onlineCount: Int,
+    displayNames: Map<String, String>,
+    onOpenDirect: (String) -> Unit
+) {
+    SectionCard(title = "People", icon = AppIcons.Users, trailing = "$onlineCount online") {
+        if (people.isEmpty()) {
+            Text(peopleDirectoryEmptyStateLabel(), color = TextMuted, fontSize = 14.sp, modifier = Modifier.padding(16.dp))
+        }
+        people.forEachIndexed { index, user ->
+            if (index > 0) RowDivider(inset = 68.dp)
+            val label = peerLabel(user.username, displayNames)
+            ListRow(
+                modifier = Modifier.semantics(mergeDescendants = true) {
+                    contentDescription = peopleDirectoryEntryLabel(user.username, user.connected)
+                },
+                onClick = { onOpenDirect(user.username) },
+                leading = { Avatar(label, online = user.connected) },
+                title = { PrivacyBlurred(revealOnTap = false) { RowTitle(label) } },
+                subtitle = {
+                    RowSubtitle(
+                        presenceStatusLabel(isCurrentUser = false, connected = user.connected) +
+                            if (label != shortAccountId(user.username)) " · ${shortAccountId(user.username)}" else "",
+                        color = if (user.connected) Success else TextSubtle
+                    )
+                },
+                trailing = { AppIcon(AppIcons.MessagePlus, tint = Accent, size = 20.dp) }
+            )
+        }
+    }
+}
+
+/** One-line preview of a conversation's latest message. */
+internal fun conversationPreview(message: Message, currentUsername: String? = null): String {
+    val from = if (message.sender == "You") "You: " else ""
+    val body = when {
+        !message.isMedia -> mentionsAsYou(message.content, currentUsername)
+        message.reactionShortcode != null -> "GIF ${message.reactionShortcode}"
+        message.oneTimeView -> "One-time media"
+        else -> when (message.mediaType) {
+            "IMAGE" -> "Photo"
+            "VIDEO" -> "Video"
+            else -> "File"
+        } + (message.attachmentName?.let { " · $it" } ?: "")
+    }
+    return from + body.lineSequence().firstOrNull().orEmpty()
+}
+
+/** Replaces mentions of the reader with "@you", as message bubbles show them. */
+internal fun mentionsAsYou(content: String, currentUsername: String?): String {
+    val ranges = MessageAttentionPolicy.mentionRanges(content, currentUsername)
+    if (ranges.isEmpty()) return content
+    val out = StringBuilder()
+    var cursor = 0
+    ranges.forEach { range ->
+        out.append(content, cursor, range.first).append("@you")
+        cursor = range.last + 1
+    }
+    return out.append(content, cursor, content.length).toString()
 }
 
 internal fun roomActionContentDescription(isOwner: Boolean, roomName: String): String {
@@ -1371,105 +788,19 @@ internal fun roomActionContentDescription(isOwner: Boolean, roomName: String): S
 }
 
 internal fun presenceStatusLabel(isCurrentUser: Boolean, connected: Boolean): String {
-    val status = if (connected) "ONLINE" else "OFFLINE"
-    return if (isCurrentUser) "YOU · $status" else status
+    val status = if (connected) "Online" else "Offline"
+    return if (isCurrentUser) "You · $status" else status
 }
-
-@Composable
-private fun PublicRoomsSection(
-    rooms: List<MlsPublicRoomSummary>,
-    onJoin: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier.padding(bottom = 8.dp)) {
-        SectionLabel("PUBLIC ROOMS", color = NeonCyan)
-        rooms.take(32).forEach { room ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 6.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.White.copy(alpha = 0.035f))
-                    .border(BorderStroke(1.dp, GlassBorder), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Public room",
-                        color = PureWhite,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp
-                    )
-                    Text(
-                        text = room.roomId,
-                        color = SteelMuted,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                MirageSecondaryButton(text = "Join", onClick = { onJoin(room.roomId) })
-            }
-        }
-    }
-}
-
-@Composable
-private fun mirageTextFieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedBorderColor = NeonCyan,
-    unfocusedBorderColor = GlassBorder,
-    cursorColor = NeonCyan,
-    focusedTextColor = PureWhite,
-    unfocusedTextColor = PureWhite,
-    focusedLabelColor = NeonCyan,
-    unfocusedLabelColor = SteelMuted
-)
-
-private fun sessionStatusLabel(state: SessionSecurityState): String {
-    val mode = if (state.retainedInBackground) "RAM" else "FOREGROUND"
-    return "$mode ${formatDuration(state.remainingSec)}"
-}
-
-private fun formatDuration(totalSeconds: Int): String {
-    val safeSeconds = totalSeconds.coerceAtLeast(0)
-    val minutes = safeSeconds / 60
-    val seconds = safeSeconds % 60
-    return "%d:%02d".format(minutes, seconds)
-}
-
-private fun isCamouflageInput(value: Char): Boolean = value in "0123456789.+-*/()"
 
 @Preview
 @Composable
 private fun DashboardContentPreview() {
-    val sampleMessage = Message(
-        id = "m1",
-        sender = "NebulaTiger93",
-        receiver = null,
-        content = "Room keys rotated.",
-        timestampMs = 0L,
-        selfDestructDurationSec = 5
-    )
     DashboardContent(
-        currentUser = User("SilentVector482", ByteArray(608)),
-        sessions = listOf(
-            ChatSession("room", "operations", true, sampleMessage, 3, 5, ownerUsername = "SilentVector482"),
-            ChatSession("dm", "LunarNode231", false, null, 0, 10)
-        ),
+        currentUser = User("SilentVector482", ByteArray(0)),
+        sessions = listOf(ChatSession("room", "operations", true, null, 3, 5, ownerUsername = "SilentVector482")),
         status = ServerStatus("CONNECTED", "Node-Alpha", 24),
-        presence = listOf(
-            UserPresence("SilentVector482", true, ByteArray(608)),
-            UserPresence("LunarNode231", false, ByteArray(608))
-        ),
-        sessionSecurity = SessionSecurityState(
-            active = true,
-            retainedInBackground = true,
-            inactivityTimeoutSec = 900,
-            remainingSec = 842
-        ),
+        presence = listOf(UserPresence("LunarNode231", true, ByteArray(0))),
+        sessionSecurity = SessionSecurityState(true, true, 900, 842),
         roomCreationLimit = 5,
         disguiseSettings = DisguiseSettings(),
         onOpenChat = {},

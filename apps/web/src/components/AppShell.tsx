@@ -1,4 +1,4 @@
-import { Menu } from "lucide-react";
+import { LockKeyhole, Menu, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { displayNamesBySender } from "../domain/displayLabels";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
@@ -38,6 +38,8 @@ interface AppShellProps {
   onLock: () => void;
   onOpenSettings: () => void;
   onLogout: () => void;
+  /** Opens the conversation finder; on phones this replaces the Ctrl+K shortcut. */
+  onSearch?: () => void;
   children?: React.ReactNode;
 }
 
@@ -70,6 +72,7 @@ export function AppShell({
   onLock,
   onOpenSettings,
   onLogout,
+  onSearch,
   children,
 }: AppShellProps) {
   const [mobileMenu, setMobileMenu] = useState(false);
@@ -81,6 +84,8 @@ export function AppShell({
         <IconButton label="Open menu" onClick={() => setMobileMenu(true)}><Menu size={20} /></IconButton>
         <Brand compact />
         <span className={`status-dot-label state-${connection}`}><i aria-hidden="true" />{connectionLabel(connection)}</span>
+        {onSearch ? <IconButton label="Find a conversation" onClick={onSearch}><Search size={20} /></IconButton> : null}
+        {canLock ? <IconButton label="Lock" title="Lock now" onClick={onLock}><LockKeyhole size={19} /></IconButton> : null}
       </header>
 
       <Sidebar
@@ -104,6 +109,7 @@ export function AppShell({
         onLock={onLock}
         onOpenSettings={onOpenSettings}
         onLogout={onLogout}
+        onSearch={onSearch ? () => { setMobileMenu(false); onSearch(); } : undefined}
       />
       {mobileMenu ? <button className="sidebar-scrim" type="button" aria-label="Close menu" onClick={() => setMobileMenu(false)} /> : null}
 

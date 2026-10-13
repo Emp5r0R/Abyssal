@@ -9,7 +9,7 @@ class DashboardRoomPolicyTest {
     @Test
     fun noEnabledAttachmentMediaFallsBackToTextAndNeverTimers() {
         assertEquals(
-            "PRIVATE · TEXT · READ Never · ABS Never",
+            "Text only · stays until the session ends",
             room(allowImages = false, allowVideos = false, allowFiles = false).roomPolicySummary()
         )
     }
@@ -17,7 +17,7 @@ class DashboardRoomPolicyTest {
     @Test
     fun someEnabledAttachmentMediaListsOnlyThoseTypesAndReadRetention() {
         assertEquals(
-            "PRIVATE · IMG · FILE · READ 5s · ABS Never",
+            "Text, images, files · vanish 5s after reading",
             room(allowImages = true, allowVideos = false, allowFiles = true, readExpiry = 5).roomPolicySummary()
         )
     }
@@ -25,7 +25,7 @@ class DashboardRoomPolicyTest {
     @Test
     fun allEnabledAttachmentMediaShowsEnforcedAbsoluteRetention() {
         assertEquals(
-            "PRIVATE · IMG · VID · FILE · READ 10s · ABS 60s",
+            "Text, images, videos, files · vanish 10s after reading · deleted 1m after sending",
             room(
                 allowImages = true,
                 allowVideos = true,
@@ -40,7 +40,7 @@ class DashboardRoomPolicyTest {
     @Test
     fun unenforcedAbsoluteValueIsNotPresentedAsActivePolicy() {
         assertEquals(
-            "PRIVATE · TEXT · READ 5s · ABS Never",
+            "Text only · vanish 5s after reading",
             room(
                 allowImages = false,
                 allowVideos = false,

@@ -1,5 +1,13 @@
 package com.abyssal.chat.presentation.screens
 
+import androidx.compose.foundation.layout.Row
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.RoundedCornerShape
+import com.abyssal.chat.theme.TextMuted
+import com.abyssal.chat.theme.AccentBorder
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Handler
@@ -18,7 +26,6 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -40,7 +47,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.abyssal.chat.BuildConfig
 import com.abyssal.chat.data.qr.InviteQrDecoder
-import com.abyssal.chat.theme.PureWhite
+import com.abyssal.chat.theme.TextPrimary
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.delay
@@ -118,14 +125,28 @@ private fun QrCameraScanner(
     LaunchedEffect(Unit) { delay(60_000); dismiss() }
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(securePolicy = SecureFlagPolicy.SecureOn)) {
         GlassSurface {
-            Column(Modifier.padding(16.dp)) {
-                Text(title, color = PureWhite)
+            Column(Modifier.padding(18.dp)) {
+                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    Avatar("", size = 36.dp, icon = AppIcons.ScanLine)
+                    Text(
+                        title,
+                        color = TextPrimary,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(start = 12.dp)
+                    )
+                }
                 if (granted) {
                     InviteCameraPreview(onScanned, onDismiss, accepted)
                 } else {
-                    Text(if (requested) "Camera unavailable. You can paste or open a QR image." else "Waiting for camera permission.", color = PureWhite)
+                    Text(
+                        if (requested) "Camera unavailable. You can paste or open a QR image instead." else "Waiting for camera permission…",
+                        color = TextMuted,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(vertical = 16.dp)
+                    )
                 }
-                TextButton(onClick = onDismiss) { Text("Close camera") }
+                MirageSecondaryButton("Close camera", onDismiss, modifier = Modifier.fillMaxWidth())
             }
         }
     }
@@ -203,6 +224,19 @@ private fun InviteCameraPreview(
         }
         onDispose { lifecycle.lifecycle.removeObserver(observer); stop() }
     }
-    AndroidView(factory = { preview }, modifier = Modifier.fillMaxWidth().aspectRatio(4f / 3f).padding(vertical = 12.dp))
-    Text(status, color = PureWhite)
+    AndroidView(
+        factory = { preview },
+        modifier = Modifier
+            .padding(vertical = 14.dp)
+            .fillMaxWidth()
+            .aspectRatio(4f / 3f)
+            .clip(RoundedCornerShape(14.dp))
+            .border(2.dp, AccentBorder, RoundedCornerShape(14.dp))
+    )
+    Text(
+        if (status == "Camera active.") "Point the camera at the QR code." else status,
+        color = TextMuted,
+        fontSize = 14.sp,
+        modifier = Modifier.padding(bottom = 12.dp)
+    )
 }

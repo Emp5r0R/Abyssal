@@ -128,6 +128,31 @@ describe("AppShell navigation and home", () => {
     expect(screen.queryByRole("button", { name: "Lock now" })).not.toBeInTheDocument();
   });
 
+  it("offers search and a quick lock in the mobile top bar", () => {
+    const onSearch = vi.fn();
+    const props = renderShell({ onSearch });
+    const finders = screen.getAllByRole("button", { name: "Find a conversation" });
+    expect(finders).toHaveLength(2);
+    finders.forEach((button) => fireEvent.click(button));
+    expect(onSearch).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "Lock" }));
+    expect(props.onLock).toHaveBeenCalledOnce();
+    cleanup();
+    renderShell({ canLock: false });
+    expect(screen.queryByRole("button", { name: "Find a conversation" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Lock" })).not.toBeInTheDocument();
+  });
+
+  it("lets members copy a room ID from the dashboard", async () => {
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Copy room ID" }));
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+    expect(writeText).toHaveBeenCalledWith("forum_ops");
+    vi.unstubAllGlobals();
+  });
+
   it("reports a failed room join request", () => {
     renderShell({ onJoinRoom: vi.fn(() => false) });
     fireEvent.change(screen.getByLabelText("Room ID"), { target: { value: "forum_ops" } });

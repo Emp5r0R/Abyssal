@@ -21,13 +21,16 @@ internal fun InviteEntryField(
     enabled: Boolean,
     isError: Boolean,
     onNext: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    trailingIcon: (@Composable () -> Unit)? = null
 ) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         label = { Text("Abyssal invite") },
-        placeholder = { Text("ABY1-... or abyssal:invite:...") },
+        placeholder = { Text("ABY1-… or abyssal:invite:…") },
+        trailingIcon = trailingIcon,
+        shape = ControlShape,
         colors = colors,
         enabled = enabled,
         singleLine = true,

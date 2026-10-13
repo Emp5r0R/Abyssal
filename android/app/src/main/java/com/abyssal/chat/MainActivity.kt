@@ -35,7 +35,7 @@ import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import com.abyssal.chat.theme.AbyssalTheme
-import com.abyssal.chat.theme.DeepBlack
+import com.abyssal.chat.theme.Background
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -67,7 +67,7 @@ class MainActivity : ComponentActivity() {
             AbyssalTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = DeepBlack
+                    color = Background
                 ) {
                     val currentScreen by viewModel.currentScreen.collectAsState()
                     val isLocked by viewModel.isLocked.collectAsState()

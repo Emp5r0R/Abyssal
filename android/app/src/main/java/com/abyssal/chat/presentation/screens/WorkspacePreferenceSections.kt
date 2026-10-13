@@ -7,7 +7,10 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,7 +21,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -37,10 +39,14 @@ import androidx.core.content.ContextCompat
 import com.abyssal.chat.domain.model.BackgroundAction
 import com.abyssal.chat.domain.model.NotificationLevel
 import com.abyssal.chat.domain.model.WorkspacePreferences
-import com.abyssal.chat.theme.GlassBorder
-import com.abyssal.chat.theme.NeonCyan
-import com.abyssal.chat.theme.PureWhite
-import com.abyssal.chat.theme.SteelMuted
+import com.abyssal.chat.theme.Outline
+import com.abyssal.chat.theme.AccentBorder
+import com.abyssal.chat.theme.AccentSoft
+import com.abyssal.chat.theme.SurfaceRaised
+import com.abyssal.chat.theme.TextSubtle
+import com.abyssal.chat.theme.Accent
+import com.abyssal.chat.theme.TextPrimary
+import com.abyssal.chat.theme.TextMuted
 
 /** Preference state and actions for Settings, matching the web client's Settings dialog. */
 internal data class WorkspacePreferenceControls(
@@ -69,38 +75,37 @@ private val NOTIFICATION_CHOICES = listOf(
     Choice(NotificationLevel.PREVIEW, "Sender and preview", "Who wrote and the start of the message. Hidden on the lock screen.")
 )
 
+/** Blur and leave-the-app choices; sits inside a Settings card. */
 @Composable
-internal fun WorkspacePreferenceSections(controls: WorkspacePreferenceControls, disguised: Boolean) {
+internal fun PrivacyPreferences(controls: WorkspacePreferenceControls, disguised: Boolean) {
     val preferences = controls.preferences
-    SectionLabel(text = "PRIVACY", modifier = Modifier.fillMaxWidth(), color = NeonCyan)
     PreferenceSwitch(
         label = "Blur names and messages",
-        detail = "Blurred text shows for a few seconds when you tap it.",
+        detail = "Tap blurred text to show it for a few seconds.",
         checked = preferences.blurEnabled,
         onCheckedChange = controls.onBlurChange
     )
     Text(
         text = "When you leave Abyssal",
-        color = PureWhite,
+        color = TextPrimary,
         fontSize = 14.sp,
         fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+        modifier = Modifier.padding(top = 18.dp, bottom = 8.dp)
     )
     BACKGROUND_CHOICES.forEach { choice ->
         val unavailable = choice.value == BackgroundAction.LOCK && !disguised
         PreferenceChoice(
             label = choice.label,
-            detail = if (unavailable) "Turn on the calculator disguise to use this." else choice.detail,
+            detail = if (unavailable) "Turn on the calculator cover to use this." else choice.detail,
             selected = preferences.backgroundAction == choice.value && !(unavailable && choice.value == BackgroundAction.LOCK),
             enabled = !unavailable,
             onSelect = { controls.onBackgroundActionChange(choice.value) }
         )
     }
-    NotificationSection(controls)
 }
 
 @Composable
-private fun NotificationSection(controls: WorkspacePreferenceControls) {
+internal fun NotificationPreferences(controls: WorkspacePreferenceControls) {
     val context = LocalContext.current
     var pending by remember { mutableStateOf<NotificationLevel?>(null) }
     var systemUiToken by remember { mutableStateOf<Long?>(null) }
@@ -130,7 +135,6 @@ private fun NotificationSection(controls: WorkspacePreferenceControls) {
         }
     }
 
-    SectionLabel(text = "NOTIFICATIONS", modifier = Modifier.fillMaxWidth().padding(top = 22.dp), color = NeonCyan)
     NOTIFICATION_CHOICES.forEach { choice ->
         PreferenceChoice(
             label = choice.label,
@@ -142,10 +146,10 @@ private fun NotificationSection(controls: WorkspacePreferenceControls) {
     }
     Text(
         text = notificationHint(controls, blocked),
-        color = SteelMuted,
+        color = TextSubtle,
         fontSize = 12.sp,
         lineHeight = 17.sp,
-        modifier = Modifier.padding(top = 6.dp)
+        modifier = Modifier.padding(top = 4.dp)
     )
     if (blocked) {
         TextButton(onClick = {
@@ -154,7 +158,7 @@ private fun NotificationSection(controls: WorkspacePreferenceControls) {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             // Leaving for system settings is an ordinary background transition.
             runCatching { context.startActivity(intent) }
-        }) { Text("OPEN NOTIFICATION SETTINGS", color = NeonCyan) }
+        }) { Text("Open notification settings", color = Accent, fontWeight = FontWeight.SemiBold) }
     }
 }
 
@@ -167,26 +171,20 @@ private fun notificationHint(controls: WorkspacePreferenceControls, blocked: Boo
 }
 
 @Composable
-private fun PreferenceSwitch(label: String, detail: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+internal fun PreferenceSwitch(label: String, detail: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange)
+            .padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(label, color = PureWhite, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-            Text(detail, color = SteelMuted, fontSize = 12.sp)
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(label, color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Text(detail, color = TextMuted, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.padding(top = 2.dp))
         }
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = NeonCyan,
-                checkedTrackColor = NeonCyan.copy(alpha = 0.28f),
-                uncheckedThumbColor = SteelMuted,
-                uncheckedTrackColor = SteelMuted.copy(alpha = 0.2f)
-            )
-        )
+        Switch(checked = checked, onCheckedChange = null, colors = appSwitchColors())
     }
 }
 
@@ -195,21 +193,23 @@ private fun PreferenceChoice(label: String, detail: String, selected: Boolean, e
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(bottom = 6.dp)
-            .border(1.dp, if (selected) NeonCyan.copy(alpha = 0.6f) else GlassBorder, RoundedCornerShape(10.dp))
+            .padding(bottom = 8.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (selected) AccentSoft else SurfaceRaised)
+            .border(1.dp, if (selected) AccentBorder else Outline, RoundedCornerShape(12.dp))
             .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onSelect)
-            .padding(horizontal = 6.dp, vertical = 6.dp),
+            .padding(horizontal = 6.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         RadioButton(
             selected = selected,
             onClick = null,
             enabled = enabled,
-            colors = RadioButtonDefaults.colors(selectedColor = NeonCyan, unselectedColor = SteelMuted)
+            colors = RadioButtonDefaults.colors(selectedColor = Accent, unselectedColor = TextMuted)
         )
-        Column(modifier = Modifier.weight(1f).padding(start = 4.dp)) {
-            Text(label, color = if (enabled) PureWhite else SteelMuted, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text(detail, color = SteelMuted, fontSize = 12.sp, lineHeight = 16.sp)
+        Column(modifier = Modifier.weight(1f).padding(start = 4.dp, end = 8.dp)) {
+            Text(label, color = if (enabled) TextPrimary else TextSubtle, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(detail, color = if (enabled) TextMuted else TextSubtle, fontSize = 13.sp, lineHeight = 18.sp)
         }
     }
 }

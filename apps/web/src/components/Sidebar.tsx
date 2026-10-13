@@ -1,4 +1,4 @@
-import { Hash, House, LockKeyhole, LogOut, MessageCirclePlus, Plus, Settings, X } from "lucide-react";
+import { Hash, House, LockKeyhole, LogOut, MessageCirclePlus, Plus, Search, Settings, X } from "lucide-react";
 import type { ChatMessage, ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
 import { accountInitials, roomLabel, shortAccountId } from "../domain/displayLabels";
 import { connectionLabel } from "./connectionCopy";
@@ -26,6 +26,7 @@ export interface SidebarProps {
   onLock: () => void;
   onOpenSettings: () => void;
   onLogout: () => void;
+  onSearch?: () => void;
 }
 
 /** Primary navigation: rooms, conversations, people, and the signed-in account. */
@@ -50,6 +51,7 @@ export function Sidebar({
   onLock,
   onOpenSettings,
   onLogout,
+  onSearch,
 }: SidebarProps) {
   const ownedRooms = rooms.filter((room) => room.owner_username === username).length;
   const peers = presence.filter((user) => user.username !== username);
@@ -70,6 +72,9 @@ export function Sidebar({
         <span className={`status-dot-label state-${connection}`} title={connectionLabel(connection)}>
           <i aria-hidden="true" />{connectionLabel(connection)}
         </span>
+        {onSearch ? (
+          <IconButton label="Find a conversation" title="Find a conversation (Ctrl+K)" onClick={onSearch}><Search size={17} /></IconButton>
+        ) : null}
         <IconButton className="mobile-only" label="Close menu" onClick={onClose}><X size={18} /></IconButton>
       </div>
 

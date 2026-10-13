@@ -18,6 +18,7 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
+import { CopyIconButton } from "./CopyableValue";
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { remainingSeconds } from "../domain/messagePolicy";
 import { formatBytes } from "../domain/format";
@@ -209,6 +210,7 @@ export function ChatView({
           )}
         </div>
         {connected ? null : <span className="offline-badge"><WifiOff size={14} aria-hidden="true" />Offline</span>}
+        {isDirect ? null : <CopyIconButton label="Copy room ID" value={room.id} />}
       </header>
 
       <div

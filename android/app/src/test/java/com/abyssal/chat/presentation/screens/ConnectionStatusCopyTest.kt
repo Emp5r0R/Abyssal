@@ -10,18 +10,18 @@ import org.junit.Test
 class ConnectionStatusCopyTest {
     @Test
     fun transportStatesMapToUserFacingCopyWithoutRawIdentifiers() {
-        assertEquals("LIVE", ConnectionStatusCopy.pillLabel("CONNECTED"))
-        assertEquals("CONNECTING", ConnectionStatusCopy.pillLabel("CONNECTING"))
-        assertEquals("OFFLINE", ConnectionStatusCopy.pillLabel("DISCONNECTED"))
-        assertEquals("UPDATE REQUIRED", ConnectionStatusCopy.pillLabel("SECURITY_REJECTED"))
-        assertEquals("OFFLINE", ConnectionStatusCopy.pillLabel("UNEXPECTED"))
-        assertEquals("WEB ACCOUNT", ConnectionStatusCopy.pillLabel("PLATFORM_CONFLICT"))
-        assertEquals("SIGNED OUT", ConnectionStatusCopy.pillLabel("SESSION_EXPIRED"))
+        assertEquals("Connected", ConnectionStatusCopy.statusLabel("CONNECTED"))
+        assertEquals("Connecting", ConnectionStatusCopy.statusLabel("CONNECTING"))
+        assertEquals("Offline", ConnectionStatusCopy.statusLabel("DISCONNECTED"))
+        assertEquals("Update required", ConnectionStatusCopy.statusLabel("SECURITY_REJECTED"))
+        assertEquals("Offline", ConnectionStatusCopy.statusLabel("UNEXPECTED"))
+        assertEquals("Web account", ConnectionStatusCopy.statusLabel("PLATFORM_CONFLICT"))
+        assertEquals("Signed out", ConnectionStatusCopy.statusLabel("SESSION_EXPIRED"))
         listOf(
             "CONNECTED", "CONNECTING", "DISCONNECTED", "SECURITY_REJECTED",
             "PLATFORM_CONFLICT", "SESSION_EXPIRED"
         ).forEach { state ->
-            assertFalse(ConnectionStatusCopy.pillLabel(state).contains('_'))
+            assertFalse(ConnectionStatusCopy.statusLabel(state).contains('_'))
             assertFalse(ConnectionStatusCopy.composerPlaceholder(state).contains('_'))
         }
     }
@@ -30,7 +30,7 @@ class ConnectionStatusCopyTest {
     fun onlyRejectedBuildsAskForAnUpdateInsteadOfReconnecting() {
         assertTrue(ConnectionStatusCopy.isLive("CONNECTED"))
         assertFalse(ConnectionStatusCopy.isLive("CONNECTING"))
-        assertEquals("Message", ConnectionStatusCopy.composerPlaceholder("CONNECTED"))
+        assertEquals("Write a message", ConnectionStatusCopy.composerPlaceholder("CONNECTED"))
         assertEquals("Reconnecting", ConnectionStatusCopy.composerPlaceholder("DISCONNECTED"))
         assertEquals("Update the app to reconnect", ConnectionStatusCopy.composerPlaceholder("SECURITY_REJECTED"))
         assertNotNull(ConnectionStatusCopy.rejectionNotice("SECURITY_REJECTED"))

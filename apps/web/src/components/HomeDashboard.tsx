@@ -4,6 +4,7 @@ import { accountInitials, roomLabel, shortAccountId, shortRoomId } from "../doma
 import type { ConnectionState, DirectRecord, PresenceUser, RoomRecord } from "../domain/types";
 import type { PublicRoomSummary } from "../transport/mlsWire";
 import { connectionNotice } from "./connectionCopy";
+import { CopyIconButton } from "./CopyableValue";
 import { PrivacyBlur } from "./PrivacyBlur";
 import { Dialog, Field, IconButton } from "./Ui";
 
@@ -225,6 +226,7 @@ function RoomRow({ room, owner, ownerName, onOpenRoom, onDeleteRoom, onLeaveRoom
           <span>{media.length === 0 ? "Text only" : `Text, ${media.join(", ")}`}</span>
         </span>
       </button>
+      <CopyIconButton label="Copy room ID" value={room.id} />
       {owner ? (
         <IconButton label="Delete room" onClick={onDeleteRoom}><Trash2 size={17} /></IconButton>
       ) : (

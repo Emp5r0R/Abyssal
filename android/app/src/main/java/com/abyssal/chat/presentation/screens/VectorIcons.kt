@@ -20,12 +20,12 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.unit.dp
-import com.abyssal.chat.theme.NeonCyan
-import com.abyssal.chat.theme.NeonGreen
-import com.abyssal.chat.theme.PureWhite
-import com.abyssal.chat.theme.SelfDestructAmber
-import com.abyssal.chat.theme.DeepBlack
-import com.abyssal.chat.theme.SteelMuted
+import com.abyssal.chat.theme.Accent
+import com.abyssal.chat.theme.Success
+import com.abyssal.chat.theme.TextPrimary
+import com.abyssal.chat.theme.Danger
+import com.abyssal.chat.theme.Background
+import com.abyssal.chat.theme.TextMuted
 
 @Composable
 fun MirageLogo(
@@ -117,7 +117,7 @@ private fun MirageLogoCanvas(
             } else {
                 (1f - t) / 0.8f
             }
-            val strokeColor = NeonCyan.copy(alpha = alpha * 0.18f)
+            val strokeColor = Accent.copy(alpha = alpha * 0.18f)
 
             scale(scale = scaleVal, pivot = center) {
                 rotate(degrees = rotationOuter + i * 20f, pivot = center) {
@@ -134,7 +134,7 @@ private fun MirageLogoCanvas(
         rotate(degrees = rotationOuter, pivot = center) {
             drawPath(
                 path = baseOuterPath,
-                color = NeonCyan,
+                color = Accent,
                 style = Stroke(width = 2.dp.toPx())
             )
         }
@@ -151,7 +151,7 @@ private fun MirageLogoCanvas(
             rotate(degrees = rotationInner, pivot = center) {
                 drawPath(
                     path = baseInnerPath,
-                    color = NeonGreen,
+                    color = Success,
                     style = Stroke(width = 1.5.dp.toPx())
                 )
             }
@@ -159,345 +159,9 @@ private fun MirageLogoCanvas(
 
         // Central core glow dot
         drawCircle(
-            color = NeonGreen,
+            color = Success,
             radius = 3.dp.toPx() * pulseScale,
             center = Offset(w / 2, h * 0.47f)
         )
-    }
-}
-
-@Composable
-fun BiometricScannerIcon(modifier: Modifier = Modifier) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        val center = Offset(w / 2, h / 2)
-        val radius = size.minDimension / 2
-        
-        drawArc(
-            color = NeonGreen.copy(alpha = 0.8f),
-            startAngle = 45f,
-            sweepAngle = 90f,
-            useCenter = false,
-            style = Stroke(width = 2.dp.toPx()),
-            topLeft = Offset(center.x - radius * 0.7f, center.y - radius * 0.7f),
-            size = Size(radius * 1.4f, radius * 1.4f)
-        )
-        
-        drawArc(
-            color = NeonGreen.copy(alpha = 0.6f),
-            startAngle = 180f,
-            sweepAngle = 140f,
-            useCenter = false,
-            style = Stroke(width = 2.dp.toPx()),
-            topLeft = Offset(center.x - radius * 0.5f, center.y - radius * 0.5f),
-            size = Size(radius * 1.0f, radius * 1.0f)
-        )
-
-        drawArc(
-            color = NeonGreen,
-            startAngle = -45f,
-            sweepAngle = 180f,
-            useCenter = false,
-            style = Stroke(width = 2.dp.toPx()),
-            topLeft = Offset(center.x - radius * 0.3f, center.y - radius * 0.3f),
-            size = Size(radius * 0.6f, radius * 0.6f)
-        )
-    }
-}
-
-@Composable
-fun LockIcon(modifier: Modifier = Modifier, color: Color = NeonGreen) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        
-        drawRoundRect(
-            color = color,
-            topLeft = Offset(0f, h * 0.42f),
-            size = Size(w, h * 0.58f),
-            cornerRadius = CornerRadius(2.dp.toPx()),
-            style = Stroke(width = 1.5.dp.toPx())
-        )
-        
-        drawArc(
-            color = color,
-            startAngle = 180f,
-            sweepAngle = 180f,
-            useCenter = false,
-            style = Stroke(width = 1.5.dp.toPx()),
-            topLeft = Offset(w * 0.18f, h * 0.08f),
-            size = Size(w * 0.64f, h * 0.68f)
-        )
-    }
-}
-
-@Composable
-fun TimerIcon(modifier: Modifier = Modifier, color: Color = SelfDestructAmber) {
-    Canvas(modifier = modifier) {
-        val r = size.minDimension / 2
-        val center = Offset(size.width / 2, size.height / 2)
-        
-        drawCircle(color = color, radius = r * 0.9f, style = Stroke(width = 1.5.dp.toPx()))
-        
-        drawLine(color = color, start = center, end = Offset(center.x, center.y - r * 0.5f), strokeWidth = 1.5.dp.toPx())
-        drawLine(color = color, start = center, end = Offset(center.x + r * 0.35f, center.y), strokeWidth = 1.5.dp.toPx())
-        
-        drawLine(color = color, start = Offset(center.x - r * 0.25f, center.y - r), end = Offset(center.x + r * 0.25f, center.y - r), strokeWidth = 2.dp.toPx())
-    }
-}
-
-@Composable
-fun HazardIcon(modifier: Modifier = Modifier, color: Color = PureWhite) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        
-        val path = Path().apply {
-            moveTo(w / 2, 0f)
-            lineTo(w, h)
-            lineTo(0f, h)
-            close()
-        }
-        drawPath(path = path, color = color, style = Stroke(width = 2.dp.toPx()))
-        
-        drawLine(color = color, start = Offset(w / 2, h * 0.35f), end = Offset(w / 2, h * 0.68f), strokeWidth = 2.dp.toPx())
-        drawCircle(color = color, radius = 1.5.dp.toPx(), center = Offset(w / 2, h * 0.82f))
-    }
-}
-
-@Composable
-fun ArrowBackIcon(modifier: Modifier = Modifier, color: Color = NeonCyan) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        
-        drawLine(color = color, start = Offset(w * 0.8f, h * 0.5f), end = Offset(w * 0.2f, h * 0.5f), strokeWidth = 2.dp.toPx())
-        drawLine(color = color, start = Offset(w * 0.5f, h * 0.2f), end = Offset(w * 0.2f, h * 0.5f), strokeWidth = 2.dp.toPx())
-        drawLine(color = color, start = Offset(w * 0.5f, h * 0.8f), end = Offset(w * 0.2f, h * 0.5f), strokeWidth = 2.dp.toPx())
-    }
-}
-
-@Composable
-fun SendIcon(modifier: Modifier = Modifier, color: Color = DeepBlack) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        
-        val path = Path().apply {
-            moveTo(0f, 0f)
-            lineTo(w, h / 2)
-            lineTo(0f, h)
-            lineTo(w * 0.35f, h / 2)
-            close()
-        }
-        drawPath(path = path, color = color)
-    }
-}
-
-@Composable
-fun ReplyIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        val path = Path().apply {
-            moveTo(w * 0.42f, h * 0.18f)
-            lineTo(w * 0.10f, h * 0.48f)
-            lineTo(w * 0.42f, h * 0.78f)
-            moveTo(w * 0.12f, h * 0.48f)
-            cubicTo(w * 0.52f, h * 0.42f, w * 0.78f, h * 0.55f, w * 0.90f, h * 0.84f)
-        }
-        drawPath(
-            path = path,
-            color = color,
-            style = Stroke(width = 1.8.dp.toPx())
-        )
-    }
-}
-
-@Composable
-fun CloseIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
-    Canvas(modifier = modifier) {
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.18f, size.height * 0.18f),
-            end = Offset(size.width * 0.82f, size.height * 0.82f),
-            strokeWidth = 1.8.dp.toPx()
-        )
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.82f, size.height * 0.18f),
-            end = Offset(size.width * 0.18f, size.height * 0.82f),
-            strokeWidth = 1.8.dp.toPx()
-        )
-    }
-}
-
-@Composable
-fun EyeIcon(
-    modifier: Modifier = Modifier,
-    color: Color = SteelMuted,
-    crossedOut: Boolean = false
-) {
-    Canvas(modifier = modifier) {
-        val eye = Path().apply {
-            moveTo(size.width * 0.08f, size.height * 0.5f)
-            cubicTo(
-                size.width * 0.28f,
-                size.height * 0.16f,
-                size.width * 0.72f,
-                size.height * 0.16f,
-                size.width * 0.92f,
-                size.height * 0.5f
-            )
-            cubicTo(
-                size.width * 0.72f,
-                size.height * 0.84f,
-                size.width * 0.28f,
-                size.height * 0.84f,
-                size.width * 0.08f,
-                size.height * 0.5f
-            )
-            close()
-        }
-        drawPath(eye, color = color, style = Stroke(width = 1.7.dp.toPx()))
-        drawCircle(
-            color = color,
-            radius = size.minDimension * 0.14f,
-            center = Offset(size.width / 2f, size.height / 2f),
-            style = Stroke(width = 1.7.dp.toPx())
-        )
-        if (crossedOut) {
-            drawLine(
-                color = color,
-                start = Offset(size.width * 0.12f, size.height * 0.12f),
-                end = Offset(size.width * 0.88f, size.height * 0.88f),
-                strokeWidth = 1.9.dp.toPx()
-            )
-        }
-    }
-}
-
-@Composable
-fun PlusIcon(modifier: Modifier = Modifier, color: Color = DeepBlack) {
-    Canvas(modifier = modifier) {
-        drawLine(
-            color = color,
-            start = Offset(size.width / 2f, size.height * 0.18f),
-            end = Offset(size.width / 2f, size.height * 0.82f),
-            strokeWidth = 2.dp.toPx()
-        )
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.18f, size.height / 2f),
-            end = Offset(size.width * 0.82f, size.height / 2f),
-            strokeWidth = 2.dp.toPx()
-        )
-    }
-}
-
-@Composable
-fun DeleteIcon(modifier: Modifier = Modifier, color: Color = SelfDestructAmber) {
-    Canvas(modifier = modifier) {
-        val stroke = 1.7.dp.toPx()
-        drawRoundRect(
-            color = color,
-            topLeft = Offset(size.width * 0.24f, size.height * 0.30f),
-            size = Size(size.width * 0.52f, size.height * 0.58f),
-            cornerRadius = CornerRadius(2.dp.toPx()),
-            style = Stroke(width = stroke)
-        )
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.16f, size.height * 0.24f),
-            end = Offset(size.width * 0.84f, size.height * 0.24f),
-            strokeWidth = stroke
-        )
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.38f, size.height * 0.12f),
-            end = Offset(size.width * 0.62f, size.height * 0.12f),
-            strokeWidth = stroke
-        )
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.42f, size.height * 0.40f),
-            end = Offset(size.width * 0.42f, size.height * 0.76f),
-            strokeWidth = stroke
-        )
-        drawLine(
-            color = color,
-            start = Offset(size.width * 0.58f, size.height * 0.40f),
-            end = Offset(size.width * 0.58f, size.height * 0.76f),
-            strokeWidth = stroke
-        )
-    }
-}
-
-@Composable
-fun SettingsIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
-    Canvas(modifier = modifier) {
-        val r = size.minDimension / 2
-        val center = Offset(size.width / 2, size.height / 2)
-        
-        drawCircle(color = color, radius = r * 0.62f, style = Stroke(width = 2.dp.toPx()))
-        drawCircle(color = color, radius = r * 0.22f, style = Stroke(width = 1.5.dp.toPx()))
-        
-        for (i in 0..7) {
-            val angle = i * (Math.PI / 4)
-            val start = Offset(
-                (center.x + Math.cos(angle) * r * 0.58f).toFloat(),
-                (center.y + Math.sin(angle) * r * 0.58f).toFloat()
-            )
-            val end = Offset(
-                (center.x + Math.cos(angle) * r * 0.90f).toFloat(),
-                (center.y + Math.sin(angle) * r * 0.90f).toFloat()
-            )
-            drawLine(color = color, start = start, end = end, strokeWidth = 3.dp.toPx())
-        }
-    }
-}
-
-@Composable
-fun PaperclipIcon(modifier: Modifier = Modifier, color: Color = SteelMuted) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        
-        val path = Path().apply {
-            moveTo(w * 0.70f, h * 0.25f)
-            lineTo(w * 0.70f, h * 0.65f)
-            // Bottom loop
-            quadraticBezierTo(w * 0.70f, h * 0.88f, w * 0.50f, h * 0.88f)
-            quadraticBezierTo(w * 0.30f, h * 0.88f, w * 0.30f, h * 0.65f)
-            lineTo(w * 0.30f, h * 0.35f)
-            // Top loop
-            quadraticBezierTo(w * 0.30f, h * 0.12f, w * 0.50f, h * 0.12f)
-            quadraticBezierTo(w * 0.70f, h * 0.12f, w * 0.70f, h * 0.35f)
-            // Inner line
-            lineTo(w * 0.70f, h * 0.55f)
-        }
-        drawPath(path = path, color = color, style = Stroke(width = 1.5.dp.toPx()))
-    }
-}
-
-@Composable
-fun MediaFileIcon(modifier: Modifier = Modifier, color: Color = NeonGreen) {
-    Canvas(modifier = modifier) {
-        val w = size.width
-        val h = size.height
-        
-        val path = Path().apply {
-            moveTo(0f, 0f)
-            lineTo(w * 0.68f, 0f)
-            lineTo(w, h * 0.32f)
-            lineTo(w, h)
-            lineTo(0f, h)
-            close()
-        }
-        drawPath(path = path, color = color, style = Stroke(width = 1.5.dp.toPx()))
-        
-        drawLine(color = color, start = Offset(w * 0.68f, 0f), end = Offset(w * 0.68f, h * 0.32f), strokeWidth = 1.5.dp.toPx())
-        drawLine(color = color, start = Offset(w * 0.68f, h * 0.32f), end = Offset(w, h * 0.32f), strokeWidth = 1.5.dp.toPx())
     }
 }

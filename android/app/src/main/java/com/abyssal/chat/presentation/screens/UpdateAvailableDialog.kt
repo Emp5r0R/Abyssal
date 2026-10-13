@@ -1,5 +1,6 @@
 package com.abyssal.chat.presentation.screens
 
+import com.abyssal.chat.theme.TextSubtle
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,9 +20,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.material3.Text
 import com.abyssal.chat.domain.model.AvailableAppUpdate
-import com.abyssal.chat.theme.NeonGreen
-import com.abyssal.chat.theme.PureWhite
-import com.abyssal.chat.theme.SteelMuted
+import com.abyssal.chat.theme.Success
+import com.abyssal.chat.theme.TextPrimary
+import com.abyssal.chat.theme.TextMuted
 
 @Composable
 fun UpdateAvailableDialog(
@@ -36,35 +37,34 @@ fun UpdateAvailableDialog(
     MirageDialog(
         title = "Update available",
         onDismiss = onRemindLater,
-        accent = NeonGreen,
+        accent = Success,
+        icon = { Avatar("", size = 40.dp, tone = Tone.Success, icon = AppIcons.Download) },
         modifier = Modifier.widthIn(max = 440.dp)
     ) {
         Text(
             text = "A signed Abyssal release is ready on the official GitHub repository.",
-            color = PureWhite,
+            color = TextPrimary,
             fontSize = 14.sp,
-            lineHeight = 20.sp,
-            textAlign = TextAlign.Center
+            lineHeight = 20.sp
         )
 
-        Spacer(modifier = Modifier.height(22.dp))
+        Spacer(modifier = Modifier.height(18.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            VersionLabel(label = "CURRENT", version = currentVersionName, color = SteelMuted)
-            VersionLabel(label = "AVAILABLE", version = update.versionName, color = NeonGreen)
+            VersionLabel(label = "Installed", version = currentVersionName, color = TextMuted)
+            VersionLabel(label = "New", version = update.versionName, color = Success)
         }
 
         Text(
             text = "Abyssal verifies the complete package against the signed release digest before Android opens it.",
-            color = SteelMuted,
+            color = TextMuted,
             fontSize = 12.sp,
             lineHeight = 17.sp,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(top = 22.dp)
+            modifier = Modifier.padding(top = 18.dp)
         )
 
         if (isPreparing) {
@@ -76,30 +76,29 @@ fun UpdateAvailableDialog(
         }
 
         MiragePrimaryButton(
-            text = if (isPreparing) "VERIFYING..." else "UPDATE",
+            text = if (isPreparing) "Verifying…" else "Update now",
             onClick = onUpdate,
             enabled = !isPreparing,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 22.dp)
+                .padding(top = 18.dp)
         )
 
         if (failureMessage != null) {
             Text(
                 text = failureMessage,
-                color = SteelMuted,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
+                color = com.abyssal.chat.theme.Danger,
+                fontSize = 13.sp,
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
             )
         }
 
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             MirageSecondaryButton(
-                text = "Cancel",
+                text = "Skip",
                 onClick = onCancel,
                 modifier = Modifier.weight(1f)
             )
@@ -117,10 +116,9 @@ private fun VersionLabel(label: String, version: String, color: Color) {
     Column(horizontalAlignment = Alignment.Start) {
         Text(
             text = label,
-            color = SteelMuted,
-            fontSize = 10.sp,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold
+            color = TextSubtle,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
         )
         Text(
             text = "v$version",

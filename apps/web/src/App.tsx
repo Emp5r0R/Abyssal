@@ -230,6 +230,7 @@ export default function App() {
           canLock={cover.coverReady}
           onLock={lockWorkspace}
           onOpenSettings={() => setShowSettings(true)}
+          onSearch={() => setShowSwitcher(true)}
           setAttachmentRetentionSec={setAttachmentRetentionSec}
           setShowAttachment={setShowAttachment}
           setShowCreateRoom={setShowCreateRoom}
@@ -298,6 +299,7 @@ function SecureWorkspace({
   canLock,
   onLock,
   onOpenSettings,
+  onSearch,
   setAttachmentRetentionSec,
   setShowAttachment,
   setShowCreateRoom,
@@ -309,6 +311,7 @@ function SecureWorkspace({
   canLock: boolean;
   onLock: () => void;
   onOpenSettings: () => void;
+  onSearch: () => void;
   setAttachmentRetentionSec: (seconds: number) => void;
   setShowAttachment: (show: boolean) => void;
   setShowCreateRoom: (show: boolean) => void;
@@ -368,6 +371,7 @@ function SecureWorkspace({
       onLock={onLock}
       onOpenSettings={onOpenSettings}
       onLogout={() => void resetLocal()}
+      onSearch={onSearch}
     >
       {abyssal.activeRoom ? (
         <ChatView

@@ -7,6 +7,7 @@ import com.abyssal.chat.domain.model.NotificationLevel
 import com.abyssal.chat.domain.model.WorkspacePreferencePolicy
 import com.abyssal.chat.domain.model.WorkspacePreferences
 import com.abyssal.chat.domain.model.shortAccountId
+import com.abyssal.chat.domain.model.withDisplayName
 import android.net.Uri
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
@@ -524,6 +525,10 @@ class ChatViewModel(
     val pendingMlsLeaves: StateFlow<List<PendingMlsLeaveSummary>> = _pendingMlsLeaves.asStateFlow()
     private val _publicMlsRooms = MutableStateFlow<List<MlsPublicRoomSummary>>(emptyList())
     val publicMlsRooms: StateFlow<List<MlsPublicRoomSummary>> = _publicMlsRooms.asStateFlow()
+
+    // Unverified self-chosen names seen on incoming messages, keyed by lower-case account ID.
+    private val _knownDisplayNames = MutableStateFlow<Map<String, String>>(emptyMap())
+    val knownDisplayNames: StateFlow<Map<String, String>> = _knownDisplayNames.asStateFlow()
     private var mlsManager: MlsRoomManager? = null
     private val requestedMlsRooms = LinkedHashSet<String>()
     private data class CachedMlsSnapshot(val evidence: ByteArray, val snapshot: PreparedMlsSnapshot)
@@ -736,7 +741,7 @@ class ChatViewModel(
                         return@withLock
                     }
                     rememberReceivedFrame(replayKey, directoryEvidenceKey)
-                    notifyIncoming(incoming.chatId, message)
+                    onIncomingStored(incoming.chatId, message)
                 } finally {
                     plainBytes.fill(0)
                 }
@@ -865,7 +870,7 @@ class ChatViewModel(
                                 }
                             }
                             if (mutateRepositoryIfAccountCurrent(stamp) { messageRepository.saveMessageIfCurrent(stamp.repositoryEpoch, frame.roomId, message) }) {
-                                notifyIncoming(frame.roomId, message)
+                                onIncomingStored(frame.roomId, message)
                             } else {
                                 wipeMessageSecrets(message)
                             }
@@ -2181,6 +2186,11 @@ class ChatViewModel(
         _notificationsAllowed.value = messageNotifier?.canNotify() == true
     }
 
+    private fun onIncomingStored(chatId: String, message: Message) {
+        _knownDisplayNames.value = withDisplayName(_knownDisplayNames.value, message.sender, message.senderDisplayName)
+        notifyIncoming(chatId, message)
+    }
+
     /** Raises a notification for a stored incoming message, per the chosen privacy level. */
     private fun notifyIncoming(chatId: String, message: Message) {
         val notifier = messageNotifier ?: return
@@ -2431,6 +2441,7 @@ class ChatViewModel(
         _pendingMlsJoins.value = emptyList()
         _pendingMlsLeaves.value = emptyList()
         _publicMlsRooms.value = emptyList()
+        _knownDisplayNames.value = emptyMap()
         mlsSnapshotCache.values.forEach { it.evidence.fill(0) }
         mlsSnapshotCache.clear()
         payloadCipher.clear()

@@ -33,8 +33,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
-import com.abyssal.chat.theme.DeepBlack
-import com.abyssal.chat.theme.PureWhite
+import com.abyssal.chat.theme.Background
+import com.abyssal.chat.theme.TextPrimary
 
 @Composable
 fun CalculatorScreen(viewModel: ChatViewModel) {
@@ -58,7 +58,7 @@ private fun CalculatorContent(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(DeepBlack)
+            .background(Background)
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(horizontal = 14.dp, vertical = 16.dp)
@@ -71,7 +71,7 @@ private fun CalculatorContent(
         ) {
             Text(
                 text = display,
-                color = PureWhite,
+                color = TextPrimary,
                 fontSize = 52.sp,
                 fontWeight = FontWeight.Light,
                 textAlign = TextAlign.End,
@@ -133,7 +133,7 @@ private fun CalculatorButton(
     ) {
         Text(
             text = label,
-            color = PureWhite,
+            color = TextPrimary,
             fontSize = 27.sp,
             fontWeight = FontWeight.Normal
         )

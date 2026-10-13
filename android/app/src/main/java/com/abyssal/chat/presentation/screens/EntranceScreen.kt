@@ -1,5 +1,12 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+
 package com.abyssal.chat.presentation.screens
 
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Box
+import com.abyssal.chat.theme.TextSubtle
+import com.abyssal.chat.theme.OnAccent
 import com.abyssal.chat.data.qr.ClipboardQrImage
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -55,13 +62,13 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
-import com.abyssal.chat.theme.DeepBlack
-import com.abyssal.chat.theme.GlassBorder
-import com.abyssal.chat.theme.NeonCyan
-import com.abyssal.chat.theme.NeonGreen
-import com.abyssal.chat.theme.PureWhite
-import com.abyssal.chat.theme.SelfDestructAmber
-import com.abyssal.chat.theme.SteelMuted
+import com.abyssal.chat.theme.Background
+import com.abyssal.chat.theme.Outline
+import com.abyssal.chat.theme.Accent
+import com.abyssal.chat.theme.Success
+import com.abyssal.chat.theme.TextPrimary
+import com.abyssal.chat.theme.Danger
+import com.abyssal.chat.theme.TextMuted
 import java.nio.charset.StandardCharsets
 import com.abyssal.chat.BuildConfig
 import com.abyssal.chat.data.qr.InviteQrDecoder
@@ -83,7 +90,7 @@ fun EntranceScreen(viewModel: ChatViewModel) {
 }
 
 @Composable
-private fun EntranceContent(
+internal fun EntranceContent(
     isVerifying: Boolean,
     error: String?,
     onInputChanged: () -> Unit,
@@ -151,6 +158,7 @@ private fun EntranceContent(
         onDismiss = { scanning = false }
     )
 
+    val inputsEnabled = !isVerifying && !readingImage && !scanning
     MirageBackground {
         Column(
             modifier = Modifier
@@ -159,130 +167,120 @@ private fun EntranceContent(
                 .navigationBarsPadding()
                 .imePadding()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+                .padding(horizontal = 20.dp, vertical = 20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .widthIn(max = 500.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    MirageLogo(modifier = Modifier.size(52.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "ABYSSAL",
-                            color = PureWhite,
-                            fontSize = 28.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1
-                        )
-                        Text(
-                            text = "Private node access",
-                            color = SteelMuted,
-                            fontSize = 13.sp,
-                            modifier = Modifier.padding(top = 2.dp)
-                        )
+            Column(modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    MirageLogo(modifier = Modifier.size(36.dp))
+                    Column(modifier = Modifier.padding(start = 12.dp)) {
+                        Text("Abyssal", color = TextPrimary, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Ephemeral encrypted chat", color = TextMuted, fontSize = 13.sp)
                     }
-                    StatusPill(label = "RAM ONLY", color = NeonGreen)
                 }
-
                 Text(
-                    text = "Enter Abyssal",
-                    color = PureWhite,
-                    fontSize = 22.sp,
+                    text = "Private conversations that leave no trace.",
+                    color = TextPrimary,
+                    fontSize = 24.sp,
+                    lineHeight = 30.sp,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 34.dp, bottom = 14.dp)
+                    modifier = Modifier.padding(top = 28.dp, bottom = 22.dp)
                 )
 
-                GlassSurface(
-                    modifier = Modifier.fillMaxWidth(),
-                    borderColor = if (error == null) GlassBorder else SelfDestructAmber.copy(alpha = 0.55f)
-                ) {
+                SectionCard {
                     Column(modifier = Modifier.padding(18.dp)) {
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            TextButton(onClick = { scanning = true }, enabled = !isVerifying && !readingImage) { Text("Scan invite") }
-                            TextButton(onClick = { imagePicker.launch("image/*") }, enabled = !isVerifying && !readingImage) {
-                                if (readingImage) AbyssalMarkLoader(size = AbyssalMarkLoaderSize.Inline)
-                                Text(if (readingImage) "Reading image" else "Open QR image")
-                            }
-                        }
-                        TextButton(
-                            onClick = {
-                                val uri = ClipboardQrImage.imageUri(context)
-                                if (uri == null) imageError = true else readImage(uri)
-                            },
-                            enabled = !isVerifying && !readingImage
-                        ) { Text("Paste copied QR image") }
-                        if (imageError) {
-                            Text(
-                                "No valid invite QR found. Copy a screenshot of the QR, then paste it.",
-                                color = SelfDestructAmber,
-                                fontSize = 12.sp
-                            )
-                        }
+                        Text("Sign in", color = TextPrimary, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Use the invite from your node operator. A new invite creates your account; a used one signs you back in.",
+                            color = TextMuted,
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp,
+                            modifier = Modifier.padding(top = 4.dp, bottom = 16.dp)
+                        )
                         InviteEntryField(
                             value = invite,
                             onValueChange = {
                                 invite = it.take(MAX_INVITE_TEXT_CHARS)
                                 onInputChanged()
                             },
-                            colors = entranceTextFieldColors(),
-                            enabled = !isVerifying && !readingImage && !scanning,
+                            colors = appTextFieldColors(),
+                            enabled = inputsEnabled,
                             isError = error != null,
                             onNext = { passwordFocusRequester.requestFocus() },
+                            trailingIcon = {
+                                IconAction(
+                                    AppIcons.ClipboardPaste,
+                                    "Paste invite",
+                                    {
+                                        invite = clipboard.getText()?.text?.take(MAX_INVITE_TEXT_CHARS).orEmpty()
+                                        onInputChanged()
+                                    },
+                                    enabled = inputsEnabled,
+                                    tint = Accent
+                                )
+                            },
                             modifier = Modifier.fillMaxWidth()
                         )
-
-                        TextButton(
-                            onClick = {
-                                invite = clipboard.getText()?.text
-                                    ?.take(MAX_INVITE_TEXT_CHARS)
-                                    .orEmpty()
-                                onInputChanged()
-                            },
-                            enabled = !isVerifying && !readingImage && !scanning,
+                        FlowRow(
                             modifier = Modifier
-                                .align(Alignment.End)
-                                .padding(top = 4.dp)
+                                .fillMaxWidth()
+                                .padding(top = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text("Paste invite")
+                            MirageSecondaryButton(
+                                "Scan QR",
+                                { scanning = true },
+                                enabled = !isVerifying && !readingImage,
+                                icon = AppIcons.ScanLine,
+                                compact = true
+                            )
+                            MirageSecondaryButton(
+                                if (readingImage) "Reading…" else "Open image",
+                                { imagePicker.launch("image/*") },
+                                enabled = !isVerifying && !readingImage,
+                                icon = AppIcons.Image,
+                                compact = true
+                            )
+                            MirageSecondaryButton(
+                                "Paste QR image",
+                                {
+                                    val uri = ClipboardQrImage.imageUri(context)
+                                    if (uri == null) imageError = true else readImage(uri)
+                                },
+                                enabled = !isVerifying && !readingImage,
+                                icon = AppIcons.ClipboardPaste,
+                                compact = true
+                            )
+                        }
+                        if (imageError) {
+                            Text(
+                                "No valid invite QR found. Copy a screenshot of the QR code, then paste it.",
+                                color = Danger,
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
                         }
 
-                        OutlinedTextField(
+                        AppTextField(
                             value = password,
                             onValueChange = {
                                 password = it.take(MAX_PASSWORD_CHARS)
                                 onInputChanged()
                             },
-                            label = { Text("Password") },
-                            placeholder = { Text("Minimum 8 characters") },
-                            colors = entranceTextFieldColors(accent = NeonGreen),
+                            label = "Password",
+                            placeholder = "At least 8 characters",
                             enabled = !isVerifying,
-                            singleLine = true,
-                            visualTransformation = if (passwordVisible) {
-                                VisualTransformation.None
-                            } else {
-                                PasswordVisualTransformation()
-                            },
-                            trailingIcon = {
-                                IconButton(onClick = { passwordVisible = !passwordVisible }) {
-                                    EyeIcon(
-                                        modifier = Modifier.size(20.dp),
-                                        color = if (passwordVisible) NeonGreen else SteelMuted,
-                                        crossedOut = !passwordVisible
-                                    )
-                                }
-                            },
                             isError = error != null,
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconAction(
+                                    if (passwordVisible) AppIcons.EyeOff else AppIcons.Eye,
+                                    if (passwordVisible) "Hide password" else "Show password",
+                                    { passwordVisible = !passwordVisible }
+                                )
+                            },
                             keyboardOptions = KeyboardOptions(
                                 capitalization = KeyboardCapitalization.None,
                                 keyboardType = KeyboardType.Password,
@@ -290,70 +288,29 @@ private fun EntranceContent(
                             ),
                             keyboardActions = KeyboardActions(onDone = { submit() }),
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 12.dp)
+                                .padding(top = 16.dp)
                                 .focusRequester(passwordFocusRequester)
                         )
 
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 14.dp)
-                                .clickable(
-                                    enabled = !isVerifying,
-                                    role = Role.Checkbox,
-                                    onClick = { rememberSession = !rememberSession }
-                                )
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Checkbox(
+                        Box(modifier = Modifier.padding(top = 14.dp)) {
+                            PreferenceSwitch(
+                                label = "Keep me signed in while hidden",
+                                detail = if (rememberSession) {
+                                    "Your session stays in memory when Abyssal is covered or in the background."
+                                } else {
+                                    "Your session ends as soon as Abyssal leaves the screen."
+                                },
                                 checked = rememberSession,
-                                onCheckedChange = { rememberSession = it },
-                                enabled = !isVerifying,
-                                colors = CheckboxDefaults.colors(
-                                    checkedColor = NeonCyan,
-                                    checkmarkColor = DeepBlack,
-                                    uncheckedColor = SteelMuted
-                                )
+                                onCheckedChange = { if (!isVerifying) rememberSession = it }
                             )
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 6.dp)
-                            ) {
-                                Text(
-                                    text = "Keep session behind privacy cover",
-                                    color = PureWhite,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Text(
-                                    text = if (rememberSession) {
-                                        "Keep it in process memory when Abyssal is covered"
-                                    } else {
-                                        "End it when Abyssal leaves the foreground"
-                                    },
-                                    color = SteelMuted,
-                                    fontSize = 12.sp,
-                                    lineHeight = 17.sp,
-                                    modifier = Modifier.padding(top = 2.dp)
-                                )
-                            }
                         }
 
                         if (error != null) {
-                            Text(
-                                text = error,
-                                color = SelfDestructAmber,
-                                fontSize = 12.sp,
-                                textAlign = TextAlign.Start,
-                                modifier = Modifier.padding(top = 10.dp)
-                            )
+                            NoticeBanner(error, Tone.Danger, icon = AppIcons.Alert, modifier = Modifier.padding(top = 14.dp))
                         }
 
                         MiragePrimaryButton(
-                            text = "Enter Abyssal",
+                            text = "Sign in",
                             onClick = ::submit,
                             enabled = canSubmit,
                             modifier = Modifier
@@ -361,55 +318,33 @@ private fun EntranceContent(
                                 .padding(top = 18.dp)
                         ) {
                             if (isVerifying) {
-                                AbyssalMarkLoader(
-                                    size = AbyssalMarkLoaderSize.Inline,
-                                    description = "Verifying node access"
-                                )
+                                AbyssalMarkLoader(size = AbyssalMarkLoaderSize.Inline, description = "Verifying node access")
+                                Text("Verifying…", fontWeight = FontWeight.SemiBold, fontSize = 15.sp, modifier = Modifier.padding(start = 8.dp))
                             } else {
-                                Text(
-                                    text = "Enter Abyssal",
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                AppIcon(AppIcons.LogIn, tint = OnAccent, size = 18.dp)
+                                Text("Sign in", fontWeight = FontWeight.SemiBold, fontSize = 15.sp, modifier = Modifier.padding(start = 8.dp))
                             }
                         }
                     }
                 }
 
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center
                 ) {
-                    LockIcon(modifier = Modifier.size(14.dp), color = SteelMuted)
+                    AppIcon(AppIcons.Lock, tint = TextSubtle, size = 14.dp)
                     Text(
-                        text = "Session state is never written to app storage",
-                        color = SteelMuted,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(start = 8.dp)
+                        text = "Nothing is written to storage. Your session lives in memory only.",
+                        color = TextSubtle,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(start = 6.dp)
                     )
                 }
             }
         }
     }
 }
-
-@Composable
-private fun entranceTextFieldColors(accent: Color = NeonCyan) = OutlinedTextFieldDefaults.colors(
-    focusedBorderColor = accent,
-    unfocusedBorderColor = GlassBorder,
-    errorBorderColor = SelfDestructAmber,
-    cursorColor = accent,
-    focusedTextColor = PureWhite,
-    unfocusedTextColor = PureWhite,
-    focusedLabelColor = accent,
-    unfocusedLabelColor = SteelMuted,
-    focusedPlaceholderColor = SteelMuted.copy(alpha = 0.55f),
-    unfocusedPlaceholderColor = SteelMuted.copy(alpha = 0.45f)
-)
 
 private const val MAX_INVITE_TEXT_CHARS = 2_048
 private const val MIN_PASSWORD_CHARS = 8

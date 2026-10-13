@@ -1,5 +1,7 @@
 package com.abyssal.chat.presentation.screens
 
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.size
@@ -56,7 +58,9 @@ internal fun DirectVerificationQr(token: String, modifier: Modifier = Modifier) 
     Canvas(
         modifier = modifier
             .size(224.dp)
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
             .background(Color(0xFFF4FBFF))
+            .padding(8.dp)
             .semantics { contentDescription = "Direct chat verification QR code" }
     ) {
         matrix?.let(::drawQrMatrix)

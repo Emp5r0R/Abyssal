@@ -54,3 +54,20 @@
 - `android/.../AbyssalMarkLoader.kt` owns the fixed-size Android loader,
   TalkBack semantics, and system-motion-scale policy. Web CSS and Android
   motion settings stop animation without removing the loading/status signal.
+
+## Android UI Kit
+
+- `android/.../theme/Color.kt` mirrors the web design tokens in
+  `apps/web/src/styles.css` (background, surfaces, outline, text, accent,
+  success, warning, danger); keep the two in step when either changes.
+- `android/.../presentation/screens/MirageComponents.kt` holds the shared
+  Compose components (cards, buttons, list rows, avatars, segmented controls,
+  banners, dialogs, text fields); `AppIcons.kt` holds the Lucide-path stroke
+  icons used across screens.
+- `DashboardScreen.kt` (home: search, rooms, direct messages, people, pending
+  requests), `SettingsScreen.kt` (full-screen settings), `RoomDialogs.kt`
+  (create, join, calculator PIN), `ChatScreen.kt` and `EntranceScreen.kt` are
+  the screens. `domain/model/DisplayLabels.kt` owns label, search and
+  display-name rules shared by them, matching `apps/web/src/domain/displayLabels.ts`.
+- The dashboard never receives message content (`InMemoryMessageRepository`
+  clears `lastMessage`); its rows show presence and unread state instead.

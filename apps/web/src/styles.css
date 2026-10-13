@@ -84,6 +84,20 @@ body {
   background: var(--bg);
 }
 
+/* A pull-to-refresh or overscroll reload would end the in-memory session. */
+html,
+body {
+  overscroll-behavior: none;
+}
+
+button,
+a,
+label,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
 h1,
 h2,
 h3,
@@ -3024,6 +3038,91 @@ button.list-row:hover {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ==========================================================================
+   Touch screens
+   ========================================================================== */
+
+/* No hover on touch screens: keep hover-revealed actions visible. */
+@media (hover: none) {
+  .reply-action,
+  .nav-trailing {
+    opacity: 1;
+  }
+}
+
+@media (pointer: coarse) {
+  /* iOS zooms into any focused field under 16px; keep fields at 16px on touch. */
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+
+  .icon-button {
+    width: 42px;
+    height: 42px;
+  }
+
+  .primary-button,
+  .secondary-button,
+  .danger-button {
+    min-height: 44px;
+  }
+}
+
+/* ==========================================================================
+   Notches and home indicators (viewport-fit=cover)
+   ========================================================================== */
+
+@supports (padding: max(0px)) {
+  .sidebar {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+  }
+
+  .workspace {
+    padding-right: env(safe-area-inset-right);
+  }
+
+  .toast {
+    margin-bottom: env(safe-area-inset-bottom);
+  }
+
+  @media (max-width: 900px) {
+    .mobile-topbar {
+      height: calc(56px + env(safe-area-inset-top));
+      padding-top: env(safe-area-inset-top);
+      padding-left: max(8px, env(safe-area-inset-left));
+    }
+
+    .chat-header {
+      padding-top: max(8px, env(safe-area-inset-top));
+      padding-left: max(6px, env(safe-area-inset-left));
+    }
+
+    .page-body {
+      padding-bottom: max(32px, env(safe-area-inset-bottom));
+    }
+
+    .composer-wrap {
+      padding-bottom: max(12px, env(safe-area-inset-bottom));
+    }
+
+    .dialog-actions {
+      padding-bottom: max(16px, env(safe-area-inset-bottom));
+    }
+
+    .entrance-intro {
+      padding-top: max(28px, env(safe-area-inset-top));
+    }
+
+    .entrance-panel {
+      padding-bottom: max(40px, env(safe-area-inset-bottom));
+    }
   }
 }
 
