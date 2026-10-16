@@ -31,7 +31,7 @@ sizes, TalkBack loading semantics, and `MotionDurationScale`-aware animation.
 ```text
 apps/web/        React + TypeScript browser client
 android/         Kotlin + Jetpack Compose Android client
-abyssal-invite/  Shared deterministic Invite Capsule codec and signatures
+abyssal-invite/  Abyssal's Invite Capsule profile (the format is the invite-capsule crate shared with Ket)
 mirage-server/   Rust Axum relay (legacy directory name)
 rust-core/       Native Rust crypto crate
 deploy/          Docker, rsync, and service scripts

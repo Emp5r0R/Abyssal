@@ -57,7 +57,7 @@ fn parse_invite_inner(
     Ok(ParsedInvite {
         node_id: derive_node_id(&invite.capsule.node_public_key),
         node_public_key: invite.capsule.node_public_key.to_vec(),
-        node_url: locator.api_base_url(),
+        node_url: locator.origin(),
         capability,
         account_context,
         expires_at: invite.capsule.expires_at,

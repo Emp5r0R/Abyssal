@@ -278,6 +278,19 @@ output is intentionally one-shot. Losing it does not create a recovery API;
 restarting the RAM-only relay issues fresh capabilities but preserves node
 identity only when the node key is retained.
 
+## Implementation
+
+The format (canonical CBOR, payload, signature input, strict Ed25519, locators,
+deep-link and manual text forms) is the `invite-capsule` crate, shared with Ket
+and licensed MIT OR Apache-2.0. It lives in the Ket repository
+(`crates/invite-capsule`) and Abyssal depends on it pinned to a commit.
+`abyssal-invite` is Abyssal's profile of it: the application ID, signature
+domain, the 32-byte bootstrap capability, every locator kind, the `ABY1-`
+manual form, plus Abyssal's node descriptors and locator selection. An Abyssal
+invite is `WRONG_APPLICATION` to Ket and the reverse. Verification is strict
+Ed25519, and a 32-byte node key that is not a valid curve point is
+`INVALID_INVITE`.
+
 ## Conformance Vector
 
 Fixed non-production vectors, including canonical binary, signature, deep link,

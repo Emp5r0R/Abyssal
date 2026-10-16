@@ -25,21 +25,5 @@ pub fn derive_node_id(public_key: &[u8; 32]) -> String {
 }
 
 pub fn node_key_fingerprint(public_key: &[u8; 32]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(NODE_FINGERPRINT_DOMAIN);
-    digest.update(public_key);
-    digest.finalize()[..16]
-        .chunks(2)
-        .map(|chunk| format!("{:02X}{:02X}", chunk[0], chunk[1]))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-pub(crate) fn signature_input(domain: &[u8], application_id: &str, payload: &[u8]) -> Vec<u8> {
-    let mut input = Vec::with_capacity(domain.len() + 2 + application_id.len() + payload.len());
-    input.extend_from_slice(domain);
-    input.extend_from_slice(&(application_id.len() as u16).to_be_bytes());
-    input.extend_from_slice(application_id.as_bytes());
-    input.extend_from_slice(payload);
-    input
+    invite_capsule::key_fingerprint(NODE_FINGERPRINT_DOMAIN, public_key)
 }

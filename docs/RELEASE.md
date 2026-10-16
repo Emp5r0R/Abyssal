@@ -43,7 +43,9 @@ dependency, their manifests, the workspace lockfile, the pinned toolchain, and
 the generation scripts. Run `./scripts/test-all.sh crypto` after changing any
 of these inputs. The digest regression test checks additions, renames, and
 mutations; hosted CI separately rebuilds all native/WASM artifacts and requires
-byte-for-byte equality with the committed outputs.
+byte-for-byte equality with the committed outputs. The shared `invite-capsule`
+format crate is a git dependency pinned to one Ket commit; the lockfile records
+that commit, so moving the pin changes the digest and forces a rebuild.
 
 ## Signed Android artifacts
 

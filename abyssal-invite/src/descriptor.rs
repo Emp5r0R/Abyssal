@@ -1,11 +1,13 @@
 use crate::{
-    codec::{self, Decoder},
-    locator::{validate_locator_set, NodeLocator, MAX_LOCATORS},
-    signing::signature_input,
-    InviteError, ABYSSAL_APPLICATION_ID, DIRECT_PROTOCOL_VERSION, INVITE_FORMAT_VERSION,
-    MAX_BINARY_INVITE_BYTES, ROOM_PROTOCOL_VERSION, TRANSPORT_PROTOCOL_VERSION,
+    InviteError, NodeLocator, ABYSSAL_APPLICATION_ID, DIRECT_PROTOCOL_VERSION,
+    INVITE_FORMAT_VERSION, MAX_BINARY_INVITE_BYTES, MAX_LOCATORS, ROOM_PROTOCOL_VERSION,
+    TRANSPORT_PROTOCOL_VERSION,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use invite_capsule::{
+    cbor::{self as codec, Decoder},
+    signature_input, LocatorKinds, MAX_APPLICATION_ID_BYTES,
+};
 use zeroize::Zeroizing;
 
 pub const MAX_BINARY_DESCRIPTOR_BYTES: usize = 1_024;
@@ -56,7 +58,8 @@ impl NodeDescriptorV1 {
         {
             return Err(InviteError::InvalidDescriptor);
         }
-        validate_locator_set(&self.locators).map_err(|_| InviteError::InvalidDescriptor)
+        invite_capsule::validate_locator_set(&self.locators, LocatorKinds::ALL)
+            .map_err(|_| InviteError::InvalidDescriptor)
     }
 
     fn canonical_payload(&self) -> Result<Vec<u8>, InviteError> {
@@ -88,8 +91,9 @@ impl NodeDescriptorV1 {
             return Err(InviteError::UnsupportedVersion);
         }
         let application_id = decoder
-            .text(codec::MAX_APPLICATION_ID_BYTES)
-            .map_err(|_| InviteError::InvalidDescriptor)?;
+            .text(MAX_APPLICATION_ID_BYTES)
+            .map_err(|_| InviteError::InvalidDescriptor)?
+            .to_owned();
         if application_id != ABYSSAL_APPLICATION_ID {
             return Err(InviteError::WrongApplication);
         }
@@ -106,7 +110,7 @@ impl NodeDescriptorV1 {
         }
         let mut locators = Vec::with_capacity(count);
         for _ in 0..count {
-            locators.push(NodeLocator::decode(&mut decoder)?);
+            locators.push(NodeLocator::decode(&mut decoder, LocatorKinds::ALL)?);
         }
         let invite_format =
             u8::try_from(decoder.uint().map_err(|_| InviteError::InvalidDescriptor)?)
@@ -225,7 +229,8 @@ impl SignedNodeDescriptor {
         let payload = Zeroizing::new(
             decoder
                 .bytes(MAX_BINARY_INVITE_BYTES)
-                .map_err(|_| InviteError::InvalidDescriptor)?,
+                .map_err(|_| InviteError::InvalidDescriptor)?
+                .to_vec(),
         );
         let signature = exact_array(
             decoder
@@ -298,7 +303,8 @@ impl NodeDescriptorV2 {
         {
             return Err(InviteError::InvalidDescriptor);
         }
-        validate_locator_set(&self.locators).map_err(|_| InviteError::InvalidDescriptor)
+        invite_capsule::validate_locator_set(&self.locators, LocatorKinds::ALL)
+            .map_err(|_| InviteError::InvalidDescriptor)
     }
 
     fn canonical_payload(&self) -> Result<Vec<u8>, InviteError> {
@@ -332,8 +338,9 @@ impl NodeDescriptorV2 {
             return Err(InviteError::UnsupportedVersion);
         }
         let application_id = decoder
-            .text(codec::MAX_APPLICATION_ID_BYTES)
-            .map_err(|_| InviteError::InvalidDescriptor)?;
+            .text(MAX_APPLICATION_ID_BYTES)
+            .map_err(|_| InviteError::InvalidDescriptor)?
+            .to_owned();
         if application_id != ABYSSAL_APPLICATION_ID {
             return Err(InviteError::WrongApplication);
         }
@@ -355,7 +362,7 @@ impl NodeDescriptorV2 {
         }
         let mut locators = Vec::with_capacity(count);
         for _ in 0..count {
-            locators.push(NodeLocator::decode(&mut decoder)?);
+            locators.push(NodeLocator::decode(&mut decoder, LocatorKinds::ALL)?);
         }
         let invite_format =
             u8::try_from(decoder.uint().map_err(|_| InviteError::InvalidDescriptor)?)
@@ -479,7 +486,8 @@ impl SignedNodeDescriptorV2 {
         let payload = Zeroizing::new(
             decoder
                 .bytes(MAX_BINARY_DESCRIPTOR_BYTES)
-                .map_err(|_| InviteError::InvalidDescriptor)?,
+                .map_err(|_| InviteError::InvalidDescriptor)?
+                .to_vec(),
         );
         let signature = exact_array(
             decoder
@@ -502,7 +510,7 @@ impl SignedNodeDescriptorV2 {
     }
 }
 
-fn exact_array<const N: usize>(value: Vec<u8>) -> Result<[u8; N], InviteError> {
+fn exact_array<const N: usize>(value: &[u8]) -> Result<[u8; N], InviteError> {
     value.try_into().map_err(|_| InviteError::InvalidDescriptor)
 }
 

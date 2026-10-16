@@ -38,14 +38,12 @@ name = "abyssal-invite"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
- "data-encoding",
  "ed25519-dalek",
+ "invite-capsule",
  "rand 0.8.7",
  "serde_json",
  "sha2 0.11.0",
- "sha3",
  "thiserror 1.0.69",
- "url",
  "zeroize",
 ]
 
@@ -1523,6 +1521,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "invite-capsule"
+version = "0.1.0"
+source = "git+https://github.com/Emp5r0R/Ket?rev=1a440eec65de2bfaa3fe74db86d5ab83153bbe62#1a440eec65de2bfaa3fe74db86d5ab83153bbe62"
+dependencies = [
+ "data-encoding",
+ "ed25519-dalek",
+ "rand_core 0.6.4",
+ "sha2 0.11.0",
+ "sha3",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2459,9 +2471,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",

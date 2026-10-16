@@ -1,3 +1,4 @@
+use invite_capsule::CapsuleError;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -43,6 +44,25 @@ impl InviteError {
             Self::InvalidChecksum => "INVALID_CHECKSUM",
             Self::NodeIdentityMismatch => "NODE_IDENTITY_MISMATCH",
             Self::InvalidDescriptor => "INVALID_NODE_DESCRIPTOR",
+        }
+    }
+}
+
+/// Maps the shared format's reasons onto Abyssal's stable codes.
+impl From<CapsuleError> for InviteError {
+    fn from(error: CapsuleError) -> Self {
+        match error {
+            CapsuleError::Invalid | CapsuleError::InvalidNodeKey => Self::Invalid,
+            CapsuleError::TooLarge => Self::TooLarge,
+            CapsuleError::UnsupportedVersion => Self::UnsupportedVersion,
+            CapsuleError::WrongApplication => Self::WrongApplication,
+            CapsuleError::UnsupportedCapability => Self::UnsupportedCapability,
+            CapsuleError::InvalidSignature => Self::InvalidSignature,
+            CapsuleError::Expired => Self::Expired,
+            CapsuleError::UnsupportedLocator => Self::UnsupportedTransport,
+            CapsuleError::UnsafeLocator => Self::UnsafeLocator,
+            CapsuleError::NodeIdentityMismatch => Self::NodeIdentityMismatch,
+            CapsuleError::InvalidChecksum => Self::InvalidChecksum,
         }
     }
 }
