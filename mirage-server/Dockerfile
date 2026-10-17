@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM rust:1.97.1-bookworm@sha256:14bc9c5966e7b3a385794b3d5389a8765668342025fbcc7b2e3d2866ac4bd8c3 AS rust-builder
+FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS rust-builder
 
 WORKDIR /repo
 COPY Cargo.toml Cargo.lock ./
@@ -32,7 +32,7 @@ RUN set -eu; \
     mkdir -p /verified/web; \
     tar -xzf "$1" -C /verified/web --no-same-owner --no-same-permissions
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS web-runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS web-runtime
 
 COPY --from=rust-builder /verified/web /opt/abyssal/web
 RUN set -eux; \
@@ -42,7 +42,7 @@ RUN set -eux; \
     test ! -L /opt/abyssal/web/build-id.json; \
     test -z "$(find /opt/abyssal/web -type l -print -quit)"
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin mirage
 
