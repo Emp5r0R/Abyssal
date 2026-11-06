@@ -2,11 +2,11 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s <exit-status> <report-file> <stderr-file>\n' \
+  printf 'Usage: %s <exit-status> <report-file> <stderr-file> [allowed-ignore-ids]\n' \
     "${BASH_SOURCE[0]}" >&2
 }
 
-if [[ $# -ne 3 ]]; then
+if [[ $# -lt 3 || $# -gt 4 ]]; then
   usage
   exit 2
 fi
@@ -14,6 +14,20 @@ fi
 exit_status="$1"
 report_file="$2"
 stderr_file="$3"
+# Newline-separated RustSec IDs from the reviewed exceptions file. The report
+# must list exactly these as ignored, so no other advisory can be hidden.
+allowed_ignores="${4:-}"
+allowed_ignores_json="$(
+  printf '%s\n' "$allowed_ignores" | jq -R -s -c '
+    split("\n") | map(select(length > 0)) | sort
+  '
+)"
+if ! jq -e '
+  all(.[]; test("^RUSTSEC-[0-9]{4}-[0-9]{4}$")) and (unique | length) == length
+' <<<"$allowed_ignores_json" >/dev/null 2>&1; then
+  printf 'Invalid allowed cargo audit ignore list.\n' >&2
+  exit 2
+fi
 
 if [[ ! "$exit_status" =~ ^[0-9]+$ ]] || (( exit_status > 255 )); then
   printf 'Invalid cargo audit exit status: %s\n' "$exit_status" >&2
@@ -42,7 +56,7 @@ if [[ -s "$stderr_file" ]]; then
   exit 1
 fi
 
-if ! jq -e -s '
+if ! jq -e -s --argjson allowed "$allowed_ignores_json" '
   if length != 1 then
     false
   else
@@ -60,7 +74,8 @@ if ! jq -e -s '
     and (.settings.target_os | type == "array" and length == 0)
     and (.settings | has("severity"))
     and (.settings.severity == null)
-    and (.settings.ignore | type == "array" and length == 0)
+    and (.settings.ignore | type == "array")
+    and ((.settings.ignore | sort) == $allowed)
     and (.settings.informational_warnings | type == "array")
     and (.settings.informational_warnings | index("unmaintained") != null)
     and (.settings.informational_warnings | index("unsound") != null)

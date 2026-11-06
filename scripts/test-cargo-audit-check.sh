@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 VALIDATOR="$ROOT_DIR/scripts/lib/verify-cargo-audit.sh"
+EXCEPTIONS="$ROOT_DIR/scripts/lib/cargo-audit-exceptions.sh"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/abyssal-cargo-audit-test.XXXXXX")"
 trap 'rm -rf -- "$TEMP_DIR"' EXIT INT TERM
 
@@ -85,6 +86,41 @@ write_valid_report "$REPORT"
 sed -i 's/"informational_warnings": \["unmaintained", "unsound", "notice"\]/"informational_warnings": []/' "$REPORT"
 expect_failure "$VALIDATOR" 0 "$REPORT" "$STDERR"
 
+# Reviewed exceptions: the report must ignore exactly the allowed IDs.
+write_valid_report "$REPORT"
+sed -i 's/"ignore": \[\]/"ignore": ["RUSTSEC-2026-0002", "RUSTSEC-2026-0001"]/' "$REPORT"
+"$VALIDATOR" 0 "$REPORT" "$STDERR" $'RUSTSEC-2026-0001\nRUSTSEC-2026-0002'
+expect_failure "$VALIDATOR" 0 "$REPORT" "$STDERR" 'RUSTSEC-2026-0001'
+expect_failure "$VALIDATOR" 0 "$REPORT" "$STDERR" $'RUSTSEC-2026-0001\nRUSTSEC-2026-0002\nRUSTSEC-2026-0003'
+expect_failure "$VALIDATOR" 0 "$REPORT" "$STDERR" $'RUSTSEC-2026-0001\nnot-an-id'
+expect_failure "$VALIDATOR" 0 "$REPORT" "$STDERR" $'RUSTSEC-2026-0001\nRUSTSEC-2026-0001'
+write_valid_report "$REPORT"
+expect_failure "$VALIDATOR" 0 "$REPORT" "$STDERR" 'RUSTSEC-2026-0001'
+
+EXCEPTION_FILE="$TEMP_DIR/exceptions.tsv"
+REASON='Unreachable in Abyssal for a documented reason.'
+printf '# comment\nRUSTSEC-2026-0002\t2027-02-01\t%s\nRUSTSEC-2026-0001\t2027-02-01\t%s\n' "$REASON" "$REASON" > "$EXCEPTION_FILE"
+[[ "$("$EXCEPTIONS" "$EXCEPTION_FILE" 2027-02-01)" == $'RUSTSEC-2026-0001\nRUSTSEC-2026-0002' ]] || {
+  printf 'Exception IDs were not listed in sorted order.\n' >&2
+  exit 1
+}
+expect_failure "$EXCEPTIONS" "$EXCEPTION_FILE" 2027-02-02
+expect_failure "$EXCEPTIONS" "$TEMP_DIR/missing.tsv" 2027-01-01
+printf 'RUSTSEC-2026-0001\t2027-02-01\t%s\nRUSTSEC-2026-0001\t2027-02-01\t%s\n' "$REASON" "$REASON" > "$EXCEPTION_FILE"
+expect_failure "$EXCEPTIONS" "$EXCEPTION_FILE" 2027-01-01
+printf 'RUSTSEC-2026-0001\t2027-02-01\tshort\n' > "$EXCEPTION_FILE"
+expect_failure "$EXCEPTIONS" "$EXCEPTION_FILE" 2027-01-01
+printf 'GHSA-xxxx\t2027-02-01\t%s\n' "$REASON" > "$EXCEPTION_FILE"
+expect_failure "$EXCEPTIONS" "$EXCEPTION_FILE" 2027-01-01
+printf 'RUSTSEC-2026-0001\t2027-2-1\t%s\n' "$REASON" > "$EXCEPTION_FILE"
+expect_failure "$EXCEPTIONS" "$EXCEPTION_FILE" 2027-01-01
+: > "$EXCEPTION_FILE"
+for index in 1 2 3 4 5 6 7 8 9; do
+  printf 'RUSTSEC-2026-000%s\t2027-02-01\t%s\n' "$index" "$REASON" >> "$EXCEPTION_FILE"
+done
+expect_failure "$EXCEPTIONS" "$EXCEPTION_FILE" 2027-01-01
+"$EXCEPTIONS" "$ROOT_DIR/scripts/lib/cargo-audit-exceptions.tsv" >/dev/null
+
 cat > "$REPORT" <<'EOF'
 {"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}
 EOF
@@ -117,12 +153,27 @@ fi
 [[ "${1:-}" == audit ]] || exit 2
 [[ "$*" == *"--deny warnings"* ]] || exit 3
 [[ "$*" == *"--format json"* ]] || exit 3
+ignored=()
+previous=""
+for argument in "$@"; do
+  [[ "$previous" == --ignore ]] && ignored+=("$argument")
+  previous="$argument"
+done
+# Echo the passed --ignore IDs into the report, as cargo audit does.
+report_with_ignores() {
+  jq --argjson ids "$(printf '%s\n' "${ignored[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')" \
+    '.settings.ignore = $ids' "$FAKE_CARGO_AUDIT_REPORT"
+}
 if [[ "${FAKE_CARGO_AUDIT_MODE:-success}" == success ]]; then
+  report_with_ignores
+  exit 0
+fi
+if [[ "${FAKE_CARGO_AUDIT_MODE:-}" == no-ignores ]]; then
   cat "$FAKE_CARGO_AUDIT_REPORT"
   exit 0
 fi
 if [[ "${FAKE_CARGO_AUDIT_MODE:-}" == incomplete ]]; then
-  cat "$FAKE_CARGO_AUDIT_REPORT"
+  report_with_ignores
   printf '%s\n' 'warning: registry request could not be completed in the allotted timeframe' >&2
   exit 0
 fi
@@ -149,6 +200,11 @@ expect_failure env TMPDIR="$AUDIT_TEMP_DIR" PATH="$FAKE_BIN:$PATH" \
 assert_audit_tempdir_clean
 expect_failure env TMPDIR="$AUDIT_TEMP_DIR" PATH="$FAKE_BIN:$PATH" \
   FAKE_CARGO_AUDIT_MODE=nonzero \
+  bash "$ROOT_DIR/scripts/test-all.sh" audit
+assert_audit_tempdir_clean
+# A report that does not record the reviewed exceptions as ignored fails.
+expect_failure env TMPDIR="$AUDIT_TEMP_DIR" PATH="$FAKE_BIN:$PATH" \
+  FAKE_CARGO_AUDIT_MODE=no-ignores \
   bash "$ROOT_DIR/scripts/test-all.sh" audit
 assert_audit_tempdir_clean
 

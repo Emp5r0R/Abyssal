@@ -1,0 +1,9 @@
+# Reviewed RustSec exceptions for `./scripts/test-all.sh audit`.
+#
+# Format: ID<TAB>review-by (YYYY-MM-DD, UTC)<TAB>reason. The audit gate passes
+# these IDs to `cargo audit --ignore`, requires the report to list exactly
+# these, and fails once a review-by date has passed. Remove a line as soon
+# as upstream ships a fix. Only add an advisory whose vulnerable code
+# cannot run in Abyssal, and say why.
+RUSTSEC-2026-0387	2027-02-01	crypto-bigint 0.5.x timing side channels. Required by elliptic-curve 0.13 through opaque-ke 4.x/voprf 0.5 (no release on 0.14 yet) and mls-rs-crypto-rustcrypto 0.22. Never runs on secrets: OPAQUE uses Ristretto255 (curve25519-dalek) and the MLS provider enables only CURVE25519_CHACHA.
+RUSTSEC-2026-0374	2027-02-01	basic-toml is unmaintained. Pulled in only by askama config parsing inside uniffi_bindgen at build time; it is not linked into the relay, WASM or Android libraries.

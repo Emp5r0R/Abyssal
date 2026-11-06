@@ -130,10 +130,21 @@ run_audit() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
+    # Reviewed exceptions only; the parser fails on malformed or expired ones.
+    cargo_audit_exceptions="$(
+      "$ROOT_DIR/scripts/lib/cargo-audit-exceptions.sh" \
+        "$ROOT_DIR/scripts/lib/cargo-audit-exceptions.tsv"
+    )"
+    cargo_audit_ignore_args=()
+    while IFS= read -r advisory_id; do
+      [[ -n "$advisory_id" ]] && cargo_audit_ignore_args+=(--ignore "$advisory_id")
+    done <<<"$cargo_audit_exceptions"
+
     cargo_audit_status=0
     cargo audit \
       --deny warnings \
       --format json \
+      "${cargo_audit_ignore_args[@]}" \
       --file "$ROOT_DIR/Cargo.lock" \
       >"$cargo_audit_report" 2>"$cargo_audit_stderr" || cargo_audit_status=$?
 
@@ -142,7 +153,8 @@ run_audit() {
     if "$ROOT_DIR/scripts/lib/verify-cargo-audit.sh" \
         "$cargo_audit_status" \
         "$cargo_audit_report" \
-        "$cargo_audit_stderr"; then
+        "$cargo_audit_stderr" \
+        "$cargo_audit_exceptions"; then
       cargo_audit_validation_status=0
     else
       cargo_audit_validation_status=$?
