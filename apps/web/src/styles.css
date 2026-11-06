@@ -3462,3 +3462,59 @@ kbd {
   font-size: var(--text-xs);
   white-space: nowrap;
 }
+
+/* Voice messages */
+.voice-recorder {
+  display: flex;
+  min-height: 40px;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  padding-left: 8px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.voice-recorder .voice-limit {
+  flex: 1;
+  color: var(--text-subtle);
+  font-size: var(--text-sm);
+}
+
+.recording-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: recording-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes recording-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recording-dot {
+    animation: none;
+  }
+}
+
+.attachment-icon.type-voice {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.audio-preview {
+  display: flex;
+  width: min(420px, 90vw);
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  color: var(--accent);
+}
+
+.audio-preview audio {
+  width: 100%;
+}

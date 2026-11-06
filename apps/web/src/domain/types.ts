@@ -134,6 +134,8 @@ export interface ChatMessage {
     oneTime: boolean;
     deleteAfterDownload: boolean;
     reactionShortcode?: string;
+    /** Set for voice messages: the recording length in milliseconds. */
+    voiceDurationMs?: number;
   };
 }
 

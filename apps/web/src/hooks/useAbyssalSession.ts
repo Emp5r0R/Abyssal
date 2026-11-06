@@ -17,6 +17,7 @@ import {
   wipeMessageAttachmentKey as wipeMessageAttachment,
 } from "../domain/messageMemoryPolicy";
 import { reactionByShortcode } from "../domain/reactions";
+import { MAX_VOICE_DURATION_MS, isAudioMime, readVoiceDuration } from "../domain/voiceNotes";
 import {
   actionAllowed,
   applyMessageAction,
@@ -143,6 +144,8 @@ interface AttachmentInput {
   options: AttachmentOptions;
   replyToId?: string;
   reactionShortcode?: string;
+  /** Marks a recorded voice message of this length. */
+  voiceDurationMs?: number;
 }
 
 interface UploadState extends UploadProgress {
@@ -1912,7 +1915,7 @@ export function useAbyssalSession() {
     return outcome === "ACCEPTED";
   }, [activeRoomId, connection, messages, recipientKeysFor, runMlsTransaction, runOutboundTransaction, updateMessages]);
 
-  const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode }: AttachmentInput): Promise<boolean> => {
+  const sendAttachment = useCallback(async ({ file, options, replyToId, reactionShortcode, voiceDurationMs }: AttachmentInput): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
     const room = conversationForId(roomsRef.current, directsRef.current, chatId);
@@ -2017,6 +2020,9 @@ export function useAbyssalSession() {
           oneTime: options.oneTime,
           deleteAfterDownload: options.deleteAfterDownload || options.oneTime,
           reactionShortcode: reaction?.shortcode,
+          voiceDurationMs: voiceDurationMs !== undefined && mediaType === "FILE" && isAudioMime(file.type)
+            ? Math.min(MAX_VOICE_DURATION_MS, Math.max(0, Math.round(voiceDurationMs)))
+            : undefined,
         },
       };
       message = outgoingMessage;
@@ -2799,6 +2805,7 @@ function parsePayload(
       oneTime: payload.one_time === true,
       deleteAfterDownload: payload.delete_after_download === true || payload.one_time === true,
       reactionShortcode,
+      voiceDurationMs: readVoiceDuration(payload, mediaType, mimeType),
     },
   };
 }
@@ -2891,6 +2898,7 @@ function messagePayload(
     one_time: attachment?.oneTime,
     delete_after_download: attachment?.deleteAfterDownload,
     reaction_shortcode: attachment?.reactionShortcode,
+    ...(attachment?.voiceDurationMs !== undefined ? { voice: true, duration_ms: attachment.voiceDurationMs } : {}),
   };
 }
 

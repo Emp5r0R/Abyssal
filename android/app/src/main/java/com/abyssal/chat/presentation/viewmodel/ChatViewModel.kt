@@ -5,6 +5,8 @@ import com.abyssal.chat.domain.model.CalculatorEntry
 import com.abyssal.chat.domain.model.MessageAction
 import com.abyssal.chat.domain.model.MessageActionCodec
 import com.abyssal.chat.domain.model.MessageActionPolicy
+import com.abyssal.chat.domain.model.VoiceNotes
+import com.abyssal.chat.data.media.PcmVoiceRecorder
 import com.abyssal.chat.domain.model.BackgroundAction
 import com.abyssal.chat.domain.model.BackgroundResponse
 import com.abyssal.chat.domain.model.NotificationLevel
@@ -399,6 +401,7 @@ internal fun attachmentMetadataJson(message: Message, senderUsername: String): J
         .put("delete_after_download", message.deleteAfterDownload)
         .apply { message.reactionShortcode?.let { put("reaction_shortcode", it) } }
         .apply { message.replyToMessageId?.let { put("reply_to_id", it) } }
+        .apply { message.voiceDurationMs?.let { put("voice", true).put("duration_ms", it) } }
 
 /** The inner authenticated message must be bound to the relay envelope id. */
 internal fun matchesAuthoritativeMessageId(
@@ -1364,6 +1367,52 @@ class ChatViewModel(
         }
     }
 
+    private val voiceRecorder = PcmVoiceRecorder()
+    private data class VoiceTarget(val chatId: String, val selfDestructSec: Int, val replyToMessageId: String?)
+    private var voiceTarget: VoiceTarget? = null
+    private val _voiceRecordingStartedAt = MutableStateFlow<Long?>(null)
+    /** When the current voice recording started, or null when not recording. */
+    val voiceRecordingStartedAt: StateFlow<Long?> = _voiceRecordingStartedAt.asStateFlow()
+
+    /** Starts recording a voice message for the open conversation. The caller already holds RECORD_AUDIO. */
+    fun startVoiceRecording(selfDestructSec: Int, replyToMessageId: String?): Boolean {
+        val chatId = _activeChatId.value ?: return false
+        if (serverStatus.value.state != "CONNECTED" || voiceRecorder.isRecording) return false
+        if (!voiceRecorder.start(viewModelScope) { finishVoiceRecording(send = true) }) return false
+        voiceTarget = VoiceTarget(chatId, selfDestructSec, replyToMessageId)
+        _voiceRecordingStartedAt.value = System.currentTimeMillis()
+        recordUserActivity()
+        return true
+    }
+
+    /**
+     * Stops recording. The recording is sent only when [send] is true and the
+     * same conversation is still open; otherwise its audio is wiped.
+     */
+    fun finishVoiceRecording(send: Boolean) {
+        val target = voiceTarget
+        voiceTarget = null
+        _voiceRecordingStartedAt.value = null
+        viewModelScope.launch {
+            if (!send || target == null || _activeChatId.value != target.chatId) {
+                voiceRecorder.cancel()
+                return@launch
+            }
+            val wav = voiceRecorder.stop() ?: return@launch
+            sendAttachment(
+                mediaType = "FILE",
+                fileName = VoiceNotes.FILE_NAME,
+                mimeType = VoiceNotes.MIME_TYPE,
+                bytes = wav,
+                selfDestructSec = target.selfDestructSec,
+                oneTimeView = false,
+                deleteAfterDownload = false,
+                replyToMessageId = target.replyToMessageId,
+                voiceDurationMs = VoiceNotes.pcmDurationMs(wav.size - 44)
+            )
+        }
+    }
+
     fun sendAttachment(
         mediaType: String,
         fileName: String,
@@ -1373,7 +1422,8 @@ class ChatViewModel(
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
         replyToMessageId: String? = null,
-        reactionShortcode: String? = null
+        reactionShortcode: String? = null,
+        voiceDurationMs: Long? = null
     ) = sendAttachmentSource(
         mediaType = mediaType,
         fileName = fileName,
@@ -1383,7 +1433,8 @@ class ChatViewModel(
         oneTimeView = oneTimeView,
         deleteAfterDownload = deleteAfterDownload,
         replyToMessageId = replyToMessageId,
-        reactionShortcode = reactionShortcode
+        reactionShortcode = reactionShortcode,
+        voiceDurationMs = voiceDurationMs
     )
 
     fun sendAttachmentSource(
@@ -1395,7 +1446,8 @@ class ChatViewModel(
         oneTimeView: Boolean,
         deleteAfterDownload: Boolean,
         replyToMessageId: String? = null,
-        reactionShortcode: String? = null
+        reactionShortcode: String? = null,
+        voiceDurationMs: Long? = null
     ) {
         val sourceSizeBytes = source.sizeBytes
         val chatId = _activeChatId.value ?: run {
@@ -1578,6 +1630,10 @@ class ChatViewModel(
                         replyToMessageId = validReplyTarget(replyToMessageId),
                         reactionShortcode = safeReactionShortcode,
                         senderPublicKey = sessionStamp.identityPublicKey.copyOf()
+                    ).copy(
+                        voiceDurationMs = voiceDurationMs
+                            ?.takeIf { normalizedMediaType == "FILE" && VoiceNotes.isAudioMime(mimeType) }
+                            ?.coerceIn(0L, VoiceNotes.MAX_DURATION_MS)
                     )
                     messageToWipe = message
                     val result = sendEncryptedMetadata(
@@ -2283,6 +2339,8 @@ class ChatViewModel(
     }
 
     fun lockForLifecycleExit() {
+        // Leaving the app never keeps the microphone open.
+        if (voiceRecorder.isRecording || voiceTarget != null) finishVoiceRecording(send = false)
         // A picker may pause the activity, but its window is already outside this
         // process. Clear decrypted preview before allowing the short picker grace
         // period; a lost callback is closed by the timeout above.
@@ -2598,6 +2656,11 @@ class ChatViewModel(
     }
 
     private suspend fun logoutLocal(revokeRemote: Boolean = false) {
+        if (voiceRecorder.isRecording || voiceTarget != null) {
+            voiceTarget = null
+            _voiceRecordingStartedAt.value = null
+            voiceRecorder.cancel()
+        }
         val remoteSession = prepareLocalLogout()
         if (revokeRemote && remoteSession != null) {
             identityService.revokeSession(remoteSession)
@@ -3231,7 +3294,10 @@ class ChatViewModel(
                     repliesToCurrentUser = repliesToCurrentUser,
                     senderPublicKey = retainedSenderPublicKey,
                     senderClient = senderClient
-                ).copy(senderDisplayName = senderDisplayName).also { ownershipTransferred = true }
+                ).copy(
+                    senderDisplayName = senderDisplayName,
+                    voiceDurationMs = VoiceNotes.readDuration(json, mediaType, mimeType)
+                ).also { ownershipTransferred = true }
             } finally {
                 if (!ownershipTransferred) {
                     attachmentKey.fill(0)

@@ -64,6 +64,13 @@ internal object AppIcons {
     }
     val Send by lazy { icon("send-horizontal", "m3 3 3 9-3 9 19-9Z", "M6 12h16") }
     val Reply by lazy { icon("reply", "M9 17 4 12 9 7", "M20 18v-2a4 4 0 0 0-4-4H4") }
+    val Mic by lazy {
+        icon("mic", "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z", "M19 10v2a7 7 0 0 1-14 0v-2", "M12 19v3")
+    }
+    val Play by lazy { icon("play", "M6 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L7.5 3.64A1 1 0 0 0 6 4.5z") }
+    val Pause by lazy {
+        icon("pause", "M7 4h2.5a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z", "M14.5 4H17a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-2.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z")
+    }
     val Pencil by lazy {
         icon(
             "pencil",

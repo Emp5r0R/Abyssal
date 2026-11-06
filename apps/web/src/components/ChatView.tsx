@@ -7,6 +7,7 @@ import {
   Image,
   LockKeyhole,
   MessageSquareReply,
+  Mic,
   Paperclip,
   Pencil,
   Search,
@@ -38,6 +39,8 @@ import { ReactionImage } from "./ReactionImage";
 import { DeleteMessageDialog, MessageActionBar, MessageReactions } from "./MessageActions";
 import { RoomMembersDialog } from "./RoomMembersDialog";
 import { RenameRoomDialog } from "./RenameRoomDialog";
+import { VoiceRecorder } from "./VoiceRecorder";
+import { formatVoiceDuration } from "../domain/voiceNotes";
 import { searchMessages, type MessageAction } from "../domain/messageActions";
 import { Dialog, Field, IconButton } from "./Ui";
 
@@ -67,6 +70,8 @@ interface ChatViewProps {
   onRemoveMember?: (username: string) => Promise<boolean>;
   /** The owner renames the room; rooms only. */
   onRename?: (name: string) => Promise<boolean>;
+  /** Sends a recorded voice message. */
+  onSendVoice?: (file: File, durationMs: number, replyToId?: string, retentionSec?: number) => Promise<boolean>;
 }
 
 export function ChatView({
@@ -91,6 +96,7 @@ export function ChatView({
   members,
   onRemoveMember,
   onRename,
+  onSendVoice,
 }: ChatViewProps) {
   const isDirect = room.conversation_type === "direct";
   const blur = usePrivacyBlur();
@@ -107,6 +113,7 @@ export function ChatView({
   const [showRename, setShowRename] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [recording, setRecording] = useState(false);
   const ownsRoom = !isDirect && !!room.owner_username && room.owner_username.toLowerCase() === username.toLowerCase();
   const [showTrustDialog, setShowTrustDialog] = useState(false);
   const [presentedVerificationToken, setPresentedVerificationToken] = useState("");
@@ -468,10 +475,10 @@ export function ChatView({
             ))}
           </div>
         ) : null}
-        <form className="composer" onSubmit={submit}>
-          <IconButton label="Attach file" disabled={!connected || submitting || upload.active} onClick={() => onOpenAttachment(effectiveRetentionSec)}><Paperclip size={20} /></IconButton>
-          <IconButton label="Send GIF" disabled={!connected || !room.allow_images || submitting || upload.active} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>
-          <textarea
+        <form className={`composer ${recording ? "is-recording" : ""}`} onSubmit={submit}>
+          {recording ? null : <IconButton label="Attach file" disabled={!connected || submitting || upload.active} onClick={() => onOpenAttachment(effectiveRetentionSec)}><Paperclip size={20} /></IconButton>}
+          {recording ? null : <IconButton label="Send GIF" disabled={!connected || !room.allow_images || submitting || upload.active} onClick={() => setShowGifs((value) => !value)}><SmilePlus size={20} /></IconButton>}
+          {recording ? null : <textarea
             ref={textareaRef}
             data-composer="true"
             aria-label="Message"
@@ -505,8 +512,20 @@ export function ChatView({
                 event.currentTarget.form?.requestSubmit();
               }
             }}
-          />
-          <IconButton className="send-button" label={editing ? "Save edit" : "Send message"} disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
+          />}
+          {onSendVoice && !editing && !draft.trim() ? (
+            <VoiceRecorder
+              disabled={!connected || !room.allow_files || submitting || upload.active}
+              onRecordingChange={setRecording}
+              onSend={async (file, durationMs) => {
+                const sent = await onSendVoice(file, durationMs, replyTarget?.id, effectiveRetentionSec);
+                if (sent) onReply(null);
+                return sent;
+              }}
+            />
+          ) : (
+            <IconButton className="send-button" label={editing ? "Save edit" : "Send message"} disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
+          )}
         </form>
       </footer>
       {showRename && ownsRoom && onRename ? (
@@ -629,6 +648,18 @@ function AttachmentMessage({
           <code>{reaction.shortcode}</code>
           <IconButton label={disabled ? "Save reaction (offline)" : "Save reaction"} disabled={disabled} onClick={onExport}><ArrowDownToLine size={16} /></IconButton>
         </div>
+      </div>
+    );
+  }
+  if (attachment.voiceDurationMs !== undefined) {
+    return (
+      <div className="attachment-message is-voice">
+        <div className="attachment-icon type-voice"><Mic size={22} /></div>
+        <div className="attachment-info">
+          <strong>Voice message</strong>
+          <span>{formatVoiceDuration(attachment.voiceDurationMs)}{attachment.oneTime ? " · Listen once" : ""}</span>
+        </div>
+        <IconButton label={disabled ? "Play voice message (offline)" : "Play voice message"} disabled={disabled} onClick={onView}><Play size={17} /></IconButton>
       </div>
     );
   }

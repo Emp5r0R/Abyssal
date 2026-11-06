@@ -55,7 +55,9 @@ data class Message(
     /** Lower-case usernames that reacted, per emoji. */
     val reactions: Map<String, List<String>> = emptyMap(),
     /** When the sender last edited this text, in local time. */
-    val editedAtMs: Long? = null
+    val editedAtMs: Long? = null,
+    /** Set for voice messages: the recording length in milliseconds. */
+    val voiceDurationMs: Long? = null
 ) {
     val isExpired: Boolean
         get() {

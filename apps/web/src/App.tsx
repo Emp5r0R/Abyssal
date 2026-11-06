@@ -403,6 +403,12 @@ function SecureWorkspace({
           members={abyssal.activeRoom.conversation_type === "direct" ? undefined : abyssal.roomMembers(abyssal.activeRoom.id)}
           onRemoveMember={(member) => abyssal.removeRoomMember(abyssal.activeRoom!.id, member)}
           onRename={(name) => abyssal.renameRoom(abyssal.activeRoom!.id, name)}
+          onSendVoice={(file, durationMs, replyToId, retentionSec) => abyssal.sendAttachment({
+            file,
+            options: { oneTime: false, deleteAfterDownload: false, ttlSec: 0, readSec: retentionSec },
+            replyToId,
+            voiceDurationMs: durationMs,
+          })}
         />
       ) : undefined}
     </AppShell>

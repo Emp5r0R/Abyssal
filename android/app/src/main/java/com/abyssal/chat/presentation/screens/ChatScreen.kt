@@ -189,6 +189,7 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
     val presence by viewModel.presence.collectAsState()
     val directTrust by viewModel.directTrust.collectAsState()
     val displayNames by viewModel.knownDisplayNames.collectAsState()
+    val voiceRecordingStartedAt by viewModel.voiceRecordingStartedAt.collectAsState()
     val attachmentError = viewModel.attachmentError.value
     val currentSession = remember(sessions, sessionId) { sessions.find { it.id == sessionId } }
 
@@ -217,7 +218,10 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         onMessageAction = viewModel::sendMessageAction,
         loadRoomMembers = { viewModel.roomMembers(sessionId) },
         onRemoveMember = { member, done -> viewModel.removeMlsMember(sessionId, member, done) },
-        onRenameRoom = { name, done -> viewModel.renameRoom(sessionId, name, done) }
+        onRenameRoom = { name, done -> viewModel.renameRoom(sessionId, name, done) },
+        voiceRecordingStartedAt = voiceRecordingStartedAt,
+        onStartVoice = viewModel::startVoiceRecording,
+        onFinishVoice = viewModel::finishVoiceRecording
     )
 }
 
@@ -257,7 +261,10 @@ internal fun ChatContent(
     onMessageAction: (MessageAction) -> Unit = {},
     loadRoomMembers: () -> List<String> = { emptyList() },
     onRemoveMember: (String, (Boolean) -> Unit) -> Unit = { _, done -> done(false) },
-    onRenameRoom: (String, (Boolean) -> Unit) -> Unit = { _, done -> done(false) }
+    onRenameRoom: (String, (Boolean) -> Unit) -> Unit = { _, done -> done(false) },
+    voiceRecordingStartedAt: Long? = null,
+    onStartVoice: (Int, String?) -> Boolean = { _, _ -> false },
+    onFinishVoice: (Boolean) -> Unit = {}
 ) {
     // Names seen in this conversation fill in for senders the dashboard has not met yet.
     val displayNames = remember(knownDisplayNames, messages) {
@@ -329,6 +336,11 @@ internal fun ChatContent(
         if (replyingToMessageId != null && replyingToMessage == null) {
             replyingToMessageId = null
         }
+    }
+
+    // Leaving the conversation discards an unfinished recording.
+    DisposableEffect(session?.id) {
+        onDispose { onFinishVoice(false) }
     }
 
     LaunchedEffect(editingMessageId, editingMessage) {
@@ -520,7 +532,26 @@ internal fun ChatContent(
                 }
             )
 
-            ChatInputBar(
+            if (voiceRecordingStartedAt != null) {
+                VoiceRecordingBar(
+                    startedAtMs = voiceRecordingStartedAt,
+                    onDiscard = { onFinishVoice(false) },
+                    onSend = {
+                        onFinishVoice(true)
+                        replyingToMessageId = null
+                    }
+                )
+            } else ChatInputBar(
+                voiceButton = if (textInput.isBlank() && editingMessage == null && session?.allowFiles != false) {
+                    {
+                        VoiceRecordButton(
+                            enabled = isConnected,
+                            onStart = { onStartVoice(selectedTimerSec, replyingToMessageId) },
+                            onExternalSystemUiStart = onExternalSystemUiStart,
+                            onExternalSystemUiEnd = onExternalSystemUiEnd
+                        )
+                    }
+                } else null,
                 value = textInput,
                 onValueChange = {
                     textInput = it
@@ -1173,6 +1204,7 @@ private fun ReplyComposerPreview(
 
 @Composable
 private fun ChatInputBar(
+    voiceButton: (@Composable () -> Unit)? = null,
     value: String,
     onValueChange: (String) -> Unit,
     onAttach: () -> Unit,
@@ -1230,7 +1262,9 @@ private fun ChatInputBar(
                     .semantics { contentDescription = "Message" }
             )
         }
-        Box(
+        if (voiceButton != null && value.isBlank()) {
+            voiceButton()
+        } else Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .size(44.dp)
@@ -2045,6 +2079,10 @@ private fun MediaMessageContent(
     onViewAttachment: () -> Unit,
     onSaveAttachment: () -> Unit
 ) {
+    if (message.voiceDurationMs != null) {
+        VoiceMessageContent(message, onPlay = onViewAttachment)
+        return
+    }
     val context = LocalContext.current
     val reactionAsset = remember(message.reactionShortcode, message.attachmentName) {
         val shortcode = message.reactionShortcode ?: return@remember null
@@ -2135,6 +2173,7 @@ private fun AttachmentPreviewDialog(
         when {
             attachment.mimeType.startsWith("video/") -> RamVideoPreview(attachment.bytes)
             attachment.mimeType.startsWith("image/") -> RamImagePreview(attachment.bytes, attachment.mimeType)
+            attachment.mimeType.startsWith("audio/") -> RamAudioPreview(attachment.bytes)
             else -> AttachmentLoadedPanel(attachment)
         }
 
@@ -2391,7 +2430,7 @@ private data class BundledEmojiPayload(
     val shortcode: String
 )
 
-private class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
+internal class ByteArrayMediaDataSource(private val bytes: ByteArray) : MediaDataSource() {
     override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
         if (
             position < 0L ||

@@ -1,4 +1,4 @@
-import { Eye, FileArchive, X } from "lucide-react";
+import { Eye, FileArchive, Mic, X } from "lucide-react";
 import { useId, useRef } from "react";
 import type { DecryptedMedia } from "../domain/types";
 import { IconButton } from "./Ui";
@@ -44,6 +44,11 @@ export function MediaViewer({ media, onClose }: { media: DecryptedMedia; onClose
             disablePictureInPicture
             controlsList="nodownload noremoteplayback"
           />
+        ) : /^audio\//iu.test(media.mimeType) ? (
+          <div className="audio-preview">
+            <Mic size={40} aria-hidden="true" />
+            <audio src={media.objectUrl} controls autoPlay controlsList="nodownload noremoteplayback" aria-label="Voice message" />
+          </div>
         ) : (
           <div className="file-preview-mark"><FileArchive size={48} /><span>{media.name}</span></div>
         )}
