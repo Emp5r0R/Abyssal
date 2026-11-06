@@ -57,7 +57,9 @@ internal class MlsRoomManager(
         var pendingRevision: ULong? = null,
         var pendingRoster: List<MlsRosterMemberWire>? = null,
         var localLabel: String? = null,
-        val visibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE
+        val visibility: MlsRoomVisibility = MlsRoomVisibility.PRIVATE,
+        /** Set once the owner renames the room: the name then travels only in room_profile messages. */
+        var renamed: Boolean = false
     )
     private data class PendingJoin(
         val roomId: String,
@@ -129,18 +131,44 @@ internal class MlsRoomManager(
     @Synchronized
     fun outgoingRoomProfile(roomId: String): JSONObject? {
         val slot = activeSlot(roomId)
-        if (!sameUsername(slot.ownerUsername, username)) return null
+        // After a rename the name is omitted: older clients reject a changed name on ordinary messages.
+        if (!sameUsername(slot.ownerUsername, username) || slot.renamed) return null
         return slot.localLabel?.let(RoomProfileCodec::encode)
     }
 
+    /** The owner's current room profile, or [name] when renaming, for a room_profile message. */
     @Synchronized
-    fun acceptRoomProfile(roomId: String, sender: String, value: Any?): String? {
+    fun roomProfileMessage(roomId: String, name: String? = null): JSONObject? {
+        val slot = activeSlot(roomId)
+        require(sameUsername(slot.ownerUsername, username))
+        return (name ?: slot.localLabel)?.let(RoomProfileCodec::encode)
+    }
+
+    /** Records the owner's new room name once its room_profile message is accepted. */
+    @Synchronized
+    fun renameRoom(roomId: String, name: String): String {
+        val slot = activeSlot(roomId)
+        require(sameUsername(slot.ownerUsername, username))
+        RoomProfileCodec.encode(name)
+        slot.renamed = slot.renamed || slot.localLabel != name
+        slot.localLabel = name
+        return name
+    }
+
+    /**
+     * Accepts a room profile from the owner. A room_profile message ([replace])
+     * may change the name; a profile on an ordinary message only fills in an
+     * unknown name and is otherwise ignored.
+     */
+    @Synchronized
+    fun acceptRoomProfile(roomId: String, sender: String, value: Any?, replace: Boolean = false): String? {
         if (value == null) return null
         checkOpen()
         val slot = requireNotNull(rooms[roomId])
         require(slot.active && slot.pendingMessageId == null && sameUsername(sender, slot.ownerUsername))
         val name = RoomProfileCodec.decode(value)
-        require(slot.localLabel == null || slot.localLabel == name)
+        if (slot.localLabel == name) return name
+        if (slot.localLabel != null && !replace) return null
         slot.localLabel = name
         return name
     }
@@ -331,6 +359,39 @@ internal class MlsRoomManager(
             runCatching { slot.handle.rollbackOutbound(messageId, commit.revision) }
             throw error
         }
+    }
+
+    /** Usernames in a room's current roster, as this client last committed or received it. */
+    @Synchronized
+    fun members(roomId: String): List<String> = rooms[roomId]?.roster?.map { it.username }.orEmpty()
+
+    /**
+     * The owner removes a member who did not ask to leave. If that member has a
+     * pending leave request, it is accepted instead so the request is consumed.
+     */
+    @Synchronized
+    fun removeMember(roomId: String, member: String, messageId: String = UUID.randomUUID().toString()): PreparedMlsTransaction {
+        leaves.values.firstOrNull { it.roomId == roomId && sameUsername(it.username, member) && !sameUsername(it.username, username) }
+            ?.let { return acceptLeave(it.requestId, messageId) }
+        val slot = activeSlot(roomId)
+        require(sameUsername(slot.ownerUsername, username) && !sameUsername(member, slot.ownerUsername))
+        val matches = slot.roster.filter { sameUsername(it.username, member) }
+        require(matches.size == 1)
+        val target = matches.single()
+        val stable = MlsWireCodec.decode(target.stableIdentityB64)
+        try {
+            val commit = slot.handle.removeMember(target.username, stable, messageId)
+            return try {
+                val nextRoster = nativeRosterWire(commit.roster)
+                require(nextRoster.none { sameUsername(it.username, member) })
+                val frame = membershipFrame(roomId, null, commit)
+                stage(slot, messageId, commit.revision, nextRoster)
+                PreparedMlsTransaction(roomId, messageId, commit.revision, frame, null, MlsTransactionKind.LEAVE)
+            } catch (error: Throwable) {
+                runCatching { slot.handle.rollbackOutbound(messageId, commit.revision) }
+                throw error
+            }
+        } finally { stable.fill(0) }
     }
 
     @Synchronized

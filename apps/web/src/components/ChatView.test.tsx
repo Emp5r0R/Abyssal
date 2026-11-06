@@ -271,3 +271,73 @@ describe("sender-client origin badges", () => {
     expect(body).toHaveAttribute("tabindex", "0");
   });
 });
+
+describe("message actions", () => {
+  afterEach(cleanup);
+  const base = { chatId: "dm_direct", kind: "text" as const, createdAtMs: 1, receivedAtMs: 1, selfDestructSec: 0, absoluteExpirySec: 0 };
+  const theirs: ChatMessage = { ...base, id: "m1", sender: "Peer", content: "hello", mine: false, reactions: { "👍": ["peer"] } };
+  const mine: ChatMessage = { ...base, id: "m2", sender: "Self", content: "typo", mine: true };
+
+  function renderWithActions(onAction = vi.fn().mockResolvedValue(true)) {
+    render(
+      <ChatView
+        room={direct}
+        username="Self"
+        connected
+        safetyNumber={null}
+        messages={[theirs, mine]}
+        users={[]}
+        upload={{ active: false, name: "", loaded: 0, total: 0 }}
+        onBack={vi.fn()}
+        onSend={vi.fn().mockResolvedValue(true)}
+        onReply={vi.fn()}
+        replyTarget={null}
+        onOpenAttachment={vi.fn()}
+        onViewAttachment={vi.fn()}
+        onExportAttachment={vi.fn()}
+        onSendGif={vi.fn().mockResolvedValue(true)}
+        onAction={onAction}
+      />,
+    );
+    return onAction;
+  }
+
+  it("shows reaction counts and toggles your own reaction", () => {
+    const onAction = renderWithActions();
+    fireEvent.click(screen.getByRole("button", { name: "👍 1" }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "reaction", targetId: "m1", emoji: "👍", active: true });
+
+    fireEvent.click(screen.getAllByRole("button", { name: "React" })[0]);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "❤️" }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "reaction", targetId: "m1", emoji: "❤️", active: true });
+  });
+
+  it("filters the conversation while searching", () => {
+    renderWithActions();
+    fireEvent.click(screen.getByRole("button", { name: "Search this conversation" }));
+    fireEvent.change(screen.getByLabelText("Search this conversation"), { target: { value: "TYPO" } });
+    expect(screen.getByRole("status")).toHaveTextContent("1 found");
+    expect(screen.queryByText("hello")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Search this conversation"), { target: { value: "nothing" } });
+    expect(screen.getByText("No matches")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Search this conversation"), { key: "Escape" });
+    expect(screen.getByText("hello")).toBeInTheDocument();
+  });
+
+  it("offers edit and delete only on your own messages", async () => {
+    const onAction = renderWithActions();
+    expect(screen.getAllByRole("button", { name: "Edit message" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete for everyone" })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit message" }));
+    expect(screen.getByText("Editing your message")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "fixed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save edit" }));
+    await waitFor(() => expect(onAction).toHaveBeenCalledWith({ kind: "edit", targetId: "m2", content: "fixed" }));
+    await waitFor(() => expect(screen.queryByText("Editing your message")).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete for everyone" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(onAction).toHaveBeenCalledWith({ kind: "delete", targetId: "m2" });
+  });
+});

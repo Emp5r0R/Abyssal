@@ -2,6 +2,9 @@ package com.abyssal.chat.presentation.viewmodel
 
 import com.abyssal.chat.data.notifications.MessageNotifier
 import com.abyssal.chat.domain.model.CalculatorEntry
+import com.abyssal.chat.domain.model.MessageAction
+import com.abyssal.chat.domain.model.MessageActionCodec
+import com.abyssal.chat.domain.model.MessageActionPolicy
 import com.abyssal.chat.domain.model.BackgroundAction
 import com.abyssal.chat.domain.model.BackgroundResponse
 import com.abyssal.chat.domain.model.NotificationLevel
@@ -696,6 +699,14 @@ class ChatViewModel(
                         return@withLock
                     }
                     val control = runCatching { JSONObject(decryptedContent) }.getOrNull()
+                    if (control != null && MessageActionCodec.isActionKind(control.optString("kind"))) {
+                        val action = MessageActionCodec.decode(control, incoming.messageId)
+                        if (action != null && isAccountSessionStampValid(stamp)) {
+                            applyIncomingAction(stamp, incoming.chatId, action, incoming.senderUsername)
+                        }
+                        if (isAccountSessionStampValid(stamp)) rememberReceivedFrame(replayKey, directoryEvidenceKey)
+                        return@withLock
+                    }
                     if (control?.optString("kind") == "read_receipt") {
                         if (!matchesAuthoritativeMessageId(control, incoming.messageId)) return@withLock
                         val targetId = MessageReplyPolicy.sanitizeMessageId(control.optString("message_id"))
@@ -854,6 +865,23 @@ class ChatViewModel(
                             rememberMlsSnapshot(replayKey, evidence, decrypted.snapshot)
                             val json = runCatching { JSONObject(String(decrypted.plaintext, StandardCharsets.UTF_8)) }.getOrNull() ?: return@withLock
                             if (!matchesCurrentDirectoryStamp(json)) return@withLock
+                            if (MessageActionCodec.isActionKind(json.optString("kind"))) {
+                                MessageActionCodec.decode(json, frame.messageId)?.let { action ->
+                                    applyIncomingAction(stamp, frame.roomId, action, frame.senderUsername)
+                                }
+                                return@withLock
+                            }
+                            if (json.optString("kind") == "room_profile") {
+                                // The owner's room name, sent after admitting a member or on rename.
+                                if (MessageReplyPolicy.sanitizeMessageId(json.optString("id")) != frame.messageId) return@withLock
+                                val label = runCatching {
+                                    manager.acceptRoomProfile(frame.roomId, frame.senderUsername, json.opt("room_profile"), replace = true)
+                                }.getOrNull() ?: return@withLock
+                                sessions.value.firstOrNull { it.id == frame.roomId }?.let { room ->
+                                    mutateRepositoryIfAccountCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, room.copy(name = label)) }
+                                }
+                                return@withLock
+                            }
                             if (json.optString("kind") == "read_receipt") {
                                 if (MessageReplyPolicy.sanitizeMessageId(json.optString("id")) != frame.messageId) return@withLock
                                 val target = MessageReplyPolicy.sanitizeMessageId(json.optString("message_id"))
@@ -1287,6 +1315,52 @@ class ChatViewModel(
                     ) return@sendMessageOperation
                     rememberOwnMessageId(message.id)
                 }
+        }
+    }
+
+    /**
+     * Sends a reaction, edit or delete for a message in the open conversation,
+     * then applies it locally once the relay accepts it.
+     */
+    fun sendMessageAction(action: MessageAction) {
+        val chatId = _activeChatId.value ?: return
+        if (serverStatus.value.state != "CONNECTED") return
+        val username = currentUser.value?.username ?: return
+        val target = activeMessages.value.firstOrNull { it.id == action.targetId } ?: return
+        if (!MessageActionPolicy.allowed(target, action, username, username)) return
+        val stamp = captureSessionStamp() ?: return
+        launchMessageOperation(stamp) actionOperation@{ capturedStamp ->
+            if (!isSessionStampValid(capturedStamp)) return@actionOperation
+            val isMlsRoom = mlsManager?.isActiveRoom(chatId) == true
+            val remoteRecipients = if (isMlsRoom) emptyList() else recipientIdentities(chatId, includeSelf = false)
+            if (!isMlsRoom && isLocalOnlyForum(chatId, remoteRecipients)) {
+                applyIncomingAction(capturedStamp, chatId, action, username)
+                return@actionOperation
+            }
+            val actionId = UUID.randomUUID().toString()
+            val result = sendEncryptedMetadata(
+                chatId = chatId,
+                messageId = actionId,
+                metadata = MessageActionCodec.encode(actionId, action).toString(),
+                recipientsOverride = remoteRecipients,
+                sessionStamp = capturedStamp
+            )
+            if (result == OutboundSendResult.ACCEPTED && isAccountSessionStampValid(capturedStamp)) {
+                applyIncomingAction(capturedStamp, chatId, action, username)
+            }
+        }
+    }
+
+    /** Applies an action from [actor]; closes an open attachment preview if its message is deleted. */
+    private fun applyIncomingAction(stamp: SessionStamp, chatId: String, action: MessageAction, actor: String) {
+        if (action is MessageAction.Delete && _attachmentPreview.value?.messageId == action.targetId) {
+            val target = activeMessages.value.firstOrNull { it.id == action.targetId }
+            if (target != null && MessageActionPolicy.allowed(target, action, actor, currentUser.value?.username)) {
+                replaceAttachmentPreview(null)
+            }
+        }
+        mutateRepositoryIfAccountCurrent(stamp) {
+            messageRepository.applyActionIfCurrent(stamp.repositoryEpoch, chatId, action, actor, currentUser.value?.username)
         }
     }
 
@@ -1998,8 +2072,43 @@ class ChatViewModel(
                 }
                 runCatching { manager.finishTransaction(prepared, result) }
                 _pendingMlsJoins.value = manager.pendingJoins()
+                if (result == OutboundSendResult.ACCEPTED) {
+                    // Outside the crypto lock: tell the new member the room's name.
+                    viewModelScope.launch { sendRoomProfile(prepared.roomId) }
+                }
             }
         }
+    }
+
+    /**
+     * The owner sends the room name as its own encrypted room message so new
+     * members learn it at once. With [name] this is a rename, recorded locally
+     * only after the relay accepts it.
+     */
+    private suspend fun sendRoomProfile(roomId: String, name: String? = null): Boolean {
+        val manager = mlsManager ?: return false
+        val profile = runCatching { manager.roomProfileMessage(roomId, name) }.getOrNull() ?: return false
+        val messageId = UUID.randomUUID().toString()
+        val metadata = JSONObject().put("kind", "room_profile").put("id", messageId).put("room_profile", profile).toString()
+        val stamp = captureSessionStamp() ?: return false
+        try {
+            val result = sendEncryptedMetadata(roomId, messageId, metadata, sessionStamp = stamp)
+            if (result != OutboundSendResult.ACCEPTED || !isAccountSessionStampValid(stamp)) return false
+            if (name != null) {
+                val label = runCatching { manager.renameRoom(roomId, name) }.getOrNull() ?: return false
+                sessions.value.firstOrNull { it.id == roomId }?.let { room ->
+                    mutateRepositoryIfAccountCurrent(stamp) { messageRepository.createForumSessionIfCurrent(stamp.repositoryEpoch, room.copy(name = label)) }
+                }
+            }
+            return true
+        } finally {
+            stamp.wipe()
+        }
+    }
+
+    /** The owner renames a room; [onDone] receives whether the relay accepted it. */
+    fun renameRoom(roomId: String, name: String, onDone: (Boolean) -> Unit = {}) {
+        viewModelScope.launch { onDone(sendRoomProfile(roomId, name.trim())) }
     }
 
     fun rejectMlsJoin(requestId: String) {
@@ -2046,6 +2155,31 @@ class ChatViewModel(
             runCatching { manager.finishTransaction(prepared, result) }
             _pendingMlsLeaves.value = manager.pendingLeaves()
         } }
+    }
+
+    /** Members of a room as the local room state knows them. */
+    fun roomMembers(roomId: String): List<String> = mlsManager?.members(roomId).orEmpty()
+
+    /** The room owner removes [member]; [onDone] receives whether the relay accepted it. */
+    fun removeMlsMember(roomId: String, member: String, onDone: (Boolean) -> Unit = {}) {
+        val transport = mlsTransport ?: return onDone(false)
+        val manager = mlsManager ?: return onDone(false)
+        val generation = chatTransport.currentConnectionGeneration()
+        viewModelScope.launch {
+            val accepted = cryptoGate.withLock {
+                val prepared = runCatching { manager.removeMember(roomId, member) }.getOrNull() ?: return@withLock false
+                val result = try {
+                    transport.sendMlsTransaction(prepared.roomId, prepared.messageId, prepared.revision, prepared.frame, generation)
+                } catch (error: CancellationException) {
+                    withContext(NonCancellable) { runCatching { manager.finishTransaction(prepared, OutboundSendResult.AMBIGUOUS) } }
+                    throw error
+                }
+                runCatching { manager.finishTransaction(prepared, result) }
+                _pendingMlsLeaves.value = manager.pendingLeaves()
+                result == OutboundSendResult.ACCEPTED
+            }
+            onDone(accepted)
+        }
     }
 
     fun rejectMlsLeave(requestId: String) {

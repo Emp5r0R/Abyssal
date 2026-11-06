@@ -14,3 +14,15 @@ export function readRoomProfile(value: unknown): RoomProfile {
   if (profile.version !== 1 || typeof profile.name !== "string") throw new Error("Room unavailable");
   return roomProfile(profile.name);
 }
+
+export const MAX_ROOM_NAME = 36;
+
+/** Whether [value], trimmed, is a name the room profile accepts. */
+export function validRoomName(value: string): boolean {
+  try {
+    roomProfile(value.trim());
+    return true;
+  } catch {
+    return false;
+  }
+}

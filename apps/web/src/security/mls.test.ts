@@ -102,7 +102,9 @@ describe("MlsRoomManager", () => {
     expect(manager.outgoingRoomProfile(roomRecord.id)).toEqual({ version: 1, name: label });
     expect(manager.acceptRoomProfile(roomRecord.id, "Alice", undefined)).toBeUndefined();
     expect(() => manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: label })).toThrow();
-    expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: "Changed" })).toThrow();
+    // A different name on an ordinary message is ignored, never a failure.
+    expect(manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: "Changed" })).toBeUndefined();
+    expect(manager.outgoingRoomProfile(roomRecord.id)).toEqual({ version: 1, name: label });
     expect(() => manager.confirmCreatedRoom({ ...wire, group_id_b64: encodeBase64Url(bytes(32, 9)) })).toThrow("Room unavailable");
     expect(() => manager.confirmCreatedRoom({ ...wire, owner_username: "Mallory" })).toThrow("Room unavailable");
     for (let update = 0; update < 2; update++) expect(manager.recoverCatalog([wire])[0].name).toBe(label);
@@ -114,6 +116,19 @@ describe("MlsRoomManager", () => {
     expect(manager.recoverCatalog([wire])[0].name).toBe(label);
     manager.close();
     expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: label })).toThrow();
+  });
+
+  it("renames a room only through room_profile messages", () => {
+    const fake = sessionWith();
+    const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
+    manager.createRoom({ ...roomRecord, name: "Original" });
+    expect(manager.outgoingRoomProfile(roomRecord.id)).toEqual({ version: 1, name: "Original" });
+    expect(manager.roomProfileMessage(roomRecord.id, "Renamed")).toEqual({ version: 1, name: "Renamed" });
+    expect(() => manager.roomProfileMessage(roomRecord.id, "bad\u0000name")).toThrow();
+    expect(manager.renameRoom(roomRecord.id, "Renamed")).toBe("Renamed");
+    // Ordinary messages stop carrying the name, so older clients never see a changed one.
+    expect(manager.outgoingRoomProfile(roomRecord.id)).toBeUndefined();
+    expect(manager.roomProfileMessage(roomRecord.id)).toEqual({ version: 1, name: "Renamed" });
   });
 
   it("rejects oversized or control-bearing local labels before native room creation", () => {
@@ -242,7 +257,10 @@ describe("MlsRoomManager", () => {
     expect(manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: "Private room" })).toBe("Private room");
     expect(manager.outgoingRoomProfile(roomRecord.id)).toBeUndefined();
     expect(() => manager.acceptRoomProfile(roomRecord.id, "Alice", { version: 1, name: "Private room" })).toThrow();
-    expect(() => manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: "Override" })).toThrow();
+    expect(manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: "Override" })).toBeUndefined();
+    expect(manager.acceptRoomProfile(roomRecord.id, "Bob", { version: 1, name: "Override" }, true)).toBe("Override");
+    expect(() => manager.roomProfileMessage(roomRecord.id, "Mine now")).toThrow("Room unavailable");
+    expect(() => manager.renameRoom(roomRecord.id, "Mine now")).toThrow("Room unavailable");
     expect(() => manager.rememberJoin(request)).toThrow("Room unavailable");
     const ownLeave = manager.beginLeave(roomRecord.id);
     manager.forgetLeave(roomRecord.id, ownLeave.request_id as string);
@@ -282,6 +300,50 @@ describe("MlsRoomManager", () => {
     manager.finishTransaction(retry, "ACCEPTED");
     expect(manager.pendingLeaves()).toHaveLength(0);
     expect(fake.room.commitOutbound).toHaveBeenCalledWith("leave-retry", 3n);
+  });
+
+  it("lets the owner remove a member without a leave request", () => {
+    const fake = sessionWith(); const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
+    manager.createRoom(roomRecord);
+    const join = { type: "mls_join_requested", protocol_version: 10, room_id: roomRecord.id, request_id: "join-request", username: "Bob", stable_identity_b64: encodeBase64Url(bytes(64, 6)), key_package_b64: encodeBase64Url(bytes(100, 8)) } as const;
+    manager.rememberJoin(join);
+    manager.finishTransaction(manager.acceptJoin(join.request_id, "join-message"), "ACCEPTED");
+    expect(manager.members(roomRecord.id)).toEqual(["Alice", "Bob", "Carol"]);
+
+    expect(() => manager.removeMember(roomRecord.id, "Alice")).toThrow("Room unavailable");
+    expect(() => manager.removeMember(roomRecord.id, "Mallory")).toThrow("Room unavailable");
+    expect(manager.members(roomRecord.id)).toHaveLength(3);
+
+    const native = fake.room.removeMember.getMockImplementation()!;
+    let passedIdentity = new Uint8Array(0);
+    fake.room.removeMember.mockImplementationOnce((username: string, stable: Uint8Array, messageId: string) => {
+      passedIdentity = stable.slice();
+      return native(username, stable, messageId);
+    });
+    const prepared = manager.removeMember(roomRecord.id, "bob", "remove-message");
+    expect(fake.room.removeMember).toHaveBeenCalledWith("Bob", expect.any(Uint8Array), "remove-message");
+    expect(passedIdentity).toEqual(bytes(64, 6));
+    // The decoded identity copy is wiped once the native call returns.
+    expect(fake.room.removeMember.mock.calls[0][1]).toEqual(new Uint8Array(64));
+    expect(prepared.frame).toMatchObject({ type: "mls_membership_commit", room_id: roomRecord.id, request_id: undefined });
+    expect(JSON.parse(JSON.stringify(prepared.frame))).not.toHaveProperty("request_id");
+    manager.finishTransaction(prepared, "ACCEPTED");
+    expect(manager.members(roomRecord.id)).toEqual(["Alice"]);
+    expect(manager.members("forum_unknown")).toEqual([]);
+  });
+
+  it("uses a member's pending leave request when the owner removes them", () => {
+    const fake = sessionWith(); const manager = new MlsRoomManager(fake.session, "Alice", "node", bytes(608, 7));
+    manager.createRoom(roomRecord);
+    const join = { type: "mls_join_requested", protocol_version: 10, room_id: roomRecord.id, request_id: "join-request", username: "Bob", stable_identity_b64: encodeBase64Url(bytes(64, 6)), key_package_b64: encodeBase64Url(bytes(100, 8)) } as const;
+    manager.rememberJoin(join);
+    manager.finishTransaction(manager.acceptJoin(join.request_id, "join-message"), "ACCEPTED");
+    manager.rememberLeave({ type: "mls_leave_requested", protocol_version: 10, room_id: roomRecord.id, request_id: "leave-request", username: "Bob", stable_identity_b64: join.stable_identity_b64 });
+
+    const prepared = manager.removeMember(roomRecord.id, "Bob", "remove-message");
+    expect(prepared.frame).toMatchObject({ request_id: "leave-request" });
+    manager.finishTransaction(prepared, "ACCEPTED");
+    expect(manager.pendingLeaves()).toHaveLength(0);
   });
 
   it("rejects owner leave initiation and wipes pending leaves on room removal", () => {

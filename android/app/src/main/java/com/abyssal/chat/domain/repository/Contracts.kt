@@ -73,6 +73,17 @@ interface IMessageRepository {
     fun saveMessageIfCurrent(epoch: ULong, chatId: String, message: Message): Boolean = false
     suspend fun markAsRead(chatId: String, messageId: String)
     fun markAsReadIfCurrent(epoch: ULong, chatId: String, messageId: String): Boolean = false
+    /**
+     * Applies a reaction, edit or delete from [actor] to a message in [chatId].
+     * A deleted message's keys are wiped. False only when [epoch] is stale.
+     */
+    fun applyActionIfCurrent(
+        epoch: ULong,
+        chatId: String,
+        action: com.abyssal.chat.domain.model.MessageAction,
+        actor: String,
+        currentUsername: String?
+    ): Boolean = false
     suspend fun forgetAttachmentKey(chatId: String, messageId: String)
     suspend fun createForumSession(session: ChatSession)
     fun createForumSessionIfCurrent(epoch: ULong, session: ChatSession): Boolean = false

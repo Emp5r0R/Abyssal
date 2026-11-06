@@ -64,6 +64,13 @@ internal object AppIcons {
     }
     val Send by lazy { icon("send-horizontal", "m3 3 3 9-3 9 19-9Z", "M6 12h16") }
     val Reply by lazy { icon("reply", "M9 17 4 12 9 7", "M20 18v-2a4 4 0 0 0-4-4H4") }
+    val Pencil by lazy {
+        icon(
+            "pencil",
+            "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z",
+            "m15 5 4 4"
+        )
+    }
     val Trash by lazy {
         icon(
             "trash-2", "M3 6h18", "M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6",

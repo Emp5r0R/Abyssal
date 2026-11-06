@@ -1,3 +1,4 @@
+import type { ReactionEmoji } from "./messageActions";
 import type { SenderClient } from "./senderClient";
 
 export type ConnectionState = "connecting" | "connected" | "disconnected";
@@ -118,6 +119,10 @@ export interface ChatMessage {
   senderPublicKeyB64?: string;
   /** Platform of the sending client, asserted inside the encrypted payload. */
   senderClient?: SenderClient;
+  /** Lower-case usernames that reacted, per emoji. */
+  reactions?: Partial<Record<ReactionEmoji, string[]>>;
+  /** When the sender last edited this text, in local time. */
+  editedAtMs?: number;
   attachment?: {
     id: string;
     encryptionVersion: number;

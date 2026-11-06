@@ -71,6 +71,8 @@ interface PendingMlsLeave extends PendingMlsLeaveSummary {
 
 interface RoomSlot {
   localLabel?: string;
+  /** Set once the owner renames the room: the name then travels only in room_profile messages. */
+  renamed?: boolean;
   visibility: RoomVisibility;
   handle: WasmMlsRoom;
   groupId: Uint8Array;
@@ -171,14 +173,39 @@ export class MlsRoomManager {
     } finally { info.groupId.fill(0); info.membershipDigest.fill(0); group.fill(0); digest.fill(0); }
   }
 
+  /**
+   * The profile the owner attaches to ordinary messages. After a rename it is
+   * omitted: clients from before renaming reject a changed name on those messages.
+   */
   outgoingRoomProfile(roomId: string): RoomProfile | undefined {
     const slot = this.activeSlot(roomId);
-    if (!sameUsername(slot.ownerUsername, this.#username) || !slot.localLabel) return undefined;
+    if (!sameUsername(slot.ownerUsername, this.#username) || !slot.localLabel || slot.renamed) return undefined;
     this.ownerSlot(roomId);
     return roomProfile(slot.localLabel);
   }
 
-  acceptRoomProfile(roomId: string, sender: string, value: unknown): string | undefined {
+  /** The owner's current room profile, or [name] when renaming, for a room_profile message. */
+  roomProfileMessage(roomId: string, name?: string): RoomProfile | undefined {
+    const slot = this.ownerSlot(roomId);
+    const label = name ?? slot.localLabel;
+    return label ? roomProfile(label) : undefined;
+  }
+
+  /** Records the owner's new room name once its room_profile message is accepted. */
+  renameRoom(roomId: string, name: string): string {
+    const slot = this.ownerSlot(roomId);
+    const profile = roomProfile(name);
+    slot.renamed = slot.renamed || slot.localLabel !== profile.name;
+    slot.localLabel = profile.name;
+    return profile.name;
+  }
+
+  /**
+   * Accepts a room profile from the owner. A room_profile message ([replace])
+   * may change the name; a profile on an ordinary message only fills in an
+   * unknown name and is otherwise ignored.
+   */
+  acceptRoomProfile(roomId: string, sender: string, value: unknown, replace = false): string | undefined {
     if (value === undefined) return undefined;
     this.assertOpen();
     const slot = this.#rooms.get(roomId);
@@ -187,7 +214,8 @@ export class MlsRoomManager {
       throw new Error("Room unavailable");
     }
     const profile = readRoomProfile(value);
-    if (slot.localLabel !== undefined && slot.localLabel !== profile.name) throw new Error("Room unavailable");
+    if (slot.localLabel === profile.name) return profile.name;
+    if (slot.localLabel !== undefined && !replace) return undefined;
     slot.localLabel = profile.name;
     return profile.name;
   }
@@ -415,6 +443,38 @@ export class MlsRoomManager {
       return prepared;
     } catch (error) { this.removeRoom(request.roomId); throw error; }
     finally { wrapper.free(); }
+  }
+
+  /** Usernames in a room's current roster, as this client last committed or received it. */
+  members(roomId: string): string[] {
+    return this.#rooms.get(roomId)?.roster.map((member) => member.username) ?? [];
+  }
+
+  /**
+   * The owner removes a member who did not ask to leave. If that member has a
+   * pending leave request, it is accepted instead so the request is consumed.
+   */
+  removeMember(roomId: string, username: string, messageId: string = crypto.randomUUID()): PreparedMlsMembership {
+    const pending = [...this.#pendingLeaves.values()]
+      .find((leave) => leave.roomId === roomId && !leave.own && sameUsername(leave.username, username));
+    if (pending) return this.acceptLeave(pending.requestId, messageId);
+    const slot = this.ownerSlot(roomId);
+    if (sameUsername(username, slot.ownerUsername) || sameUsername(username, this.#username)) throw new Error("Room unavailable");
+    const member = uniqueMember(slot.roster, username);
+    if (!member) throw new Error("Room unavailable");
+    const stableIdentity = decodeBase64Url(member.stable_identity_b64);
+    let wrapper: ReturnType<WasmMlsRoom["removeMember"]> | undefined;
+    try {
+      wrapper = slot.handle.removeMember(member.username, stableIdentity, messageId);
+      const prepared = membershipFromWrapper(roomId, undefined, wrapper);
+      const nextRoster = nativeRosterJson(wrapper.rosterJson);
+      if (!validActiveRoster(nextRoster, slot.ownerUsername, this.#username, this.#stableIdentity) ||
+        nextRoster.some((candidate) => sameUsername(candidate.username, username))) throw new Error("Room unavailable");
+      prepared.requestType = "leave";
+      this.stage(slot, messageId, prepared.revision, nextRoster);
+      return prepared;
+    } catch (error) { this.removeRoom(roomId); throw error; }
+    finally { wrapper?.free(); stableIdentity.fill(0); }
   }
 
   rejectLeave(requestId: string): Record<string, unknown> {

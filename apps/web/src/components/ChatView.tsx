@@ -8,6 +8,8 @@ import {
   LockKeyhole,
   MessageSquareReply,
   Paperclip,
+  Pencil,
+  Search,
   Play,
   Send,
   ShieldCheck,
@@ -15,6 +17,7 @@ import {
   Smartphone,
   SmilePlus,
   TriangleAlert,
+  Users,
   WifiOff,
   X,
 } from "lucide-react";
@@ -32,6 +35,10 @@ import { privacyBlurProps, usePrivacyBlur } from "./privacyBlurContext";
 import { DirectVerificationQr } from "./DirectVerificationQr";
 import { GifPicker } from "./GifPicker";
 import { ReactionImage } from "./ReactionImage";
+import { DeleteMessageDialog, MessageActionBar, MessageReactions } from "./MessageActions";
+import { RoomMembersDialog } from "./RoomMembersDialog";
+import { RenameRoomDialog } from "./RenameRoomDialog";
+import { searchMessages, type MessageAction } from "../domain/messageActions";
 import { Dialog, Field, IconButton } from "./Ui";
 
 interface ChatViewProps {
@@ -52,6 +59,14 @@ interface ChatViewProps {
   onExportAttachment: (message: ChatMessage) => void;
   onSendGif: (reaction: ReactionAsset, replyToId?: string, retentionSec?: number) => Promise<boolean>;
   onVerifyToken?: (presentedToken: string) => boolean;
+  /** Sends a reaction, edit or delete for a message in this conversation. */
+  onAction?: (action: MessageAction) => Promise<boolean>;
+  /** Room roster; rooms only. */
+  members?: string[];
+  /** The owner removes a member; rooms only. */
+  onRemoveMember?: (username: string) => Promise<boolean>;
+  /** The owner renames the room; rooms only. */
+  onRename?: (name: string) => Promise<boolean>;
 }
 
 export function ChatView({
@@ -72,6 +87,10 @@ export function ChatView({
   onExportAttachment,
   onSendGif,
   onVerifyToken,
+  onAction,
+  members,
+  onRemoveMember,
+  onRename,
 }: ChatViewProps) {
   const isDirect = room.conversation_type === "direct";
   const blur = usePrivacyBlur();
@@ -82,6 +101,13 @@ export function ChatView({
   const [submitting, setSubmitting] = useState(false);
   const [now, setNow] = useState(0);
   const [flashTargetId, setFlashTargetId] = useState<string | null>(null);
+  const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ChatMessage | null>(null);
+  const [showMembers, setShowMembers] = useState(false);
+  const [showRename, setShowRename] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const ownsRoom = !isDirect && !!room.owner_username && room.owner_username.toLowerCase() === username.toLowerCase();
   const [showTrustDialog, setShowTrustDialog] = useState(false);
   const [presentedVerificationToken, setPresentedVerificationToken] = useState("");
   const [verificationRejected, setVerificationRejected] = useState(false);
@@ -107,8 +133,15 @@ export function ChatView({
     event.preventDefault();
     if (!draft.trim() || submitting || upload.active) return;
     setSubmitting(true);
-    const reaction = exactReactionShortcut(draft);
+    const reaction = editing ? undefined : exactReactionShortcut(draft);
     try {
+      if (editing) {
+        if (!onAction || await onAction({ kind: "edit", targetId: editing.id, content: draft.trim() })) {
+          setDraft("");
+          setEditTarget(null);
+        }
+        return;
+      }
       if (reaction) {
         if (await onSendGif(reaction, replyTarget?.id, effectiveRetentionSec)) {
           setDraft("");
@@ -126,6 +159,9 @@ export function ChatView({
   };
 
   const byId = useMemo(() => new Map(messages.map((message) => [message.id, message])), [messages]);
+  const visibleMessages = searchOpen ? searchMessages(messages, searchQuery) : messages;
+  /** The message being edited, while it is still in memory. */
+  const editing = editTarget && byId.has(editTarget.id) ? editTarget : null;
   const mentionQuery = trailingComposerQuery(draft, "@");
   const reactionQuery = trailingComposerQuery(draft, ":");
   const mentionSuggestions = useMemo(() => {
@@ -210,8 +246,40 @@ export function ChatView({
           )}
         </div>
         {connected ? null : <span className="offline-badge"><WifiOff size={14} aria-hidden="true" />Offline</span>}
+        <IconButton
+          label={searchOpen ? "Close search" : "Search this conversation"}
+          onClick={() => { setSearchOpen((open) => !open); setSearchQuery(""); }}
+        >
+          {searchOpen ? <X size={18} /> : <Search size={18} />}
+        </IconButton>
+        {ownsRoom && onRename ? (
+          <IconButton label="Rename room" onClick={() => setShowRename(true)}><Pencil size={17} /></IconButton>
+        ) : null}
+        {isDirect || !members ? null : (
+          <IconButton label={`Members (${members.length})`} onClick={() => setShowMembers(true)}><Users size={18} /></IconButton>
+        )}
         {isDirect ? null : <CopyIconButton label="Copy room ID" value={room.id} />}
       </header>
+
+      {searchOpen ? (
+        <div className="chat-search" role="search">
+          <Search size={16} aria-hidden="true" />
+          <input
+            aria-label="Search this conversation"
+            placeholder="Search messages in memory"
+            value={searchQuery}
+            autoFocus
+            onChange={(event) => setSearchQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                setSearchOpen(false);
+                setSearchQuery("");
+              }
+            }}
+          />
+          {searchQuery.trim() ? <span role="status">{visibleMessages.length} found</span> : null}
+        </div>
+      ) : null}
 
       <div
         className="message-stream"
@@ -221,13 +289,19 @@ export function ChatView({
           wasNearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100;
         }}
       >
-        {messages.length === 0 ? (
+        {searchOpen && searchQuery.trim() && visibleMessages.length === 0 ? (
+          <div className="empty-chat">
+            <Search size={26} aria-hidden="true" />
+            <strong>No matches</strong>
+            <span>Only messages still in memory are searched.</span>
+          </div>
+        ) : messages.length === 0 ? (
           <div className="empty-chat">
             <LockKeyhole size={26} aria-hidden="true" />
             <strong>No messages yet</strong>
             <span>{isDirect ? "Messages are end-to-end encrypted. Say hello." : "Messages in this room are end-to-end encrypted."}</span>
           </div>
-        ) : messages.map((message) => {
+        ) : visibleMessages.map((message) => {
           const original = message.replyToId ? byId.get(message.replyToId) : undefined;
           const attention = !message.mine && (message.mentionsCurrentUser || message.repliesToCurrentUser);
           const attentionLabel = message.mentionsCurrentUser && message.repliesToCurrentUser
@@ -295,9 +369,32 @@ export function ChatView({
                   <div className="message-expiry">
                     <Clock3 size={12} />
                     <span>{expiryLabel(message, now)}</span>
+                    {message.editedAtMs !== undefined ? <span className="message-edited">· edited</span> : null}
                   </div>
+                  <MessageReactions
+                    message={message}
+                    username={username}
+                    disabled={!connected || !onAction}
+                    onToggle={(emoji, active) => void onAction?.({ kind: "reaction", targetId: message.id, emoji, active })}
+                  />
                 </div>
-                <IconButton className="reply-action" label="Reply" onClick={() => onReply(message)}><MessageSquareReply size={16} /></IconButton>
+                <MessageActionBar
+                  message={message}
+                  username={username}
+                  disabled={!connected || !onAction}
+                  onReply={() => {
+                    setEditTarget(null);
+                    onReply(message);
+                  }}
+                  onReact={(emoji, active) => void onAction?.({ kind: "reaction", targetId: message.id, emoji, active })}
+                  onEdit={() => {
+                    onReply(null);
+                    setEditTarget(message);
+                    setDraft(message.content);
+                    textareaRef.current?.focus();
+                  }}
+                  onDelete={() => setDeleteTarget(message)}
+                />
               </div>
             </article>
           );
@@ -331,7 +428,16 @@ export function ChatView({
             </div>
           </div>
         ) : null}
-        {replyTarget ? (
+        {editing ? (
+          <div className="composer-reply">
+            <Pencil size={16} />
+            <span className="composer-reply-text">
+              <span className="composer-reply-label">Editing your message</span>
+              <PrivacyBlur>{editing.content}</PrivacyBlur>
+            </span>
+            <IconButton label="Cancel edit" onClick={() => { setEditTarget(null); setDraft(""); }}><X size={17} /></IconButton>
+          </div>
+        ) : replyTarget ? (
           <div className="composer-reply">
             <MessageSquareReply size={16} />
             <span className="composer-reply-text">
@@ -388,15 +494,54 @@ export function ChatView({
                 insertComposerToken(reactionSuggestions[0].shortcode);
                 return;
               }
+              if (event.key === "Escape" && editing) {
+                event.preventDefault();
+                setEditTarget(null);
+                setDraft("");
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }
             }}
           />
-          <IconButton className="send-button" label="Send message" disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
+          <IconButton className="send-button" label={editing ? "Save edit" : "Send message"} disabled={!connected || !draft.trim() || submitting || upload.active} type="submit"><Send size={19} /></IconButton>
         </form>
       </footer>
+      {showRename && ownsRoom && onRename ? (
+        <RenameRoomDialog
+          currentName={roomLabel(room)}
+          connected={connected}
+          onRename={onRename}
+          onClose={() => setShowRename(false)}
+        />
+      ) : null}
+      {showMembers && members && !isDirect ? (
+        <RoomMembersDialog
+          members={members}
+          ownerUsername={room.owner_username}
+          username={username}
+          displayNames={senderNames}
+          connected={connected}
+          onRemove={onRemoveMember}
+          onClose={() => setShowMembers(false)}
+        />
+      ) : null}
+      {deleteTarget && onAction ? (
+        <DeleteMessageDialog
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={() => {
+            const target = deleteTarget;
+            setDeleteTarget(null);
+            if (editTarget?.id === target.id) {
+              setEditTarget(null);
+              setDraft("");
+            }
+            void onAction({ kind: "delete", targetId: target.id });
+          }}
+        />
+      ) : null}
       {showTrustDialog && isDirect && safetyNumber && directTrust.verificationToken && onVerifyToken ? (
         <Dialog
           className="verify-dialog"

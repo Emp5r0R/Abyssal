@@ -33,6 +33,7 @@ import kotlin.math.ceil
 import androidx.compose.ui.graphics.compositeOver
 import com.abyssal.chat.data.qr.ClipboardQrImage
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.foundation.text.selection.SelectionContainer
 import android.content.Context
@@ -144,6 +145,8 @@ import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DecryptedAttachment
 import com.abyssal.chat.domain.model.DirectTrustStatus
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MessageAction
+import com.abyssal.chat.domain.model.searchMessages
 import com.abyssal.chat.domain.model.MessageAttentionPolicy
 import com.abyssal.chat.domain.model.SenderClient
 import com.abyssal.chat.domain.model.ServerStatus
@@ -210,7 +213,11 @@ fun ChatScreen(viewModel: ChatViewModel, sessionId: String) {
         onExternalSystemUiEnd = viewModel::endExternalSystemUi,
         onUserActivity = viewModel::recordUserActivity,
         onVerifyToken = viewModel::verifyDirectVerificationToken,
-        knownDisplayNames = displayNames
+        knownDisplayNames = displayNames,
+        onMessageAction = viewModel::sendMessageAction,
+        loadRoomMembers = { viewModel.roomMembers(sessionId) },
+        onRemoveMember = { member, done -> viewModel.removeMlsMember(sessionId, member, done) },
+        onRenameRoom = { name, done -> viewModel.renameRoom(sessionId, name, done) }
     )
 }
 
@@ -246,7 +253,11 @@ internal fun ChatContent(
     onExternalSystemUiEnd: (Long) -> Boolean,
     onUserActivity: () -> Unit,
     onVerifyToken: (String) -> Boolean,
-    knownDisplayNames: Map<String, String> = emptyMap()
+    knownDisplayNames: Map<String, String> = emptyMap(),
+    onMessageAction: (MessageAction) -> Unit = {},
+    loadRoomMembers: () -> List<String> = { emptyList() },
+    onRemoveMember: (String, (Boolean) -> Unit) -> Unit = { _, done -> done(false) },
+    onRenameRoom: (String, (Boolean) -> Unit) -> Unit = { _, done -> done(false) }
 ) {
     // Names seen in this conversation fill in for senders the dashboard has not met yet.
     val displayNames = remember(knownDisplayNames, messages) {
@@ -264,6 +275,16 @@ internal fun ChatContent(
     var highlightedMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
     var hasPositionedMessageList by remember(session?.id) { mutableStateOf(false) }
     var showTrustDialog by remember(session?.id) { mutableStateOf(false) }
+    var editingMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
+    var actionsMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
+    var deleteMessageId by remember(session?.id) { mutableStateOf<String?>(null) }
+    var roomMembers by remember(session?.id) { mutableStateOf<List<String>?>(null) }
+    var showRename by remember(session?.id) { mutableStateOf(false) }
+    var searchQuery by remember(session?.id) { mutableStateOf<String?>(null) }
+    val visibleMessages = remember(messages, searchQuery) { searchQuery?.let { searchMessages(messages, it) } ?: messages }
+    val ownsRoom = session?.isForum == true && currentUsername != null &&
+        session.ownerUsername.equals(currentUsername, ignoreCase = true)
+    val clipboard = LocalClipboardManager.current
     val messageListState = remember(session?.id) { LazyListState() }
     val inputFocusRequester = remember { FocusRequester() }
     val scope = rememberCoroutineScope()
@@ -271,6 +292,7 @@ internal fun ChatContent(
     val hapticFeedback = LocalHapticFeedback.current
     val messagesById = remember(messages) { messages.associateBy(Message::id) }
     val replyingToMessage = replyingToMessageId?.let(messagesById::get)
+    val editingMessage = editingMessageId?.let(messagesById::get)
     val isConnected = ConnectionStatusCopy.isLive(status.state)
     val bundledAssets = remember { context.listBundledEmojiAssets() }
     val bundledByShortcode = remember(bundledAssets) {
@@ -309,23 +331,31 @@ internal fun ChatContent(
         }
     }
 
+    LaunchedEffect(editingMessageId, editingMessage) {
+        // The message expired or was deleted while being edited.
+        if (editingMessageId != null && editingMessage == null) {
+            editingMessageId = null
+            textInput = ""
+        }
+    }
+
     LaunchedEffect(replyingToMessageId) {
         if (replyingToMessageId != null) inputFocusRequester.requestFocus()
     }
 
     LaunchedEffect(messages.lastOrNull()?.id) {
-        if (messages.isEmpty()) {
+        if (visibleMessages.isEmpty()) {
             hasPositionedMessageList = false
             return@LaunchedEffect
         }
 
         val lastVisibleIndex = messageListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-        val isNearBottom = lastVisibleIndex >= messages.lastIndex - 2
+        val isNearBottom = lastVisibleIndex >= visibleMessages.lastIndex - 2
         if (!hasPositionedMessageList) {
-            messageListState.scrollToItem(messages.lastIndex)
+            messageListState.scrollToItem(visibleMessages.lastIndex)
             hasPositionedMessageList = true
         } else if (isNearBottom) {
-            messageListState.animateScrollToItem(messages.lastIndex)
+            messageListState.animateScrollToItem(visibleMessages.lastIndex)
         }
     }
     val saveLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
@@ -352,10 +382,32 @@ internal fun ChatContent(
                 presence = presence,
                 displayNames = displayNames,
                 onVerifySafetyNumber = { showTrustDialog = true },
+                onShowMembers = { roomMembers = loadRoomMembers() },
+                onRename = if (ownsRoom) { { showRename = true } } else null,
+                searching = searchQuery != null,
+                onToggleSearch = { searchQuery = if (searchQuery == null) "" else null },
                 onBack = onBack
             )
 
-            if (messages.isEmpty()) {
+            searchQuery?.let { query ->
+                ConversationSearchBar(
+                    query = query,
+                    matches = visibleMessages.size,
+                    onQueryChange = { searchQuery = it },
+                    onClose = { searchQuery = null }
+                )
+            }
+
+            if (searchQuery?.isNotBlank() == true && visibleMessages.isEmpty()) {
+                EmptyState(
+                    title = "No matches",
+                    detail = "Only messages still in memory are searched.",
+                    icon = AppIcons.Search,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                )
+            } else if (messages.isEmpty()) {
                 EmptyState(
                     title = "No messages yet",
                     detail = "Say hello. Messages live only in memory and disappear on their timer.",
@@ -373,17 +425,25 @@ internal fun ChatContent(
                         .padding(horizontal = 8.dp),
                     contentPadding = PaddingValues(vertical = 10.dp)
                 ) {
-                    itemsIndexed(messages, key = { _, item -> item.id }) { index, message ->
+                    itemsIndexed(visibleMessages, key = { _, item -> item.id }) { index, message ->
                         MessageBubbleItem(
                             message = message,
-                            showSender = index == 0 || messages[index - 1].sender != message.sender,
+                            showSender = index == 0 || visibleMessages[index - 1].sender != message.sender,
                             displayNames = displayNames,
                             replyTarget = message.replyToMessageId?.let(messagesById::get),
                             highlighted = highlightedMessageId == message.id,
                             onBecomeVisible = { onMessageVisible(message.id) },
                             onReply = {
-                                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                editingMessageId = null
                                 replyingToMessageId = message.id
+                            },
+                            onLongPress = {
+                                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                actionsMessageId = message.id
+                            },
+                            reactionsEnabled = isConnected,
+                            onToggleReaction = { emoji, active ->
+                                onMessageAction(MessageAction.Reaction(message.id, emoji, active))
                             },
                             currentUsername = currentUsername,
                             onMentionSender = { sender ->
@@ -391,7 +451,7 @@ internal fun ChatContent(
                                 inputFocusRequester.requestFocus()
                             },
                             onOpenReply = { messageId ->
-                                messages.indexOfFirst { it.id == messageId }
+                                visibleMessages.indexOfFirst { it.id == messageId }
                                     .takeIf { it >= 0 }
                                     ?.let { index ->
                                         scope.launch {
@@ -430,7 +490,15 @@ internal fun ChatContent(
 
             UploadProgressStrip(uploadProgress = uploadProgress)
 
-            if (replyingToMessage != null) {
+            if (editingMessage != null) {
+                EditComposerPreview(
+                    message = editingMessage,
+                    onCancel = {
+                        editingMessageId = null
+                        textInput = ""
+                    }
+                )
+            } else if (replyingToMessage != null) {
                 ReplyComposerPreview(
                     message = replyingToMessage,
                     displayNames = displayNames,
@@ -462,7 +530,12 @@ internal fun ChatContent(
                 onGif = { showBundledGifDialog = true },
                 onSend = {
                     val trimmed = textInput.trim()
-                    if (trimmed.isNotEmpty()) {
+                    val editTarget = editingMessage
+                    if (trimmed.isNotEmpty() && editTarget != null) {
+                        if (trimmed != editTarget.content) onMessageAction(MessageAction.Edit(editTarget.id, trimmed))
+                        editingMessageId = null
+                        textInput = ""
+                    } else if (trimmed.isNotEmpty()) {
                         val reaction = bundledByShortcode[trimmed.lowercase(Locale.ROOT)]
                         if (reaction == null) {
                             onSendMessage(trimmed, selectedTimerSec, replyingToMessageId)
@@ -559,6 +632,84 @@ internal fun ChatContent(
             )
         }
 
+        actionsMessageId?.let(messagesById::get)?.let { target ->
+            MessageActionsSheet(
+                message = target,
+                currentUsername = currentUsername,
+                canSend = isConnected,
+                onDismiss = { actionsMessageId = null },
+                onReact = { emoji, active ->
+                    actionsMessageId = null
+                    onMessageAction(MessageAction.Reaction(target.id, emoji, active))
+                },
+                onReply = {
+                    actionsMessageId = null
+                    editingMessageId = null
+                    replyingToMessageId = target.id
+                },
+                onCopy = if (target.isMedia) null else {
+                    {
+                        actionsMessageId = null
+                        clipboard.setText(AnnotatedString(target.content))
+                    }
+                },
+                onEdit = {
+                    actionsMessageId = null
+                    replyingToMessageId = null
+                    editingMessageId = target.id
+                    textInput = target.content
+                    inputFocusRequester.requestFocus()
+                },
+                onDelete = {
+                    actionsMessageId = null
+                    deleteMessageId = target.id
+                }
+            )
+        }
+
+        if (showRename && ownsRoom && session != null) {
+            RenameRoomDialog(
+                currentName = roomLabel(session.id, session.name),
+                connected = isConnected,
+                onRename = onRenameRoom,
+                onDismiss = { showRename = false }
+            )
+        }
+
+        roomMembers?.let { members ->
+            RoomMembersDialog(
+                members = members,
+                ownerUsername = session?.ownerUsername,
+                currentUsername = currentUsername,
+                displayNames = displayNames,
+                connected = isConnected,
+                onRemove = { member, done ->
+                    onRemoveMember(member) { removed ->
+                        if (removed) roomMembers = loadRoomMembers()
+                        done(removed)
+                    }
+                },
+                onDismiss = { roomMembers = null }
+            )
+        }
+
+        deleteMessageId?.let(messagesById::get)?.let { target ->
+            ConfirmDialog(
+                title = "Delete for everyone?",
+                message = "The message is removed from this conversation in every Abyssal app that still has it. Anyone who already read it may have kept a copy.",
+                confirmLabel = "Delete",
+                onConfirm = {
+                    deleteMessageId = null
+                    if (editingMessageId == target.id) {
+                        editingMessageId = null
+                        textInput = ""
+                    }
+                    onMessageAction(MessageAction.Delete(target.id))
+                },
+                onDismiss = { deleteMessageId = null }
+            )
+        }
+
         if (attachmentPreview != null) {
             AttachmentPreviewDialog(
                 attachment = attachmentPreview,
@@ -576,6 +727,10 @@ private fun ChatHeader(
     presence: List<UserPresence>,
     displayNames: Map<String, String>,
     onVerifySafetyNumber: () -> Unit,
+    onShowMembers: () -> Unit,
+    onRename: (() -> Unit)?,
+    searching: Boolean,
+    onToggleSearch: () -> Unit,
     onBack: () -> Unit
 ) {
     val isRoom = session?.isForum != false
@@ -648,7 +803,14 @@ private fun ChatHeader(
                     }
                 }
             }
+            IconAction(
+                if (searching) AppIcons.Close else AppIcons.Search,
+                if (searching) "Close search" else "Search this conversation",
+                onToggleSearch
+            )
             if (isRoom && session != null) {
+                if (onRename != null) IconAction(AppIcons.Pencil, "Rename room", onRename)
+                IconAction(AppIcons.Users, "Room members", onShowMembers)
                 val clipboard = LocalClipboardManager.current
                 val context = LocalContext.current
                 var copied by remember(session.id) { mutableStateOf(false) }
@@ -1543,6 +1705,9 @@ private fun MessageBubbleItem(
     displayNames: Map<String, String>,
     onBecomeVisible: () -> Unit,
     onReply: () -> Unit,
+    onLongPress: () -> Unit,
+    reactionsEnabled: Boolean,
+    onToggleReaction: (String, Boolean) -> Unit,
     onMentionSender: (String) -> Unit,
     onOpenReply: (String) -> Unit,
     onViewAttachment: () -> Unit,
@@ -1661,8 +1826,8 @@ private fun MessageBubbleItem(
                         .border(1.dp, borderColor, bubbleShape)
                         .combinedClickable(
                             onClick = {},
-                            onLongClick = onReply,
-                            onLongClickLabel = "Reply"
+                            onLongClick = onLongPress,
+                            onLongClickLabel = "Message actions"
                         )
                         .padding(horizontal = 12.dp, vertical = 9.dp)
                 ) {
@@ -1699,7 +1864,15 @@ private fun MessageBubbleItem(
                         }
                     }
 
+                    MessageReactionsRow(
+                        message = message,
+                        currentUsername = currentUsername,
+                        enabled = reactionsEnabled,
+                        onToggle = onToggleReaction
+                    )
+
                     MessageFooter(
+                        edited = message.editedAtMs != null,
                         timestampMs = message.timestampMs,
                         counting = message.readTimestampMs != null && message.selfDestructDurationSec > 0,
                         millisRemaining = millisRemaining,
@@ -1763,6 +1936,7 @@ private fun MessageText(content: String, currentUsername: String?) {
 /** Send time plus, once read, a small countdown ring until the message disappears. */
 @Composable
 private fun MessageFooter(
+    edited: Boolean,
     timestampMs: Long,
     counting: Boolean,
     millisRemaining: Float,
@@ -1803,6 +1977,9 @@ private fun MessageFooter(
                     modifier = Modifier.padding(start = 3.dp, end = 8.dp)
                 )
             }
+        }
+        if (edited) {
+            Text("edited · ", color = TextSubtle, fontSize = 11.sp, fontStyle = FontStyle.Italic)
         }
         Text(time, color = TextSubtle, fontSize = 11.sp)
     }

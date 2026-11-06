@@ -28,6 +28,9 @@ export function estimateMessageMemoryBytes(message: ChatMessage): number {
   bytes += estimateString(message.content);
   bytes += estimateString(message.replyToId);
   bytes += estimateString(message.senderPublicKeyB64);
+  for (const people of Object.values(message.reactions ?? {})) {
+    for (const person of people ?? []) bytes += estimateString(person);
+  }
 
   const attachment = message.attachment;
   if (attachment) {
@@ -117,6 +120,7 @@ export function wipeEvictedMessage(message: ChatMessage): void {
   message.content = "";
   message.senderDisplayName = undefined;
   message.replyToId = undefined;
+  message.reactions = undefined;
   if (message.attachment) {
     message.attachment.name = "";
     message.attachment.reactionShortcode = undefined;

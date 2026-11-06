@@ -1333,14 +1333,96 @@ button.list-row:hover {
   white-space: nowrap;
 }
 
-.reply-action {
+.message-actions {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
   opacity: 0;
   transition: opacity 120ms ease;
 }
 
-.message-row:hover .reply-action,
-.reply-action:focus-visible {
+.message-actions .icon-button {
+  width: 30px;
+  height: 30px;
+}
+
+.message-row:hover .message-actions,
+.message-actions:focus-within {
   opacity: 1;
+}
+
+.message-row.is-mine .message-actions {
+  flex-direction: row-reverse;
+}
+
+.reaction-picker {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 6px);
+  left: 0;
+  display: flex;
+  padding: 4px;
+  gap: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-2);
+  box-shadow: var(--shadow);
+}
+
+.message-row.is-mine .reaction-picker {
+  right: 0;
+  left: auto;
+}
+
+.reaction-picker button {
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  font-size: 20px;
+  line-height: 1;
+  background: transparent;
+}
+
+.reaction-picker button:hover,
+.reaction-picker button.is-mine {
+  background: var(--accent-soft);
+}
+
+.message-reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.message-reactions button {
+  display: inline-flex;
+  min-height: 26px;
+  padding: 0 8px;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  background: var(--surface-2);
+}
+
+.message-reactions button.is-mine {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.message-reactions button:disabled {
+  cursor: default;
+}
+
+.message-edited {
+  font-style: italic;
 }
 
 .mention-token {
@@ -2914,7 +2996,7 @@ button.list-row:hover {
     display: none;
   }
 
-  .reply-action {
+  .message-actions {
     opacity: 1;
   }
 
@@ -3047,7 +3129,7 @@ button.list-row:hover {
 
 /* No hover on touch screens: keep hover-revealed actions visible. */
 @media (hover: none) {
-  .reply-action,
+  .message-actions,
   .nav-trailing {
     opacity: 1;
   }
@@ -3256,4 +3338,72 @@ kbd {
   margin: 14px 2px 4px;
   color: var(--text-muted);
   font-size: var(--text-md);
+}
+
+/* Room members dialog */
+.member-list {
+  display: flex;
+  margin: 0;
+  padding: 0;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+}
+
+.member-list li {
+  display: flex;
+  min-height: 52px;
+  padding: 6px 4px;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.member-list li:last-child {
+  border-bottom: 0;
+}
+
+.member-name {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.member-name strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-name small {
+  color: var(--text-subtle);
+  font-size: var(--text-xs);
+}
+
+/* In-conversation search */
+.chat-search {
+  display: flex;
+  padding: 8px 16px;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-subtle);
+  background: var(--surface);
+}
+
+.chat-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: none;
+  color: var(--text);
+  font-size: var(--text-md);
+  background: transparent;
+}
+
+.chat-search span {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
 }

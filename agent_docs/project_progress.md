@@ -1,5 +1,59 @@
 # Project Progress
 
+## Active Deployment: 3.5.1-4.0 Feature, Robustness and Storage Program
+
+Started 2026-11-06 (Medium route, inline only by user request). Excludes in-app
+invite minting (intentionally restart-only for now) and the Hush cover-traffic
+research. Typing indicators are deliberately not built: they leak activity timing.
+
+### Phases
+
+1. **3.5.1 patch.** Release the shared invite-capsule crate and the rustls fix
+   for RUSTSEC-2026-0346..0349 already on `main`, plus calculator-cover input
+   fixes (leading-zero PINs, delete key, result continuation) and forgiving
+   Android PIN setup (digits, confirmation, skip). Deploy.
+2. **3.6 conversation and room features (web + Android, no wire break).**
+   New encrypted payload kinds carried like `read_receipt`; older clients drop
+   unknown kinds without state loss.
+   - Message actions: emoji reactions from a fixed allowlist, delete for
+     everyone and edit (original sender only, bound to the authoritative sender),
+     voice notes (FILE attachments with an audio MIME type and a voice flag).
+   - Rooms: owner removes a member (relay already accepts request-less removal
+     commits), room profile sent to members after admission, rename by the owner.
+     Ownership transfer needs a relay owner-change transition.
+   - In-conversation search and a light theme on both clients.
+3. **Relay-authorized Android device storage.** Off by default. When the relay
+   allows it, Android keeps messages, attachments, rooms and contacts across
+   app restarts in an encrypted store whose key combines an Android Keystore key
+   with a relay-held share that exists only in relay RAM and is released only
+   after OPAQUE login. Relay restart or wipe destroys the share, making the
+   store cryptographically unrecoverable even before the app deletes it
+   (crypto-erase; flash overwrite is not relied on).
+4. **Protocol-v11 client adoption** (the existing plan below, steps 6-8):
+   breaking release with coordinated relay, web and Android.
+
+### Acceptance
+
+- Each phase passes `./scripts/test-all.sh all` (via the release build) before
+  its tag; features have unit coverage on both clients.
+- New payload kinds are validated (bounded, allowlisted, sender-bound) and never
+  extend message lifetime or bypass room media policy.
+- Device storage never writes plaintext or an unwrapped key to disk, and a relay
+  restart, relay wipe, duress PIN, logout-with-wipe or session mismatch leaves
+  the store undecryptable.
+- Physical-phone qualification needs a connected device (none attached on
+  2026-11-06); emulator evidence is labeled as such.
+
+### Status
+
+- Phase 1 done 2026-11-06: v3.5.1 (`936a263`, manifest sequence 19) released
+  and deployed; production serves `web@3.5.1`. The release also cleared new
+  npm and RustSec advisories; RUSTSEC-2026-0387 and -0374 (no upstream fix)
+  are user-approved, dated exceptions in `scripts/lib/cargo-audit-exceptions.tsv`.
+- Phase 2 in progress: reactions, edit, delete for everyone, owner member
+  removal, room profile after admission, owner rename and in-conversation
+  search are implemented and unit-tested on web and Android (unreleased).
+
 ## Active Deployment: Protocol-v11 Transport Confidentiality
 
 ### Goal

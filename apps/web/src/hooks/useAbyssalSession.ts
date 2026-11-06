@@ -17,6 +17,14 @@ import {
   wipeMessageAttachmentKey as wipeMessageAttachment,
 } from "../domain/messageMemoryPolicy";
 import { reactionByShortcode } from "../domain/reactions";
+import {
+  actionAllowed,
+  applyMessageAction,
+  isMessageActionKind,
+  messageActionPayload,
+  parseMessageAction,
+  type MessageAction,
+} from "../domain/messageActions";
 import { JoinAdmissionQueue } from "../domain/joinAdmission";
 import type {
   AccountSession,
@@ -441,6 +449,26 @@ export function useAbyssalSession() {
     setMedia(null);
   }, []);
 
+  /** Applies a reaction, edit or delete from [actor] to one conversation in memory. */
+  const applyChatAction = useCallback((chatId: string, action: MessageAction, actor: string) => {
+    const username = sessionRef.current?.username;
+    if (!username) return;
+    updateMessages((current) => {
+      const list = current[chatId];
+      if (!list) return current;
+      const result = applyMessageAction(list, action, actor, username, Date.now());
+      if (result.messages === list) return current;
+      if (result.removed) {
+        if (mediaRef.current?.messageId === result.removed.id) clearMedia();
+        wipeEvictedMessage(result.removed);
+      }
+      const next = { ...current };
+      if (result.messages.length > 0) next[chatId] = result.messages;
+      else delete next[chatId];
+      return next;
+    });
+  }, [clearMedia, updateMessages]);
+
   useEffect(() => {
     const directTrustStore = directTrustRef.current;
     return () => {
@@ -807,6 +835,21 @@ export function useAbyssalSession() {
             const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as unknown;
             if (!plainRecord(decoded)) return;
             if (!directoryStampMatches(directoryStampRef.current, decoded)) return;
+            if (isMessageActionKind(decoded.kind)) {
+              const action = parseMessageAction(decoded, frame.message_id);
+              if (action && accountActive()) applyChatAction(frame.room_id, action, frame.sender_username);
+              return;
+            }
+            if (decoded.kind === "room_profile") {
+              // The owner's room name, sent after admitting a member or on rename.
+              if (decoded.id !== frame.message_id || !accountActive()) return;
+              const label = mlsRef.current?.acceptRoomProfile(frame.room_id, frame.sender_username, decoded.room_profile, true);
+              if (label !== undefined && accountActive()) {
+                roomsRef.current = roomsRef.current.map((candidate) => candidate.id === frame.room_id ? { ...candidate, name: label } : candidate);
+                setRooms(roomsRef.current);
+              }
+              return;
+            }
             if (decoded.kind === "read_receipt") {
               if (typeof decoded.id !== "string" || !validControlId(decoded.id) || decoded.id !== frame.message_id) return;
               const targetId = decoded.message_id;
@@ -1102,6 +1145,11 @@ export function useAbyssalSession() {
       ) return;
       receivedFrameIdsRef.current.set(replayKey, directoryEvidenceKey);
       const payload = JSON.parse(decrypted) as Record<string, unknown>;
+      if (isMessageActionKind(payload.kind)) {
+        const action = parseMessageAction(payload, frame.message_id);
+        if (action) applyChatAction(frame.chat_id, action, frame.sender_username);
+        return;
+      }
       if (payload.kind === "read_receipt") {
         if (payload.id !== frame.message_id) return;
         const targetId = typeof payload.message_id === "string" ? payload.message_id : "";
@@ -1152,7 +1200,7 @@ export function useAbyssalSession() {
         // Authentication failure or malformed plaintext stays outside UI state.
       }
     });
-  }, [clearMemory, failClosed, knownDirectoryEvidence, rememberDirectoryStamp, updateMessages]);
+  }, [applyChatAction, clearMemory, failClosed, knownDirectoryEvidence, rememberDirectoryStamp, updateMessages]);
 
   const login = useCallback(async (input: LoginInput): Promise<AccountSession> => {
     if (sessionRef.current || loginAbortRef.current) {
@@ -1740,6 +1788,60 @@ export function useAbyssalSession() {
     sendReadReceiptRef.current = sendReadReceipt;
   }, [sendReadReceipt]);
 
+  /**
+   * Sends a reaction, edit or delete for a message in [chatId] and applies it
+   * locally once the relay accepts it. Only the sender may edit or delete.
+   */
+  const sendMessageAction = useCallback(async (chatId: string, action: MessageAction): Promise<boolean> => {
+    const currentSession = sessionRef.current;
+    const room = conversationForId(roomsRef.current, directsRef.current, chatId);
+    if (!currentSession || !room || connection !== "connected") return false;
+    const target = messagesRef.current[chatId]?.find((message) => message.id === action.targetId);
+    if (!target || !actionAllowed(target, action, currentSession.username)) return false;
+    const generation = sessionGenerationRef.current;
+    const connectionGeneration = connectionGenerationRef.current;
+    const recipients = recipientKeysFor(chatId);
+    const isMlsRoom = room.conversation_type !== "direct" && room.mlsActive !== undefined;
+    if (!isMlsRoom && recipients.length === 0) return false;
+    const actionId = crypto.randomUUID();
+    let outcome: string;
+    if (isMlsRoom) {
+      let plaintext = new Uint8Array(0);
+      try {
+        plaintext = new TextEncoder().encode(JSON.stringify({
+          ...messageActionPayload(actionId, action),
+          ...(directoryStampRef.current ? directoryStampFields(directoryStampRef.current) : {}),
+        }));
+        const prepared = mlsRef.current?.prepareApplication(chatId, actionId, currentSession.username, plaintext);
+        if (!prepared) return false;
+        outcome = await runMlsTransaction(currentSession, generation, connectionGeneration, prepared);
+      } catch { return false; }
+      finally { plaintext.fill(0); }
+    } else {
+      outcome = await runOutboundTransaction(
+        currentSession,
+        generation,
+        connectionGeneration,
+        chatId,
+        actionId,
+        recipients,
+        (directoryStamp) => cipherRef.current.encryptText(
+          chatId,
+          actionId,
+          currentSession.username,
+          JSON.stringify({
+            ...messageActionPayload(actionId, action),
+            ...(directoryStamp ? directoryStampFields(directoryStamp) : {}),
+          }),
+          recipients,
+        ),
+      );
+    }
+    if (outcome !== "ACCEPTED" || sessionRef.current !== currentSession) return false;
+    applyChatAction(chatId, action, currentSession.username);
+    return true;
+  }, [applyChatAction, connection, recipientKeysFor, runMlsTransaction, runOutboundTransaction]);
+
   const sendText = useCallback(async (content: string, replyToId?: string, retentionSec?: number): Promise<boolean> => {
     const currentSession = sessionRef.current;
     const chatId = activeRoomId;
@@ -2155,6 +2257,42 @@ export function useAbyssalSession() {
     /^[A-Za-z0-9_-]{1,128}$/u.test(roomId) &&
     (socketRef.current?.sendMlsControl({ type: "mls_discover_room", protocol_version: 10, room_id: roomId }) ?? false), [connection]);
 
+  /**
+   * The owner sends the room name as its own encrypted room message, so newly
+   * admitted members learn it at once. With [name] this is a rename, which is
+   * recorded locally only after the relay accepts it.
+   */
+  const sendRoomProfile = useCallback(async (roomId: string, name?: string): Promise<boolean> => {
+    const current = sessionRef.current;
+    if (!current || connection !== "connected") return false;
+    let plaintext = new Uint8Array(0);
+    try {
+      const profile = mlsRef.current?.roomProfileMessage(roomId, name);
+      if (!profile) return false;
+      const messageId = crypto.randomUUID();
+      plaintext = new TextEncoder().encode(JSON.stringify({
+        kind: "room_profile",
+        id: messageId,
+        room_profile: profile,
+        ...(directoryStampRef.current ? directoryStampFields(directoryStampRef.current) : {}),
+      }));
+      const prepared = mlsRef.current?.prepareApplication(roomId, messageId, current.username, plaintext);
+      if (!prepared) return false;
+      const outcome = await runMlsTransaction(current, sessionGenerationRef.current, connectionGenerationRef.current, prepared);
+      if (outcome !== "ACCEPTED" || sessionRef.current !== current) return false;
+      if (name !== undefined) {
+        const label = mlsRef.current?.renameRoom(roomId, name);
+        if (label === undefined) return false;
+        roomsRef.current = roomsRef.current.map((room) => room.id === roomId ? { ...room, name: label } : room);
+        setRooms(roomsRef.current);
+      }
+      return true;
+    } catch { return false; }
+    finally { plaintext.fill(0); }
+  }, [connection, runMlsTransaction]);
+
+  const renameRoom = useCallback((roomId: string, name: string) => sendRoomProfile(roomId, name.trim()), [sendRoomProfile]);
+
   const acceptRoomJoin = useCallback(async (requestId: string): Promise<boolean> => {
     const current = sessionRef.current;
     if (!current || connection !== "connected") return false;
@@ -2163,9 +2301,10 @@ export function useAbyssalSession() {
       if (!prepared) return false;
       const outcome = await runMlsTransaction(current, sessionGenerationRef.current, connectionGenerationRef.current, prepared);
       setPendingMlsJoins(mlsRef.current?.pendingJoins() ?? []);
+      if (outcome === "ACCEPTED") void sendRoomProfile(prepared.roomId);
       return outcome === "ACCEPTED";
     } catch { return false; }
-  }, [connection, runMlsTransaction]);
+  }, [connection, runMlsTransaction, sendRoomProfile]);
 
   // Public rooms need no owner decision. The owner's client still commits each admission itself,
   // one at a time; a failed admission is retried briefly and then left for a manual decision.
@@ -2219,6 +2358,27 @@ export function useAbyssalSession() {
       const outcome = await runMlsTransaction(current, sessionGenerationRef.current, connectionGenerationRef.current, prepared);
       setPendingMlsLeaves(mlsRef.current?.pendingLeaves() ?? []);
       return outcome === "ACCEPTED";
+    } catch { return false; }
+  }, [connection, runMlsTransaction]);
+
+  /** Members of a room as the local room state knows them. */
+  const roomMembers = useCallback((roomId: string): string[] => mlsRef.current?.members(roomId) ?? [], []);
+
+  /** The room owner removes a member. */
+  const removeRoomMember = useCallback(async (roomId: string, username: string): Promise<boolean> => {
+    const current = sessionRef.current;
+    if (!current || connection !== "connected") return false;
+    try {
+      const prepared = mlsRef.current?.removeMember(roomId, username);
+      if (!prepared) return false;
+      const outcome = await runMlsTransaction(current, sessionGenerationRef.current, connectionGenerationRef.current, prepared);
+      setPendingMlsLeaves(mlsRef.current?.pendingLeaves() ?? []);
+      if (outcome !== "ACCEPTED") return false;
+      roomsRef.current = roomsRef.current.map((room) => room.id === roomId
+        ? { ...room, mlsMembers: mlsRef.current?.members(roomId) ?? room.mlsMembers }
+        : room);
+      setRooms(roomsRef.current);
+      return true;
     } catch { return false; }
   }, [connection, runMlsTransaction]);
 
@@ -2289,6 +2449,7 @@ export function useAbyssalSession() {
     verifyDirectVerificationToken,
     markRoomRead,
     sendText,
+    sendMessageAction,
     sendAttachment,
     viewAttachment,
     exportAttachment,
@@ -2300,6 +2461,9 @@ export function useAbyssalSession() {
     leaveRoom,
     acceptRoomLeave,
     rejectRoomLeave,
+    roomMembers,
+    removeRoomMember,
+    renameRoom,
     deleteRoom,
     wipeRelay,
     clearNotice: () => setNotice(null),

@@ -200,7 +200,9 @@ class MlsRoomManagerTest {
             member.finishSnapshot(secondSnapshot.snapshot, OutboundSendResult.ACCEPTED)
             assertEquals(profile.getString("name"), member.acceptRoomProfile("room_custom", "Alice", receivedProfile))
             assertTrue(runCatching { member.acceptRoomProfile("room_custom", "Bob", receivedProfile) }.isFailure)
-            assertTrue(runCatching { member.acceptRoomProfile("room_custom", "Alice", RoomProfileCodec.encode("Override")) }.isFailure)
+            // A different name on an ordinary message is ignored; only a room_profile message replaces it.
+            assertEquals(null, member.acceptRoomProfile("room_custom", "Alice", RoomProfileCodec.encode("Override")))
+            assertEquals(profile.getString("name"), member.acceptRoomProfile("room_custom", "Alice", receivedProfile))
 
             assertTrue(runCatching { member.receiveApplication(firstFrame) }.isFailure)
             assertTrue(runCatching { member.prepareApplication("room_custom", "message-c", "Bob", byteArrayOf(3)) }.isFailure)
@@ -400,6 +402,62 @@ class MlsRoomManagerTest {
         } finally {
             owner.close(); member.close(); ownerCipher.clear(); memberCipher.clear(); memberKey.fill(0)
         }
+    }
+
+    @Test
+    fun ownerRemovesAMemberWithoutALeaveRequest() {
+        val ownerCipher = identity(7)
+        val ownerKey = ownerCipher.publicKey()
+        val owner = MlsRoomManager(ownerCipher, "Alice", "node-1", ownerKey)
+        ownerKey.fill(0)
+        val memberCipher = identity(8)
+        val memberKey = memberCipher.publicKey()
+        val member = MlsRoomManager(memberCipher, "Bob", "node-1", memberKey)
+        try {
+            val create = owner.createRoom(room("room_custom"))
+            val join = member.beginJoin(MlsIncomingFrame.RoomDiscovered("room_custom", create.getString("group_id_b64"), "Alice"))
+            val request = joinRequest(join, memberKey)
+            owner.rememberJoin(request)
+            owner.finishTransaction(owner.acceptJoin(request.requestId, "membership-join"), OutboundSendResult.ACCEPTED)
+            assertEquals(listOf("alice", "bob"), owner.members("room_custom").map { it.lowercase() }.sorted())
+
+            assertTrue(runCatching { owner.removeMember("room_custom", "Alice") }.isFailure)
+            assertTrue(runCatching { owner.removeMember("room_custom", "Mallory") }.isFailure)
+            assertTrue(runCatching { member.removeMember("room_custom", "Alice") }.isFailure)
+            assertTrue(owner.isActiveRoom("room_custom"))
+
+            val removal = owner.removeMember("room_custom", "bob", "membership-remove")
+            assertEquals("mls_membership_commit", removal.frame.getString("type"))
+            assertTrue(removal.frame.isNull("request_id"))
+            owner.finishTransaction(removal, OutboundSendResult.ACCEPTED)
+            assertEquals(listOf("alice"), owner.members("room_custom").map { it.lowercase() })
+            assertTrue(owner.isActiveRoom("room_custom"))
+            assertEquals(emptyList<String>(), owner.members("room_unknown"))
+        } finally {
+            owner.close(); member.close(); ownerCipher.clear(); memberCipher.clear(); memberKey.fill(0)
+        }
+    }
+
+    @Test
+    fun renamedRoomsSendTheNameOnlyInRoomProfileMessages() {
+        val cipher = identity()
+        val key = cipher.publicKey()
+        val manager = MlsRoomManager(cipher, "Alice", "node-1", key)
+        key.fill(0)
+        try {
+            manager.createRoom(room().copy(name = "Original"))
+            assertEquals("Original", manager.outgoingRoomProfile("forum_alpha")?.getString("name"))
+            assertEquals("Renamed", manager.roomProfileMessage("forum_alpha", "Renamed")?.getString("name"))
+            assertTrue(runCatching { manager.roomProfileMessage("forum_alpha", "bad\u0000name") }.isFailure)
+            assertEquals("Renamed", manager.renameRoom("forum_alpha", "Renamed"))
+            assertEquals(null, manager.outgoingRoomProfile("forum_alpha"))
+            assertEquals("Renamed", manager.roomProfileMessage("forum_alpha")?.getString("name"))
+            // A different name on an ordinary message is ignored rather than failing the session.
+            val other = JSONObject().put("version", 1).put("name", "Other")
+            assertEquals(null, manager.acceptRoomProfile("forum_alpha", "Alice", other))
+            assertEquals("Other", manager.acceptRoomProfile("forum_alpha", "Alice", other, replace = true))
+            assertTrue(runCatching { manager.acceptRoomProfile("forum_alpha", "Mallory", other, replace = true) }.isFailure)
+        } finally { manager.close(); cipher.clear() }
     }
 
     private fun identity(seed: Int = 7) = InMemoryPayloadCipher().also {

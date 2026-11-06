@@ -2,6 +2,8 @@ package com.abyssal.chat.data.repository
 
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.Message
+import com.abyssal.chat.domain.model.MessageAction
+import com.abyssal.chat.domain.model.MessageActionPolicy
 import com.abyssal.chat.domain.repository.IMessageRepository
 import com.abyssal.chat.domain.repository.IMessageSender
 import kotlinx.coroutines.CoroutineScope
@@ -323,6 +325,24 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         }
     }
 
+    override fun applyActionIfCurrent(
+        epoch: ULong,
+        chatId: String,
+        action: MessageAction,
+        actor: String,
+        currentUsername: String?
+    ): Boolean {
+        synchronized(stateLock) {
+            if (repositoryEpochExhausted || epoch != repositoryEpoch) return false
+            val chatMsgs = _messages.value[chatId] ?: return true
+            val applied = MessageActionPolicy.apply(chatMsgs, action, actor, currentUsername, System.currentTimeMillis())
+            if (!applied.changed) return true
+            applied.removed?.let(::wipeMessageKeys)
+            _messages.value = _messages.value.toMutableMap().apply { put(chatId, applied.messages) }
+            return true
+        }
+    }
+
     override suspend fun forgetAttachmentKey(chatId: String, messageId: String) {
         synchronized(stateLock) {
             val current = _messages.value[chatId] ?: return
@@ -385,6 +405,10 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         addString(message.attachmentMimeType)
         addString(message.replyToMessageId)
         addString(message.reactionShortcode)
+        message.reactions.forEach { (emoji, people) ->
+            addString(emoji)
+            people.forEach(::addString)
+        }
         total = total.saturatingAdd(message.senderPublicKey?.size?.toLong() ?: 0L)
         total = total.saturatingAdd(message.attachmentKey?.size?.toLong() ?: 0L)
         return total

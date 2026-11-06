@@ -392,6 +392,10 @@ function SecureWorkspace({
           onExportAttachment={abyssal.exportAttachment}
           onSendGif={sendGif}
           onVerifyToken={abyssal.verifyDirectVerificationToken}
+          onAction={(action) => abyssal.sendMessageAction(abyssal.activeRoom!.id, action)}
+          members={abyssal.activeRoom.conversation_type === "direct" ? undefined : abyssal.roomMembers(abyssal.activeRoom.id)}
+          onRemoveMember={(member) => abyssal.removeRoomMember(abyssal.activeRoom!.id, member)}
+          onRename={(name) => abyssal.renameRoom(abyssal.activeRoom!.id, name)}
         />
       ) : undefined}
     </AppShell>
