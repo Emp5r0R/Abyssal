@@ -73,6 +73,15 @@ interface IMessageRepository {
     fun saveMessageIfCurrent(epoch: ULong, chatId: String, message: Message): Boolean = false
     suspend fun markAsRead(chatId: String, messageId: String)
     fun markAsReadIfCurrent(epoch: ULong, chatId: String, messageId: String): Boolean = false
+    /** Every conversation's messages as they change; used to keep the device store current. */
+    fun observeAllMessages(): kotlinx.coroutines.flow.Flow<Map<String, List<Message>>> = kotlinx.coroutines.flow.emptyFlow()
+    /** The current messages of every conversation. */
+    fun snapshotAllMessages(): Map<String, List<Message>> = emptyMap()
+    /**
+     * Adds messages restored from the device store, older than anything
+     * received since sign-in, without counting them as unread.
+     */
+    fun restoreMessagesIfCurrent(epoch: ULong, messages: Map<String, List<Message>>): Boolean = false
     /**
      * Applies a reaction, edit or delete from [actor] to a message in [chatId].
      * A deleted message's keys are wiped. False only when [epoch] is stale.

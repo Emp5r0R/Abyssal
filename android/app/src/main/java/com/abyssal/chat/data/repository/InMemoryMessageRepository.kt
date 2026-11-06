@@ -325,6 +325,29 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
         }
     }
 
+    override fun observeAllMessages(): Flow<Map<String, List<Message>>> = _messages.asStateFlow()
+
+    override fun snapshotAllMessages(): Map<String, List<Message>> = _messages.value
+
+    override fun restoreMessagesIfCurrent(epoch: ULong, messages: Map<String, List<Message>>): Boolean {
+        synchronized(stateLock) {
+            if (repositoryEpochExhausted || epoch != repositoryEpoch) {
+                messages.values.flatten().forEach(::wipeMessageKeys)
+                return false
+            }
+            val merged = _messages.value.toMutableMap()
+            messages.forEach { (chatId, restored) ->
+                val current = merged[chatId].orEmpty()
+                val known = current.mapTo(HashSet()) { it.id }
+                val older = restored.filterNot { it.id in known }
+                restored.filter { it.id in known }.forEach(::wipeMessageKeys)
+                merged[chatId] = (older + current).takeLast(MAX_RESTORED_PER_CHAT)
+            }
+            _messages.value = merged
+            return true
+        }
+    }
+
     override fun applyActionIfCurrent(
         epoch: ULong,
         chatId: String,
@@ -382,6 +405,10 @@ class InMemoryMessageRepository : IMessageRepository, IMessageSender {
     override fun close() {
         clearAllDataNow()
         scope.cancel()
+    }
+
+    private companion object {
+        const val MAX_RESTORED_PER_CHAT = 500
     }
 
     private fun wipeMessageKeys(message: Message) {

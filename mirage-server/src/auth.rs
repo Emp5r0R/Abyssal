@@ -420,6 +420,7 @@ pub(super) async fn finish_opaque_account(
                         attachment_uploads: Arc::new(Semaphore::new(
                             MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT,
                         )),
+                        device_storage_share: crate::device_storage::new_share(),
                     },
                 );
                 username
@@ -990,6 +991,8 @@ pub(super) async fn account_error(
             identity_public_b64: None,
             identity_prekey_id: None,
             identity_envelope_b64: None,
+            device_storage: state.device_storage.allowed(),
+            device_storage_share_b64: None,
             error: Some("Wrong information.".to_string()),
         }),
     )
@@ -1011,10 +1014,19 @@ pub(super) async fn issue_session(
                 URL_SAFE_NO_PAD.encode(&account.identity_public),
                 account.prekey_id.clone(),
                 URL_SAFE_NO_PAD.encode(&account.identity_envelope),
+                state
+                    .device_storage
+                    .allowed()
+                    .then(|| URL_SAFE_NO_PAD.encode(account.device_storage_share)),
             )
         })
     };
-    let Some((identity_public_b64, identity_prekey_id, identity_envelope_b64)) = account_identity
+    let Some((
+        identity_public_b64,
+        identity_prekey_id,
+        identity_envelope_b64,
+        device_storage_share_b64,
+    )) = account_identity
     else {
         return account_error(StatusCode::UNAUTHORIZED, state, String::new()).await;
     };
@@ -1059,6 +1071,8 @@ pub(super) async fn issue_session(
             identity_public_b64: Some(identity_public_b64),
             identity_prekey_id: Some(identity_prekey_id),
             identity_envelope_b64: Some(identity_envelope_b64),
+            device_storage: state.device_storage.allowed(),
+            device_storage_share_b64,
             error: None,
         }),
     )

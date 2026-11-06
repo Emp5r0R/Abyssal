@@ -89,6 +89,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     val disguiseSet by viewModel.disguiseSettings.collectAsState()
     val presence by viewModel.presence.collectAsState()
     val sessionSecurity by viewModel.sessionSecurity.collectAsState()
+    val deviceStorageActive by viewModel.deviceStorageActive.collectAsState()
     val roomCreationLimit by viewModel.roomCreationLimit.collectAsState()
     val pendingMlsJoins by viewModel.pendingMlsJoins.collectAsState()
     val pendingMlsLeaves by viewModel.pendingMlsLeaves.collectAsState()
@@ -132,6 +133,8 @@ fun DashboardScreen(viewModel: ChatViewModel) {
             notificationsAllowed = notificationsAllowed,
             onBlurChange = viewModel::setBlurEnabled,
             onAppearanceChange = viewModel::setAppearance,
+            deviceStorageActive = deviceStorageActive,
+            onEraseDeviceStorage = viewModel::eraseDeviceStorage,
             onBackgroundActionChange = viewModel::setBackgroundAction,
             onNotificationLevelChange = viewModel::setNotificationLevel,
             onNotificationPermissionResult = viewModel::refreshNotificationPermission,

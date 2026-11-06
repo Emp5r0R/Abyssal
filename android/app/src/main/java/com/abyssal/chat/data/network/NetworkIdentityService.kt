@@ -40,7 +40,9 @@ internal data class ValidatedAccountResponse(
     val maxRoomsPerUser: Int,
     val sessionInactivitySec: Int,
     val identityPublicB64: String,
-    val identityPrekeyId: String
+    val identityPrekeyId: String,
+    /** Present only when the relay allows device storage. */
+    val deviceStorageShare: ByteArray? = null
 )
 
 internal fun validateOpaqueStartResponse(json: JSONObject): ValidatedOpaqueStartResponse? {
@@ -121,6 +123,16 @@ internal fun validateAcceptedAccountResponse(
     json.strictString("identity_envelope_b64")
         ?.takeIf { isCanonicalBase64Url(it, 1, MAX_IDENTITY_ENVELOPE_BYTES) }
         ?: return null
+    val deviceStorage = if (json.has("device_storage")) json.strictBoolean("device_storage") ?: return null else false
+    val deviceStorageShare = if (json.has("device_storage_share_b64")) {
+        if (!deviceStorage) return null
+        json.strictString("device_storage_share_b64")
+            ?.takeIf { isCanonicalBase64Url(it, DEVICE_STORAGE_SHARE_BYTES, DEVICE_STORAGE_SHARE_BYTES) }
+            ?.let { java.util.Base64.getUrlDecoder().decode(it) }
+            ?: return null
+    } else {
+        null
+    }
     return ValidatedAccountResponse(
         created,
         token,
@@ -129,7 +141,8 @@ internal fun validateAcceptedAccountResponse(
         maxRooms,
         inactivity,
         publicKeyB64,
-        prekeyId
+        prekeyId,
+        deviceStorageShare
     )
 }
 
@@ -365,7 +378,8 @@ class NetworkIdentityService(
             maxRoomsPerUser = response.maxRoomsPerUser,
             sessionInactivitySec = response.sessionInactivitySec,
             publicKey = publicKey,
-            prekeyId = response.identityPrekeyId
+            prekeyId = response.identityPrekeyId,
+            deviceStorageShare = response.deviceStorageShare
         )
     }
 
@@ -411,8 +425,9 @@ private val OPAQUE_START_RESPONSE_KEYS = setOf(
 private val ACCOUNT_RESPONSE_KEYS = setOf(
     "accepted", "created", "token", "node_id", "username", "max_rooms_per_user",
     "session_inactivity_sec", "identity_public_b64", "identity_prekey_id",
-    "identity_envelope_b64", "error"
+    "identity_envelope_b64", "error", "device_storage", "device_storage_share_b64"
 )
+private const val DEVICE_STORAGE_SHARE_BYTES = 32
 
 private fun JSONObject.hasOnlyKeys(allowed: Set<String>): Boolean =
     keys().asSequence().all { it in allowed }

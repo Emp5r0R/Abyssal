@@ -55,6 +55,9 @@ internal data class WorkspacePreferenceControls(
     val notificationsAllowed: Boolean = false,
     val onBlurChange: (Boolean) -> Unit = {},
     val onAppearanceChange: (Appearance) -> Unit = {},
+    /** Whether this account's messages are kept, encrypted, on this device. */
+    val deviceStorageActive: Boolean = false,
+    val onEraseDeviceStorage: () -> Unit = {},
     val onBackgroundActionChange: (BackgroundAction) -> Unit = {},
     val onNotificationLevelChange: (NotificationLevel) -> Unit = {},
     val onNotificationPermissionResult: () -> Unit = {},

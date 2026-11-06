@@ -159,7 +159,12 @@ data class IdentityValidationResult(
     val sessionInactivitySec: Int = 15 * 60,
     val publicKey: ByteArray? = null,
     val prekeyId: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    /**
+     * The relay's RAM-only storage share when it allows device storage, else
+     * null. The receiver owns it and wipes it after deriving the store key.
+     */
+    val deviceStorageShare: ByteArray? = null
 )
 
 data class AvailableAppUpdate(

@@ -69,6 +69,7 @@ mod bootstrap_auth;
 mod client_platform;
 mod config;
 mod control;
+mod device_storage;
 mod http;
 mod invite_bootstrap;
 mod invite_output;
@@ -262,6 +263,7 @@ struct AppState {
     attachment_max_lifetime_sec: u64,
     max_rooms_per_user: usize,
     interop_policy: InteropPolicy,
+    device_storage: device_storage::DeviceStoragePolicy,
     conversation_ops: Arc<Mutex<()>>,
     presence_broadcast_ops: Arc<Mutex<()>>,
     pending_message_ttl_ms: u64,
@@ -331,6 +333,8 @@ struct Account {
     connected: bool,
     client_platform: Option<ClientPlatform>,
     attachment_uploads: Arc<Semaphore>,
+    /// RAM-only share for relay-authorized device storage; see `device_storage`.
+    device_storage_share: [u8; device_storage::DEVICE_STORAGE_SHARE_BYTES],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -477,6 +481,7 @@ impl Drop for Account {
         self.identity_public.zeroize();
         self.identity_envelope.zeroize();
         self.prekey_id.zeroize();
+        self.device_storage_share.zeroize();
     }
 }
 
@@ -602,6 +607,13 @@ struct AccountResponse {
     identity_public_b64: Option<String>,
     identity_prekey_id: Option<String>,
     identity_envelope_b64: Option<String>,
+    /// Whether this relay lets clients keep an encrypted local store. Omitted
+    /// when off, so clients that predate the field keep accepting the response.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    device_storage: bool,
+    /// The account's RAM-only storage share; only on accepted responses when allowed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_storage_share_b64: Option<String>,
     error: Option<String>,
 }
 
@@ -1530,6 +1542,7 @@ impl AppState {
         .clamp(1, MAX_ATTACHMENT_UPLOAD_CONCURRENCY);
         let max_rooms_per_user = read_usize_env("ABYSSAL_MAX_ROOMS_PER_USER", 5).clamp(1, 100);
         let interop_policy = InteropPolicy::from_env();
+        let device_storage = device_storage::DeviceStoragePolicy::from_env();
         let pending_message_ttl_ms = pending_message_ttl_ms_from_env();
         let web_origins = parse_origins_from_env("ABYSSAL_WEB_ORIGINS");
         let session_inactivity_minutes =
@@ -1587,6 +1600,7 @@ impl AppState {
             attachment_max_lifetime_sec,
             max_rooms_per_user,
             interop_policy,
+            device_storage,
             conversation_ops: Arc::new(Mutex::new(())),
             presence_broadcast_ops: Arc::new(Mutex::new(())),
             pending_message_ttl_ms,

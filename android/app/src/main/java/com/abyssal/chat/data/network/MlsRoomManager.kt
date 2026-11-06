@@ -144,6 +144,14 @@ internal class MlsRoomManager(
         return (name ?: slot.localLabel)?.let(RoomProfileCodec::encode)
     }
 
+    /** Restores a room name kept in the device store, if this client does not know one yet. */
+    @Synchronized
+    fun restoreLocalLabel(roomId: String, name: String) {
+        val slot = rooms[roomId] ?: return
+        if (slot.localLabel != null || runCatching { RoomProfileCodec.encode(name) }.isFailure) return
+        slot.localLabel = name
+    }
+
     /** Records the owner's new room name once its room_profile message is accepted. */
     @Synchronized
     fun renameRoom(roomId: String, name: String): String {

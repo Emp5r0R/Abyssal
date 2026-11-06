@@ -221,6 +221,7 @@ pub(super) async fn bootstrap_finish_registration(
                 connected: false,
                 client_platform: None,
                 attachment_uploads: Arc::new(Semaphore::new(MAX_ATTACHMENT_UPLOADS_PER_ACCOUNT)),
+                device_storage_share: crate::device_storage::new_share(),
             },
         );
         username

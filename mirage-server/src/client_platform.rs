@@ -56,7 +56,7 @@ impl InteropPolicy {
     }
 }
 
-fn strict_bool_env(name: &str, default: bool) -> bool {
+pub(crate) fn strict_bool_env(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(value) => parse_bool_env_value(name, &value),
         Err(env::VarError::NotPresent) => default,

@@ -99,6 +99,7 @@ internal fun SettingsScreen(
                     SectionCard(title = "Notifications", icon = AppIcons.Bell) {
                         Column(Modifier.padding(16.dp)) { NotificationPreferences(preferenceControls) }
                     }
+                    DeviceStorageCard(preferenceControls)
                     CalculatorCoverCard(disguiseSettings, onSaveDisguise)
                     if (!directoryCheckpoint.isNullOrBlank()) {
                         SecurityCard(directoryCheckpoint)
@@ -228,6 +229,46 @@ private fun CalculatorCoverCard(disguiseSettings: DisguiseSettings, onSave: (Boo
                 )
             }
         }
+    }
+}
+
+/** Whether messages are kept on this device, and a way to erase them. */
+@Composable
+private fun DeviceStorageCard(controls: WorkspacePreferenceControls) {
+    var confirmErase by remember { mutableStateOf(false) }
+    SectionCard(title = "Saved on this device", icon = AppIcons.Lock) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                if (controls.deviceStorageActive) {
+                    "This relay lets Abyssal keep your messages, room names and contacts on this phone, encrypted. " +
+                        "They come back after you sign in again. The key needs a secret the relay holds only in memory, " +
+                        "so a relay restart or wipe makes the saved copy unreadable for good, and it is then deleted."
+                } else {
+                    "Nothing is saved on this device. Messages live in memory only and are gone when the app closes."
+                },
+                color = TextMuted,
+                fontSize = 13.sp,
+                lineHeight = 18.sp
+            )
+            if (controls.deviceStorageActive) {
+                MirageSecondaryButton(
+                    text = "Erase saved messages",
+                    onClick = { confirmErase = true },
+                    danger = true,
+                    icon = AppIcons.Trash,
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+                )
+            }
+        }
+    }
+    if (confirmErase) {
+        ConfirmDialog(
+            title = "Erase saved messages?",
+            message = "Deletes everything Abyssal saved on this phone and its device key. Messages stay in memory until you sign out, but nothing more is saved this session.",
+            confirmLabel = "Erase",
+            onConfirm = { confirmErase = false; controls.onEraseDeviceStorage() },
+            onDismiss = { confirmErase = false }
+        )
     }
 }
 

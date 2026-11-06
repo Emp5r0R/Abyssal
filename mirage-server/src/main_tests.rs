@@ -10474,6 +10474,7 @@ fn test_state() -> AppState {
         attachment_max_lifetime_sec: DEFAULT_ATTACHMENT_MAX_LIFETIME_HOURS as u64 * 60 * 60,
         max_rooms_per_user: 2,
         interop_policy: InteropPolicy::new(false, true),
+        device_storage: crate::device_storage::DeviceStoragePolicy::new(true),
         conversation_ops: Arc::new(Mutex::new(())),
         presence_broadcast_ops: Arc::new(Mutex::new(())),
         pending_message_ttl_ms: pending_message_ttl_ms_from_value(None),
@@ -10556,6 +10557,7 @@ async fn add_test_account_with_id(
             connected: true,
             client_platform: Some(client_platform),
             attachment_uploads: Arc::new(Semaphore::new(1)),
+            device_storage_share: crate::device_storage::new_share(),
         },
     );
 }
@@ -11060,4 +11062,47 @@ fn hmac_sha256_matches_rfc_4231_known_answer() {
             0x64, 0xec, 0x38, 0x43,
         ]
     );
+}
+
+#[tokio::test]
+async fn device_storage_share_is_stable_per_account_and_only_sent_when_allowed() {
+    let mut state = test_state();
+    add_test_account(&state, "storage-a", "Alice").await;
+    let code_id = test_code_id("storage-a");
+
+    let (status, Json(first)) =
+        auth::issue_session(&state, code_id, "Alice".to_string(), false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.device_storage);
+    let share = first
+        .device_storage_share_b64
+        .clone()
+        .expect("share when allowed");
+    assert_eq!(
+        URL_SAFE_NO_PAD.decode(&share).expect("base64 share").len(),
+        device_storage::DEVICE_STORAGE_SHARE_BYTES
+    );
+    let (_, Json(second)) = auth::issue_session(&state, code_id, "Alice".to_string(), false).await;
+    assert_eq!(
+        second.device_storage_share_b64.as_deref(),
+        Some(share.as_str())
+    );
+
+    add_test_account(&state, "storage-b", "Bob").await;
+    let (_, Json(other)) =
+        auth::issue_session(&state, test_code_id("storage-b"), "Bob".to_string(), false).await;
+    assert_ne!(
+        other.device_storage_share_b64.as_deref(),
+        Some(share.as_str())
+    );
+
+    state.device_storage = device_storage::DeviceStoragePolicy::new(false);
+    let (_, Json(disabled)) =
+        auth::issue_session(&state, code_id, "Alice".to_string(), false).await;
+    assert!(!disabled.device_storage);
+    assert!(disabled.device_storage_share_b64.is_none());
+
+    let (_, Json(rejected)) =
+        auth::account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
+    assert!(rejected.device_storage_share_b64.is_none());
 }

@@ -85,6 +85,25 @@ class NetworkIdentityServiceTest {
         assertNull(validateAcceptedAccountResponse(finish, "node-2", true, "prekey-1"))
         assertNull(validateAcceptedAccountResponse(finish, "node-1", false, "prekey-1"))
         assertNull(validateAcceptedAccountResponse(finish, "node-1", true, "prekey-2"))
+        assertNull(validated?.deviceStorageShare)
+    }
+
+    @Test
+    fun deviceStorageShareIsAcceptedOnlyWhenTheRelayAllowsStorage() {
+        val share = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 5 })
+        val allowed = JSONObject(validAccountFinish().toString()).put("device_storage", true).put("device_storage_share_b64", share)
+        val validated = validateAcceptedAccountResponse(allowed, "node-1", true, "prekey-1")
+        assertNotNull(validated)
+        org.junit.Assert.assertArrayEquals(ByteArray(32) { 5 }, validated?.deviceStorageShare)
+
+        assertNull(validateAcceptedAccountResponse(JSONObject(validAccountFinish().toString()).put("device_storage", true), "node-1", true, "prekey-1")?.deviceStorageShare)
+        val invalid = listOf(
+            JSONObject(validAccountFinish().toString()).put("device_storage_share_b64", share),
+            JSONObject(allowed.toString()).put("device_storage", "true"),
+            JSONObject(allowed.toString()).put("device_storage_share_b64", share.dropLast(2)),
+            JSONObject(allowed.toString()).put("device_storage_share_b64", 7)
+        )
+        invalid.forEach { assertNull(validateAcceptedAccountResponse(it, "node-1", true, "prekey-1")) }
     }
 
     @Test

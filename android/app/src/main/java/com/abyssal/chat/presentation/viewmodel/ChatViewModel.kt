@@ -7,6 +7,9 @@ import com.abyssal.chat.domain.model.MessageActionCodec
 import com.abyssal.chat.domain.model.MessageActionPolicy
 import com.abyssal.chat.domain.model.VoiceNotes
 import com.abyssal.chat.data.media.PcmVoiceRecorder
+import com.abyssal.chat.data.storage.EncryptedDeviceStore
+import com.abyssal.chat.domain.model.roomLabel
+import kotlinx.coroutines.flow.map
 import com.abyssal.chat.domain.model.BackgroundAction
 import com.abyssal.chat.domain.model.BackgroundResponse
 import com.abyssal.chat.domain.model.NotificationLevel
@@ -427,8 +430,17 @@ class ChatViewModel(
     initialReleaseVerificationStatus: ReleaseVerificationStatus = ReleaseVerificationStatus.CHECKING,
     private val payloadCipher: InMemoryPayloadCipher = InMemoryPayloadCipher(),
     private val mlsTransport: IMlsTransport? = chatTransport as? IMlsTransport,
-    private val messageNotifier: MessageNotifier? = null
+    private val messageNotifier: MessageNotifier? = null,
+    deviceStore: EncryptedDeviceStore? = null
 ) : ViewModel() {
+
+    private val deviceStorage = DeviceStorageController(deviceStore, messageRepository, viewModelScope)
+    /** Whether this account's messages are being kept, encrypted, on this device. */
+    val deviceStorageActive: StateFlow<Boolean> = deviceStorage.active
+    private var restoredRoomNames: Map<String, String> = emptyMap()
+
+    /** Deletes everything kept on this device and its device key; this session stops saving. */
+    fun eraseDeviceStorage() = deviceStorage.eraseAll()
 
     private data class SessionStamp(
         val generation: Long,
@@ -994,7 +1006,10 @@ class ChatViewModel(
         }
 
         viewModelScope.launch {
-            sessions.collect { refreshDirectTrust() }
+            sessions.collect {
+                refreshDirectTrust()
+                applyRestoredRoomNames(it)
+            }
         }
 
         viewModelScope.launch {
@@ -1203,6 +1218,20 @@ class ChatViewModel(
                         _isLocked.value = false
                         _showCamouflagePinPrompt.value = true
                     }
+                    val restoreEpoch = messageRepository.currentEpoch()
+                    deviceStorage.attach(
+                        share = result.deviceStorageShare,
+                        nodeId = nodeId,
+                        username = identity.username,
+                        roomNames = sessions.map(DeviceStorageController::learnedRoomNames),
+                        displayNames = knownDisplayNames
+                    ) { snapshot ->
+                        messageRepository.restoreMessagesIfCurrent(restoreEpoch, snapshot.messages)
+                        snapshot.messages.values.flatten().filter { it.sender == "You" }.forEach { rememberOwnMessageId(it.id) }
+                        _knownDisplayNames.value = snapshot.displayNames + _knownDisplayNames.value
+                        restoredRoomNames = snapshot.roomNames
+                        applyRestoredRoomNames(sessions.value)
+                    }
                     chatTransport.connect()
                     val connectionGeneration = chatTransport.currentConnectionGeneration()
                     joinAvailableSessions(connectionGeneration)
@@ -1210,6 +1239,7 @@ class ChatViewModel(
                     _currentScreen.value = Screen.Dashboard
                 } else {
                     result.publicKey?.fill(0)
+                    result.deviceStorageShare?.fill(0)
                     payloadCipher.clear()
                     _inviteError.value = "Wrong information."
                 }
@@ -1410,6 +1440,17 @@ class ChatViewModel(
                 replyToMessageId = target.replyToMessageId,
                 voiceDurationMs = VoiceNotes.pcmDurationMs(wav.size - 44)
             )
+        }
+    }
+
+    /** Gives restored names to rooms that only have an ID-derived label so far. */
+    private fun applyRestoredRoomNames(current: List<ChatSession>) {
+        if (restoredRoomNames.isEmpty()) return
+        val epoch = messageRepository.currentEpoch()
+        current.filter { it.isForum && roomLabel(it.id, it.name) != it.name }.forEach { room ->
+            val name = restoredRoomNames[room.id] ?: return@forEach
+            mlsManager?.restoreLocalLabel(room.id, name)
+            messageRepository.createForumSessionIfCurrent(epoch, room.copy(name = name))
         }
     }
 
@@ -2578,6 +2619,8 @@ class ChatViewModel(
     }
 
     private suspend fun executeLocalMemoryPurge() {
+        // A relay wipe also removes what this device kept.
+        deviceStorage.eraseAll()
         logoutLocal()
         _isLocked.value = false
     }
@@ -2588,6 +2631,7 @@ class ChatViewModel(
         // A successful wipe can close the socket. Keep the local purge bound to
         // the captured account even when its connection generation advances.
         if (!isAccountSessionStampValid(stamp)) return
+        deviceStorage.eraseAll()
         logoutLocal()
         _isLocked.value = true
         resetCalculator()
@@ -2598,6 +2642,10 @@ class ChatViewModel(
      * this boundary so lifecycle/logout never leaves a renderable authenticated frame.
      */
     private fun prepareLocalLogout(): NodeSession? {
+        // Save and close the device store before memory is cleared, so an empty
+        // state is never written over it. Wipes erase the store before this.
+        deviceStorage.detach()
+        restoredRoomNames = emptyMap()
         // Invalidate first so cancellation/finally paths cannot act on a newly
         // installed identity even if a provider ignores coroutine cancellation.
         sessionGeneration.incrementAndGet()

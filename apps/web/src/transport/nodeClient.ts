@@ -1456,8 +1456,12 @@ function validAccountResponse(value: unknown): value is AccountResponse & {
     "accepted", "created", "token", "node_id", "username", "max_rooms_per_user",
     "session_inactivity_sec", "identity_public_b64", "identity_prekey_id",
     "identity_envelope_b64", "error",
-  ])) return false;
+  ], ["device_storage", "device_storage_share_b64"])) return false;
   const payload = value as Record<string, unknown>;
+  // Device storage is Android-only; the web client checks the fields' shape and keeps nothing.
+  if (payload.device_storage !== undefined && typeof payload.device_storage !== "boolean") return false;
+  if (payload.device_storage_share_b64 !== undefined &&
+    (payload.device_storage !== true || !validBase64Url(payload.device_storage_share_b64, 32, 32))) return false;
   return payload.accepted === true &&
     typeof payload.created === "boolean" &&
     validUuid(payload.token) &&
@@ -1476,12 +1480,17 @@ function validAccountResponse(value: unknown): value is AccountResponse & {
     nullish(payload.error);
 }
 
-function plainObjectWithKeys(value: unknown, allowedKeys: readonly string[]): value is Record<string, unknown> {
+/** Exactly [requiredKeys], plus any of [optionalKeys]. */
+function plainObjectWithKeys(
+  value: unknown,
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = [],
+): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
     return false;
   }
-  return Object.keys(value).every((key) => allowedKeys.includes(key)) &&
-    allowedKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+  return Object.keys(value).every((key) => requiredKeys.includes(key) || optionalKeys.includes(key)) &&
+    requiredKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 }
 
 function validUuid(value: unknown): value is string {

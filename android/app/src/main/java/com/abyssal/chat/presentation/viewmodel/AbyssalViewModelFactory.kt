@@ -1,5 +1,8 @@
 package com.abyssal.chat.presentation.viewmodel
 
+import com.abyssal.chat.data.storage.EncryptedDeviceStore
+import com.abyssal.chat.data.storage.KeystoreLocalSecretStore
+
 import com.abyssal.chat.data.notifications.AndroidMessageNotifier
 import android.content.Context
 import androidx.lifecycle.ViewModel
@@ -103,7 +106,11 @@ class AbyssalViewModelFactory(
                 localBuildAttestation != null
             ),
             payloadCipher = payloadCipher,
-            messageNotifier = AndroidMessageNotifier(appContext)
+            messageNotifier = AndroidMessageNotifier(appContext),
+            deviceStore = EncryptedDeviceStore(
+                java.io.File(appContext.noBackupFilesDir, "${KeystoreLocalSecretStore.STORE_DIR}/accounts"),
+                KeystoreLocalSecretStore(appContext)
+            )
         ) as T
     }
 }

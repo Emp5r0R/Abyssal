@@ -473,6 +473,24 @@ describe("account transport", () => {
     }));
   });
 
+  it("accepts the optional device storage fields and rejects malformed ones", async () => {
+    const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
+    const base = {
+      accepted: true, created: true, token: SESSION_TOKEN, node_id: "node-1", username: "Alice",
+      max_rooms_per_user: 3, session_inactivity_sec: 900, identity_public_b64: bytesToBase64(publicKey),
+      identity_prekey_id: "test-prekey", identity_envelope_b64: "AQID", error: null,
+    };
+    const share = bytesToBase64(new Uint8Array(32).fill(5)).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+    const finish = (body: Record<string, unknown>) => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(body), { status: 200 }));
+      return finishOpaqueAccount(endpoint, { handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c", credentialFinalization: new Uint8Array([9]) });
+    };
+    await expect(finish({ ...base, device_storage: true, device_storage_share_b64: share })).resolves.toMatchObject({ username: "Alice" });
+    await expect(finish({ ...base, device_storage: "true" })).rejects.toThrow();
+    await expect(finish({ ...base, device_storage_share_b64: share })).rejects.toThrow();
+    await expect(finish({ ...base, device_storage: true, device_storage_share_b64: "AQID" })).rejects.toThrow();
+  });
+
   it("revokes a token with a no-store bearer request", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     await revokeSession(session);
