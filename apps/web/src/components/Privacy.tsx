@@ -147,6 +147,8 @@ export function CalculatorCover({
 }) {
   const [display, setDisplay] = useState("0");
   const inputRef = useRef("");
+  /** True while a result is shown: a digit then starts a new entry, an operator continues it. */
+  const resultShownRef = useRef(false);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -159,8 +161,9 @@ export function CalculatorCover({
     };
   }, []);
 
-  const replaceInput = (value: string) => {
+  const replaceInput = (value: string, resultShown = false) => {
     inputRef.current = value;
+    resultShownRef.current = resultShown;
   };
 
   const press = async (key: string) => {
@@ -191,7 +194,7 @@ export function CalculatorCover({
       }
       try {
         const result = evaluateExpression(submitted);
-        replaceInput(result);
+        replaceInput(result, true);
         setDisplay(result);
       } catch {
         replaceInput("");
@@ -199,6 +202,8 @@ export function CalculatorCover({
       }
       return;
     }
+    if (resultShownRef.current && !continuesResult(key)) replaceInput("");
+    resultShownRef.current = false;
     if (inputRef.current.length >= 40) return;
 
     let append = key;
@@ -257,6 +262,10 @@ export function CalculatorCover({
 
 function digits(value: string): string {
   return value.replace(/\D/g, "").slice(0, 12);
+}
+
+function continuesResult(key: string): boolean {
+  return ["/", "*", "-", "+", "^", "x²"].includes(key);
 }
 
 function isArithmetic(key: string): boolean {

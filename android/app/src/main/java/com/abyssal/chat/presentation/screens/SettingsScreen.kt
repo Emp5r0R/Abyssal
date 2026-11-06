@@ -39,7 +39,6 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
 import com.abyssal.chat.BuildConfig
-import com.abyssal.chat.data.repository.isValidCamouflageConfiguration
 import com.abyssal.chat.domain.model.DisguiseSettings
 import com.abyssal.chat.domain.model.SessionSecurityState
 import com.abyssal.chat.domain.model.User
@@ -194,10 +193,9 @@ private fun AccountCard(
 @Composable
 private fun CalculatorCoverCard(disguiseSettings: DisguiseSettings, onSave: (Boolean, String, String) -> Unit) {
     var enabled by remember(disguiseSettings) { mutableStateOf(disguiseSettings.isDisguised) }
-    var pin by remember(disguiseSettings) { mutableStateOf("") }
-    var duressPin by remember(disguiseSettings) { mutableStateOf("") }
-    val changed = enabled != disguiseSettings.isDisguised || pin.isNotEmpty() || duressPin.isNotEmpty()
-    val valid = isValidCamouflageConfiguration(enabled = enabled, unlockPin = pin.trim(), duressPin = duressPin.trim())
+    var draft by remember(disguiseSettings) { mutableStateOf(CoverPinDraft()) }
+    val turningOff = !enabled && disguiseSettings.isDisguised
+    val changingPin = enabled && (!disguiseSettings.isDisguised || draft.pin.isNotEmpty() || draft.confirm.isNotEmpty())
     SectionCard(title = "Calculator cover", icon = AppIcons.Calculator) {
         Column(Modifier.padding(16.dp)) {
             PreferenceSwitch(
@@ -207,14 +205,22 @@ private fun CalculatorCoverCard(disguiseSettings: DisguiseSettings, onSave: (Boo
                 onCheckedChange = { enabled = it }
             )
             if (enabled) {
+                if (disguiseSettings.isDisguised) {
+                    Text(
+                        "On. Type a new PIN below to change it.",
+                        color = TextMuted,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
                 Spacer(Modifier.height(12.dp))
-                CamouflagePinFields(pin, { pin = it }, duressPin, { duressPin = it })
+                CamouflagePinFields(draft) { draft = it }
             }
-            if (changed) {
+            if (turningOff || changingPin) {
                 MiragePrimaryButton(
-                    text = if (enabled) "Save calculator cover" else "Turn off calculator cover",
-                    onClick = { onSave(enabled, pin.trim(), duressPin.trim()) },
-                    enabled = valid,
+                    text = if (turningOff) "Turn off calculator cover" else "Save calculator PIN",
+                    onClick = { onSave(enabled, draft.pin, draft.duress) },
+                    enabled = turningOff || draft.isReady,
                     modifier = Modifier.fillMaxWidth().padding(top = 14.dp)
                 )
             }

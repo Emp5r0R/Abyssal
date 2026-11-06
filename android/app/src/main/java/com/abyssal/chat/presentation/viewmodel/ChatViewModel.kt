@@ -1,6 +1,7 @@
 package com.abyssal.chat.presentation.viewmodel
 
 import com.abyssal.chat.data.notifications.MessageNotifier
+import com.abyssal.chat.domain.model.CalculatorEntry
 import com.abyssal.chat.domain.model.BackgroundAction
 import com.abyssal.chat.domain.model.BackgroundResponse
 import com.abyssal.chat.domain.model.NotificationLevel
@@ -498,7 +499,8 @@ class ChatViewModel(
     val notificationsAllowed: StateFlow<Boolean> = _notificationsAllowed.asStateFlow()
     private var hostInForeground = true
 
-    private val _calculatorDisplay = MutableStateFlow("0")
+    private var calculatorEntry = CalculatorEntry()
+    private val _calculatorDisplay = MutableStateFlow(calculatorEntry.display)
     val calculatorDisplay: StateFlow<String> = _calculatorDisplay.asStateFlow()
 
     private val _availableUpdate = MutableStateFlow<AvailableAppUpdate?>(null)
@@ -2091,6 +2093,11 @@ class ChatViewModel(
         if (!enabled) _isLocked.value = false
     }
 
+    /** Leaves the calculator cover off; it can be turned on later in Settings. */
+    fun skipCamouflagePinSetup() {
+        _showCamouflagePinPrompt.value = false
+    }
+
     fun completeCamouflagePinSetup(pin: String, duressPin: String) {
         val safePin = pin.trim()
         val safeDuressPin = duressPin.trim()
@@ -2146,7 +2153,7 @@ class ChatViewModel(
         // process. Clear decrypted preview before allowing the short picker grace
         // period; a lost callback is closed by the timeout above.
         replaceAttachmentPreview(null)
-        _calculatorDisplay.value = "0"
+        resetCalculator()
         if (externalSystemUiTokens.activeToken() != null) return
         if (!sessionInactivityPolicy.isActive()) return
         val disguised = disguiseSettings.value.isDisguised
@@ -2204,7 +2211,7 @@ class ChatViewModel(
 
     fun onHostTrimMemory(level: Int) {
         replaceAttachmentPreview(null)
-        _calculatorDisplay.value = "0"
+        resetCalculator()
         if (externalSystemUiTokens.activeToken() != null) return
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
             lockForLifecycleExit()
@@ -2274,27 +2281,20 @@ class ChatViewModel(
     }
 
     fun onCalculatorInput(input: String) {
-        val current = _calculatorDisplay.value
-        when (input) {
-            "C" -> {
-                cancelCalculatorEvaluation()
-                _calculatorDisplay.value = "0"
-            }
-            "⌫" -> {
-                cancelCalculatorEvaluation()
-                _calculatorDisplay.value = current.dropLast(1).ifBlank { "0" }
-            }
-            "=" -> startCalculatorEvaluation(current)
-            "+", "-", "*", "/", "(", ")" -> {
-                cancelCalculatorEvaluation()
-                _calculatorDisplay.value = if (current == "0" || current == "Error") input else current + input
-            }
-            else -> {
-                cancelCalculatorEvaluation()
-                _calculatorDisplay.value = if (current == "0" || current == "Error") input else current + input
-            }
+        if (input == CalculatorEntry.EQUALS) {
+            startCalculatorEvaluation(calculatorEntry.submission())
+            return
         }
+        cancelCalculatorEvaluation()
+        setCalculatorEntry(calculatorEntry.press(input))
     }
+
+    private fun setCalculatorEntry(entry: CalculatorEntry) {
+        calculatorEntry = entry
+        _calculatorDisplay.value = entry.display
+    }
+
+    private fun resetCalculator() = setCalculatorEntry(CalculatorEntry())
 
     private data class CalculatorEvaluation(
         val duressMatched: Boolean,
@@ -2319,7 +2319,7 @@ class ChatViewModel(
                     CalculatorEvaluation(
                         duressMatched = duressMatched,
                         unlockMatched = unlockMatched,
-                        display = if (duressMatched || unlockMatched) "0" else evaluateCalculatorOnly(cleanExpr)
+                        display = if (duressMatched || unlockMatched) "" else evaluateCalculatorOnly(cleanExpr)
                     )
                 }
                 withContext(kotlinx.coroutines.Dispatchers.Main.immediate) {
@@ -2334,7 +2334,7 @@ class ChatViewModel(
                                 duressSessionStamp != null -> executeDuressWipe(duressSessionStamp)
                                 accountGeneration == sessionGeneration.get() && currentUser.value == null -> {
                                     _isLocked.value = true
-                                    _calculatorDisplay.value = "0"
+                                    resetCalculator()
                                 }
                             }
                         }
@@ -2346,10 +2346,10 @@ class ChatViewModel(
                                     sessionInactivityPolicy.touch()
                                     updateSessionSecurityState()
                                 }
-                                _calculatorDisplay.value = "0"
+                                resetCalculator()
                             }
                         }
-                        else -> _calculatorDisplay.value = evaluation.display
+                        else -> setCalculatorEntry(CalculatorEntry(result = evaluation.display))
                     }
                 }
             } finally {
@@ -2393,7 +2393,7 @@ class ChatViewModel(
         if (!isAccountSessionStampValid(stamp)) return
         logoutLocal()
         _isLocked.value = true
-        _calculatorDisplay.value = "0"
+        resetCalculator()
     }
 
     /**

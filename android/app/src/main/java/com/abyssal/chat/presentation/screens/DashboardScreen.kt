@@ -140,7 +140,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
     )
 
     if (showCamouflagePinPrompt) {
-        CamouflagePinSetupDialog(onSave = viewModel::completeCamouflagePinSetup)
+        CamouflagePinSetupDialog(onSave = viewModel::completeCamouflagePinSetup, onSkip = viewModel::skipCamouflagePinSetup)
     }
 }
 

@@ -32,6 +32,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.abyssal.chat.domain.model.CalculatorEntry
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.theme.Background
 import com.abyssal.chat.theme.TextPrimary
@@ -52,7 +53,7 @@ private fun CalculatorContent(
         listOf("7", "8", "9", "*"),
         listOf("4", "5", "6", "-"),
         listOf("1", "2", "3", "+"),
-        listOf("0", ".", "=")
+        listOf("0", ".", CalculatorEntry.BACKSPACE, CalculatorEntry.EQUALS)
     )
 
     BoxWithConstraints(
@@ -96,7 +97,7 @@ private fun CalculatorContent(
                         CalculatorButton(
                             label = label,
                             height = buttonHeight,
-                            modifier = Modifier.weight(if (label == "0" && row.size == 3) 2f else 1f),
+                            modifier = Modifier.weight(1f),
                             onClick = { onInput(label) }
                         )
                     }
@@ -114,7 +115,7 @@ private fun CalculatorButton(
     onClick: () -> Unit
 ) {
     val isNumber = label.first().isDigit() || label == "."
-    val isAction = label == "C" || label == "(" || label == ")"
+    val isAction = label == "C" || label == "(" || label == ")" || label == CalculatorEntry.BACKSPACE
     val background = when {
         label == "=" -> Color(0xFFF57C00)
         isAction -> Color(0xFF5C5C5C)
@@ -128,7 +129,7 @@ private fun CalculatorButton(
             .height(height)
             .clip(CircleShape)
             .background(background)
-            .semantics { contentDescription = "Calculator $label" }
+            .semantics { contentDescription = if (label == CalculatorEntry.BACKSPACE) "Calculator delete" else "Calculator $label" }
             .clickable(role = Role.Button, onClick = onClick)
     ) {
         Text(

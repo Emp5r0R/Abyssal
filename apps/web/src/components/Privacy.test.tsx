@@ -23,6 +23,27 @@ describe("calculator privacy cover", () => {
     gate.destroy();
   });
 
+  it("keeps leading zeros and starts a fresh entry after a result", async () => {
+    const gate = await PrivacyPinGate.create("012340", "", {
+      iterations: 1_000,
+      backoffMs: 1,
+    });
+    const onUnlock = vi.fn();
+
+    render(<CalculatorCover pinGate={gate} onUnlock={onUnlock} onDuress={vi.fn()} />);
+    const press = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
+    press("4"); press("Add"); press("2"); press("Equals");
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("6"));
+    press("Multiply"); press("2"); press("Equals");
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("12"));
+
+    for (const digit of "012340") press(digit);
+    expect(screen.getByRole("status")).toHaveTextContent(/^012340$/u);
+    press("Equals");
+    await waitFor(() => expect(onUnlock).toHaveBeenCalledOnce());
+    gate.destroy();
+  });
+
   it("routes the distinct duress verifier without unlocking", async () => {
     const gate = await PrivacyPinGate.create("123456", "654321", {
       iterations: 1_000,
