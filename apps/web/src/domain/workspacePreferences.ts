@@ -1,5 +1,8 @@
 import type { NotificationLevel } from "./notificationPolicy";
 
+/** Colour scheme: follow the device, or force light or dark. */
+export type Appearance = "system" | "light" | "dark";
+
 /** What the workspace does when the browser tab is hidden. */
 export type HiddenTabAction = "cover" | "sign-out" | "stay";
 
@@ -18,6 +21,7 @@ export interface WorkspacePreferences {
   readonly hiddenTabAction: HiddenTabAction;
   /** How much a message notification reveals; off until the user opts in. */
   readonly notificationLevel: NotificationLevel;
+  readonly appearance: Appearance;
 }
 
 export const DEFAULT_WORKSPACE_PREFERENCES: WorkspacePreferences = Object.freeze({
@@ -25,6 +29,7 @@ export const DEFAULT_WORKSPACE_PREFERENCES: WorkspacePreferences = Object.freeze
   blurEnabled: false,
   hiddenTabAction: "cover",
   notificationLevel: "off",
+  appearance: "system",
 });
 
 /** Turning the cover off never leaves a hidden tab unprotected by default: it signs out instead. */
@@ -50,6 +55,15 @@ export function withHiddenTabAction(preferences: WorkspacePreferences, hiddenTab
 
 export function withNotificationLevel(preferences: WorkspacePreferences, notificationLevel: NotificationLevel): WorkspacePreferences {
   return preferences.notificationLevel === notificationLevel ? preferences : { ...preferences, notificationLevel };
+}
+
+export function withAppearance(preferences: WorkspacePreferences, appearance: Appearance): WorkspacePreferences {
+  return preferences.appearance === appearance ? preferences : { ...preferences, appearance };
+}
+
+/** The `data-theme` value for the document root; none means follow the device. */
+export function themeAttribute(appearance: Appearance): "light" | "dark" | null {
+  return appearance === "system" ? null : appearance;
 }
 
 /** A cover whose PIN is not set yet cannot lock, so the session ends instead. */

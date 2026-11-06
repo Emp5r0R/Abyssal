@@ -42,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldColors
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -84,12 +85,26 @@ internal val CardShape = RoundedCornerShape(14.dp)
 internal val ControlShape = RoundedCornerShape(12.dp)
 
 /** Tone of a banner, badge or dialog. */
-internal enum class Tone(val color: Color, val soft: Color) {
-    Accent(com.abyssal.chat.theme.Accent, AccentSoft),
-    Success(com.abyssal.chat.theme.Success, SuccessSoft),
-    Warning(com.abyssal.chat.theme.Warning, WarningSoft),
-    Danger(com.abyssal.chat.theme.Danger, DangerSoft),
-    Neutral(TextMuted, SurfaceRaised)
+internal enum class Tone {
+    Accent, Success, Warning, Danger, Neutral;
+
+    val color: Color
+        @Composable @ReadOnlyComposable get() = when (this) {
+            Accent -> com.abyssal.chat.theme.Accent
+            Success -> com.abyssal.chat.theme.Success
+            Warning -> com.abyssal.chat.theme.Warning
+            Danger -> com.abyssal.chat.theme.Danger
+            Neutral -> TextMuted
+        }
+
+    val soft: Color
+        @Composable @ReadOnlyComposable get() = when (this) {
+            Accent -> AccentSoft
+            Success -> SuccessSoft
+            Warning -> WarningSoft
+            Danger -> DangerSoft
+            Neutral -> SurfaceRaised
+        }
 }
 
 @Composable

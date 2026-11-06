@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -35,12 +36,17 @@ import androidx.compose.ui.unit.sp
 import com.abyssal.chat.domain.model.CalculatorEntry
 import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.theme.Background
+import com.abyssal.chat.theme.DarkPalette
+import com.abyssal.chat.theme.LocalAppPalette
 import com.abyssal.chat.theme.TextPrimary
 
 @Composable
 fun CalculatorScreen(viewModel: ChatViewModel) {
     val display by viewModel.calculatorDisplay.collectAsState()
-    CalculatorContent(display = display, onInput = viewModel::onCalculatorInput)
+    // A calculator looks the same whatever the app theme, so the cover stays convincing.
+    CompositionLocalProvider(LocalAppPalette provides DarkPalette) {
+        CalculatorContent(display = display, onInput = viewModel::onCalculatorInput)
+    }
 }
 
 @Composable

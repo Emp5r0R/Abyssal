@@ -36,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.abyssal.chat.domain.model.Appearance
 import com.abyssal.chat.domain.model.BackgroundAction
 import com.abyssal.chat.domain.model.NotificationLevel
 import com.abyssal.chat.domain.model.WorkspacePreferences
@@ -53,6 +54,7 @@ internal data class WorkspacePreferenceControls(
     val preferences: WorkspacePreferences = WorkspacePreferences(),
     val notificationsAllowed: Boolean = false,
     val onBlurChange: (Boolean) -> Unit = {},
+    val onAppearanceChange: (Appearance) -> Unit = {},
     val onBackgroundActionChange: (BackgroundAction) -> Unit = {},
     val onNotificationLevelChange: (NotificationLevel) -> Unit = {},
     val onNotificationPermissionResult: () -> Unit = {},
@@ -61,6 +63,18 @@ internal data class WorkspacePreferenceControls(
 )
 
 private data class Choice<T>(val value: T, val label: String, val detail: String)
+
+private val APPEARANCES = listOf(Appearance.SYSTEM to "Match device", Appearance.LIGHT to "Light", Appearance.DARK to "Dark")
+
+/** Light, dark, or follow the device. */
+@Composable
+internal fun AppearancePreferences(controls: WorkspacePreferenceControls) {
+    SegmentedControl(
+        options = APPEARANCES.map { it.second },
+        selectedIndex = APPEARANCES.indexOfFirst { it.first == controls.preferences.appearance }.coerceAtLeast(0),
+        onSelect = { index -> controls.onAppearanceChange(APPEARANCES[index].first) }
+    )
+}
 
 private val BACKGROUND_CHOICES = listOf(
     Choice(BackgroundAction.LOCK, "Lock behind the calculator", "Your session stays open. Enter your PIN on the calculator to return."),

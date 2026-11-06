@@ -17,7 +17,7 @@ import { CalculatorCover, PinSetup } from "./components/Privacy";
 import { conversationEntries, displayNamesBySender, roomLabel, shortAccountId } from "./domain/displayLabels";
 import type { NotificationLevel } from "./domain/notificationPolicy";
 import { adjacentConversation } from "./domain/keyboardShortcuts";
-import { withBlurEnabled, withCoverEnabled, withNotificationLevel } from "./domain/workspacePreferences";
+import { themeAttribute, withBlurEnabled, withCoverEnabled, withNotificationLevel } from "./domain/workspacePreferences";
 import type { ReactionAsset } from "./domain/reactions";
 import type { ChatMessage } from "./domain/types";
 import { useAbyssalSession } from "./hooks/useAbyssalSession";
@@ -34,6 +34,13 @@ import {
 export default function App() {
   const abyssal = useAbyssalSession();
   const cover = usePrivacyCover();
+  const appearance = cover.preferences.appearance;
+  useEffect(() => {
+    // Preferences are per tab and in memory only; "system" follows prefers-color-scheme.
+    const theme = themeAttribute(appearance);
+    if (theme) document.documentElement.dataset.theme = theme;
+    else delete document.documentElement.dataset.theme;
+  }, [appearance]);
   const clearPrivateView = abyssal.clearPrivateView;
   const { destroyPinGate, lock, respondToHiddenTab } = cover;
   const [showCreateRoom, setShowCreateRoom] = useState(false);

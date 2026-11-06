@@ -55,6 +55,61 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Light theme: chosen in Settings, or the device preference under "Match device". */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f7fa;
+  --surface: #ffffff;
+  --surface-2: #f0f3f7;
+  --surface-3: #e6ebf1;
+  --border: #dce2ea;
+  --border-strong: #c5cdd8;
+  --text: #121821;
+  --text-muted: #4a5565;
+  --text-subtle: #687384;
+  --accent: #0a8792;
+  --accent-hover: #087079;
+  --accent-contrast: #ffffff;
+  --accent-soft: rgba(10, 135, 146, 0.1);
+  --accent-border: rgba(10, 135, 146, 0.35);
+  --success: #12804f;
+  --success-soft: rgba(18, 128, 79, 0.1);
+  --warning: #9a5b00;
+  --warning-soft: rgba(154, 91, 0, 0.1);
+  --danger: #c22a3f;
+  --danger-hover: #a52134;
+  --danger-soft: rgba(194, 42, 63, 0.08);
+  --shadow: 0 16px 48px rgba(16, 24, 40, 0.14);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f5f7fa;
+    --surface: #ffffff;
+    --surface-2: #f0f3f7;
+    --surface-3: #e6ebf1;
+    --border: #dce2ea;
+    --border-strong: #c5cdd8;
+    --text: #121821;
+    --text-muted: #4a5565;
+    --text-subtle: #687384;
+    --accent: #0a8792;
+    --accent-hover: #087079;
+    --accent-contrast: #ffffff;
+    --accent-soft: rgba(10, 135, 146, 0.1);
+    --accent-border: rgba(10, 135, 146, 0.35);
+    --success: #12804f;
+    --success-soft: rgba(18, 128, 79, 0.1);
+    --warning: #9a5b00;
+    --warning-soft: rgba(154, 91, 0, 0.1);
+    --danger: #c22a3f;
+    --danger-hover: #a52134;
+    --danger-soft: rgba(194, 42, 63, 0.08);
+    --shadow: 0 16px 48px rgba(16, 24, 40, 0.14);
+  }
+}
+
 /* ==========================================================================
    Base
    ========================================================================== */
@@ -1324,7 +1379,7 @@ button.list-row:hover {
   color: var(--text-muted);
   font-size: var(--text-sm);
   text-align: left;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--surface-3);
 }
 
 .reply-preview span {

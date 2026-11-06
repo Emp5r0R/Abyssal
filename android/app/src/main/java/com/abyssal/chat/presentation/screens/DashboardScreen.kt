@@ -131,6 +131,7 @@ fun DashboardScreen(viewModel: ChatViewModel) {
             preferences = preferences,
             notificationsAllowed = notificationsAllowed,
             onBlurChange = viewModel::setBlurEnabled,
+            onAppearanceChange = viewModel::setAppearance,
             onBackgroundActionChange = viewModel::setBackgroundAction,
             onNotificationLevelChange = viewModel::setNotificationLevel,
             onNotificationPermissionResult = viewModel::refreshNotificationPermission,

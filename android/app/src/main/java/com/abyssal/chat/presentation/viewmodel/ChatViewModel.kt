@@ -2306,6 +2306,11 @@ class ChatViewModel(
         messageNotifier?.cancelAll()
     }
 
+    /** Kept in memory only, like every other preference. */
+    fun setAppearance(appearance: com.abyssal.chat.domain.model.Appearance) {
+        _workspacePreferences.value = _workspacePreferences.value.copy(appearance = appearance)
+    }
+
     fun setBlurEnabled(enabled: Boolean) {
         _workspacePreferences.value = _workspacePreferences.value.copy(blurEnabled = enabled)
     }

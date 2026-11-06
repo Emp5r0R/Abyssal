@@ -1911,13 +1911,15 @@ private fun WebOriginBadge(notice: String) {
 
 @Composable
 private fun MessageText(content: String, currentUsername: String?) {
-    val styledContent = remember(content, currentUsername) {
+    val mentionColor = Warning
+    val mentionBackground = WarningSoft
+    val styledContent = remember(content, currentUsername, mentionColor, mentionBackground) {
         buildAnnotatedString {
             var cursor = 0
             MessageAttentionPolicy.mentionRanges(content, currentUsername).forEach { range ->
                 append(content.substring(cursor, range.first))
                 // Show the reader's own mention as "@you", as the web client does.
-                withStyle(SpanStyle(color = Warning, background = WarningSoft, fontWeight = FontWeight.SemiBold)) {
+                withStyle(SpanStyle(color = mentionColor, background = mentionBackground, fontWeight = FontWeight.SemiBold)) {
                     append("@you")
                 }
                 cursor = range.last + 1

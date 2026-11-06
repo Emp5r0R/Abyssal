@@ -10,13 +10,13 @@ import {
 
 describe("workspace preferences", () => {
   it("defaults to the calculator cover with blur off", () => {
-    expect(DEFAULT_WORKSPACE_PREFERENCES).toEqual({ coverEnabled: true, blurEnabled: false, hiddenTabAction: "cover", notificationLevel: "off" });
+    expect(DEFAULT_WORKSPACE_PREFERENCES).toEqual({ coverEnabled: true, blurEnabled: false, hiddenTabAction: "cover", notificationLevel: "off", appearance: "system" });
     expect(Object.isFrozen(DEFAULT_WORKSPACE_PREFERENCES)).toBe(true);
   });
 
   it("signs out instead of locking once the cover is turned off, and restores locking when it returns", () => {
     const off = withCoverEnabled(DEFAULT_WORKSPACE_PREFERENCES, false);
-    expect(off).toEqual({ coverEnabled: false, blurEnabled: false, hiddenTabAction: "sign-out", notificationLevel: "off" });
+    expect(off).toEqual({ coverEnabled: false, blurEnabled: false, hiddenTabAction: "sign-out", notificationLevel: "off", appearance: "system" });
     expect(withCoverEnabled(off, true).hiddenTabAction).toBe("cover");
   });
 
@@ -44,5 +44,18 @@ describe("workspace preferences", () => {
     expect(hiddenTabResponse(DEFAULT_WORKSPACE_PREFERENCES, false)).toBe("sign-out");
     expect(hiddenTabResponse(withCoverEnabled(DEFAULT_WORKSPACE_PREFERENCES, false), true)).toBe("sign-out");
     expect(hiddenTabResponse(withHiddenTabAction(DEFAULT_WORKSPACE_PREFERENCES, "stay"), false)).toBe("none");
+  });
+});
+
+describe("appearance", () => {
+  it("follows the device by default and maps choices to the root theme attribute", async () => {
+    const { DEFAULT_WORKSPACE_PREFERENCES: defaults, themeAttribute, withAppearance } = await import("./workspacePreferences");
+    expect(defaults.appearance).toBe("system");
+    expect(themeAttribute("system")).toBeNull();
+    expect(themeAttribute("light")).toBe("light");
+    expect(themeAttribute("dark")).toBe("dark");
+    const light = withAppearance(defaults, "light");
+    expect(light.appearance).toBe("light");
+    expect(withAppearance(light, "light")).toBe(light);
   });
 });

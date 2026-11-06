@@ -35,6 +35,8 @@ import com.abyssal.chat.presentation.viewmodel.ChatViewModel
 import com.abyssal.chat.presentation.viewmodel.Screen
 import com.abyssal.chat.domain.model.ReleaseVerificationStatus
 import com.abyssal.chat.theme.AbyssalTheme
+import com.abyssal.chat.theme.AppearanceChoice
+import com.abyssal.chat.domain.model.Appearance
 import com.abyssal.chat.theme.Background
 import kotlinx.coroutines.launch
 
@@ -64,7 +66,12 @@ class MainActivity : ComponentActivity() {
         )[ChatViewModel::class.java]
 
         setContent {
-            AbyssalTheme {
+            val preferences by viewModel.workspacePreferences.collectAsState()
+            AbyssalTheme(appearance = when (preferences.appearance) {
+                Appearance.SYSTEM -> AppearanceChoice.SYSTEM
+                Appearance.LIGHT -> AppearanceChoice.LIGHT
+                Appearance.DARK -> AppearanceChoice.DARK
+            }) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = Background

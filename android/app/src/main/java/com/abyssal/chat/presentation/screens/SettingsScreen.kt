@@ -93,6 +93,9 @@ internal fun SettingsScreen(
                             PrivacyPreferences(preferenceControls, disguised = disguiseSettings.isDisguised)
                         }
                     }
+                    SectionCard(title = "Appearance", icon = AppIcons.Eye) {
+                        Column(Modifier.padding(16.dp)) { AppearancePreferences(preferenceControls) }
+                    }
                     SectionCard(title = "Notifications", icon = AppIcons.Bell) {
                         Column(Modifier.padding(16.dp)) { NotificationPreferences(preferenceControls) }
                     }

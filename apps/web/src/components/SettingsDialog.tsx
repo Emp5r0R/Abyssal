@@ -1,9 +1,11 @@
 import { Keyboard, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 import {
+  withAppearance,
   withBlurEnabled,
   withCoverEnabled,
   withHiddenTabAction,
+  type Appearance,
   type HiddenTabAction,
   type WorkspacePreferences,
 } from "../domain/workspacePreferences";
@@ -16,6 +18,12 @@ const HIDDEN_TAB_OPTIONS: ReadonlyArray<{ value: HiddenTabAction; label: string;
   { value: "cover", label: "Lock behind the calculator", detail: "Your session stays open. Enter your PIN on the calculator to return." },
   { value: "sign-out", label: "Sign out", detail: "End the session. You sign in again with your invite and password." },
   { value: "stay", label: "Stay signed in", detail: "Nothing happens. The idle timer still signs you out." },
+];
+
+const APPEARANCE_OPTIONS: ReadonlyArray<{ value: Appearance; label: string }> = [
+  { value: "system", label: "Match device" },
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
 ];
 
 const NOTIFICATION_OPTIONS: ReadonlyArray<{ value: NotificationLevel; label: string; detail: string }> = [
@@ -97,6 +105,24 @@ export function SettingsDialog({
           checked={preferences.blurEnabled}
           onChange={(enabled) => onChange(withBlurEnabled(preferences, enabled))}
         />
+      </section>
+
+      <section className="settings-section" aria-labelledby="settings-appearance">
+        <h3 id="settings-appearance">Appearance</h3>
+        <div className="segmented" role="radiogroup" aria-labelledby="settings-appearance">
+          {APPEARANCE_OPTIONS.map((option) => (
+            <button
+              type="button"
+              role="radio"
+              key={option.value}
+              aria-checked={preferences.appearance === option.value}
+              className={preferences.appearance === option.value ? "is-active" : ""}
+              onClick={() => onChange(withAppearance(preferences, option.value))}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
       </section>
 
       <section className="settings-section" aria-labelledby="settings-notifications">

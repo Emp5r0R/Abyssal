@@ -19,6 +19,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.unit.dp
+import com.abyssal.chat.theme.SurfaceHigh
 import kotlinx.coroutines.delay
 
 /** Whether names and message text are hidden until tapped. Off unless Settings turns it on. */
@@ -55,7 +56,7 @@ internal fun PrivacyBlurred(
             .clearAndSetSemantics {
                 contentDescription = if (revealOnTap) "Hidden. Double tap to reveal." else "Hidden."
             }
-            .obscured()
+            .obscured(SurfaceHigh)
     }
     val reveal = if (revealOnTap) {
         Modifier.clickable(role = Role.Button, onClickLabel = if (revealed) "Hide" else "Reveal") { revealed = !revealed }
@@ -66,11 +67,11 @@ internal fun PrivacyBlurred(
 }
 
 /** A real blur where the platform supports it; a solid block on older Android versions. */
-private fun Modifier.obscured(): Modifier =
+private fun Modifier.obscured(placeholder: Color): Modifier =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         blur(8.dp)
     } else {
         drawWithContent {
-            drawRoundRect(Color(0xFF2A313D), cornerRadius = CornerRadius(4.dp.toPx()))
+            drawRoundRect(placeholder, cornerRadius = CornerRadius(4.dp.toPx()))
         }
     }

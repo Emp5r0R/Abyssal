@@ -96,6 +96,8 @@ private fun MirageLogoCanvas(
     pulseScale: Float,
     wormholeProgress: Float
 ) {
+    val accent = Accent
+    val success = Success
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
@@ -117,7 +119,7 @@ private fun MirageLogoCanvas(
             } else {
                 (1f - t) / 0.8f
             }
-            val strokeColor = Accent.copy(alpha = alpha * 0.18f)
+            val strokeColor = accent.copy(alpha = alpha * 0.18f)
 
             scale(scale = scaleVal, pivot = center) {
                 rotate(degrees = rotationOuter + i * 20f, pivot = center) {
@@ -134,7 +136,7 @@ private fun MirageLogoCanvas(
         rotate(degrees = rotationOuter, pivot = center) {
             drawPath(
                 path = baseOuterPath,
-                color = Accent,
+                color = accent,
                 style = Stroke(width = 2.dp.toPx())
             )
         }
@@ -151,7 +153,7 @@ private fun MirageLogoCanvas(
             rotate(degrees = rotationInner, pivot = center) {
                 drawPath(
                     path = baseInnerPath,
-                    color = Success,
+                    color = success,
                     style = Stroke(width = 1.5.dp.toPx())
                 )
             }
@@ -159,7 +161,7 @@ private fun MirageLogoCanvas(
 
         // Central core glow dot
         drawCircle(
-            color = Success,
+            color = success,
             radius = 3.dp.toPx() * pulseScale,
             center = Offset(w / 2, h * 0.47f)
         )

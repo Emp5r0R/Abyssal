@@ -17,10 +17,14 @@ enum class BackgroundResponse { LOCK, SIGN_OUT, NONE }
  * In-memory display and privacy preferences, matching the web client's Settings.
  * Nothing here is written to disk.
  */
+/** Colour scheme: follow the device, or force light or dark. */
+enum class Appearance { SYSTEM, LIGHT, DARK }
+
 data class WorkspacePreferences(
     val blurEnabled: Boolean = false,
     val backgroundAction: BackgroundAction = BackgroundAction.LOCK,
-    val notificationLevel: NotificationLevel = NotificationLevel.OFF
+    val notificationLevel: NotificationLevel = NotificationLevel.OFF,
+    val appearance: Appearance = Appearance.SYSTEM
 )
 
 data class NotificationContent(val title: String, val body: String)
