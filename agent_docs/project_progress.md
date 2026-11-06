@@ -50,9 +50,17 @@ research. Typing indicators are deliberately not built: they leak activity timin
   and deployed; production serves `web@3.5.1`. The release also cleared new
   npm and RustSec advisories; RUSTSEC-2026-0387 and -0374 (no upstream fix)
   are user-approved, dated exceptions in `scripts/lib/cargo-audit-exceptions.tsv`.
-- Phase 2 in progress: reactions, edit, delete for everyone, owner member
-  removal, room profile after admission, owner rename and in-conversation
-  search are implemented and unit-tested on web and Android (unreleased).
+- Phase 2 code complete (unreleased): reactions, edit, delete for everyone,
+  owner member removal, room profile after admission, owner rename,
+  in-conversation search, light theme and voice messages on web and Android
+  (`273c94d`, `2ce8488`, `4c88a74`).
+- Phase 3 code complete (unreleased, `e9313f8`): `ABYSSAL_DEVICE_STORAGE`
+  relay share plus the Android Keystore/HKDF/AES-GCM device store.
+- Next: emulator end-to-end check against a local relay with
+  `ABYSSAL_DEVICE_STORAGE=true` (debug APK built as android@3.5.1 with the
+  3.5.1 build record), then release 3.6.0 (manifest sequence 20) and deploy.
+  Production keeps device storage off until the user chooses to enable it.
+  Phase 4 (protocol-v11 client adoption) has not started.
 
 ## Active Deployment: Protocol-v11 Transport Confidentiality
 
