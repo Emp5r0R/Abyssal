@@ -2,6 +2,9 @@ package com.abyssal.chat.presentation.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.MediaPlayer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -26,6 +29,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -51,7 +55,10 @@ import com.abyssal.chat.theme.SurfaceHigh
 import com.abyssal.chat.theme.TextMuted
 import com.abyssal.chat.theme.TextPrimary
 import com.abyssal.chat.theme.TextSubtle
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 
 /** A voice message inside a bubble: its length and a play button that opens the in-memory player. */
 @Composable
@@ -164,9 +171,90 @@ internal fun VoiceRecordingBar(startedAtMs: Long, onDiscard: () -> Unit, onSend:
     }
 }
 
-/** Plays decrypted audio straight from memory; the bytes never reach a file. */
+/**
+ * Plays decrypted audio straight from memory; the bytes never reach a file.
+ * Abyssal's own WAV recordings go straight to AudioTrack after a strict header
+ * check; anything else (such as Opus from the web client) uses MediaPlayer.
+ */
 @Composable
 internal fun RamAudioPreview(bytes: ByteArray) {
+    val wav = remember(bytes) { VoiceNotes.parseWav(bytes) }
+    if (wav != null) PcmAudioPlayer(bytes, wav) else MediaAudioPlayer(bytes)
+}
+
+@Composable
+private fun PcmAudioPlayer(bytes: ByteArray, wav: VoiceNotes.WavInfo) {
+    val track = remember(bytes) {
+        runCatching {
+            val channelMask = if (wav.channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+            val minBuffer = AudioTrack.getMinBufferSize(wav.sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(wav.sampleRate)
+                        .setChannelMask(channelMask)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(maxOf(minBuffer, 4096) * 4)
+                .build()
+                .takeIf { it.state == AudioTrack.STATE_INITIALIZED }
+        }.getOrNull()
+    }
+    var playing by remember(bytes) { mutableStateOf(true) }
+    var progress by remember(bytes) { mutableFloatStateOf(0f) }
+    var written by remember(bytes) { mutableIntStateOf(0) }
+    DisposableEffect(track) {
+        onDispose { runCatching { track?.pause(); track?.flush(); track?.release() } }
+    }
+    LaunchedEffect(track, playing) {
+        val player = track ?: return@LaunchedEffect
+        if (!playing) {
+            runCatching { player.pause() }
+            return@LaunchedEffect
+        }
+        if (written >= wav.dataLength) {
+            // Replay from the start.
+            runCatching { player.stop(); player.flush() }
+            written = 0
+            progress = 0f
+        }
+        runCatching { player.play() }
+        withContext(Dispatchers.IO) {
+            while (isActive && written < wav.dataLength) {
+                val count = player.write(
+                    bytes, wav.dataOffset + written, minOf(8_192, wav.dataLength - written), AudioTrack.WRITE_NON_BLOCKING
+                )
+                if (count < 0) break
+                if (count == 0) delay(20) else written += count
+                progress = player.playbackHeadPosition.toFloat() / wav.frames.coerceAtLeast(1)
+            }
+            while (isActive && player.playbackHeadPosition < wav.frames) {
+                progress = player.playbackHeadPosition.toFloat() / wav.frames.coerceAtLeast(1)
+                delay(100)
+            }
+        }
+        progress = 1f
+        playing = false
+    }
+    AudioPlayerControls(
+        available = track != null,
+        ready = true,
+        playing = playing,
+        progress = progress,
+        onToggle = { playing = !playing }
+    )
+}
+
+@Composable
+private fun MediaAudioPlayer(bytes: ByteArray) {
     var playing by remember { mutableStateOf(false) }
     var ready by remember { mutableStateOf(false) }
     var failed by remember { mutableStateOf(false) }
@@ -192,28 +280,40 @@ internal fun RamAudioPreview(bytes: ByteArray) {
             delay(200)
         }
     }
-    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        if (player == null || failed) {
-            Text("This audio could not be played.", color = Danger, fontSize = 14.sp)
-            return@Column
+    AudioPlayerControls(
+        available = player != null && !failed,
+        ready = ready,
+        playing = playing,
+        progress = progress,
+        onToggle = {
+            if (player != null) {
+                if (playing) { player.pause(); playing = false } else { player.start(); playing = true }
+            }
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
+    )
+}
+
+@Composable
+private fun AudioPlayerControls(available: Boolean, ready: Boolean, playing: Boolean, progress: Float, onToggle: () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        // No early return inside this layout lambda: Compose cannot unwind it on recomposition.
+        if (!available) {
+            Text("This audio could not be played.", color = Danger, fontSize = 14.sp)
+        } else Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .size(52.dp)
                     .clip(CircleShape)
                     .background(if (ready) Accent else SurfaceHigh)
-                    .clickable(enabled = ready, role = Role.Button) {
-                        if (playing) { player.pause(); playing = false } else { player.start(); playing = true }
-                    }
+                    .clickable(enabled = ready, role = Role.Button, onClick = onToggle)
                     .semantics { contentDescription = if (playing) "Pause" else "Play" }
             ) {
                 AppIcon(if (playing) AppIcons.Pause else AppIcons.Play, tint = OnAccent, size = 22.dp)
             }
             Spacer(Modifier.width(14.dp))
             LinearProgressIndicator(
-                progress = { progress },
+                progress = { progress.coerceIn(0f, 1f) },
                 color = Accent,
                 trackColor = SurfaceHigh,
                 modifier = Modifier.weight(1f)

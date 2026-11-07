@@ -8,13 +8,24 @@ import java.io.File
  * account has one sealed file; its key exists only in memory while signed in.
  */
 class EncryptedDeviceStore internal constructor(private val directory: File, private val secrets: LocalSecretStore) {
-    /** Opens the store for an account, or null if the device cannot hold a local secret. */
+    /**
+     * Opens the store for an account, or null if the device cannot hold a local
+     * secret. Other files saved for the same relay are deleted: after a relay
+     * restart every earlier account there is gone (and its share with it), so
+     * those files could never be read again. Files for other relays are kept.
+     */
     internal fun open(relayShare: ByteArray, nodeId: String, username: String): Session? {
         val local = secrets.getOrCreate() ?: return null
+        val name = DeviceStoreCrypto.fileName(nodeId, username)
+        val prefix = DeviceStoreCrypto.nodePrefix(nodeId)
+        directory.mkdirs()
+        directory.listFiles()
+            ?.filter { it.name != name && (it.name.startsWith(prefix) || !it.name.contains('-')) }
+            ?.forEach(::overwriteAndDelete)
         return try {
             Session(
                 key = DeviceStoreCrypto.deriveKey(local, relayShare, nodeId, username),
-                file = File(directory.apply { mkdirs() }, DeviceStoreCrypto.fileName(nodeId, username)),
+                file = File(directory, name),
                 aad = DeviceStoreCrypto.context(nodeId, username)
             )
         } finally {

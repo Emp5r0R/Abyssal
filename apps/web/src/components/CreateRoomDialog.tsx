@@ -1,3 +1,4 @@
+import { withTextReadTimer } from "../domain/roomTimers";
 import { useState, type FormEvent } from "react";
 import { clampRoom } from "../domain/messagePolicy";
 import type { RoomRecord, RoomVisibility } from "../domain/types";
@@ -29,7 +30,9 @@ function newRoom(): RoomRecord {
 export function CreateRoomDialog({ onCancel, onCreate }: { onCancel: () => void; onCreate: (room: RoomRecord) => boolean }) {
   const [room, setRoom] = useState(newRoom);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const number = (key: keyof RoomRecord, value: string) => setRoom((current) => ({ ...current, [key]: Number(value) || 0 }));
+  const number = (key: keyof RoomRecord, value: string) => setRoom((current) => key === "self_destruct_timer_sec"
+    ? withTextReadTimer(current, Number(value) || 0)
+    : { ...current, [key]: Number(value) || 0 });
   const boolean = (key: keyof RoomRecord, value: boolean) => setRoom((current) => ({ ...current, [key]: value }));
   const submit = (event: FormEvent) => {
     event.preventDefault();

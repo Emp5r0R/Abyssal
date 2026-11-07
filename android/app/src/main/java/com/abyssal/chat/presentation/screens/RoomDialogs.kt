@@ -82,7 +82,17 @@ internal data class RoomDraft(
     val images: MediaRuleDraft = MediaRuleDraft(),
     val videos: MediaRuleDraft = MediaRuleDraft(),
     val files: MediaRuleDraft = MediaRuleDraft()
-)
+) {
+    /**
+     * Sets the main after-reading timer. Media timers that still match the old
+     * value follow it, so "0" keeps images, videos and files too; a media timer
+     * changed under Advanced keeps its own value.
+     */
+    fun withReadSec(value: String): RoomDraft {
+        fun follow(rule: MediaRuleDraft) = if (rule.readSec == readSec) rule.copy(readSec = value) else rule
+        return copy(readSec = value, images = follow(images), videos = follow(videos), files = follow(files))
+    }
+}
 
 internal data class MediaRuleDraft(
     val allowed: Boolean = true,
@@ -135,7 +145,7 @@ internal fun CreateForumDialog(
         )
         AppTextField(
             value = draft.readSec,
-            onValueChange = { draft = draft.copy(readSec = it.filter(Char::isDigit).take(5)) },
+            onValueChange = { draft = draft.withReadSec(it.filter(Char::isDigit).take(5)) },
             label = "Messages disappear after reading (seconds)",
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             supportingText = "0 keeps messages until the room or session ends.",

@@ -33,6 +33,8 @@ import kotlin.math.ceil
 import androidx.compose.ui.graphics.compositeOver
 import com.abyssal.chat.data.qr.ClipboardQrImage
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -422,7 +424,7 @@ internal fun ChatContent(
             } else if (messages.isEmpty()) {
                 EmptyState(
                     title = "No messages yet",
-                    detail = "Say hello. Messages live only in memory and disappear on their timer.",
+                    detail = "Say hello. Messages disappear on their timer.",
                     icon = AppIcons.Message,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1215,6 +1217,7 @@ private fun ChatInputBar(
     connectionState: String,
     focusRequester: FocusRequester
 ) {
+    var field by remember { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1246,8 +1249,12 @@ private fun ChatInputBar(
                 )
             }
             BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
+                // Text set by the app (an edit, a mention, a cleared draft) puts the cursor at the end.
+                value = if (field.text == value) field else TextFieldValue(value, TextRange(value.length)),
+                onValueChange = {
+                    field = it
+                    if (it.text != value) onValueChange(it.text)
+                },
                 textStyle = TextStyle(color = TextPrimary, fontSize = 15.sp, lineHeight = 21.sp),
                 cursorBrush = SolidColor(Accent),
                 maxLines = 5,

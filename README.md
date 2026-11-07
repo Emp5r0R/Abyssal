@@ -98,8 +98,9 @@ the canonical capsule, signature, application, protocol range, expiry, and
 locator before any bootstrap request. The client then fetches the signed
 `/v1/node` descriptor and requires the connected node identity to match the
 invite. Account creation consumes the capability once; later login uses the
-same invite and password while the relay account remains alive. A second login
-is rejected while that account has an unexpired session.
+same invite and password while the relay account remains alive. Signing in again
+replaces the account's previous session (for example one left by a closed app);
+there is never more than one live session per account.
 
 `Remember this session` is optional and never stores the invite, capability,
 password, locator, or token on disk. It only changes lifecycle behavior for the
@@ -256,7 +257,7 @@ and optional expiry. The relay never writes capsules to a file or Docker log;
 after printing, plaintext capability buffers are zeroized and only
 per-process HMAC identifiers remain in account state. A capability creates
 exactly one RAM-only account and can later log into that account while the
-relay remains alive. Only one unexpired bearer session may exist per account.
+relay remains alive. Only one bearer session exists per account; a new login replaces it.
 Lost invites are deliberately unrecoverable; restarting destroys all RAM state
 and emits fresh capabilities while the separately backed-up node key preserves
 the node identity. There are no administrator roles or privileged invites.

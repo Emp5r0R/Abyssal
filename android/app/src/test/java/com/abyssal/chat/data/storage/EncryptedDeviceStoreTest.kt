@@ -95,6 +95,20 @@ class EncryptedDeviceStoreTest {
     }
 
     @Test
+    fun signingInDeletesOtherAccountsOfTheSameRelayButKeepsOtherRelays() {
+        val dir = Files.createTempDirectory("store").toFile()
+        val store = EncryptedDeviceStore(dir, FakeSecrets())
+        store.open(share(2), "node", "acct_before_restart")!!.save(snapshot())
+        store.open(share(3), "other-node", "acct_elsewhere")!!.save(snapshot())
+        assertEquals(2, dir.listFiles()!!.size)
+        // After a relay restart the same node hands out a new account.
+        store.open(share(4), "node", "acct_after_restart")!!
+        val names = dir.listFiles()!!.map { it.name }
+        assertEquals(listOf(DeviceStoreCrypto.fileName("other-node", "acct_elsewhere")), names)
+        dir.deleteRecursively()
+    }
+
+    @Test
     fun eraseAllDeletesFilesAndTheDeviceSecret() {
         val dir = Files.createTempDirectory("store").toFile()
         val secrets = FakeSecrets()

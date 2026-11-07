@@ -192,7 +192,9 @@ internal suspend fun decryptAndCompleteAttachment(
     } catch (_: Exception) {
         return null
     } finally {
-        downloaded.bytes.fill(0)
+        // The download already holds decrypted bytes, and callers usually return
+        // that same array as the plaintext: never wipe what is being handed back.
+        if (!(exposed && plaintext === downloaded.bytes)) downloaded.bytes.fill(0)
         if (!exposed) plaintext?.fill(0)
         downloaded.claim?.takeUnless { completed }?.let { claim ->
             withContext(NonCancellable) {

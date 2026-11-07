@@ -1155,8 +1155,9 @@ async fn binary_registration_continues_through_opaque_login_without_early_sessio
     );
     drop(transport);
 
-    state.sessions.lock().await.clear();
-    state.transport_sessions.lock().await.clear();
+    // Signing in again while the first session is still live replaces it:
+    // a closed or killed app must not lock the account out until it idles.
+    let first_token = state.sessions.lock().await.keys().next().unwrap().0.clone();
     state.available_codes.lock().await.insert(code_id);
     let opaque_login = abyssal_core::secure_protocol::opaque_client_start(password).unwrap();
     let login_start = bootstrap_auth::bootstrap_start(
@@ -1196,6 +1197,16 @@ async fn binary_registration_continues_through_opaque_login_without_early_sessio
         panic!("login rejected");
     };
     assert!(!created);
+    {
+        let sessions = state.sessions.lock().await;
+        assert_eq!(sessions.len(), 1, "never two live sessions");
+        assert_ne!(
+            sessions.keys().next().unwrap().0,
+            first_token,
+            "the old token is revoked"
+        );
+    }
+    assert_eq!(state.transport_sessions.lock().await.len(), 1);
     assert_eq!(max_rooms_per_user as usize, state.max_rooms_per_user);
     assert_eq!(
         session_inactivity_sec as u64,
@@ -10307,29 +10318,29 @@ async fn stale_reusable_state_requires_the_current_public_bundle() {
 }
 
 #[tokio::test]
-async fn account_code_allows_only_one_unexpired_session() {
+async fn sign_in_prunes_expired_sessions_and_replaces_the_live_one() {
     let state = test_state();
-    let code = "ABYS-SESSION-0001";
-    let code_id = test_code_id(code);
+    add_test_account(&state, "ABYS-SESSION-0001", "Alice").await;
+    let code_id = test_code_id("ABYS-SESSION-0001");
     state.sessions.lock().await.insert(
-        SessionToken::new("active-token".to_string()),
+        SessionToken::new("stale-token".to_string()),
         AuthSession {
-            code_id,
-            username: "Alice".to_string(),
-            last_activity_ms: now_ms(),
+            code_id: test_code_id("ABYS-SESSION-0002"),
+            username: "Bob".to_string(),
+            last_activity_ms: 0,
         },
     );
-    assert!(code_has_active_session(&state, &code_id).await);
-
-    state
-        .sessions
-        .lock()
-        .await
-        .get_mut("active-token")
-        .expect("session")
-        .last_activity_ms = 0;
-    assert!(!code_has_active_session(&state, &code_id).await);
+    auth::prune_expired_sessions(&state).await;
     assert!(state.sessions.lock().await.is_empty());
+
+    let (status, _) = auth::issue_session(&state, code_id, "Alice".to_string(), false).await;
+    assert_eq!(status, StatusCode::OK);
+    let first = state.sessions.lock().await.keys().next().unwrap().0.clone();
+    let (status, _) = auth::issue_session(&state, code_id, "Alice".to_string(), false).await;
+    assert_eq!(status, StatusCode::OK);
+    let sessions = state.sessions.lock().await;
+    assert_eq!(sessions.len(), 1, "one live session per account");
+    assert_ne!(sessions.keys().next().unwrap().0, first);
 }
 
 #[tokio::test]

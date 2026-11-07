@@ -617,6 +617,24 @@ class EncryptedAttachmentServiceTest {
     }
 
     @Test
+    fun returnedDownloadBufferIsNotWiped() = runBlocking {
+        // The app returns the already-decrypted download array itself; it must reach the caller intact.
+        val downloaded = DecryptedAttachmentDownload("RIFF....WAVE".encodeToByteArray(), CLAIM)
+        val result = decryptAndCompleteAttachment(
+            downloaded = downloaded,
+            decrypt = { downloaded.bytes },
+            complete = { true },
+            release = { true }
+        )
+        assertSame(downloaded.bytes, result)
+        assertEquals("RIFF....WAVE", result!!.decodeToString())
+
+        val failed = DecryptedAttachmentDownload(ByteArray(4) { 7 }, CLAIM)
+        assertNull(decryptAndCompleteAttachment(failed, decrypt = { failed.bytes }, complete = { false }, release = { true }))
+        assertArrayEquals(ByteArray(4), failed.bytes)
+    }
+
+    @Test
     fun completionFailureReleasesClaimAndWipesPlaintext() = runBlocking {
         val plaintext = ByteArray(6) { 4 }
         var releaseCalled = false

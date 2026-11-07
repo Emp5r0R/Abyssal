@@ -45,10 +45,8 @@ pub(super) async fn bootstrap_start(
     let _account_guard = state.account_ops.lock().await;
     auth::prune_opaque_handshakes(state).await;
     let code_id = derive_code_id(&state.invite_code_pepper[..], capability.as_ref());
-    if !known_code_id(state, &code_id).await
-        || !login_attempt_allowed(state, &code_id).await
-        || auth::code_has_active_session(state, &code_id).await
-    {
+    auth::prune_expired_sessions(state).await;
+    if !known_code_id(state, &code_id).await || !login_attempt_allowed(state, &code_id).await {
         return BootstrapResult::Failure;
     }
     let handshake_id = Uuid::new_v4();
@@ -278,9 +276,8 @@ pub(super) async fn bootstrap_finish_login(
         Ok(value) => Zeroizing::new(value),
         Err(_) => return BootstrapResult::Failure,
     };
-    if auth::code_has_active_session(state, &code_id).await {
-        return BootstrapResult::Failure;
-    }
+    // Newest sign-in wins, as on the HTTP account path.
+    auth::replace_connected_clients_for_code(state, &code_id).await;
     clear_login_limit(state, &code_id).await;
     let Some(session) =
         issue_transport_session(state, code_id, username, transport_root, created).await

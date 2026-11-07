@@ -56,6 +56,54 @@ object VoiceNotes {
         }
     }
 
+    /** Where the samples of a 16-bit PCM WAV file are. */
+    data class WavInfo(val sampleRate: Int, val channels: Int, val dataOffset: Int, val dataLength: Int) {
+        val frames: Int get() = dataLength / (channels * BYTES_PER_SAMPLE)
+    }
+
+    /**
+     * Parses a 16-bit PCM WAV strictly (mono or stereo, 8-48 kHz), so it can be
+     * played straight from memory without the system media parser. Returns
+     * null for anything else, which is then left to the media player.
+     */
+    fun parseWav(bytes: ByteArray): WavInfo? {
+        if (bytes.size < 44) return null
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        fun tag(at: Int) = String(bytes, at, 4, Charsets.US_ASCII)
+        if (tag(0) != "RIFF" || tag(8) != "WAVE") return null
+        var position = 12
+        var format: Triple<Int, Int, Int>? = null
+        while (position + 8 <= bytes.size) {
+            val id = tag(position)
+            val size = buffer.getInt(position + 4)
+            if (size < 0 || size > bytes.size - position - 8) {
+                // A streamed "data" chunk may declare more than was written; use what is there.
+                if (id != "data") return null
+            }
+            val body = position + 8
+            when (id) {
+                "fmt " -> {
+                    if (size < 16) return null
+                    val audioFormat = buffer.getShort(body).toInt()
+                    val channels = buffer.getShort(body + 2).toInt()
+                    val rate = buffer.getInt(body + 4)
+                    val bits = buffer.getShort(body + 14).toInt()
+                    if (audioFormat != 1 || bits != 16 || channels !in 1..2 || rate !in 8_000..48_000) return null
+                    format = Triple(rate, channels, bits)
+                }
+                "data" -> {
+                    val (rate, channels, _) = format ?: return null
+                    val available = minOf(if (size < 0) Int.MAX_VALUE else size, bytes.size - body)
+                    val length = available - available % (channels * BYTES_PER_SAMPLE)
+                    return if (length > 0) WavInfo(rate, channels, body, length) else null
+                }
+            }
+            if (size < 0) return null
+            position = body + size + (size and 1)
+        }
+        return null
+    }
+
     /** "0:07", "1:45". */
     fun format(durationMs: Long): String {
         val seconds = (durationMs.coerceAtLeast(0L) + 500L) / 1000L

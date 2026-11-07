@@ -44,6 +44,23 @@ class VoiceNotesTest {
     }
 
     @Test
+    fun parsesOwnWavFilesAndRejectsOtherAudio() {
+        val wav = VoiceNotes.wav(ByteArray(32_000) { 1 }, 32_000)
+        val info = VoiceNotes.parseWav(wav)!!
+        assertEquals(VoiceNotes.SAMPLE_RATE, info.sampleRate)
+        assertEquals(1, info.channels)
+        assertEquals(44, info.dataOffset)
+        assertEquals(32_000, info.dataLength)
+        assertEquals(16_000, info.frames)
+        // Truncated data is played as far as it goes.
+        assertEquals(31_000, VoiceNotes.parseWav(wav.copyOf(44 + 31_000))!!.dataLength)
+        assertNull(VoiceNotes.parseWav(byteArrayOf(0x1a, 0x45, 0xdf.toByte(), 0xa3.toByte()) + ByteArray(60)))
+        assertNull(VoiceNotes.parseWav(wav.copyOf().also { it[20] = 3 })) // not PCM
+        assertNull(VoiceNotes.parseWav(wav.copyOf().also { it[34] = 8 })) // 8-bit
+        assertNull(VoiceNotes.parseWav(wav.copyOf(30)))
+    }
+
+    @Test
     fun formatsDurations() {
         assertEquals("0:07", VoiceNotes.format(7_400))
         assertEquals("1:45", VoiceNotes.format(105_000))

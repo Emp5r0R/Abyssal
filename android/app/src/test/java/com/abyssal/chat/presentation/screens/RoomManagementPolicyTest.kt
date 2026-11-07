@@ -28,3 +28,14 @@ class RoomManagementPolicyTest {
         assertFalse(validRoomName("bad\u0000name"))
     }
 }
+
+class RoomDraftTimerTest {
+    @Test
+    fun mediaTimersFollowTheMainTimerUnlessChangedSeparately() {
+        val draft = RoomDraft(videos = MediaRuleDraft(readSec = "30")).withReadSec("0")
+        assertEquals("0", draft.readSec)
+        assertEquals("0", draft.images.readSec)
+        assertEquals("0", draft.files.readSec)
+        assertEquals("30", draft.videos.readSec)
+    }
+}

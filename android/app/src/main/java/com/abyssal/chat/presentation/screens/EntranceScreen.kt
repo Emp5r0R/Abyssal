@@ -335,7 +335,7 @@ internal fun EntranceContent(
                 ) {
                     AppIcon(AppIcons.Lock, tint = TextSubtle, size = 14.dp)
                     Text(
-                        text = "Nothing is written to storage. Your session lives in memory only.",
+                        text = "Your session lives in memory only. Messages stay on this phone only if your relay allows it.",
                         color = TextSubtle,
                         fontSize = 12.sp,
                         modifier = Modifier.padding(start = 6.dp)

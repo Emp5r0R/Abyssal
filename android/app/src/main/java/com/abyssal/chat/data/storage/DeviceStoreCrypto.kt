@@ -37,10 +37,14 @@ internal object DeviceStoreCrypto {
     fun context(nodeId: String, username: String): ByteArray =
         DOMAIN + byteArrayOf(0) + nodeId.toByteArray(Charsets.UTF_8) + byteArrayOf(0) + username.lowercase().toByteArray(Charsets.UTF_8)
 
-    /** A file name that does not reveal the node or account. */
-    fun fileName(nodeId: String, username: String): String =
-        MessageDigest.getInstance("SHA-256").digest(context(nodeId, username))
-            .take(16).joinToString("") { "%02x".format(it) } + ".store"
+    /** File name prefix for one relay node; reveals neither node nor account. */
+    fun nodePrefix(nodeId: String): String = hex(DOMAIN + byteArrayOf(0) + nodeId.toByteArray(Charsets.UTF_8)) + "-"
+
+    /** A file name that does not reveal the node or account, grouped by node. */
+    fun fileName(nodeId: String, username: String): String = nodePrefix(nodeId) + hex(context(nodeId, username)) + ".store"
+
+    private fun hex(data: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(data).take(8).joinToString("") { "%02x".format(it) }
 
     fun seal(key: ByteArray, plaintext: ByteArray, aad: ByteArray, random: SecureRandom = SecureRandom()): ByteArray {
         val nonce = ByteArray(NONCE_BYTES).also(random::nextBytes)

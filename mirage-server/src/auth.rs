@@ -124,7 +124,9 @@ pub(super) async fn active_session(
     Some(session.clone())
 }
 
-pub(super) async fn code_has_active_session(state: &AppState, code_id: &CodeId) -> bool {
+/// Drops expired sessions and their transport sessions. Run at sign-in so
+/// sessions of apps that closed without signing out do not linger in RAM.
+pub(super) async fn prune_expired_sessions(state: &AppState) {
     let now = now_ms();
     let mut sessions = state.sessions.lock().await;
     let mut expired_tokens = sessions
@@ -133,7 +135,6 @@ pub(super) async fn code_has_active_session(state: &AppState, code_id: &CodeId) 
         .map(|(token, _)| token.0.clone())
         .collect::<Vec<_>>();
     sessions.retain(|_, session| !session_is_expired(session, now, state.session_inactivity_ms));
-    let active = sessions.values().any(|session| session.code_id == *code_id);
     drop(sessions);
     if !expired_tokens.is_empty() {
         state
@@ -149,7 +150,6 @@ pub(super) async fn code_has_active_session(state: &AppState, code_id: &CodeId) 
             token.zeroize();
         }
     }
-    active
 }
 
 pub(super) async fn start_opaque_account(
@@ -179,9 +179,8 @@ pub(super) async fn start_opaque_account(
     if !login_attempt_allowed(&state, &code_id).await {
         return opaque_start_error(StatusCode::TOO_MANY_REQUESTS, &state);
     }
-    if code_has_active_session(&state, &code_id).await {
-        return opaque_start_error(StatusCode::CONFLICT, &state);
-    }
+    // An existing session does not block a new login; a proven login replaces it.
+    prune_expired_sessions(&state).await;
 
     let handshake_id = Uuid::new_v4();
     if let Some(account) = state.accounts.lock().await.get(&code_id).cloned() {
@@ -458,9 +457,10 @@ pub(super) async fn finish_opaque_account(
             if opaque_server_finish_login(server_state, finalization.as_slice()).is_err() {
                 return account_error(StatusCode::UNAUTHORIZED, &state, String::new()).await;
             }
-            if code_has_active_session(&state, code_id).await {
-                return account_error(StatusCode::CONFLICT, &state, String::new()).await;
-            }
+            // Newest sign-in wins: once the password is proven, the previous
+            // session's sockets close and issue_session revokes its token, so
+            // there is still never more than one live session per account.
+            replace_connected_clients_for_code(&state, code_id).await;
             clear_login_limit(&state, code_id).await;
             let response = issue_session(&state, *code_id, username.clone(), false).await;
             if response.0.is_success() {
