@@ -1,5 +1,14 @@
 package com.abyssal.chat.data.network
 
+import com.abyssal.chat.data.network.v11.ControlExchanges
+import com.abyssal.chat.data.network.v11.ControlTicketRequest
+import com.abyssal.chat.data.network.v11.UniffiControlExchanges
+import com.abyssal.chat.data.network.v11.WsRecordLayer
+import com.abyssal.chat.domain.model.TransportKeys
+import com.abyssal.chat.data.network.v11.SealedWebSocketListener
+import com.abyssal.chat.data.network.v11.TicketOutcome
+import com.abyssal.chat.data.network.v11.UniffiWsRecordLayer
+import com.abyssal.chat.data.network.v11.sealedWebSocketRequest
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DirectoryStamp
 import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
@@ -8,7 +17,6 @@ import com.abyssal.chat.domain.model.IncomingTransportPayload
 import com.abyssal.chat.domain.model.MlsInboundEnvelope
 import com.abyssal.chat.domain.model.MlsIncomingFrame
 import com.abyssal.chat.domain.model.IdentityStateSnapshot
-import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
 import com.abyssal.chat.domain.model.PrekeyLease
 import com.abyssal.chat.domain.model.RoomChange
@@ -50,9 +58,6 @@ import org.json.JSONArray
 import okhttp3.OkHttpClient
 import okhttp3.Call
 import okhttp3.Callback
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -83,13 +88,8 @@ internal fun exceedsUtf8ByteLimit(value: String, maxBytes: Int): Boolean {
     return false
 }
 
-internal data class WsTicket(val value: String, val expiresInSec: Int)
-
-internal const val WS_TICKET_MAX_RESPONSE_BYTES = 4 * 1024
 internal const val PURGE_CLOSE_CODE = 4001
 internal const val PURGE_CLOSE_REASON = "purge"
-private const val WS_TICKET_B64_LENGTH = 43
-private val WS_TICKET_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
 private const val TRANSACTION_RETRY_INTERVAL_MS = 3_000L
 private const val TRANSACTION_RECOVERY_TIMEOUT_MS = 30_000L
 internal const val RECONNECT_INITIAL_DELAY_MS = 750L
@@ -205,40 +205,10 @@ internal fun JSONObject.toAcknowledgementResult(): Pair<String, Boolean>? {
 internal fun isPurgeClose(code: Int, reason: String): Boolean =
     code == PURGE_CLOSE_CODE && reason == PURGE_CLOSE_REASON
 
-/** Strict relay ticket schema. Caller owns and must wipe [raw] after this call. */
-internal fun parseWsTicketResponseBody(raw: ByteArray): WsTicket? {
-    if (raw.isEmpty() || raw.size > WS_TICKET_MAX_RESPONSE_BYTES) return null
-    return runCatching {
-        val json = JSONObject(String(raw, StandardCharsets.UTF_8))
-        val keys = json.keys().asSequence().toSet()
-        if (keys != setOf("ticket", "expires_in_sec")) return@runCatching null
-        val ticket = json.get("ticket") as? String
-            ?: return@runCatching null
-        if (ticket.length != WS_TICKET_B64_LENGTH || !WS_TICKET_REGEX.matches(ticket)) {
-            return@runCatching null
-        }
-        val decodedTicket = runCatching { Base64.getUrlDecoder().decode(ticket) }.getOrNull()
-            ?: return@runCatching null
-        val canonicalTicket = try {
-            if (decodedTicket.size != 32) return@runCatching null
-            Base64.getUrlEncoder().withoutPadding().encodeToString(decodedTicket)
-        } finally {
-            decodedTicket.fill(0)
-        }
-        if (canonicalTicket != ticket) return@runCatching null
-        val expires = when (val value = json.get("expires_in_sec")) {
-            is Int -> value
-            is Long -> value.takeIf { it in 1L..30L }?.toInt()
-            else -> null
-        } ?: return@runCatching null
-        if (expires !in 1..30) return@runCatching null
-        WsTicket(ticket, expires)
-    }.getOrNull()
-}
-
 /**
- * Maps a relay HTTP rejection to a terminal transport state, or null when the
- * failure is transient and the transport should retry with backoff.
+ * Maps a relay HTTP rejection of the WebSocket upgrade to a terminal
+ * transport state, or null when the failure is transient and the transport
+ * should retry with backoff.
  */
 internal fun terminalTicketState(code: Int?): String? = when (code) {
     401 -> "SESSION_EXPIRED"
@@ -247,20 +217,14 @@ internal fun terminalTicketState(code: Int?): String? = when (code) {
     else -> null
 }
 
-internal fun websocketUpgradeRequest(endpoint: NodeEndpoint, ticket: String): Request {
-    require(WS_TICKET_REGEX.matches(ticket))
-    return Request.Builder()
-        .url("${endpoint.wsBaseUrl}/v1/ws")
-        .header("Sec-WebSocket-Protocol", "abyssal-v2, ticket.$ticket")
-        .build()
-}
-
 internal class RealChatTransport(
     private val nodeConfigService: INodeConfigService,
     private val client: OkHttpClient,
     private val callFactory: Call.Factory = client,
     private val buildAttestationProvider: BuildAttestationProvider = AndroidBuildAttestationProvider,
-    private val reconnectExecutor: ScheduledExecutorService = newReconnectExecutor()
+    private val reconnectExecutor: ScheduledExecutorService = newReconnectExecutor(),
+    private val controlExchanges: ControlExchanges = UniffiControlExchanges,
+    private val recordLayers: (TransportKeys, String) -> WsRecordLayer = ::UniffiWsRecordLayer
 ) : IChatTransport, IMlsTransport {
     private data class ReconnectIntent(
         val generation: Long,
@@ -407,26 +371,30 @@ internal class RealChatTransport(
             }
             _serverStatus.value = ServerStatus("CONNECTING", session.nodeId, 0)
         }
-        val request = Request.Builder()
-            .url("${session.endpoint.apiBaseUrl}/v1/ws-ticket")
-            .header("Authorization", "Bearer ${session.token}")
-            .header("Cache-Control", "no-store")
-            .header("Pragma", "no-cache")
-            .post(
-                buildAttestation.toJson().toRequestBody(
-                    "application/json; charset=utf-8".toMediaType()
-                )
+        val ticketRequest = try {
+            ControlTicketRequest(
+                apiBaseUrl = session.endpoint.apiBaseUrl,
+                keys = session.transport,
+                platform = buildAttestation.platform,
+                version = buildAttestation.version,
+                buildSignature = buildAttestation.signatureBase64Url,
+                exchanges = controlExchanges
             )
-            .build()
+        } catch (_: Exception) {
+            if (failTicketConnection(generation, session)) scheduleReconnect(generation, session)
+            return
+        }
         val call = try {
-            callFactory.newCall(request)
+            callFactory.newCall(ticketRequest.httpRequest())
         } catch (_: RuntimeException) {
+            ticketRequest.close()
             if (failTicketConnection(generation, session)) scheduleReconnect(generation, session)
             return
         }
         synchronized(connectionLock) {
             if (!isCurrentConnection(generation, session)) {
                 call.cancel()
+                ticketRequest.close()
                 return
             }
             ticketCall = call
@@ -434,6 +402,7 @@ internal class RealChatTransport(
         try {
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    ticketRequest.close()
                     val retry = synchronized(connectionLock) {
                         if (!isCurrentTicket(call, generation, session)) return@synchronized false
                         ticketCall = null
@@ -445,19 +414,17 @@ internal class RealChatTransport(
                 }
 
                 override fun onResponse(call: Call, response: Response) {
-                    if (!isCurrentTicket(call, generation, session)) {
+                    val outcome = try {
+                        if (!isCurrentTicket(call, generation, session)) null
+                        else response.use(ticketRequest::readOutcome)
+                    } finally {
                         response.close()
-                        return
+                        ticketRequest.close()
                     }
-                    val terminalState = terminalTicketState(response.code)
-                    val ticket = response.use { parseWsTicket(it) }
-                    if (ticket == null || !isCurrentTicket(call, generation, session)) {
-                        val retry = failTicketConnection(
-                            generation,
-                            session,
-                            terminalState ?: "DISCONNECTED"
-                        )
-                        if (retry) scheduleReconnect(generation, session)
+                    if (outcome == null) return
+                    if (outcome !is TicketOutcome.Issued || !isCurrentTicket(call, generation, session)) {
+                        val state = (outcome as? TicketOutcome.Terminal)?.state ?: "DISCONNECTED"
+                        if (failTicketConnection(generation, session, state)) scheduleReconnect(generation, session)
                         return
                     }
                     var retry = false
@@ -471,9 +438,8 @@ internal class RealChatTransport(
                             return@synchronized
                         }
                         webSocket = try {
-                            val wsRequest = websocketUpgradeRequest(active.endpoint, ticket.value)
-                            client.newWebSocket(wsRequest, listener(active.nodeId, generation, active))
-                        } catch (_: RuntimeException) {
+                            openSealedSocket(active, generation, outcome.ticket)
+                        } catch (_: Exception) {
                             connecting.set(false)
                             _serverStatus.value = ServerStatus("DISCONNECTED", active.nodeId, 0)
                             retry = true
@@ -485,7 +451,30 @@ internal class RealChatTransport(
             })
         } catch (_: RuntimeException) {
             call.cancel()
+            ticketRequest.close()
             if (failTicketConnection(generation, session)) scheduleReconnect(generation, session)
+        }
+    }
+
+    /**
+     * Opens the v11 socket for [session]. Must be called under [connectionLock].
+     * The returned wrapper is the socket every send site and callback sees; a
+     * frame that does not authenticate fails this socket closed and reconnects.
+     */
+    private fun openSealedSocket(session: NodeSession, generation: Long, ticket: String): WebSocket {
+        val layer = recordLayers(session.transport, ticket)
+        try {
+            val adapter = SealedWebSocketListener(
+                layer = layer,
+                inner = listener(session.nodeId, generation, session)
+            ) { socket ->
+                closeCurrentSocket(socket, session.nodeId, "unauthenticated relay frame")
+            }
+            val raw = client.newWebSocket(sealedWebSocketRequest(session.endpoint.wsBaseUrl), adapter)
+            return adapter.wrap(raw)
+        } catch (error: Exception) {
+            runCatching { layer.close() }
+            throw error
         }
     }
 
@@ -897,27 +886,6 @@ internal class RealChatTransport(
         replay(pendingOutbound)
         replay(pendingAcknowledgements)
         replay(pendingMls)
-    }
-
-    private fun parseWsTicket(response: Response): WsTicket? {
-        if (!response.isSuccessful) return null
-        val cacheControl = response.header("Cache-Control") ?: return null
-        if (!cacheControl.split(',').any { it.trim().equals("no-store", ignoreCase = true) }) {
-            return null
-        }
-        val body = response.body ?: return null
-        if (body.contentLength() > WS_TICKET_MAX_RESPONSE_BYTES) return null
-        // Read at most the limit. Okio's readByteArray(n) demands exactly n bytes and
-        // throws on the (normal) shorter body, which rejected every relay ticket.
-        val raw = BoundedInputReader.read(
-            body.byteStream(),
-            WS_TICKET_MAX_RESPONSE_BYTES.toLong()
-        ) ?: return null
-        return try {
-            parseWsTicketResponseBody(raw)
-        } finally {
-            raw.fill(0)
-        }
     }
 
     private fun isSameSession(actual: NodeSession?, expected: NodeSession): Boolean =

@@ -1,202 +1,224 @@
 package com.abyssal.chat.data.network
 
+import com.abyssal.chat.data.network.v11.AccountBootstrapClient
+import com.abyssal.chat.data.network.v11.ControlExchange
+import com.abyssal.chat.data.network.v11.ControlExchanges
+import com.abyssal.chat.data.network.v11.FakeBootstrapExchanges
+import com.abyssal.chat.data.network.v11.FakeOpaque
+import com.abyssal.chat.data.network.v11.SealedRecordHttp
 import com.abyssal.chat.domain.model.NodeEndpoint
+import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.domain.model.TransportKeys
 import java.io.IOException
-import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
-import org.json.JSONObject
+import okio.Buffer
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.abyssal_core.ControlAttestationInput
+import uniffi.abyssal_core.ControlResponse
 
 class NetworkIdentityServiceTest {
-    @Test
-    fun strictOpaqueStartAcceptsOnlyTypedModeConsistentResponse() {
-        val registration = validOpaqueStart("registration")
-        val validatedRegistration = validateOpaqueStartResponse(registration)
-        assertNotNull(validatedRegistration)
-        assertEquals("registration", validatedRegistration?.mode)
-        assertEquals("node-1", validatedRegistration?.nodeId)
+    private val password get() = "correct horse battery staple".toByteArray()
 
-        val login = validOpaqueStart("login")
-            .put("identity_public_b64", base64(ByteArray(608) { 7 }))
-            .put("identity_prekey_id", "prekey-1")
-            .put("identity_envelope_b64", base64(byteArrayOf(1, 2, 3)))
-        assertNotNull(validateOpaqueStartResponse(login))
+    private fun ByteArray.zeroed() = all { it == 0.toByte() }
 
-        val invalid = listOf(
-            JSONObject(registration.toString()).put("accepted", "true"),
-            JSONObject(registration.toString()).put("handshake_id", "76f1b4b6-6dd8-1352-80b9-76fa0150484c"),
-            JSONObject(registration.toString()).put("node_id", "node 1"),
-            JSONObject(registration.toString()).put("response_b64", "AQID="),
-            JSONObject(registration.toString()).put("challenge_b64", "AQID"),
-            JSONObject(registration.toString()).put("identity_public_b64", 7),
-            JSONObject(login.toString()).put("identity_prekey_id", "bad prekey"),
-            JSONObject(login.toString()).put("unexpected", true)
-        )
-        invalid.forEach { assertNull(validateOpaqueStartResponse(it)) }
-    }
+    private fun endpoint(baseUrl: String) = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
 
-    @Test
-    fun strictAccountFinishBindsModeNodePrekeyAndExactFieldTypes() {
-        val finish = validAccountFinish()
-        val validated = validateAcceptedAccountResponse(
-            finish,
-            expectedNodeId = "node-1",
-            expectedCreated = true,
-            expectedPrekeyId = "prekey-1"
-        )
-        assertNotNull(validated)
-        assertEquals(3, validated?.maxRoomsPerUser)
-        assertEquals(900, validated?.sessionInactivitySec)
+    private suspend fun NetworkIdentityService.enter(
+        baseUrl: String,
+        password: ByteArray = this@NetworkIdentityServiceTest.password,
+        capability: ByteArray = ByteArray(32) { 4 },
+        accountContext: ByteArray = ByteArray(32) { 5 }
+    ) = enterAccount(
+        capability = capability,
+        accountContext = accountContext,
+        expectedNodeId = "node-1",
+        nodePublicKey = ByteArray(32) { 9 },
+        bootstrapPublicKey = ByteArray(32) { 8 },
+        password = password,
+        endpoint = endpoint(baseUrl)
+    )
 
-        val invalid = listOf(
-            JSONObject(finish.toString()).put("accepted", 1),
-            JSONObject(finish.toString()).put("created", "true"),
-            JSONObject(finish.toString()).put("token", "not-a-v4-session-token"),
-            JSONObject(finish.toString()).put("username", "Alice Smith"),
-            JSONObject(finish.toString()).put("max_rooms_per_user", "3"),
-            JSONObject(finish.toString()).put("max_rooms_per_user", 101),
-            JSONObject(finish.toString()).put("session_inactivity_sec", 900.0),
-            JSONObject(finish.toString()).put("session_inactivity_sec", 59),
-            JSONObject(finish.toString()).put("identity_public_b64", "AQID"),
-            JSONObject(finish.toString()).put("unexpected", true)
-        )
-        invalid.forEach { response ->
-            assertNull(
-                validateAcceptedAccountResponse(response, "node-1", true, "prekey-1")
-            )
+    /** Records logout requests and answers them LoggedOut. */
+    private class RecordingControl : ControlExchanges {
+        val loggedOut = mutableListOf<List<Byte>>()
+        override fun issueWsTicket(keys: TransportKeys, attestation: ControlAttestationInput) = error("not used")
+        override fun logout(keys: TransportKeys): ControlExchange {
+            loggedOut += keys.sessionId.toList()
+            return object : ControlExchange {
+                override fun requestBytes() = ByteArray(CONTROL_BYTES) { 1 }
+                override fun openResponse(reply: ByteArray) = ControlResponse.LoggedOut
+                override fun close() = Unit
+            }
         }
-        assertNull(validateAcceptedAccountResponse(finish, "node-2", true, "prekey-1"))
-        assertNull(validateAcceptedAccountResponse(finish, "node-1", false, "prekey-1"))
-        assertNull(validateAcceptedAccountResponse(finish, "node-1", true, "prekey-2"))
-        assertNull(validated?.deviceStorageShare)
     }
 
-    @Test
-    fun deviceStorageShareIsAcceptedOnlyWhenTheRelayAllowsStorage() {
-        val share = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 5 })
-        val allowed = JSONObject(validAccountFinish().toString()).put("device_storage", true).put("device_storage_share_b64", share)
-        val validated = validateAcceptedAccountResponse(allowed, "node-1", true, "prekey-1")
-        assertNotNull(validated)
-        org.junit.Assert.assertArrayEquals(ByteArray(32) { 5 }, validated?.deviceStorageShare)
-
-        assertNull(validateAcceptedAccountResponse(JSONObject(validAccountFinish().toString()).put("device_storage", true), "node-1", true, "prekey-1")?.deviceStorageShare)
-        val invalid = listOf(
-            JSONObject(validAccountFinish().toString()).put("device_storage_share_b64", share),
-            JSONObject(allowed.toString()).put("device_storage", "true"),
-            JSONObject(allowed.toString()).put("device_storage_share_b64", share.dropLast(2)),
-            JSONObject(allowed.toString()).put("device_storage_share_b64", 7)
-        )
-        invalid.forEach { assertNull(validateAcceptedAccountResponse(it, "node-1", true, "prekey-1")) }
-    }
+    private fun fakeService(
+        server: MockWebServer,
+        exchanges: FakeBootstrapExchanges,
+        control: RecordingControl = RecordingControl(),
+        cipher: InMemoryPayloadCipher = InMemoryPayloadCipher()
+    ) = NetworkIdentityService(
+        payloadCipher = cipher,
+        callFactory = OkHttpClient(),
+        bootstrap = AccountBootstrapClient(
+            post = { _, _ -> ByteArray(32) { 1 } },
+            opaque = FakeOpaque(),
+            exchanges = exchanges
+        ),
+        controlExchanges = control
+    ).also { server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(CONTROL_BYTES)))) }
 
     @Test
-    fun opaqueStartNeverSendsPasswordToRelay() = runBlocking {
+    fun accountEntrySendsOnlyOneSealedRecordAndConsumesEverySecret() = runBlocking {
         val server = MockWebServer()
-        server.enqueue(MockResponse().setResponseCode(401).setBody("{}"))
+        server.enqueue(MockResponse().setBody(Buffer().write(ByteArray(4_096) { 0x33 })))
         server.start()
         try {
-            val baseUrl = server.url("/").toString().removeSuffix("/")
             val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
-
-            val password = "correct horse battery staple".toByteArray()
+            val password = password
             val capability = ByteArray(32) { 4 }
             val accountContext = ByteArray(32) { 5 }
-            val result = service.enterAccount(
-                capability = capability,
-                accountContext = accountContext,
-                expectedNodeId = "node-1",
-                password = password,
-                endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
-            )
+
+            val result = service.enter(server.url("/").toString().removeSuffix("/"), password, capability, accountContext)
+
+            // The relay's reply did not open under the sealed exchange: rejected.
+            assertFalse(result.accepted)
+            val request = server.takeRequest()
+            val body = request.body.readByteArray()
+            assertEquals("/v1/bootstrap", request.path)
+            assertEquals("POST", request.method)
+            assertEquals("application/octet-stream", request.getHeader("Content-Type"))
+            assertNull(request.getHeader("Authorization"))
+            assertTrue(body.size > 1_000)
+            val text = String(body, Charsets.ISO_8859_1)
+            assertFalse(text.contains("correct horse battery staple"))
+            assertFalse(text.contains(String(ByteArray(32) { 4 }, Charsets.ISO_8859_1)))
+            assertEquals(1, server.requestCount)
+            assertTrue(password.zeroed() && capability.zeroed() && accountContext.zeroed())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun rejectsAnOversizedReplyWithoutReadingItIntoHeap() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setChunkedBody("x".repeat(SealedRecordHttp.MAX_BOOTSTRAP_REPLY_BYTES.toInt() + 1), 8192))
+        server.start()
+        try {
+            val password = password
+            val result = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
+                .enter(server.url("/").toString().removeSuffix("/"), password)
+            assertFalse(result.accepted)
+            assertTrue(password.zeroed())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun acceptsAConsistentSessionAndHandsOverItsTransportKeys() = runBlocking {
+        val server = MockWebServer().apply { start() }
+        try {
+            val cipher = InMemoryPayloadCipher()
+            val result = fakeService(server, FakeBootstrapExchanges.registering(), cipher = cipher)
+                .enter(server.url("/").toString().removeSuffix("/"))
+
+            assertTrue(result.accepted)
+            assertTrue(result.created)
+            assertEquals("Alice_1", result.username)
+            assertEquals("node-1", result.nodeId)
+            assertEquals(3, result.maxRoomsPerUser)
+            assertEquals(900, result.sessionInactivitySec)
+            assertNotNull(UUID.fromString(result.token))
+            assertArrayEquals(cipher.publicKey(), result.publicKey)
+            assertEquals(cipher.prekeyId(), result.prekeyId)
+            assertArrayEquals(ByteArray(32) { 0x5a }, result.deviceStorageShare)
+            val keys = requireNotNull(result.transport)
+            assertArrayEquals(ByteArray(32) { 9 }, keys.nodePublicKey)
+            assertArrayEquals(ByteArray(32) { 0x51 }, keys.sessionId)
+            assertArrayEquals(ByteArray(32) { 9 }, keys.transportRoot)
+            assertEquals(0, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun logsOutAndWipesASessionItRefuses() = runBlocking {
+        val cases = listOf(
+            "a registration marked as an existing account" to FakeBootstrapExchanges.registering(created = false),
+            "a malformed username" to FakeBootstrapExchanges.registering(username = "Alice Smith"),
+            "a short storage share" to FakeBootstrapExchanges.registering(share = ByteArray(16))
+        )
+        for ((label, exchanges) in cases) {
+            val server = MockWebServer().apply { start() }
+            try {
+                val control = RecordingControl()
+                val cipher = InMemoryPayloadCipher()
+                val result = fakeService(server, exchanges, control, cipher)
+                    .enter(server.url("/").toString().removeSuffix("/"))
+
+                assertFalse(label, result.accepted)
+                assertNull(label, result.transport)
+                assertEquals(label, List<Byte>(32) { 0x51 }, control.loggedOut.single())
+                assertEquals(label, "/v1/control", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+                assertTrue(label, runCatching { cipher.publicKey() }.isFailure)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun revokeSessionLogsOutOverControlAndWipesTheKeys() = runBlocking {
+        val server = MockWebServer().apply { start() }
+        try {
+            val control = RecordingControl()
+            val service = fakeService(server, FakeBootstrapExchanges(), control)
+            val baseUrl = server.url("/").toString().removeSuffix("/")
+            val keys = TransportKeys(ByteArray(32) { 1 }, ByteArray(32) { 2 }, ByteArray(32) { 3 })
+
+            assertTrue(service.revokeSession(NodeSession(endpoint(baseUrl), "local", "node-1", 5, keys)))
 
             val request = server.takeRequest()
-            val body = request.body.readUtf8()
-            assertFalse(result.accepted)
-            assertTrue(request.path == "/v2/account/start")
-            assertTrue(body.contains("registration_request_b64"))
-            assertTrue(body.contains("credential_request_b64"))
-            assertFalse(body.contains("correct horse battery staple"))
-            assertFalse(body.contains("password"))
-            assertTrue(body.contains("capability_b64"))
-            assertTrue(password.all { it == 0.toByte() })
-            assertTrue(capability.all { it == 0.toByte() })
-            assertTrue(accountContext.all { it == 0.toByte() })
+            assertEquals("/v1/control", request.path)
+            assertNull(request.getHeader("Authorization"))
+            assertEquals(List<Byte>(32) { 2 }, control.loggedOut.single())
+            assertTrue(keys.nodePublicKey.zeroed() && keys.sessionId.zeroed() && keys.transportRoot.zeroed())
         } finally {
             server.shutdown()
         }
     }
 
     @Test
-    fun rejectsOversizedAccountResponseWithoutReadingItIntoHeap() = runBlocking {
-        val server = MockWebServer()
-        server.enqueue(
-            MockResponse().setChunkedBody("x".repeat(1_048_577), 8192)
-        )
-        server.start()
-        try {
-            val baseUrl = server.url("/").toString().removeSuffix("/")
-            val service = NetworkIdentityService(OkHttpClient(), InMemoryPayloadCipher())
-
-            val password = "correct horse battery staple".toByteArray()
-            val capability = ByteArray(32) { 4 }
-            val accountContext = ByteArray(32) { 5 }
-            val result = service.enterAccount(
-                capability = capability,
-                accountContext = accountContext,
-                expectedNodeId = "node-1",
-                password = password,
-                endpoint = NodeEndpoint(baseUrl, baseUrl, baseUrl.replace("http", "ws"), "test")
-            )
-
-            assertFalse(result.accepted)
-            assertTrue(password.all { it == 0.toByte() })
-            assertTrue(capability.all { it == 0.toByte() })
-            assertTrue(accountContext.all { it == 0.toByte() })
-        } finally {
-            server.shutdown()
-        }
-    }
-
-    @Test
-    fun cancellationCancelsIdentityCallAndPropagatesCancellation() = runBlocking {
+    fun cancellationCancelsTheBootstrapCallAndPropagates() = runBlocking {
         val factory = IdentityCancellationCallFactory()
         val service = NetworkIdentityService(
             client = OkHttpClient(),
             payloadCipher = InMemoryPayloadCipher(),
             callFactory = factory
         )
-        val endpoint = NodeEndpoint(
-            inputUrl = "http://127.0.0.1",
-            apiBaseUrl = "http://127.0.0.1",
-            wsBaseUrl = "ws://127.0.0.1",
-            displayHost = "test"
-        )
-        val job = launch(Dispatchers.Default) {
-            service.enterAccount(
-                ByteArray(32) { 4 },
-                ByteArray(32) { 5 },
-                "node-1",
-                "correct horse battery staple".toByteArray(),
-                endpoint
-            )
-        }
+        val job = launch(Dispatchers.Default) { service.enter("http://127.0.0.1") }
 
         assertTrue(factory.call.enqueued.await(2, TimeUnit.SECONDS))
         job.cancelAndJoin()
@@ -212,7 +234,7 @@ class NetworkIdentityServiceTest {
     }
 
     private class IdentityCancellationCall : Call {
-        private val request = Request.Builder().url("http://127.0.0.1/account").build()
+        private val request = Request.Builder().url("http://127.0.0.1/v1/bootstrap").build()
         private var callback: Callback? = null
         val enqueued = CountDownLatch(1)
         @Volatile var cancelled = false
@@ -241,35 +263,6 @@ class NetworkIdentityServiceTest {
     }
 
     private companion object {
-        fun validOpaqueStart(mode: String): JSONObject = JSONObject()
-            .put("accepted", true)
-            .put("mode", mode)
-            .put("handshake_id", "76f1b4b6-6dd8-4352-80b9-76fa0150484c")
-            .put("response_b64", "AQID")
-            .put(
-                "challenge_b64",
-                if (mode == "registration") base64(ByteArray(32) { 1 }) else JSONObject.NULL
-            )
-            .put("node_id", "node-1")
-            .put("identity_public_b64", JSONObject.NULL)
-            .put("identity_prekey_id", JSONObject.NULL)
-            .put("identity_envelope_b64", JSONObject.NULL)
-            .put("error", JSONObject.NULL)
-
-        fun validAccountFinish(): JSONObject = JSONObject()
-            .put("accepted", true)
-            .put("created", true)
-            .put("token", "6ba7b810-9dad-41d1-80b4-00c04fd430c8")
-            .put("node_id", "node-1")
-            .put("username", "Alice_1")
-            .put("max_rooms_per_user", 3)
-            .put("session_inactivity_sec", 900)
-            .put("identity_public_b64", base64(ByteArray(608) { 7 }))
-            .put("identity_prekey_id", "prekey-1")
-            .put("identity_envelope_b64", "AQID")
-            .put("error", JSONObject.NULL)
-
-        fun base64(bytes: ByteArray): String =
-            Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        const val CONTROL_BYTES = 4_170
     }
 }

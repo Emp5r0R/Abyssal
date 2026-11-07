@@ -1161,6 +1161,8 @@ class ChatViewModel(
                     capability = verified.capability,
                     accountContext = verified.accountContext,
                     expectedNodeId = verified.nodeId,
+                    nodePublicKey = verified.nodePublicKey,
+                    bootstrapPublicKey = verified.bootstrapPublicKey,
                     password = password,
                     endpoint = endpoint
                 )
@@ -1187,6 +1189,7 @@ class ChatViewModel(
                         return@launch
                     }
                     val token = requireNotNull(result.token)
+                    val transport = requireNotNull(result.transport)
                     val identity = User(
                         username = result.username ?: "AbyssalUser",
                         publicKey = publicKey,
@@ -1198,7 +1201,7 @@ class ChatViewModel(
                     mlsManager = MlsRoomManager(payloadCipher, identity.username, nodeId, publicKey)
                     identityService.setCurrentUser(identity)
                     nodeConfigService.setActiveSession(
-                        NodeSession(endpoint, token, nodeId, result.maxRoomsPerUser)
+                        NodeSession(endpoint, token, nodeId, result.maxRoomsPerUser, transport)
                     )
                     installedSession = true
                     _currentUser.value = identity
@@ -1268,7 +1271,11 @@ class ChatViewModel(
             } finally {
                 verifiedInvite?.destroy()
                 password.fill(0)
-                if (!installedSession) validation?.publicKey?.fill(0)
+                if (!installedSession) {
+                    validation?.publicKey?.fill(0)
+                    validation?.deviceStorageShare?.fill(0)
+                    validation?.transport?.destroy()
+                }
                 _isVerifyingInvite.value = false
                 if (accountEntryJob === currentCoroutineContext()[Job]) {
                     accountEntryJob = null
@@ -2703,15 +2710,24 @@ class ChatViewModel(
         return remoteSession
     }
 
-    private suspend fun logoutLocal(revokeRemote: Boolean = false) {
+    /**
+     * Clears local state, then revokes the relay session when [revokeRemote]
+     * (bounded by [revokeTimeoutMs] when set). Either way the session's
+     * transport keys are wiped: revokeSession wipes them when it finishes.
+     */
+    private suspend fun logoutLocal(revokeRemote: Boolean = false, revokeTimeoutMs: Long? = null) {
         if (voiceRecorder.isRecording || voiceTarget != null) {
             voiceTarget = null
             _voiceRecordingStartedAt.value = null
             voiceRecorder.cancel()
         }
-        val remoteSession = prepareLocalLogout()
-        if (revokeRemote && remoteSession != null) {
-            identityService.revokeSession(remoteSession)
+        val remoteSession = prepareLocalLogout() ?: return
+        when {
+            !revokeRemote -> remoteSession.transport.destroy()
+            revokeTimeoutMs == null -> identityService.revokeSession(remoteSession)
+            else -> withTimeoutOrNull(revokeTimeoutMs) {
+                runCatching { identityService.revokeSession(remoteSession) }
+            } ?: remoteSession.transport.destroy()
         }
     }
 
@@ -3078,13 +3094,7 @@ class ChatViewModel(
     /** Clear local state first, then make a bounded best-effort remote revoke. */
     private suspend fun failClosedAfterAmbiguous() {
         withContext(NonCancellable) {
-            val remoteSession = nodeConfigService.getActiveSession()
-            runCatching { logoutLocal() }
-            if (remoteSession != null) {
-                withTimeoutOrNull(3_000L) {
-                    runCatching { identityService.revokeSession(remoteSession) }
-                }
-            }
+            runCatching { logoutLocal(revokeRemote = true, revokeTimeoutMs = 3_000L) }
         }
     }
 

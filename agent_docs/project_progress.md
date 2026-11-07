@@ -72,6 +72,26 @@ research. Typing indicators are deliberately not built: they leak activity timin
   6. Port the TypeScript integration harness to v11.
   7. Remove v2 account/ticket/logout/attachment routes and client code;
      reconcile README/SECURITY; release as 4.0.
+- Phase 4 status (2026-11-07):
+  - Steps 1-6 done. Web (`31f10b2`) and Android use only v11. The integration
+    harness (`scripts/relay-integration.mjs` with `scripts/lib/relay-v11-client.mjs`)
+    drives the relay only over v11.
+  - Android uploads stream large files through `AttachmentUploadEncryptor`
+    (rust-core): a per-upload seed kept in Rust makes the chunk encryption
+    replayable, so the ciphertext SHA-256 that v3 declares up front is computed
+    in a first pass. A changed chunk is refused before it is sealed.
+    Plaintext sources open at most twice.
+  - Step 7 split: client v2 code is removed, but the relay keeps serving the v2
+    routes in 4.0. Removing them deletes about 55 relay tests that also cover
+    shared claim, capacity, wipe and registration logic. Those must first be
+    ported to the v3 and bootstrap functions (`admit_upload`, `commit_upload`,
+    `reserve_attachment_download_retryable`, `bootstrap_*`), not deleted.
+    Planned for 4.1.
+  - Interim hardening: tickets issued over `/v1/control` are
+    `sealed_transport` and cannot be redeemed through the legacy `abyssal-v2`
+    subprotocol.
+  - No release or deploy happens before the emulator check against a local
+    relay, and a pre-deploy check of the signed 4.0 web bundle and APK.
 
 ## Active Deployment: Protocol-v11 Transport Confidentiality
 

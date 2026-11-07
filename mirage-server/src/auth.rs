@@ -28,6 +28,9 @@ pub(super) struct WsTicket {
     pub(super) session_token: Zeroizing<String>,
     pub(super) expires_at_ms: u64,
     pub(super) client_platform: ClientPlatform,
+    /// Issued over the sealed v11 control channel: redeemable only inside a
+    /// v11 ClientHello, never through the legacy ticket subprotocol.
+    pub(super) sealed_transport: bool,
 }
 
 impl Drop for WsTicket {
@@ -878,6 +881,7 @@ pub(super) async fn issue_ws_ticket(
             session_token,
             expires_at_ms: now.saturating_add(WS_TICKET_TTL_MS),
             client_platform,
+            sealed_transport: false,
         },
     );
     touch_activity(&state).await;
@@ -901,6 +905,15 @@ pub(super) async fn consume_ws_ticket(
     let ticket = {
         let mut tickets = state.ws_tickets.lock().await;
         prune_ws_tickets_locked(&mut tickets, now_ms());
+        // A v11 ticket never downgrades to a plaintext legacy socket. It stays
+        // stored so its own sealed connection attempt can still redeem it.
+        if tickets
+            .get(&digest)
+            .is_none_or(|ticket| ticket.sealed_transport)
+        {
+            digest.zeroize();
+            return None;
+        }
         let (mut stored_digest, ticket) = tickets.remove_entry(&digest)?;
         stored_digest.zeroize();
         digest.zeroize();

@@ -70,6 +70,7 @@ export const uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_b
 export const uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_complete_download: () => number;
 export const uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_delete_attachment: () => number;
 export const uniffi_abyssal_core_checksum_constructor_attachmentclientexchange_release_download: () => number;
+export const uniffi_abyssal_core_checksum_constructor_attachmentuploadencryptor_new: () => number;
 export const uniffi_abyssal_core_checksum_constructor_controlclientexchange_issue_ws_ticket: () => number;
 export const uniffi_abyssal_core_checksum_constructor_controlclientexchange_logout: () => number;
 export const uniffi_abyssal_core_checksum_constructor_e2eesession_create: () => number;
@@ -108,6 +109,9 @@ export const uniffi_abyssal_core_checksum_method_attachmentclientexchange_seal_p
 export const uniffi_abyssal_core_checksum_method_attachmentclientexchange_stream_complete: () => number;
 export const uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_bucket_frame_count: () => number;
 export const uniffi_abyssal_core_checksum_method_attachmentclientexchange_upload_data_frame_count: () => number;
+export const uniffi_abyssal_core_checksum_method_attachmentuploadencryptor_chunk_count: () => number;
+export const uniffi_abyssal_core_checksum_method_attachmentuploadencryptor_ciphertext_len: () => number;
+export const uniffi_abyssal_core_checksum_method_attachmentuploadencryptor_encrypt_chunk: () => number;
 export const uniffi_abyssal_core_checksum_method_controlclientexchange_open_response: () => number;
 export const uniffi_abyssal_core_checksum_method_controlclientexchange_request_bytes: () => number;
 export const uniffi_abyssal_core_checksum_method_e2eesession_commit_outbound: () => number;
@@ -156,6 +160,7 @@ export const uniffi_abyssal_core_fn_constructor_attachmentclientexchange_begin_u
 export const uniffi_abyssal_core_fn_constructor_attachmentclientexchange_complete_download: (a: number, b: number, c: number, d: number, e: number, f: number) => bigint;
 export const uniffi_abyssal_core_fn_constructor_attachmentclientexchange_delete_attachment: (a: number, b: number, c: number, d: number, e: number) => bigint;
 export const uniffi_abyssal_core_fn_constructor_attachmentclientexchange_release_download: (a: number, b: number, c: number, d: number, e: number, f: number) => bigint;
+export const uniffi_abyssal_core_fn_constructor_attachmentuploadencryptor_new: (a: number, b: number, c: number, d: number, e: number, f: bigint, g: number) => bigint;
 export const uniffi_abyssal_core_fn_constructor_controlclientexchange_issue_ws_ticket: (a: number, b: number, c: number, d: number, e: number) => bigint;
 export const uniffi_abyssal_core_fn_constructor_controlclientexchange_logout: (a: number, b: number, c: number, d: number) => bigint;
 export const uniffi_abyssal_core_fn_constructor_e2eesession_create: (a: number, b: number) => bigint;
@@ -163,6 +168,7 @@ export const uniffi_abyssal_core_fn_constructor_e2eesession_recover: (a: number,
 export const uniffi_abyssal_core_fn_constructor_wsclientconnection_new: (a: number, b: number, c: number, d: number, e: number) => bigint;
 export const uniffi_abyssal_core_fn_free_accountbootstrapexchange: (a: bigint, b: number) => void;
 export const uniffi_abyssal_core_fn_free_attachmentclientexchange: (a: bigint, b: number) => void;
+export const uniffi_abyssal_core_fn_free_attachmentuploadencryptor: (a: bigint, b: number) => void;
 export const uniffi_abyssal_core_fn_free_controlclientexchange: (a: bigint, b: number) => void;
 export const uniffi_abyssal_core_fn_free_e2eesession: (a: bigint, b: number) => void;
 export const uniffi_abyssal_core_fn_free_mlsprocessedcontrol: (a: bigint, b: number) => void;
@@ -201,6 +207,9 @@ export const uniffi_abyssal_core_fn_method_attachmentclientexchange_seal_padding
 export const uniffi_abyssal_core_fn_method_attachmentclientexchange_stream_complete: (a: bigint, b: number) => number;
 export const uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_bucket_frame_count: (a: bigint, b: number) => number;
 export const uniffi_abyssal_core_fn_method_attachmentclientexchange_upload_data_frame_count: (a: bigint, b: number) => number;
+export const uniffi_abyssal_core_fn_method_attachmentuploadencryptor_chunk_count: (a: bigint, b: number) => number;
+export const uniffi_abyssal_core_fn_method_attachmentuploadencryptor_ciphertext_len: (a: bigint, b: number) => bigint;
+export const uniffi_abyssal_core_fn_method_attachmentuploadencryptor_encrypt_chunk: (a: number, b: bigint, c: number, d: number, e: number) => void;
 export const uniffi_abyssal_core_fn_method_controlclientexchange_open_response: (a: number, b: bigint, c: number, d: number) => void;
 export const uniffi_abyssal_core_fn_method_controlclientexchange_request_bytes: (a: number, b: bigint, c: number) => void;
 export const uniffi_abyssal_core_fn_method_e2eesession_commit_outbound: (a: bigint, b: number, c: bigint, d: number) => void;
@@ -359,6 +368,7 @@ export const wasmwsclientconnection_openServerHello: (a: number, b: number, c: n
 export const wasmwsclientconnection_ready: (a: number) => number;
 export const wasmwsclientconnection_sealFrame: (a: number, b: number, c: number) => [number, number, number, number];
 export const uniffi_abyssal_core_fn_clone_attachmentclientexchange: (a: bigint, b: number) => bigint;
+export const uniffi_abyssal_core_fn_clone_attachmentuploadencryptor: (a: bigint, b: number) => bigint;
 export const uniffi_abyssal_core_fn_clone_controlclientexchange: (a: bigint, b: number) => bigint;
 export const uniffi_abyssal_core_fn_clone_e2eesession: (a: bigint, b: number) => bigint;
 export const uniffi_abyssal_core_fn_clone_mlsprocessedcontrol: (a: bigint, b: number) => bigint;

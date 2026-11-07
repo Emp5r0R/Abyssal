@@ -7,7 +7,7 @@
 use super::*;
 use abyssal_transport::{
     inspect_ws_client_hello, open_ws_client_hello, seal_ws_server_hello, ConnectionNonce,
-    WsConnectionBinding, WsSealer, WS_CLIENT_HELLO_BYTES,
+    WsConnectionBinding, WsOpener, WsSealer, WS_CLIENT_HELLO_BYTES,
 };
 
 const WS_PROTOCOL_V11: &str = "abyssal-v11";
@@ -437,6 +437,55 @@ pub(super) async fn discard_client_stage(state: &AppState, client_id: Uuid) {
     }
 }
 
+/// What the v11 reader does after one inbound binary record.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum InboundRecord {
+    /// Authenticated and handled.
+    Handled,
+    /// Authenticated, but the relay refused the frame (unauthorized, stale or
+    /// malformed content). It is dropped and the socket stays open, as on
+    /// every transport: one refused frame must not disconnect a client.
+    Refused,
+    /// The rate limit, record layer or transport framing failed: close.
+    Fatal,
+}
+
+/// Opens, validates and dispatches one inbound v11 record.
+pub(super) async fn handle_inbound_v11_record(
+    state: &AppState,
+    client_id: Uuid,
+    opener: &mut WsOpener,
+    bytes: &[u8],
+) -> InboundRecord {
+    if bytes.len() > CONTROL_TRANSPORT_MAX_BUCKET
+        || check_ws_frame_allowed(state, client_id, bytes.len())
+            .await
+            .is_err()
+    {
+        return InboundRecord::Fatal;
+    }
+    let Ok(plaintext) = opener.open(WS_FRAME_AAD, bytes) else {
+        return InboundRecord::Fatal;
+    };
+    let Ok(text) = String::from_utf8(plaintext.to_vec()).map(Zeroizing::new) else {
+        return InboundRecord::Fatal;
+    };
+    if validate_inbound_transport_size_before_parse(&text).is_err() {
+        return InboundRecord::Fatal;
+    }
+    let Ok(inner) = strip_inbound_control_transport(&text).map(Zeroizing::new) else {
+        return InboundRecord::Fatal;
+    };
+    if handle_frame(state, client_id, inner.as_str())
+        .await
+        .is_err()
+    {
+        debug!("dropping refused frame");
+        return InboundRecord::Refused;
+    }
+    InboundRecord::Handled
+}
+
 async fn socket_loop_v11(state: AppState, socket: WebSocket) {
     let Some(handshake_permit) = state.ws_handshake_workers.clone().try_acquire_owned().ok() else {
         debug!("websocket_upgrade_rejected reason=handshake_capacity");
@@ -684,12 +733,11 @@ async fn socket_loop_v11(state: AppState, socket: WebSocket) {
             result = stream.next() => {
                 match result {
                     Some(Ok(Message::Binary(bytes))) => {
-                        if bytes.len() > CONTROL_TRANSPORT_MAX_BUCKET || check_ws_frame_allowed(&state, client_id, bytes.len()).await.is_err() { break; }
-                        let plaintext = match opener.open(WS_FRAME_AAD, &bytes) { Ok(value) => value, Err(_) => break };
-                        let text = match String::from_utf8(plaintext.to_vec()) { Ok(value) => Zeroizing::new(value), Err(_) => break };
-                        if validate_inbound_transport_size_before_parse(&text).is_err() { break; }
-                        let inner = match strip_inbound_control_transport(&text) { Ok(inner) => Zeroizing::new(inner), Err(_) => break };
-                        if handle_frame(&state, client_id, inner.as_str()).await.is_err() { break; }
+                        if handle_inbound_v11_record(&state, client_id, &mut opener, &bytes).await
+                            == InboundRecord::Fatal
+                        {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Text(_))) => break,
                     Some(Ok(Message::Close(_))) | None => break,

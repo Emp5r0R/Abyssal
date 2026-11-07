@@ -11,7 +11,7 @@ import okhttp3.CacheControl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import uniffi.abyssal_core.parseInviteCapsule
-import uniffi.abyssal_core.verifyInviteNodeDescriptor
+import uniffi.abyssal_core.verifyTransportNodeDescriptor
 
 class InviteBootstrapService(
     client: OkHttpClient,
@@ -23,6 +23,7 @@ class InviteBootstrapService(
         var nodePublicKey = ByteArray(0)
         var capability = ByteArray(0)
         var accountContext = ByteArray(0)
+        var bootstrapPublicKey = ByteArray(0)
         try {
             val parsed = parseInviteCapsule(
                 inviteText = invite,
@@ -39,17 +40,21 @@ class InviteBootstrapService(
             require(endpoint.apiBaseUrl == parsed.nodeUrl)
             val descriptor = fetchDescriptor(endpoint.apiBaseUrl)
                 ?: throw IllegalArgumentException("Unable to verify node")
-            try {
-                verifyInviteNodeDescriptor(descriptor, nodePublicKey, endpoint.apiBaseUrl)
+            // The signed descriptor names the relay's bootstrap key, to which
+            // account entry is sealed.
+            bootstrapPublicKey = try {
+                verifyTransportNodeDescriptor(descriptor, nodePublicKey, endpoint.apiBaseUrl).bootstrapPublicKey
             } finally {
                 descriptor.fill(0)
             }
+            require(bootstrapPublicKey.size == BOOTSTRAP_PUBLIC_KEY_BYTES)
             val result = VerifiedInvite(
                 nodeId = parsed.nodeId,
                 nodePublicKey = nodePublicKey.copyOf(),
                 endpoint = endpoint,
                 capability = capability.copyOf(),
-                accountContext = accountContext.copyOf()
+                accountContext = accountContext.copyOf(),
+                bootstrapPublicKey = bootstrapPublicKey.copyOf()
             )
             Result.success(result)
         } catch (error: CancellationException) {
@@ -60,6 +65,7 @@ class InviteBootstrapService(
             nodePublicKey.fill(0)
             capability.fill(0)
             accountContext.fill(0)
+            bootstrapPublicKey.fill(0)
         }
     }
 
@@ -90,5 +96,6 @@ class InviteBootstrapService(
         const val NODE_PUBLIC_KEY_BYTES = 32
         const val CAPABILITY_BYTES = 32
         const val ACCOUNT_CONTEXT_BYTES = 32
+        const val BOOTSTRAP_PUBLIC_KEY_BYTES = 32
     }
 }

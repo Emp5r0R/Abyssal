@@ -105,7 +105,7 @@ coproc RELAY_PROCESS {
   ABYSSAL_SESSION_INACTIVITY_MINUTES=5 \
   ABYSSAL_WEB_ROOT="$TMP_DIR/no-web" \
   RUST_LOG="${RUST_LOG:-mirage_server=warn}" \
-    "$ROOT_DIR/target/debug/mirage-server" 2>&1
+    exec "$ROOT_DIR/target/debug/mirage-server" 2>&1
 }
 RELAY_PID="$RELAY_PROCESS_PID"
 RELAY_FD="${RELAY_PROCESS[0]}"

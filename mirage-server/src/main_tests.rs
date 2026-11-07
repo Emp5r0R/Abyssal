@@ -688,18 +688,23 @@ async fn authenticated_control_rejections_are_decryptable_and_specific() {
 
     // The same account unbound is issued a ticket.
     let state = test_state();
-    assert!(matches!(
+    let abyssal_core::transport_protocol::ControlResponse::WsTicket { ticket, .. } =
         sealed_web_ticket_response(
             &state,
             "open-control-session",
             "open-control-code",
             [0x95; 32],
             [0x96; 32],
-            None
+            None,
         )
-        .await,
-        abyssal_core::transport_protocol::ControlResponse::WsTicket { .. }
-    ));
+        .await
+    else {
+        panic!("unbound account was refused a ticket");
+    };
+    // A sealed-transport ticket never opens a plaintext legacy socket, and the
+    // refused attempt leaves it for its own sealed connection.
+    assert!(consume_ws_ticket(&state, &ticket).await.is_none());
+    assert_eq!(state.ws_tickets.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -2879,6 +2884,67 @@ async fn full_data_queue_does_not_block_global_wipe_control_channel() {
 }
 
 #[tokio::test]
+async fn v11_reader_drops_refused_frames_but_closes_on_broken_records() {
+    use abyssal_transport::{ConnectionNonce, WsConnectionBinding};
+    let state = test_state();
+    add_test_account(&state, "v11-reader", "Alice").await;
+    let (client_id, _rx) = add_test_client(&state, "v11-reader", "Alice").await;
+    let root = [0x41_u8; 32];
+    let binding = || {
+        WsConnectionBinding::new(
+            [0x42; 32],
+            ConnectionNonce::new([0x43; 32]).unwrap(),
+            ConnectionNonce::new([0x44; 32]).unwrap(),
+        )
+        .unwrap()
+    };
+    let mut client = binding().into_client(&root).unwrap();
+    let mut server = binding().into_server(&root).unwrap();
+    let seal = |sealer: &mut abyssal_transport::WsSealer, inner: &str| {
+        let padded = pad_control_transport_frame(inner, WS_MAX_FRAME_BYTES).unwrap();
+        sealer
+            .seal(b"ABYSSAL-TRANSPORT-V11-WS-FRAME", padded.as_bytes())
+            .unwrap()
+    };
+
+    // An authenticated frame for a chat this account cannot join is refused,
+    // and the reader keeps the socket and its record counter in step.
+    let refused = seal(
+        &mut client.sealer,
+        r#"{"type":"join","chat_id":"dm_not_a_member"}"#,
+    );
+    assert_eq!(
+        transport::handle_inbound_v11_record(&state, client_id, &mut server.opener, &refused).await,
+        transport::InboundRecord::Refused
+    );
+    let refused_again = seal(
+        &mut client.sealer,
+        r#"{"type":"join","chat_id":"dm_not_a_member"}"#,
+    );
+    assert_eq!(
+        transport::handle_inbound_v11_record(&state, client_id, &mut server.opener, &refused_again)
+            .await,
+        transport::InboundRecord::Refused
+    );
+
+    // A replayed record, an altered record or a plaintext frame closes it.
+    assert_eq!(
+        transport::handle_inbound_v11_record(&state, client_id, &mut server.opener, &refused).await,
+        transport::InboundRecord::Fatal
+    );
+    let mut altered = seal(
+        &mut client.sealer,
+        r#"{"type":"join","chat_id":"dm_not_a_member"}"#,
+    );
+    let last = altered.len() - 1;
+    altered[last] ^= 1;
+    assert_eq!(
+        transport::handle_inbound_v11_record(&state, client_id, &mut server.opener, &altered).await,
+        transport::InboundRecord::Fatal
+    );
+}
+
+#[tokio::test]
 async fn v11_presence_broadcast_reaches_existing_clients_and_snapshot_supersedes_raced_copy() {
     let state = test_state();
     add_test_account(&state, "presence-existing", "Alice").await;
@@ -4945,6 +5011,7 @@ async fn websocket_ticket_expiry_is_pruned_before_session_validation() {
             session_token: Zeroizing::new("expired-session".to_string()),
             expires_at_ms: now_ms().saturating_sub(1),
             client_platform: ClientPlatform::Web,
+            sealed_transport: false,
         },
     );
     assert!(
@@ -4969,6 +5036,7 @@ async fn websocket_ticket_cap_fails_closed_without_eviction() {
                 session_token: Zeroizing::new(format!("other-session-{index}")),
                 expires_at_ms: now_ms().saturating_add(WS_TICKET_TTL_MS),
                 client_platform: ClientPlatform::Web,
+                sealed_transport: false,
             },
         );
     }

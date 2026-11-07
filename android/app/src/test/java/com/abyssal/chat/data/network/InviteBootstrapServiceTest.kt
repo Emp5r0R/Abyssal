@@ -29,7 +29,7 @@ class InviteBootstrapServiceTest {
 
     @Test
     fun verifiesExactSignedDescriptorBeforeReturningCapability() = runBlocking {
-        val factory = StaticCallFactory(DESCRIPTOR_HEX.hexBytes())
+        val factory = StaticCallFactory(TRANSPORT_DESCRIPTOR_HEX.hexBytes())
         val service = InviteBootstrapService(
             client = OkHttpClient(),
             nodeConfigService = InMemoryNodeConfigService(),
@@ -41,20 +41,25 @@ class InviteBootstrapServiceTest {
         assertEquals(NODE_ID, verified.nodeId)
         assertEquals("https://node.example.com", verified.endpoint.apiBaseUrl)
         assertArrayEquals(ByteArray(32) { 0x22 }, verified.capability)
+        // Account entry is sealed to the bootstrap key the signed descriptor names.
+        assertArrayEquals(ByteArray(32) { 0x33 }, verified.bootstrapPublicKey)
         assertEquals("https://node.example.com/v1/node", factory.request?.url.toString())
         assertEquals("application/cbor", factory.request?.header("Accept"))
         verified.destroy()
         assertTrue(verified.capability.all { it == 0.toByte() })
         assertTrue(verified.nodePublicKey.all { it == 0.toByte() })
+        assertTrue(verified.bootstrapPublicKey.all { it == 0.toByte() })
     }
 
     @Test
     fun rejectsTamperedOversizedAndRedirectedDescriptors() = runBlocking {
-        val tampered = DESCRIPTOR_HEX.hexBytes().also { it[it.lastIndex] = (it.last() xor 1) }
+        val tampered = TRANSPORT_DESCRIPTOR_HEX.hexBytes().also { it[it.lastIndex] = (it.last() xor 1) }
         assertTrue(service(StaticCallFactory(tampered)).verify(DEEP_LINK).isFailure)
+        // A pre-v11 descriptor names no bootstrap key, so sign-in cannot start.
+        assertTrue(service(StaticCallFactory(DESCRIPTOR_HEX.hexBytes())).verify(DEEP_LINK).isFailure)
         assertTrue(service(StaticCallFactory(ByteArray(1_025))).verify(DEEP_LINK).isFailure)
         assertTrue(
-            service(StaticCallFactory(DESCRIPTOR_HEX.hexBytes(), redirected = true))
+            service(StaticCallFactory(TRANSPORT_DESCRIPTOR_HEX.hexBytes(), redirected = true))
                 .verify(DEEP_LINK)
                 .isFailure
         )
@@ -124,5 +129,7 @@ class InviteBootstrapServiceTest {
         const val ACCOUNT_CONTEXT_HEX = "f5145cdbee41235643f64efca7a605d19ebce805cdb66295ff479414856f2734"
         const val DEEP_LINK = "abyssal:invite:glh3igFwb3JnLmFieXNzYWwuY2hhdAFYINBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3gYMBcG5vZGUuZXhhbXBsZS5jb20ZAbtYICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiCQoAGn0rdQBYQDgZJxVYJlrtgAJBj4VbdykqYpymbDWTNY0Uz-18fOOxGzi6fwKTPzEnVkJ6QldbfyY0pl1JJchNJv3TknkT-Qs"
         const val DESCRIPTOR_HEX = "8258508801706f72672e6162797373616c2e636861745820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737818301706e6f64652e6578616d706c652e636f6d1901bb01090a00584011d674f2075930853f2ae2ea008d7787de469c3d1e954ea8aea6ae5a19e31a2c7d790ce0c473036e3bb016c3bc50c96e85b214659d994da7a8a43dfcff383401"
+        /** The v11 descriptor for the same node, with bootstrap key 0x33 x 32 (pinned in abyssal-invite/tests/capsule.rs). */
+        const val TRANSPORT_DESCRIPTOR_HEX = "8258738a02706f72672e6162797373616c2e636861745820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873758203333333333333333333333333333333333333333333333333333333333333333818301706e6f64652e6578616d706c652e636f6d1901bb01090b0a00584005dd7bd4584b58cc7441ccd9a008cc5d91025970fd1eda173466dc7bc163d0e3be5f4083328ca7f740fd388c333fd39c31afd29bf609791d8257444133728308"
     }
 }

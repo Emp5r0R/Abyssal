@@ -604,6 +604,7 @@ async fn issue_ws_ticket_for_transport(
             session_token: Zeroizing::new(token.to_owned()),
             expires_at_ms: now.saturating_add(WS_TICKET_TTL_MS),
             client_platform,
+            sealed_transport: true,
         },
     );
     drop(tickets);

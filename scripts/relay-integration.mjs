@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { createHash, randomFillSync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { attachmentUploadEnvelope, decodeAttachmentUploadResponse } from "../apps/web/src/transport/attachmentUploadEnvelope.ts";
+import * as abyssalCore from "../apps/web/src/generated/abyssal_core/abyssal_core.js";
+import {
+  AttachmentKind,
+  BootstrapKind,
+  ControlKind,
+  v11Client,
+} from "./lib/relay-v11-client.mjs";
 import {
   decryptAttachment,
   encryptAttachment,
   initSync,
-  opaqueClientFinishLogin,
-  opaqueClientFinishRegistration,
-  opaqueClientStart,
   parseInviteCapsule,
-  verifyInviteNodeDescriptor,
-  WasmE2eeSession,
+  verifyTransportNodeDescriptor,
 } from "../apps/web/src/generated/abyssal_core/abyssal_core.js";
 
 initSync({
@@ -30,10 +32,9 @@ assert.ok(aliceInvite, "ABYSSAL_TEST_INVITE_A is required");
 assert.ok(bobInvite, "ABYSSAL_TEST_INVITE_B is required");
 assert.match(buildSignatureB64 ?? "", /^[A-Za-z0-9_-]{86}$/);
 const encoder = new TextEncoder();
-const uploadEnvelope = (chatId, messageId, encrypted, oneTime = false) => attachmentUploadEnvelope({
-  chat_id: chatId, message_id: messageId, media_type: "FILE",
-  one_time: oneTime, delete_after_download: oneTime, ttl_sec: 0,
-}, encrypted);
+// Every relay request below goes through the sealed protocol-v11 routes.
+const v11 = v11Client(abyssalCore, baseUrl);
+const WEB_ATTESTATION = Object.freeze({ platform: "web", version: "2.2.0", buildSignatureB64 });
 const decoder = new TextDecoder();
 const RESULT_TIMEOUT_MS = 5_000;
 const MAX_PENDING_RESULT_WAITERS = 256;
@@ -714,274 +715,109 @@ async function verifyIntegrationNode(parsed) {
   const descriptor = new Uint8Array(await response.arrayBuffer());
   try {
     assert.ok(descriptor.byteLength > 0 && descriptor.byteLength <= 1024);
-    verifyInviteNodeDescriptor(descriptor, new Uint8Array(parsed.node_public_key), parsed.node_url);
+    // The signed descriptor names the bootstrap key that account entry is sealed to.
+    const bootstrapKey = verifyTransportNodeDescriptor(descriptor, new Uint8Array(parsed.node_public_key), parsed.node_url);
+    assert.equal(bootstrapKey.byteLength, 32);
+    return bootstrapKey;
   } finally {
     descriptor.fill(0);
   }
 }
 
+let bootstrapPublicKey = null;
+
+/** The invite's fields as the v11 client takes them. */
+function integrationInvite(invite) {
+  const parsed = parseIntegrationInvite(invite);
+  assert.ok(bootstrapPublicKey, "verify the node before signing in");
+  return {
+    nodeId: parsed.node_id,
+    nodePublicKey: new Uint8Array(parsed.node_public_key),
+    capability: new Uint8Array(parsed.capability),
+    accountContext: new Uint8Array(parsed.account_context),
+    bootstrapPublicKey,
+  };
+}
+
+function wipeInvite(invite) {
+  invite.nodePublicKey.fill(0);
+  invite.capability.fill(0);
+  invite.accountContext.fill(0);
+}
+
 async function register(invite, password) {
   const passwordBytes = encoder.encode(password);
-  const parsed = parseIntegrationInvite(invite);
-  let opaque;
-  let identity;
-  let context = new Uint8Array(0);
-  let challenge = new Uint8Array(0);
-  let exportKey = new Uint8Array(0);
-  let registrationUpload = new Uint8Array(0);
-  let identityPublic = new Uint8Array(0);
-  let identityEnvelope = new Uint8Array(0);
-  let identityProof = new Uint8Array(0);
-  let response = new Uint8Array(0);
-  let registrationState = new Uint8Array(0);
-  let finished;
-  let account;
+  const parsed = integrationInvite(invite);
   try {
-    opaque = JSON.parse(opaqueClientStart(passwordBytes));
-    const startRequest = {
-      capability_b64: encode(parsed.capability),
-      registration_request_b64: encode(opaque.registration_request),
-      credential_request_b64: encode(opaque.credential_request),
-    };
-    assert.equal(JSON.stringify(startRequest).includes(password), false);
-    const startResponse = await fetch(`${baseUrl}/v2/account/start`, {
-      method: "POST",
-      cache: "no-store",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(startRequest),
-    });
-    assert.equal(startResponse.status, 200);
-    assert.match(startResponse.headers.get("cache-control") ?? "", /no-store/);
-    const start = await startResponse.json();
-    assert.equal(start.mode, "registration");
-    assert.equal(typeof start.node_id, "string");
-    assert.equal(typeof start.handshake_id, "string");
-    assert.equal(typeof start.challenge_b64, "string");
-    challenge = decode(start.challenge_b64);
-    assert.equal(challenge.byteLength, 32);
-
-    response = decode(start.response_b64);
-    registrationState = new Uint8Array(opaque.registration_state);
-    finished = JSON.parse(opaqueClientFinishRegistration(
-      passwordBytes,
-      registrationState,
-      response,
-    ));
-    exportKey = new Uint8Array(finished.export_key);
-    registrationUpload = new Uint8Array(finished.registration_upload);
-    identity = WasmE2eeSession.create(exportKey);
-    assert.equal(start.node_id, parsed.node_id);
-    context = new Uint8Array(parsed.account_context);
-    identityPublic = identity.publicKey();
-    assert.equal(identityPublic.byteLength, IDENTITY_PUBLIC_BYTES_V9);
-    const identityPrekeyId = identity.prekeyId();
-    identityEnvelope = identity.sealIdentity(exportKey, context);
-    identityProof = identity.signRegistrationIdentityProof(
-      start.node_id,
-      start.handshake_id,
-      challenge,
-      registrationUpload,
-      identityPublic,
-      identityPrekeyId,
-      identityEnvelope,
-    );
-    assert.equal(identityProof.byteLength, 64);
-    const finishBody = {
-      handshake_id: start.handshake_id,
-      registration_upload_b64: encode(registrationUpload),
-      identity_public_b64: encode(identityPublic),
-      identity_prekey_id: identityPrekeyId,
-      identity_envelope_b64: encode(identityEnvelope),
-      identity_proof_b64: encode(identityProof),
-    };
-    assert.equal(JSON.stringify(finishBody).includes(password), false);
-    const finishResponse = await fetch(`${baseUrl}/v2/account/finish`, {
-      method: "POST",
-      cache: "no-store",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(finishBody),
-    });
-    assert.equal(finishResponse.status, 200);
-    account = await finishResponse.json();
-    assert.equal(account.accepted, true);
-    assert.ok(account.token);
+    const account = await v11.signIn(parsed, passwordBytes, { expectRegistration: true });
+    assert.equal(account.kind, BootstrapKind.Session);
+    assert.equal(account.created, true);
     assert.match(account.username, /^acct_[0-9a-f]{32}$/u);
-    assert.equal(account.identity_public_b64, encode(identityPublic));
-    assert.equal(account.identity_prekey_id, identityPrekeyId);
-    return { ...account, identity };
-  } catch (error) {
-    identity?.free();
-    throw error;
+    assert.deepEqual(account.identityPublic, account.identity.publicKey());
+    assert.equal(account.identityPublic.byteLength, IDENTITY_PUBLIC_BYTES_V9);
+    assert.equal(account.identityPrekeyId, account.identity.prekeyId());
+    assert.equal(account.keys.sessionId.byteLength, 32);
+    assert.equal(account.keys.transportRoot.byteLength, 32);
+    return account;
   } finally {
     passwordBytes.fill(0);
-    context.fill(0);
-    challenge.fill(0);
-    response.fill(0);
-    registrationState.fill(0);
-    exportKey.fill(0);
-    registrationUpload.fill(0);
-    identityPublic.fill(0);
-    identityEnvelope.fill(0);
-    identityProof.fill(0);
-    finished?.export_key?.fill?.(0);
-    finished?.registration_upload?.fill?.(0);
-    if (opaque) {
-      opaque.registration_state.fill(0);
-      opaque.registration_request.fill(0);
-      opaque.login_state.fill(0);
-      opaque.credential_request.fill(0);
-    }
-    parsed.capability.fill(0);
-    parsed.account_context.fill(0);
-    parsed.node_public_key.fill(0);
+    wipeInvite(parsed);
   }
 }
 
-async function opaqueStartStatus(invite, password) {
-  const parsed = parseIntegrationInvite(invite);
+/** The first bootstrap reply's kind; the relay cannot judge a password at the start. */
+async function bootstrapStartKind(invite, password) {
+  const parsed = integrationInvite(invite);
   const passwordBytes = encoder.encode(password);
-  const opaque = JSON.parse(opaqueClientStart(passwordBytes));
-  passwordBytes.fill(0);
-  const response = await fetch(`${baseUrl}/v2/account/start`, {
-    method: "POST",
-    cache: "no-store",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      capability_b64: encode(parsed.capability),
-      registration_request_b64: encode(opaque.registration_request),
-      credential_request_b64: encode(opaque.credential_request),
-    }),
-  });
-  opaque.registration_state.fill(0);
-  opaque.registration_request.fill(0);
-  opaque.login_state.fill(0);
-  opaque.credential_request.fill(0);
-  parsed.capability.fill(0);
-  parsed.account_context.fill(0);
-  parsed.node_public_key.fill(0);
-  return response.status;
-}
-
-/** Full OPAQUE login over the HTTP account path; returns the finish status. */
-async function loginStatus(invite, password) {
-  const parsed = parseIntegrationInvite(invite);
-  const passwordBytes = encoder.encode(password);
-  const opaque = JSON.parse(opaqueClientStart(passwordBytes));
   try {
-    const startResponse = await fetch(`${baseUrl}/v2/account/start`, {
-      method: "POST",
-      cache: "no-store",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        capability_b64: encode(parsed.capability),
-        registration_request_b64: encode(opaque.registration_request),
-        credential_request_b64: encode(opaque.credential_request),
-      }),
-    });
-    assert.equal(startResponse.status, 200);
-    const start = await startResponse.json();
-    assert.equal(start.mode, "login");
-    let finalization;
-    try {
-      finalization = new Uint8Array(JSON.parse(opaqueClientFinishLogin(
-        passwordBytes,
-        new Uint8Array(opaque.login_state),
-        decode(start.response_b64),
-      )).credential_finalization);
-    } catch {
-      // A wrong password fails on the client; send a junk finalization so the relay rejects it too.
-      finalization = randomFillSync(new Uint8Array(64));
-    }
-    const finishResponse = await fetch(`${baseUrl}/v2/account/finish`, {
-      method: "POST",
-      cache: "no-store",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        handshake_id: start.handshake_id,
-        credential_finalization_b64: encode(finalization),
-      }),
-    });
-    finalization.fill(0);
-    return finishResponse.status;
+    return await v11.startKind(parsed, passwordBytes);
   } finally {
     passwordBytes.fill(0);
-    opaque.registration_state.fill(0);
-    opaque.registration_request.fill(0);
-    opaque.login_state.fill(0);
-    opaque.credential_request.fill(0);
-    parsed.capability.fill(0);
-    parsed.account_context.fill(0);
-    parsed.node_public_key.fill(0);
+    wipeInvite(parsed);
   }
 }
 
-function requestWsTicketResponse(account) {
-  return fetch(`${baseUrl}/v1/ws-ticket`, {
-    method: "POST",
-    cache: "no-store",
-    headers: { authorization: `Bearer ${account.token}`, "content-type": "application/json" },
-    body: JSON.stringify({ platform: "web", version: "2.2.0", build_signature_b64: buildSignatureB64 }),
-  });
+/** A full OPAQUE login over the sealed bootstrap; returns the final reply kind. */
+async function loginKind(invite, password) {
+  const parsed = integrationInvite(invite);
+  const passwordBytes = encoder.encode(password);
+  try {
+    const result = await v11.signIn(parsed, passwordBytes, { expectRegistration: false });
+    result.identity?.free();
+    return result.kind;
+  } finally {
+    passwordBytes.fill(0);
+    wipeInvite(parsed);
+  }
 }
 
 async function requestWsTicket(account) {
-  const response = await fetch(`${baseUrl}/v1/ws-ticket`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    headers: {
-      authorization: `Bearer ${account.token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      platform: "web",
-      version: "2.2.0",
-      build_signature_b64: buildSignatureB64,
-    }),
-  });
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("cache-control") ?? "", /no-store/);
-  const payload = await response.json();
-  assert.deepEqual(Object.keys(payload).sort(), ["expires_in_sec", "ticket"]);
-  assert.match(payload.ticket, /^[A-Za-z0-9_-]{43}$/);
-  assert.ok(Number.isInteger(payload.expires_in_sec));
-  assert.ok(payload.expires_in_sec >= 1 && payload.expires_in_sec <= 30);
-  return payload.ticket;
+  const reply = await v11.issueTicket(account, WEB_ATTESTATION);
+  assert.equal(reply.kind, ControlKind.WsTicket);
+  assert.match(reply.ticket, /^[A-Za-z0-9_-]{43}$/);
+  assert.ok(Number.isInteger(reply.expiresInSec));
+  assert.ok(reply.expiresInSec >= 1 && reply.expiresInSec <= 30);
+  return reply.ticket;
 }
 
 async function expectBuildAdmissionRejected(account) {
-  const response = await fetch(`${baseUrl}/v1/ws-ticket`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    headers: {
-      authorization: `Bearer ${account.token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      platform: "web",
-      version: "2.0.0",
-      build_signature_b64: buildSignatureB64,
-    }),
-  });
-  assert.equal(response.status, 426);
-  assert.equal(await response.text(), "");
+  const reply = await v11.issueTicket(account, { ...WEB_ATTESTATION, version: "2.0.0" });
+  assert.equal(reply.kind, ControlKind.BuildRejected);
 }
 
-function connectWithTicket(ticket, expectedNodeId) {
+function connectWithTicket(account, ticket) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(
-      `${baseUrl.replace(/^http/, "ws")}/v1/ws`,
-      ["abyssal-v2", `ticket.${ticket}`],
-    );
+    const socket = new v11.SealedSocket(account, ticket);
     const timeout = setTimeout(() => reject(new Error("WebSocket connection timed out")), 5_000);
     socket.addEventListener("open", () => {
       clearTimeout(timeout);
-      installDirectoryTracker(socket, expectedNodeId);
+      installDirectoryTracker(socket, account.node_id);
       installMlsTracker(socket);
       resolve(socket);
+    }, { once: true });
+    socket.addEventListener("close", (event) => {
+      clearTimeout(timeout);
+      reject(new Error(`WebSocket closed before its handshake: ${event.code}`));
     }, { once: true });
     socket.addEventListener("error", (event) => {
       clearTimeout(timeout);
@@ -996,7 +832,27 @@ function connectWithTicket(ticket, expectedNodeId) {
 }
 
 async function connect(account) {
-  return connectWithTicket(await requestWsTicket(account), account.node_id);
+  return connectWithTicket(account, await requestWsTicket(account));
+}
+
+/** A sealed socket the relay must refuse (for example, a ticket already used). */
+function expectSealedSocketRejected(account, ticket) {
+  return new Promise((resolve, reject) => {
+    const socket = new v11.SealedSocket(account, ticket);
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new Error("Expected sealed socket rejection timed out"));
+    }, 5_000);
+    socket.addEventListener("open", () => {
+      clearTimeout(timeout);
+      socket.close();
+      reject(new Error("Sealed socket unexpectedly accepted"));
+    }, { once: true });
+    socket.addEventListener("close", () => {
+      clearTimeout(timeout);
+      resolve();
+    }, { once: true });
+  });
 }
 
 function expectWebSocketRejected(protocols) {
@@ -2053,16 +1909,11 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
     const attachmentKey = new Uint8Array(encryptedAttachment.key);
     const attachmentBlob = new Uint8Array(encryptedAttachment.blob);
     try {
-      const uploadResponse = await fetch(
-        `${baseUrl}/v2/attachment`,
-        { method: "POST", headers: { authorization: `Bearer ${alice.token}` }, body: uploadEnvelope(roomId, attachmentMessageId, attachmentBlob) },
-      );
-      assert.equal(uploadResponse.status, 200);
-      const upload = await uploadResponse.json();
-      assert.equal(decodeAttachmentUploadResponse(upload), upload.attachment_id);
-      assert.equal(upload.accepted, true);
-      const staged = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
-      assert.equal(staged.status, 404, "staged MLS attachment must not be downloadable");
+      const uploaded = await v11.uploadAttachment(alice, { chatId: roomId, messageId: attachmentMessageId }, attachmentBlob);
+      assert.equal(uploaded.kind, AttachmentKind.UploadAccepted);
+      const upload = { attachment_id: uploaded.attachmentId };
+      const staged = await v11.downloadAttachment(bob, upload.attachment_id);
+      assert.equal(staged.kind, AttachmentKind.Failure, "staged MLS attachment must not be downloadable");
       const keyB64 = encode(attachmentKey);
       const metadata = encoder.encode(JSON.stringify({
         kind: "attachment", id: attachmentMessageId, attachment_id: upload.attachment_id,
@@ -2071,9 +1922,10 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
       }));
       const frame = await sendAliceApplication(metadata, attachmentMessageId);
       assert.equal(JSON.stringify(frame).includes(keyB64), false, "attachment key must stay inside E2EE application ciphertext");
-      const downloaded = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
-      assert.equal(downloaded.status, 200);
-      const downloadedBytes = new Uint8Array(await downloaded.arrayBuffer());
+      const downloaded = await v11.downloadAttachment(bob, upload.attachment_id);
+      assert.equal(downloaded.kind, AttachmentKind.DownloadAccepted);
+      assert.equal(downloaded.claim, null);
+      const downloadedBytes = downloaded.ciphertext;
       assert.ok(downloadedBytes.byteLength > 0);
       assert.deepEqual(downloadedBytes, attachmentBlob);
       assert.deepEqual(decryptAttachment(roomId, attachmentMessageId, alice.username, "FILE", attachmentKey, downloadedBytes), attachmentPlaintext);
@@ -2113,8 +1965,8 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
         assert.equal(await sendMlsRoomTransaction(aliceSocket, removalFrame), "ACCEPTED");
         mlsNative("commit member removal", () => aliceRoom.commitOutbound(leaveMessageId, removal.revision));
         await leftOnBob;
-        const removedDownload = await fetch(`${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`, { headers: { authorization: `Bearer ${bob.token}` } });
-        assert.equal(removedDownload.status, 403, "removed member must lose MLS attachment access");
+        const removedDownload = await v11.downloadAttachment(bob, upload.attachment_id);
+        assert.equal(removedDownload.kind, AttachmentKind.Failure, "removed member must lose MLS attachment access");
         bobRoom.free();
         bobRoom = null;
 
@@ -2195,21 +2047,23 @@ async function runMlsIntegration(alice, bob, aliceSocket, bobSocket) {
 }
 
 const aliceParsed = parseIntegrationInvite(aliceInvite);
-await verifyIntegrationNode(aliceParsed);
+bootstrapPublicKey = await verifyIntegrationNode(aliceParsed);
 aliceParsed.capability.fill(0);
 aliceParsed.account_context.fill(0);
 aliceParsed.node_public_key.fill(0);
 const alice = await register(aliceInvite, "alice-password");
 const bob = await register(bobInvite, "bob-password");
 // A live session no longer blocks a new sign-in; only a proven login replaces it (checked at the end).
-assert.equal(await opaqueStartStatus(aliceInvite, "alice-password"), 200);
-assert.equal(await opaqueStartStatus(aliceInvite, "other-password"), 200);
+assert.equal(await bootstrapStartKind(aliceInvite, "alice-password"), BootstrapKind.LoginStart);
+assert.equal(await bootstrapStartKind(aliceInvite, "other-password"), BootstrapKind.LoginStart);
 
 await expectBuildAdmissionRejected(alice);
 const aliceTicket = await requestWsTicket(alice);
-await expectWebSocketRejected(["abyssal-v2", `bearer.${alice.token}`]);
-let aliceSocket = await connectWithTicket(aliceTicket, alice.node_id);
+// No bearer or plaintext ticket subprotocol is accepted; only a sealed ClientHello opens a socket.
+await expectWebSocketRejected(["abyssal-v2", `bearer.${randomUUID()}`]);
 await expectWebSocketRejected(["abyssal-v2", `ticket.${aliceTicket}`]);
+let aliceSocket = await connectWithTicket(alice, aliceTicket);
+await expectSealedSocketRejected(alice, aliceTicket);
 let bobSocket = await connect(bob);
 let bobReconnect;
 try {
@@ -2314,40 +2168,14 @@ try {
   const attachmentKey = new Uint8Array(encryptedAttachment.key);
   const attachmentBytes = new Uint8Array(encryptedAttachment.blob);
   assert.ok(attachmentBytes.byteLength > attachmentPlaintext.byteLength);
-  const uploadResponse = await fetch(
-    `${baseUrl}/v2/attachment`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${alice.token}` },
-      body: uploadEnvelope(aliceOpened.direct.id, attachmentMessageId, attachmentBytes),
-    },
-  );
-  assert.equal(uploadResponse.status, 200);
-  const upload = await uploadResponse.json();
-  assert.equal(decodeAttachmentUploadResponse(upload), upload.attachment_id);
-  assert.equal(upload.accepted, true);
+  const uploaded = await v11.uploadAttachment(alice, { chatId: aliceOpened.direct.id, messageId: attachmentMessageId }, attachmentBytes);
+  assert.equal(uploaded.kind, AttachmentKind.UploadAccepted);
+  const upload = { attachment_id: uploaded.attachmentId };
   assert.match(String(upload.attachment_id), /^[0-9a-f-]{36}$/);
 
-  const legacyUpload = await fetch(`${baseUrl}/v1/attachment?chat_id=fixture`, {
-    method: "POST", headers: { authorization: `Bearer ${alice.token}` }, body: new Uint8Array([3]),
-  });
-  assert.equal(legacyUpload.status, 410, "legacy metadata-in-URL uploads must fail closed");
-  const queryUpload = await fetch(`${baseUrl}/v2/attachment?chat_id=fixture`, {
-    method: "POST", headers: { authorization: `Bearer ${alice.token}` },
-    body: uploadEnvelope(aliceOpened.direct.id, attachmentMessageId, attachmentBytes),
-  });
-  assert.equal(queryUpload.status, 400, "v2 uploads must not accept query metadata");
-
-  const stagedOwnerDownload = await fetch(
-    `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
-    { headers: { authorization: `Bearer ${alice.token}` } },
-  );
-  assert.equal(stagedOwnerDownload.status, 404);
-  const downloadResponse = await fetch(
-    `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
-    { headers: { authorization: `Bearer ${bob.token}` } },
-  );
-  assert.equal(downloadResponse.status, 404);
+  // A staged attachment exists for no one until its message is accepted.
+  assert.equal((await v11.downloadAttachment(alice, upload.attachment_id)).kind, AttachmentKind.Failure);
+  assert.equal((await v11.downloadAttachment(bob, upload.attachment_id)).kind, AttachmentKind.Failure);
 
   const acceptAttachmentMetadata = async ({
     messageId,
@@ -2406,15 +2234,10 @@ try {
     deleteAfterDownload: false,
   });
 
-  const admittedDownload = await fetch(
-    `${baseUrl}/v1/attachment/${encodeURIComponent(upload.attachment_id)}`,
-    { headers: { authorization: `Bearer ${bob.token}` } },
-  );
-  assert.equal(admittedDownload.status, 200);
-  assert.equal(admittedDownload.headers.get("x-abyssal-attachment-claim"), null);
-  assert.equal(admittedDownload.headers.get("content-length"), String(attachmentBytes.byteLength));
-  assert.ok(Number(admittedDownload.headers.get("content-length")) > 0);
-  const downloadedAttachmentBytes = new Uint8Array(await admittedDownload.arrayBuffer());
+  const admittedDownload = await v11.downloadAttachment(bob, upload.attachment_id);
+  assert.equal(admittedDownload.kind, AttachmentKind.DownloadAccepted);
+  assert.equal(admittedDownload.claim, null);
+  const downloadedAttachmentBytes = admittedDownload.ciphertext;
   assert.ok(downloadedAttachmentBytes.byteLength > 0);
   assert.deepEqual(downloadedAttachmentBytes, attachmentBytes);
   assert.deepEqual(
@@ -2440,18 +2263,11 @@ try {
   ));
   const oneTimeAttachmentKey = new Uint8Array(oneTimeEncryptedAttachment.key);
   const oneTimeAttachmentBytes = new Uint8Array(oneTimeEncryptedAttachment.blob);
-  const oneTimeUploadResponse = await fetch(
-    `${baseUrl}/v2/attachment`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${alice.token}` },
-      body: uploadEnvelope(aliceOpened.direct.id, oneTimeMessageId, oneTimeAttachmentBytes, true),
-    },
+  const oneTimeUploaded = await v11.uploadAttachment(
+    alice, { chatId: aliceOpened.direct.id, messageId: oneTimeMessageId, oneTime: true }, oneTimeAttachmentBytes,
   );
-  assert.equal(oneTimeUploadResponse.status, 200);
-  const oneTimeUpload = await oneTimeUploadResponse.json();
-  assert.equal(decodeAttachmentUploadResponse(oneTimeUpload), oneTimeUpload.attachment_id);
-  assert.equal(oneTimeUpload.accepted, true);
+  assert.equal(oneTimeUploaded.kind, AttachmentKind.UploadAccepted);
+  const oneTimeUpload = { attachment_id: oneTimeUploaded.attachmentId };
   await acceptAttachmentMetadata({
     messageId: oneTimeMessageId,
     attachmentId: oneTimeUpload.attachment_id,
@@ -2460,16 +2276,11 @@ try {
     oneTime: true,
     deleteAfterDownload: true,
   });
-  const oneTimeDownloadUrl = `${baseUrl}/v1/attachment/${encodeURIComponent(oneTimeUpload.attachment_id)}`;
-  const firstOneTimeDownload = await fetch(oneTimeDownloadUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(firstOneTimeDownload.status, 200);
-  assert.equal(firstOneTimeDownload.headers.get("content-length"), String(oneTimeAttachmentBytes.byteLength));
-  assert.ok(Number(firstOneTimeDownload.headers.get("content-length")) > 0);
-  const attachmentClaim = firstOneTimeDownload.headers.get("x-abyssal-attachment-claim");
+  const firstOneTimeDownload = await v11.downloadAttachment(bob, oneTimeUpload.attachment_id);
+  assert.equal(firstOneTimeDownload.kind, AttachmentKind.DownloadAccepted);
+  const attachmentClaim = firstOneTimeDownload.claim;
   assert.match(attachmentClaim ?? "", /^[0-9a-f-]{36}$/);
-  const firstOneTimeBytes = new Uint8Array(await firstOneTimeDownload.arrayBuffer());
+  const firstOneTimeBytes = firstOneTimeDownload.ciphertext;
   assert.ok(firstOneTimeBytes.byteLength > 0);
   assert.deepEqual(firstOneTimeBytes, oneTimeAttachmentBytes);
   assert.deepEqual(
@@ -2484,42 +2295,13 @@ try {
     attachmentPlaintext,
   );
   firstOneTimeBytes.fill(0);
-  const invalidClaimCompletion = await fetch(`${oneTimeDownloadUrl}/complete`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${bob.token}`,
-      "x-abyssal-attachment-claim": randomUUID(),
-    },
-  });
-  assert.equal(invalidClaimCompletion.status, 404);
-  const invalidTokenCompletion = await fetch(`${oneTimeDownloadUrl}/complete`, {
-    method: "POST",
-    headers: {
-      authorization: "Bearer invalid-token",
-      "x-abyssal-attachment-claim": attachmentClaim,
-    },
-  });
-  assert.equal(invalidTokenCompletion.status, 401);
-  const wrongUserCompletion = await fetch(`${oneTimeDownloadUrl}/complete`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${alice.token}`,
-      "x-abyssal-attachment-claim": attachmentClaim,
-    },
-  });
-  assert.equal(wrongUserCompletion.status, 403);
-  const completeOneTime = await fetch(`${oneTimeDownloadUrl}/complete`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${bob.token}`,
-      "x-abyssal-attachment-claim": attachmentClaim,
-    },
-  });
-  assert.equal(completeOneTime.status, 204);
-  const secondOneTimeDownload = await fetch(oneTimeDownloadUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(secondOneTimeDownload.status, 404);
+  // A wrong claim, another account, or keys the relay never issued complete nothing.
+  assert.equal((await v11.completeDownload(bob, oneTimeUpload.attachment_id, randomUUID())).kind, AttachmentKind.Failure);
+  assert.equal((await v11.completeDownload(alice, oneTimeUpload.attachment_id, attachmentClaim)).kind, AttachmentKind.Failure);
+  const forgedSession = { keys: { ...bob.keys, sessionId: crypto.getRandomValues(new Uint8Array(32)) } };
+  await assert.rejects(v11.completeDownload(forgedSession, oneTimeUpload.attachment_id, attachmentClaim));
+  assert.equal((await v11.completeDownload(bob, oneTimeUpload.attachment_id, attachmentClaim)).kind, AttachmentKind.Success);
+  assert.equal((await v11.downloadAttachment(bob, oneTimeUpload.attachment_id)).kind, AttachmentKind.Failure);
 
   const releasableMessageId = randomUUID();
   const releasableEncryptedAttachment = JSON.parse(encryptAttachment(
@@ -2531,17 +2313,11 @@ try {
   ));
   const releasableAttachmentKey = new Uint8Array(releasableEncryptedAttachment.key);
   const releasableAttachmentBytes = new Uint8Array(releasableEncryptedAttachment.blob);
-  const releasableUploadResponse = await fetch(
-    `${baseUrl}/v2/attachment`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${alice.token}` },
-      body: uploadEnvelope(aliceOpened.direct.id, releasableMessageId, releasableAttachmentBytes, true),
-    },
+  const releasableUploaded = await v11.uploadAttachment(
+    alice, { chatId: aliceOpened.direct.id, messageId: releasableMessageId, oneTime: true }, releasableAttachmentBytes,
   );
-  assert.equal(releasableUploadResponse.status, 200);
-  const releasableUpload = await releasableUploadResponse.json();
-  assert.equal(decodeAttachmentUploadResponse(releasableUpload), releasableUpload.attachment_id);
+  assert.equal(releasableUploaded.kind, AttachmentKind.UploadAccepted);
+  const releasableUpload = { attachment_id: releasableUploaded.attachmentId };
   await acceptAttachmentMetadata({
     messageId: releasableMessageId,
     attachmentId: releasableUpload.attachment_id,
@@ -2550,47 +2326,19 @@ try {
     oneTime: true,
     deleteAfterDownload: true,
   });
-  const releasableUrl = `${baseUrl}/v1/attachment/${encodeURIComponent(releasableUpload.attachment_id)}`;
-  const interruptedDownload = await fetch(releasableUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(interruptedDownload.status, 200);
-  const interruptedClaim = interruptedDownload.headers.get("x-abyssal-attachment-claim");
+  // A download dropped after its head keeps the claim until it is released.
+  const interruptedDownload = await v11.downloadAttachment(bob, releasableUpload.attachment_id, { stopAfterHead: true });
+  assert.equal(interruptedDownload.kind, AttachmentKind.DownloadAccepted);
+  const interruptedClaim = interruptedDownload.claim;
   assert.match(interruptedClaim ?? "", /^[0-9a-f-]{36}$/);
-  assert.ok(interruptedDownload.body);
-  const interruptedReader = interruptedDownload.body.getReader();
-  const interruptedChunk = await interruptedReader.read();
-  assert.ok(interruptedChunk.value?.byteLength);
-  await interruptedReader.cancel();
-  const releaseResponse = await fetch(`${releasableUrl}/claim`, {
-    method: "DELETE",
-    headers: {
-      authorization: `Bearer ${bob.token}`,
-      "x-abyssal-attachment-claim": interruptedClaim,
-    },
-  });
-  assert.equal(releaseResponse.status, 204);
-  const retryDownload = await fetch(releasableUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(retryDownload.status, 200);
-  assert.equal(retryDownload.headers.get("content-length"), String(releasableAttachmentBytes.byteLength));
-  assert.ok(Number(retryDownload.headers.get("content-length")) > 0);
-  const retryClaim = retryDownload.headers.get("x-abyssal-attachment-claim");
+  assert.equal((await v11.releaseDownload(bob, releasableUpload.attachment_id, interruptedClaim)).kind, AttachmentKind.Success);
+  const retryDownload = await v11.downloadAttachment(bob, releasableUpload.attachment_id);
+  assert.equal(retryDownload.kind, AttachmentKind.DownloadAccepted);
+  const retryClaim = retryDownload.claim;
   assert.match(retryClaim ?? "", /^[0-9a-f-]{36}$/);
-  assert.deepEqual(new Uint8Array(await retryDownload.arrayBuffer()), releasableAttachmentBytes);
-  const completeRetry = await fetch(`${releasableUrl}/complete`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${bob.token}`,
-      "x-abyssal-attachment-claim": retryClaim,
-    },
-  });
-  assert.equal(completeRetry.status, 204);
-  const retryGone = await fetch(releasableUrl, {
-    headers: { authorization: `Bearer ${bob.token}` },
-  });
-  assert.equal(retryGone.status, 404);
+  assert.deepEqual(retryDownload.ciphertext, releasableAttachmentBytes);
+  assert.equal((await v11.completeDownload(bob, releasableUpload.attachment_id, retryClaim)).kind, AttachmentKind.Success);
+  assert.equal((await v11.downloadAttachment(bob, releasableUpload.attachment_id)).kind, AttachmentKind.Failure);
 
   // A stale, otherwise well-formed checkpoint must reject before fanout. The
   // ratchet rolls back, but the terminal receipt reserves that message ID, so
@@ -2760,15 +2508,10 @@ try {
   await acknowledgeFrame(bob, bobReconnect, replayedFrame, replayedPlain);
 
   const unauthorizedUploadMessageId = randomUUID();
-  const unauthorizedUpload = await fetch(
-    `${baseUrl}/v2/attachment`,
-    {
-      method: "POST",
-      headers: { authorization: `Bearer ${alice.token}` },
-      body: uploadEnvelope("dm_guessed", unauthorizedUploadMessageId, new Uint8Array([1, 2, 3])),
-    },
+  const unauthorizedUpload = await v11.uploadAttachment(
+    alice, { chatId: "dm_guessed", messageId: unauthorizedUploadMessageId }, new Uint8Array([1, 2, 3]),
   );
-  assert.equal(unauthorizedUpload.status, 403);
+  assert.equal(unauthorizedUpload.kind, AttachmentKind.Failure);
 
   const aliceDisconnected = waitForFrame(
     bobReconnect,
@@ -2792,11 +2535,11 @@ try {
 assert.equal(releasedPrekeysAwaitingReuse.size, 0);
 
 // Newest sign-in wins: a wrong password changes nothing, and a correct one
-// replaces the live session, revoking the old token.
-assert.equal(await loginStatus(aliceInvite, "wrong-password"), 401);
-assert.equal((await requestWsTicketResponse(alice)).status, 200);
-assert.equal(await loginStatus(aliceInvite, "alice-password"), 200);
-assert.equal((await requestWsTicketResponse(alice)).status, 401);
+// replaces the live session, so the old session's keys no longer open replies.
+assert.equal(await loginKind(aliceInvite, "wrong-password"), BootstrapKind.Failure);
+assert.equal((await v11.issueTicket(alice, WEB_ATTESTATION)).kind, ControlKind.WsTicket);
+assert.equal(await loginKind(aliceInvite, "alice-password"), BootstrapKind.Session);
+assert.equal((await v11.issueTicket(alice, WEB_ATTESTATION)).kind, "unopenable");
 
 console.log(
   "relay integration passed: OPAQUE auth, v9 E2EE DM, v10 MLS rooms, offline recovery/replay, and access control",

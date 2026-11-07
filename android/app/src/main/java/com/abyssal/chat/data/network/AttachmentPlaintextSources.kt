@@ -8,18 +8,25 @@ import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * An upload reads its plaintext exactly twice: once to hash the ciphertext it
+ * declares up front, once to send it. A third open is refused.
+ */
+internal const val MAX_PLAINTEXT_SOURCE_OPENS = 2
 
 class ByteArrayAttachmentSource(
     private val bytes: ByteArray
 ) : IAttachmentPlaintextSource {
-    private val opened = AtomicBoolean(false)
+    private val opens = AtomicInteger(0)
     private val destroyed = AtomicBoolean(false)
 
     override val sizeBytes: Long = bytes.size.toLong()
 
     override fun openStream(): InputStream {
-        if (destroyed.get() || !opened.compareAndSet(false, true)) {
+        if (destroyed.get() || opens.incrementAndGet() > MAX_PLAINTEXT_SOURCE_OPENS) {
             throw IOException("Attachment unavailable")
         }
         return ByteArrayInputStream(bytes)
@@ -35,12 +42,13 @@ class ContentUriAttachmentSource(
     private val uri: Uri,
     override val sizeBytes: Long
 ) : IAttachmentPlaintextSource {
-    private val opened = AtomicBoolean(false)
+    private val opens = AtomicInteger(0)
     private val destroyed = AtomicBoolean(false)
     private val activeStream = AtomicReference<InputStream?>(null)
 
+    /** Opens one stream at a time, at most [MAX_PLAINTEXT_SOURCE_OPENS] times. */
     override fun openStream(): InputStream {
-        if (destroyed.get() || !opened.compareAndSet(false, true)) {
+        if (destroyed.get() || opens.incrementAndGet() > MAX_PLAINTEXT_SOURCE_OPENS) {
             throw IOException("Attachment unavailable")
         }
         val stream = resolver.openInputStream(uri) ?: throw IOException("Attachment unavailable")

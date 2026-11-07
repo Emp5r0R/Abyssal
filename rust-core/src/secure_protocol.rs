@@ -55,7 +55,7 @@ const IMAGE_ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const VIDEO_ATTACHMENT_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_ATTACHMENT_PLAINTEXT_BYTES: usize = 200 * 1024 * 1024;
 pub const ATTACHMENT_BLOB_VERSION: u8 = 2;
-const ATTACHMENT_NONCE_BYTES: usize = 24;
+pub(crate) const ATTACHMENT_NONCE_BYTES: usize = 24;
 const ATTACHMENT_KEY_BYTES: usize = 32;
 const ATTACHMENT_TAG_BYTES: usize = 16;
 pub const ATTACHMENT_CHUNK_PLAINTEXT_BYTES: usize = 256 * 1024;
@@ -515,9 +515,74 @@ pub fn encrypt_attachment_chunk(
 ) -> Result<Vec<u8>, AbyssalError> {
     let key = Zeroizing::new(key);
     let plaintext = Zeroizing::new(plaintext);
-    validate_attachment_context(&chat_id, &message_id, &sender_username, &media_type)
-        .map_err(AbyssalError::from)?;
-    let plaintext_limit = attachment_plaintext_limit(&media_type).map_err(AbyssalError::from)?;
+    let mut nonce = [0_u8; ATTACHMENT_NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce);
+    seal_attachment_chunk(
+        &AttachmentChunkContext {
+            chat_id: &chat_id,
+            message_id: &message_id,
+            sender_username: &sender_username,
+            media_type: &media_type,
+        },
+        &key,
+        total_plaintext_bytes,
+        chunk_index,
+        &plaintext,
+        &nonce,
+        |padding| OsRng.fill_bytes(padding),
+    )
+}
+
+/// The message binding of one attachment's chunks.
+pub(crate) struct AttachmentChunkContext<'a> {
+    pub chat_id: &'a str,
+    pub message_id: &'a str,
+    pub sender_username: &'a str,
+    pub media_type: &'a str,
+}
+
+/// Checks an attachment's binding, key and size and returns its chunk count.
+pub(crate) fn attachment_upload_layout(
+    context: &AttachmentChunkContext<'_>,
+    key: &[u8],
+    total_plaintext_bytes: u64,
+) -> Result<usize, AbyssalError> {
+    validate_attachment_context(
+        context.chat_id,
+        context.message_id,
+        context.sender_username,
+        context.media_type,
+    )
+    .map_err(AbyssalError::from)?;
+    let plaintext_limit =
+        attachment_plaintext_limit(context.media_type).map_err(AbyssalError::from)?;
+    let total_plaintext_bytes = usize::try_from(total_plaintext_bytes)
+        .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
+    if key.len() != ATTACHMENT_KEY_BYTES || total_plaintext_bytes > plaintext_limit {
+        return Err("Payload unavailable".to_string().into());
+    }
+    attachment_chunk_layout(total_plaintext_bytes, 0).map(|(chunk_count, _)| chunk_count)
+}
+
+/// The exact sealed size of an attachment of [chunk_count] chunks.
+pub(crate) fn attachment_ciphertext_len(chunk_count: usize) -> u64 {
+    (chunk_count as u64).saturating_mul(ATTACHMENT_CHUNK_RECORD_BYTES as u64)
+}
+
+/// Seals one attachment chunk under [nonce]; [fill_padding] supplies the
+/// random bytes that pad a short final chunk to the full chunk size. Callers
+/// must never reuse a nonce for different plaintext under the same key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_attachment_chunk(
+    context: &AttachmentChunkContext<'_>,
+    key: &[u8],
+    total_plaintext_bytes: u64,
+    chunk_index: u32,
+    plaintext: &[u8],
+    nonce: &[u8; ATTACHMENT_NONCE_BYTES],
+    fill_padding: impl FnOnce(&mut [u8]),
+) -> Result<Vec<u8>, AbyssalError> {
+    attachment_upload_layout(context, key, total_plaintext_bytes)?;
     let total_plaintext_bytes = usize::try_from(total_plaintext_bytes)
         .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?;
     let (chunk_count, expected_chunk_bytes) = attachment_chunk_layout(
@@ -525,19 +590,14 @@ pub fn encrypt_attachment_chunk(
         usize::try_from(chunk_index)
             .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
     )?;
-    if key.len() != ATTACHMENT_KEY_BYTES
-        || total_plaintext_bytes > plaintext_limit
-        || plaintext.len() != expected_chunk_bytes
-    {
+    if plaintext.len() != expected_chunk_bytes {
         return Err("Payload unavailable".to_string().into());
     }
 
-    let mut nonce = [0_u8; ATTACHMENT_NONCE_BYTES];
-    OsRng.fill_bytes(&mut nonce);
     let mut padded = Zeroizing::new(vec![0_u8; ATTACHMENT_CHUNK_PLAINTEXT_BYTES]);
-    padded[..plaintext.len()].copy_from_slice(&plaintext);
+    padded[..plaintext.len()].copy_from_slice(plaintext);
     if plaintext.len() < padded.len() {
-        OsRng.fill_bytes(&mut padded[plaintext.len()..]);
+        fill_padding(&mut padded[plaintext.len()..]);
     }
     let header = attachment_chunk_header(
         chunk_index,
@@ -545,20 +605,20 @@ pub fn encrypt_attachment_chunk(
             .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
         u64::try_from(total_plaintext_bytes)
             .map_err(|_| AbyssalError::from("Payload unavailable".to_string()))?,
-        &nonce,
+        nonce,
     );
     let aad = attachment_chunk_aad(
-        &chat_id,
-        &message_id,
-        &sender_username,
-        &media_type,
+        context.chat_id,
+        context.message_id,
+        context.sender_username,
+        context.media_type,
         &header[..ATTACHMENT_CHUNK_HEADER_BYTES - ATTACHMENT_NONCE_BYTES],
     );
-    let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
-        .map_err(|_| "Payload unavailable".to_string())?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key).map_err(|_| "Payload unavailable".to_string())?;
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            XNonce::from_slice(nonce),
             Payload {
                 msg: &padded,
                 aad: &aad,

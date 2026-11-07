@@ -31,11 +31,14 @@ interface IIdentityService {
         capability: ByteArray,
         accountContext: ByteArray,
         expectedNodeId: String,
+        nodePublicKey: ByteArray,
+        bootstrapPublicKey: ByteArray,
         password: ByteArray,
         endpoint: NodeEndpoint
     ): IdentityValidationResult
     fun setCurrentUser(user: User)
     fun getCurrentUser(): User?
+    /** Logs the session out on the relay (best effort) and wipes its transport keys. */
     suspend fun revokeSession(session: NodeSession): Boolean
     fun logout()
 }
@@ -257,6 +260,7 @@ interface IMlsTransport {
 
 interface IAttachmentPlaintextSource {
     val sizeBytes: Long
+    /** Opens the plaintext; an upload reads it twice, one stream at a time. */
     fun openStream(): InputStream
     fun destroy()
 }

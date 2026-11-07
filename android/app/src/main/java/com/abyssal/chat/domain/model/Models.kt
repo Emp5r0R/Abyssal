@@ -133,20 +133,44 @@ data class VerifiedInvite(
     val nodePublicKey: ByteArray,
     val endpoint: NodeEndpoint,
     val capability: ByteArray,
-    val accountContext: ByteArray
+    val accountContext: ByteArray,
+    /** The relay's process-lifetime key that account entry is sealed to. */
+    val bootstrapPublicKey: ByteArray
 ) {
     fun destroy() {
         nodePublicKey.fill(0)
         capability.fill(0)
         accountContext.fill(0)
+        bootstrapPublicKey.fill(0)
+    }
+}
+
+/**
+ * Protocol-v11 keys that authenticate every control, WebSocket and attachment
+ * record of one signed-in session. Held in memory only; [destroy] wipes them.
+ */
+class TransportKeys(
+    val nodePublicKey: ByteArray,
+    val sessionId: ByteArray,
+    val transportRoot: ByteArray
+) {
+    fun destroy() {
+        nodePublicKey.fill(0)
+        sessionId.fill(0)
+        transportRoot.fill(0)
     }
 }
 
 data class NodeSession(
     val endpoint: NodeEndpoint,
+    /**
+     * A random local identifier for this signed-in session, used to tell
+     * sessions apart in memory. It is never sent: v11 authenticates with [transport].
+     */
     val token: String,
     val nodeId: String,
-    val maxRoomsPerUser: Int
+    val maxRoomsPerUser: Int,
+    val transport: TransportKeys
 )
 
 data class IdentityValidationResult(
@@ -164,7 +188,9 @@ data class IdentityValidationResult(
      * The relay's RAM-only storage share when it allows device storage, else
      * null. The receiver owns it and wipes it after deriving the store key.
      */
-    val deviceStorageShare: ByteArray? = null
+    val deviceStorageShare: ByteArray? = null,
+    /** The session's v11 transport keys; the receiver owns and wipes them. */
+    val transport: TransportKeys? = null
 )
 
 data class AvailableAppUpdate(

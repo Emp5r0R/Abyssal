@@ -3,6 +3,15 @@ package com.abyssal.chat.data.network
 import com.abyssal.chat.data.repository.InMemoryMessageRepository
 import com.abyssal.chat.domain.model.NodeEndpoint
 import com.abyssal.chat.domain.model.NodeSession
+import com.abyssal.chat.testTransportKeys
+import com.abyssal.chat.data.network.v11.CONTROL_RECORD_BYTES
+import com.abyssal.chat.data.network.v11.ScriptedControlExchanges
+import com.abyssal.chat.data.network.v11.TaggedRecordLayer
+import com.abyssal.chat.data.network.v11.WsRecordLayer
+import com.abyssal.chat.data.network.v11.sealedWebSocketRequest
+import com.abyssal.chat.domain.model.TransportKeys
+import uniffi.abyssal_core.ControlAttestationInput
+import uniffi.abyssal_core.ControlResponse
 import com.abyssal.chat.domain.model.ChatSession
 import com.abyssal.chat.domain.model.DirectoryStamp
 import com.abyssal.chat.domain.model.DirectoryEvidenceStatus
@@ -1006,55 +1015,13 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun websocketTicketResponseRejectsMalformedExtraAndOversizedBodies() {
-        val ticket = "A".repeat(43)
-        val valid = JSONObject()
-            .put("ticket", ticket)
-            .put("expires_in_sec", 15)
-            .toString()
-            .toByteArray()
-        assertEquals(WsTicket(ticket, 15), parseWsTicketResponseBody(valid))
-        val nonCanonicalTicket = ticket.dropLast(1) + "B"
-        assertNull(
-            parseWsTicketResponseBody(
-                JSONObject().put("ticket", nonCanonicalTicket).put("expires_in_sec", 15)
-                    .toString().toByteArray()
-            )
-        )
-
-        assertNull(
-            parseWsTicketResponseBody(
-                JSONObject()
-                    .put("ticket", ticket)
-                    .put("expires_in_sec", 15)
-                    .put("unexpected", true)
-                    .toString()
-                    .toByteArray()
-            )
-        )
-        assertNull(
-            parseWsTicketResponseBody(
-                JSONObject().put("ticket", ticket).put("expires_in_sec", 15.5).toString().toByteArray()
-            )
-        )
-        assertNull(parseWsTicketResponseBody(ByteArray(WS_TICKET_MAX_RESPONSE_BYTES + 1) { '{'.code.toByte() }))
-    }
-
-    @Test
-    fun websocketUpgradeContainsOnlyShortTicketAndNeverBearer() {
-        val ticket = "A".repeat(43)
-        val endpoint = NodeEndpoint(
-            inputUrl = "https://node.example",
-            apiBaseUrl = "https://node.example",
-            wsBaseUrl = "wss://node.example",
-            displayHost = "node.example"
-        )
-
-        val request = websocketUpgradeRequest(endpoint, ticket)
-        val protocols = request.header("Sec-WebSocket-Protocol")
-        assertEquals("abyssal-v2, ticket.$ticket", protocols)
-        assertFalse(protocols.orEmpty().contains("bearer."))
+    fun websocketUpgradeOffersOnlyTheV11ProtocolAndCarriesNoCredential() {
+        val request = sealedWebSocketRequest("wss://node.example")
+        assertEquals("https://node.example/v1/ws", request.url.toString())
+        // The ticket travels inside the sealed ClientHello, never in a header.
+        assertEquals("abyssal-v11", request.header("Sec-WebSocket-Protocol"))
         assertNull(request.header("Authorization"))
+        assertEquals(1, request.headers.size)
     }
 
     @Test
@@ -1067,7 +1034,7 @@ class RealChatTransportSecurityTest {
             wsBaseUrl = "ws://127.0.0.1",
             displayHost = "127.0.0.1"
         )
-        node.setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
+        node.setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5, testTransportKeys()))
         val transport = RealChatTransport(node, OkHttpClient(), factory, TEST_BUILD_ATTESTATION)
 
         transport.connect()
@@ -1157,27 +1124,46 @@ class RealChatTransportSecurityTest {
         }
     }
 
+    private fun sealedControlServer(replies: Int = 1) = MockWebServer().apply {
+        repeat(replies) { enqueue(MockResponse().setBody(Buffer().write(ByteArray(CONTROL_RECORD_BYTES.toInt())))) }
+    }
+
+    private fun sessionAt(server: MockWebServer): NodeSession {
+        val base = server.url("/")
+        val endpoint = NodeEndpoint(
+            inputUrl = base.toString(),
+            apiBaseUrl = base.toString().removeSuffix("/"),
+            wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
+            displayHost = base.host
+        )
+        return NodeSession(endpoint, "token-1", "node-1", 5, testTransportKeys())
+    }
+
+    private fun scriptedTransport(
+        session: NodeSession,
+        control: ScriptedControlExchanges,
+        layers: (TransportKeys, String) -> WsRecordLayer = { _, _ -> TaggedRecordLayer() }
+    ): RealChatTransport {
+        val node = InMemoryNodeConfigService().apply { setActiveSession(session) }
+        val client = OkHttpClient.Builder().build()
+        return RealChatTransport(
+            node, client, client, TEST_BUILD_ATTESTATION,
+            controlExchanges = control,
+            recordLayers = layers
+        )
+    }
+
     @Test
     fun ticketAdmissionRejectionsAreTerminalAndNeverRetried() = runBlocking {
-        for ((code, expectedState) in listOf(
-            401 to "SESSION_EXPIRED",
-            403 to "SECURITY_REJECTED",
-            409 to "PLATFORM_CONFLICT"
+        for ((answer, expectedState) in listOf<Pair<() -> ControlResponse, String>>(
+            { ControlResponse.BuildRejected } to "SECURITY_REJECTED",
+            { ControlResponse.PlatformConflict } to "PLATFORM_CONFLICT",
+            // A reply that does not open under the session keys: the relay forgot the session.
+            { error("aead") } to "SESSION_EXPIRED"
         )) {
-            val server = MockWebServer()
-            server.enqueue(MockResponse().setResponseCode(code))
-            server.start()
-            val base = server.url("/")
-            val endpoint = NodeEndpoint(
-                inputUrl = base.toString(),
-                apiBaseUrl = base.toString().removeSuffix("/"),
-                wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
-                displayHost = base.host
-            )
-            val node = InMemoryNodeConfigService().apply {
-                setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
-            }
-            val transport = RealChatTransport(node, OkHttpClient(), OkHttpClient(), TEST_BUILD_ATTESTATION)
+            val server = sealedControlServer().apply { start() }
+            val control = ScriptedControlExchanges(answer)
+            val transport = scriptedTransport(sessionAt(server), control)
             try {
                 transport.connect()
                 val status = withTimeout(2_000L) {
@@ -1186,6 +1172,7 @@ class RealChatTransportSecurityTest {
                 assertEquals("node-1", status.nodeId)
                 Thread.sleep(RECONNECT_INITIAL_DELAY_MS + RECONNECT_JITTER_MS + 100L)
                 assertEquals(1, server.requestCount)
+                assertEquals(1, control.closed)
             } finally {
                 transport.close()
                 server.shutdown()
@@ -1194,21 +1181,21 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun realSizedTicketResponseOpensTheRelaySocket() = runBlocking {
-        // Regression: the ticket body is far smaller than the read limit. An
-        // exact-length read rejected every real ticket and kept Android offline.
-        val server = MockWebServer()
-        val ticket = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 7 })
-        server.enqueue(
-            MockResponse()
-                .setHeader("Content-Type", "application/json")
-                .setHeader("Cache-Control", "no-store")
-                .setBody(JSONObject().put("ticket", ticket).put("expires_in_sec", 30).toString())
-        )
+    fun issuedTicketOpensTheSealedSocketAndConnectsAfterTheServerHello() = runBlocking {
+        val server = sealedControlServer()
+        val ticket = "T".repeat(43)
+        val received = CopyOnWriteArrayList<String>()
         // Answer the client's close frame so MockWebServer.shutdown() does not
         // wait out a half-closed socket (slow CI runners hit its give-up path).
         val serverClosed = CountDownLatch(1)
         server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                received += String(bytes.toByteArray(), Charsets.ISO_8859_1)
+                if (bytes.size == 1 && bytes[0] == TaggedRecordLayer.HELLO) {
+                    webSocket.send(ByteString.of(TaggedRecordLayer.SERVER_HELLO))
+                }
+            }
+
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(code, null)
             }
@@ -1222,35 +1209,35 @@ class RealChatTransportSecurityTest {
             }
         }))
         server.start()
+        val tickets = CopyOnWriteArrayList<String>()
+        val layer = TaggedRecordLayer()
+        val transport = scriptedTransport(
+            sessionAt(server),
+            ScriptedControlExchanges { ControlResponse.WsTicket(ticket, 30u) }
+        ) { _, issued ->
+            tickets += issued
+            layer
+        }
         try {
-            val base = server.url("/")
-            val endpoint = NodeEndpoint(
-                inputUrl = base.toString(),
-                apiBaseUrl = base.toString().removeSuffix("/"),
-                wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
-                displayHost = base.host
-            )
-            val node = InMemoryNodeConfigService().apply {
-                setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
+            transport.connect()
+            withTimeout(3_000L) {
+                transport.getServerStatus().first { it.state == "CONNECTED" }
             }
-            val client = OkHttpClient.Builder().build()
-            val transport = RealChatTransport(node, client, client, TEST_BUILD_ATTESTATION)
-            try {
-                transport.connect()
-                withTimeout(3_000L) {
-                    transport.getServerStatus().first { it.state == "CONNECTED" }
-                }
-                assertEquals("/v1/ws-ticket", server.takeRequest(2, TimeUnit.SECONDS)?.path)
-                val upgrade = server.takeRequest(2, TimeUnit.SECONDS)
-                assertEquals("/v1/ws", upgrade?.path)
-                assertEquals("abyssal-v2, ticket.$ticket", upgrade?.getHeader("Sec-WebSocket-Protocol"))
-            } finally {
-                transport.close()
-                serverClosed.await(5, TimeUnit.SECONDS)
-            }
+            assertEquals("/v1/control", server.takeRequest(2, TimeUnit.SECONDS)?.path)
+            val upgrade = server.takeRequest(2, TimeUnit.SECONDS)
+            assertEquals("/v1/ws", upgrade?.path)
+            // The ticket goes only into the sealed ClientHello, never into a header.
+            assertEquals("abyssal-v11", upgrade?.getHeader("Sec-WebSocket-Protocol"))
+            assertNull(upgrade?.getHeader("Authorization"))
+            assertEquals(listOf(ticket), tickets)
+            assertEquals("H", received.first())
+            assertTrue(layer.helloOpened)
         } finally {
+            transport.close()
+            serverClosed.await(5, TimeUnit.SECONDS)
             server.shutdown()
         }
+        assertTrue(layer.closed)
     }
 
     @Test
@@ -1274,23 +1261,11 @@ class RealChatTransportSecurityTest {
     }
 
     @Test
-    fun relayBuildRejectionIsDistinctAndTicketBodyIsExact() = runBlocking {
-        val server = MockWebServer()
-        server.enqueue(MockResponse().setResponseCode(426))
-        server.start()
+    fun relayBuildRejectionIsDistinctAndTheTicketRequestIsOneSealedRecord() = runBlocking {
+        val server = sealedControlServer().apply { start() }
         try {
-            val base = server.url("/")
-            val endpoint = NodeEndpoint(
-                inputUrl = base.toString(),
-                apiBaseUrl = base.toString().removeSuffix("/"),
-                wsBaseUrl = base.toString().replaceFirst("http://", "ws://").removeSuffix("/"),
-                displayHost = base.host
-            )
-            val node = InMemoryNodeConfigService().apply {
-                setActiveSession(NodeSession(endpoint, "token-1", "node-1", 5))
-            }
-            val client = OkHttpClient.Builder().build()
-            val transport = RealChatTransport(node, client, client, TEST_BUILD_ATTESTATION)
+            val control = ScriptedControlExchanges { ControlResponse.BuildRejected }
+            val transport = scriptedTransport(sessionAt(server), control)
 
             transport.connect()
 
@@ -1300,11 +1275,11 @@ class RealChatTransportSecurityTest {
             assertEquals("node-1", status.nodeId)
             val request = server.takeRequest(2, TimeUnit.SECONDS)
             assertNotNull(request)
-            val payload = JSONObject(request!!.body.readUtf8())
-            assertEquals(
-                setOf("platform", "version", "build_signature_b64"),
-                payload.keys().asSequence().toSet()
-            )
+            assertEquals("/v1/control", request!!.path)
+            assertNull(request.getHeader("Authorization"))
+            assertEquals(CONTROL_RECORD_BYTES, request.bodySize)
+            // The attestation travels inside the sealed record.
+            assertEquals(ControlAttestationInput("android", "2.2.0", "A".repeat(86)), control.attestation)
             Thread.sleep(RECONNECT_INITIAL_DELAY_MS + 100L)
             assertNull(server.takeRequest(100, TimeUnit.MILLISECONDS))
             transport.disconnect()
@@ -1872,7 +1847,8 @@ class RealChatTransportSecurityTest {
         ),
         token = "token-1",
         nodeId = "node-1",
-        maxRoomsPerUser = 5
+        maxRoomsPerUser = 5,
+        transport = testTransportKeys()
     )
 
     private fun room(id: String = "forum_alpha"): JSONObject = JSONObject()
@@ -1952,21 +1928,16 @@ class RealChatTransportSecurityTest {
         val call = TicketCancellationCall()
 
         override fun newCall(request: Request): Call {
+            // One sealed control record: no bearer token, no readable attestation.
             assertEquals("POST", request.method)
-            assertEquals("Bearer token-1", request.header("Authorization"))
+            assertNull(request.header("Authorization"))
             assertEquals("no-store", request.header("Cache-Control"))
-            assertEquals("application/json; charset=utf-8", request.body?.contentType().toString())
+            assertEquals("application/octet-stream", request.body?.contentType().toString())
+            assertEquals(CONTROL_RECORD_BYTES, request.body?.contentLength())
             val body = Buffer()
             request.body?.writeTo(body)
-            val payload = JSONObject(body.readUtf8())
-            assertEquals(
-                setOf("platform", "version", "build_signature_b64"),
-                payload.keys().asSequence().toSet()
-            )
-            assertEquals("android", payload.getString("platform"))
-            assertEquals("2.2.0", payload.getString("version"))
-            assertEquals("A".repeat(86), payload.getString("build_signature_b64"))
-            assertTrue(request.url.encodedPath.endsWith("/v1/ws-ticket"))
+            assertFalse(body.readUtf8().contains("android"))
+            assertTrue(request.url.encodedPath.endsWith("/v1/control"))
             return call
         }
     }

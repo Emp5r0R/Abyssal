@@ -1,4 +1,5 @@
 pub mod attachment_transport;
+pub mod attachment_upload_encryptor;
 pub mod invite_protocol;
 pub mod mls_protocol;
 pub mod qr_decode;

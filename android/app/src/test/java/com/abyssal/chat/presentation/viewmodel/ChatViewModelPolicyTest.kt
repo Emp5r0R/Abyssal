@@ -1959,7 +1959,8 @@ class ChatViewModelPolicyTest {
         ),
         token = token,
         nodeId = nodeId,
-        maxRoomsPerUser = 5
+        maxRoomsPerUser = 5,
+        transport = com.abyssal.chat.testTransportKeys()
     )
 
     private fun attachmentMessage(seed: Int): Message = Message(
