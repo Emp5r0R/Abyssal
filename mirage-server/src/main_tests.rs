@@ -589,14 +589,23 @@ async fn concurrent_identical_control_requests_execute_once_and_share_response()
     assert_eq!(state.control_receipts.lock().await.len(), 1);
 }
 
-#[tokio::test]
-async fn authenticated_control_rejection_is_a_decryptable_terminal_failure() {
-    let mut state = test_state();
-    state.release_admission = Arc::new(ReleaseAdmissionStore::new());
-    let token = "rejected-control-session";
-    let session_id = [0x91_u8; 32];
-    let transport_root = [0x92_u8; 32];
-    add_test_session(&state, token, "rejected-control-code", "Alice").await;
+/// Sends one sealed web ticket request for a live transport session and opens the reply.
+async fn sealed_web_ticket_response(
+    state: &AppState,
+    token: &str,
+    code: &str,
+    session_id: [u8; 32],
+    transport_root: [u8; 32],
+    bound_platform: Option<ClientPlatform>,
+) -> abyssal_core::transport_protocol::ControlResponse {
+    add_test_session(state, token, code, "Alice").await;
+    state
+        .accounts
+        .lock()
+        .await
+        .get_mut(&test_code_id(code))
+        .expect("test account")
+        .client_platform = bound_platform;
     state.transport_sessions.lock().await.insert(
         TransportSessionId::new(session_id),
         SessionTransportState {
@@ -630,16 +639,67 @@ async fn authenticated_control_rejection_is_a_decryptable_terminal_failure() {
         .await
         .expect("fixed control body");
     assert_eq!(body.len(), control::CONTROL_RECORD_BYTES);
+    exchange.open_response(body.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn authenticated_control_rejections_are_decryptable_and_specific() {
+    // A build the release manifest does not admit gets a sealed BuildRejected.
+    let mut state = test_state();
+    state.release_admission = Arc::new(ReleaseAdmissionStore::new());
+    let token = "rejected-control-session";
+    let session_id = [0x91_u8; 32];
     assert!(matches!(
-        exchange.open_response(body.to_vec()).unwrap(),
-        abyssal_core::transport_protocol::ControlResponse::Failure
+        sealed_web_ticket_response(
+            &state,
+            token,
+            "rejected-control-code",
+            session_id,
+            [0x92; 32],
+            None
+        )
+        .await,
+        abyssal_core::transport_protocol::ControlResponse::BuildRejected
     ));
+    // The refusal is terminal for the client but leaves the session in place.
     assert!(state.sessions.lock().await.contains_key(token));
     assert!(state
         .transport_sessions
         .lock()
         .await
         .contains_key(&TransportSessionId::new(session_id)));
+    assert!(state.ws_tickets.lock().await.is_empty());
+
+    // An account bound to Android this session gets a sealed PlatformConflict from the web.
+    let state = test_state();
+    assert!(matches!(
+        sealed_web_ticket_response(
+            &state,
+            "conflict-control-session",
+            "conflict-control-code",
+            [0x93; 32],
+            [0x94; 32],
+            Some(ClientPlatform::Android),
+        )
+        .await,
+        abyssal_core::transport_protocol::ControlResponse::PlatformConflict
+    ));
+    assert!(state.ws_tickets.lock().await.is_empty());
+
+    // The same account unbound is issued a ticket.
+    let state = test_state();
+    assert!(matches!(
+        sealed_web_ticket_response(
+            &state,
+            "open-control-session",
+            "open-control-code",
+            [0x95; 32],
+            [0x96; 32],
+            None
+        )
+        .await,
+        abyssal_core::transport_protocol::ControlResponse::WsTicket { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1047,7 +1107,7 @@ async fn bootstrap_receipt_capacity_releases_replay_id_for_retry() {
 
 #[tokio::test]
 async fn binary_registration_continues_through_opaque_login_without_early_session() {
-    let state = test_state();
+    let mut state = test_state();
     let capability = [0x72_u8; 32];
     let code_id = derive_code_id(&state.invite_code_pepper[..], capability);
     state.available_codes.lock().await.insert(code_id);
@@ -1133,6 +1193,7 @@ async fn binary_registration_continues_through_opaque_login_without_early_sessio
         created,
         max_rooms_per_user,
         session_inactivity_sec,
+        device_storage_share,
         ..
     } = session
     else {
@@ -1140,6 +1201,15 @@ async fn binary_registration_continues_through_opaque_login_without_early_sessio
     };
     assert_ne!(session_id.as_ref(), &[0_u8; 32]);
     assert!(created);
+    // Device storage is allowed in tests: the sealed session carries the account's share.
+    let account_share = state
+        .accounts
+        .lock()
+        .await
+        .get(&code_id)
+        .expect("registered account")
+        .device_storage_share;
+    assert_eq!(device_storage_share.as_deref(), Some(&account_share));
     assert_eq!(max_rooms_per_user as usize, state.max_rooms_per_user);
     assert_eq!(
         session_inactivity_sec as u64,
@@ -1157,6 +1227,8 @@ async fn binary_registration_continues_through_opaque_login_without_early_sessio
 
     // Signing in again while the first session is still live replaces it:
     // a closed or killed app must not lock the account out until it idles.
+    // With device storage switched off, the new session carries no share.
+    state.device_storage = device_storage::DeviceStoragePolicy::new(false);
     let first_token = state.sessions.lock().await.keys().next().unwrap().0.clone();
     state.available_codes.lock().await.insert(code_id);
     let opaque_login = abyssal_core::secure_protocol::opaque_client_start(password).unwrap();
@@ -1191,12 +1263,14 @@ async fn binary_registration_continues_through_opaque_login_without_early_sessio
         created,
         max_rooms_per_user,
         session_inactivity_sec,
+        device_storage_share,
         ..
     } = session
     else {
         panic!("login rejected");
     };
     assert!(!created);
+    assert!(device_storage_share.is_none());
     {
         let sessions = state.sessions.lock().await;
         assert_eq!(sessions.len(), 1, "never two live sessions");

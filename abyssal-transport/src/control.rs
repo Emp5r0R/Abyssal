@@ -23,6 +23,9 @@ const ACTION_LOGOUT: u8 = 2;
 const RESULT_FAILURE: u8 = 0;
 const RESULT_WS_TICKET: u8 = 1;
 const RESULT_LOGGED_OUT: u8 = 2;
+const RESULT_BUILD_REJECTED: u8 = 3;
+const RESULT_PLATFORM_CONFLICT: u8 = 4;
+const _: () = assert!(ACTION_LOGOUT == RESULT_LOGGED_OUT);
 const ENVELOPE_BYTES: usize = 6;
 const MAX_PAYLOAD_BYTES: usize = CONTROL_PLAINTEXT_BYTES - ENVELOPE_BYTES;
 
@@ -42,6 +45,10 @@ pub enum ControlResult {
         expires_in_sec: u32,
     },
     LoggedOut,
+    /// The build attestation was refused: the client must update.
+    BuildRejected,
+    /// The account is bound to another client platform for this session.
+    PlatformConflict,
 }
 
 pub fn encode_control_action(action: &ControlAction) -> Result<Zeroizing<Vec<u8>>, TransportError> {
@@ -93,6 +100,8 @@ pub fn encode_control_result(result: &ControlResult) -> Result<Zeroizing<Vec<u8>
             RESULT_WS_TICKET
         }
         ControlResult::LoggedOut => RESULT_LOGGED_OUT,
+        ControlResult::BuildRejected => RESULT_BUILD_REJECTED,
+        ControlResult::PlatformConflict => RESULT_PLATFORM_CONFLICT,
     };
     pad(payload, kind)
 }
@@ -113,6 +122,8 @@ pub fn decode_control_result(plaintext: &[u8]) -> Result<ControlResult, Transpor
             }
         }
         RESULT_LOGGED_OUT => ControlResult::LoggedOut,
+        RESULT_BUILD_REJECTED => ControlResult::BuildRejected,
+        RESULT_PLATFORM_CONFLICT => ControlResult::PlatformConflict,
         _ => return Err(TransportError::NonCanonical),
     };
     reader.finish()?;
@@ -162,16 +173,13 @@ fn decode_envelope(plaintext: &[u8]) -> Result<(u8, Reader<'_>), TransportError>
     if payload_len > MAX_PAYLOAD_BYTES {
         return Err(TransportError::NonCanonical);
     }
-    if (kind == RESULT_FAILURE || kind == RESULT_LOGGED_OUT || kind == ACTION_LOGOUT)
-        && payload_len != 0
-    {
-        return Err(TransportError::NonCanonical);
-    }
-    if kind != RESULT_FAILURE
-        && kind != RESULT_LOGGED_OUT
-        && kind != ACTION_LOGOUT
-        && payload_len == 0
-    {
+    // Actions and results share this envelope; the logout action and the
+    // logged-out result carry the same kind byte (checked at compile time).
+    let empty_kind = matches!(
+        kind,
+        RESULT_FAILURE | RESULT_LOGGED_OUT | RESULT_BUILD_REJECTED | RESULT_PLATFORM_CONFLICT
+    );
+    if empty_kind != (payload_len == 0) {
         return Err(TransportError::NonCanonical);
     }
     Ok((
@@ -271,6 +279,20 @@ mod tests {
             decode_control_result(&result).unwrap(),
             ControlResult::LoggedOut
         ));
+
+        for (result, kind) in [
+            (ControlResult::BuildRejected, RESULT_BUILD_REJECTED),
+            (ControlResult::PlatformConflict, RESULT_PLATFORM_CONFLICT),
+        ] {
+            let encoded = encode_control_result(&result).unwrap();
+            assert_eq!(encoded.len(), CONTROL_PLAINTEXT_BYTES);
+            let decoded = decode_control_result(&encoded).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&result),
+                "kind {kind}"
+            );
+        }
     }
 
     #[test]

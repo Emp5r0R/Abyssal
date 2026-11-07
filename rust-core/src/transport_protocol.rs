@@ -38,7 +38,14 @@ pub struct ControlAttestationInput {
 #[derive(uniffi::Enum)]
 pub enum ControlResponse {
     Failure,
-    WsTicket { ticket: String, expires_in_sec: u32 },
+    /// The relay refused this build: the app must update.
+    BuildRejected,
+    /// The account is bound to another platform for this session.
+    PlatformConflict,
+    WsTicket {
+        ticket: String,
+        expires_in_sec: u32,
+    },
     LoggedOut,
 }
 
@@ -386,6 +393,8 @@ fn public_control_response(result: ControlResult) -> ControlResponse {
             expires_in_sec,
         },
         ControlResult::LoggedOut => ControlResponse::LoggedOut,
+        ControlResult::BuildRejected => ControlResponse::BuildRejected,
+        ControlResult::PlatformConflict => ControlResponse::PlatformConflict,
     }
 }
 
@@ -442,6 +451,8 @@ pub enum AccountBootstrapResponse {
         identity_public: Vec<u8>,
         identity_prekey_id: String,
         identity_envelope: Vec<u8>,
+        /// The relay's RAM-only device-storage share when it allows device storage.
+        device_storage_share: Option<Vec<u8>>,
     },
 }
 
@@ -704,6 +715,7 @@ fn public_response(result: AccountBootstrapResult) -> AccountBootstrapResponse {
             identity_public,
             identity_prekey_id,
             identity_envelope,
+            device_storage_share,
         } => AccountBootstrapResponse::Session {
             session_id: session_id.to_vec(),
             created,
@@ -713,6 +725,7 @@ fn public_response(result: AccountBootstrapResult) -> AccountBootstrapResponse {
             identity_public: identity_public.to_vec(),
             identity_prekey_id: identity_prekey_id.to_string(),
             identity_envelope: identity_envelope.to_vec(),
+            device_storage_share: device_storage_share.map(|share| share.to_vec()),
         },
     }
 }

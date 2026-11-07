@@ -1,6 +1,6 @@
 import {
   parseInviteCapsule as rustParseInviteCapsule,
-  verifyInviteNodeDescriptor as rustVerifyInviteNodeDescriptor,
+  verifyTransportNodeDescriptor as rustVerifyTransportNodeDescriptor,
 } from "../generated/abyssal_core/abyssal_core";
 import type { NodeEndpoint } from "../domain/types";
 import { normalizeNodeUrl } from "./nodeUrl";
@@ -60,11 +60,15 @@ export async function parseInvite(input: string, now = Date.now()): Promise<Pars
   }
 }
 
+/**
+ * Fetches and verifies the relay's signed node descriptor and returns its
+ * process-lifetime bootstrap public key, to which account entry is sealed.
+ */
 export async function verifyConnectedInviteNode(
   invite: ParsedInvite,
   signal: AbortSignal,
   runtimeLocation: Pick<Location, "hostname" | "origin" | "protocol"> = window.location,
-): Promise<void> {
+): Promise<Uint8Array> {
   enforceBrowserLocatorPolicy(invite.endpoint, runtimeLocation);
   let response: Response;
   try {
@@ -87,7 +91,7 @@ export async function verifyConnectedInviteNode(
   }
   const descriptor = await readBoundedBytes(response, MAX_NODE_DESCRIPTOR_BYTES, signal);
   try {
-    rustVerifyInviteNodeDescriptor(
+    return rustVerifyTransportNodeDescriptor(
       descriptor,
       invite.nodePublicKey,
       invite.endpoint.apiBaseUrl,

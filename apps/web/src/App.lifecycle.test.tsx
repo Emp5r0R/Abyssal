@@ -20,6 +20,11 @@ const mocks = vi.hoisted(() => {
 
   const session: AccountSession = {
     token: "123e4567-e89b-42d3-a456-426614174000",
+    transport: {
+      nodePublicKey: new Uint8Array(32).fill(9),
+      sessionId: new Uint8Array(32).fill(1),
+      transportRoot: new Uint8Array(32).fill(2),
+    },
     nodeId: "node-one",
     username: "Alice",
     maxRoomsPerUser: 2,

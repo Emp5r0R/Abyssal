@@ -17,6 +17,8 @@ import {
   wipeMessageAttachmentKey as wipeMessageAttachment,
 } from "../domain/messageMemoryPolicy";
 import { reactionByShortcode } from "../domain/reactions";
+import { signInV11, type V11SignInResult } from "../transport/v11Login";
+import { wipeBootstrapSession } from "../transport/v11Account";
 import { MAX_VOICE_DURATION_MS, isAudioMime, readVoiceDuration } from "../domain/voiceNotes";
 import {
   actionAllowed,
@@ -49,17 +51,13 @@ import {
   ATTACHMENT_CHUNK_PLAINTEXT_BYTES,
   ATTACHMENT_CIPHER_VERSION,
   ATTACHMENT_KEY_BYTES,
-  finishOpaqueLogin,
-  finishOpaqueRegistration,
   FatalCipherError,
   IDENTITY_PUBLIC_KEY_BYTES,
   InMemoryPayloadCipher,
   payloadToFrame,
   PROTOCOL_VERSION,
-  startOpaque,
   type EncryptedPayload,
   wipeBytes,
-  wipeOpaqueStart,
 } from "../security/crypto";
 import { attachmentDownloadBlob, attachmentDownloadName } from "../security/attachmentExport";
 import {
@@ -88,11 +86,10 @@ import {
 import {
   decryptAndCompleteAttachment,
   deleteUploadedAttachment,
-  finishOpaqueAccount,
   RelaySocket,
   releaseAttachmentDownloadClaim,
   revokeSession,
-  startOpaqueAccount,
+  revokeTransportKeys,
   streamEncryptedAttachmentRecords,
   uploadEncryptedAttachment,
   type EncryptedSendOutcome,
@@ -1229,103 +1226,51 @@ export function useAbyssalSession() {
     setEntryNotice(null);
     try {
       parsedInvite = await parseInvite(input.invite);
-      await verifyConnectedInviteNode(parsedInvite, loginAbort.signal);
+      const bootstrapPublicKey = await verifyConnectedInviteNode(parsedInvite, loginAbort.signal);
       ensureLoginActive();
       const endpoint = parsedInvite.endpoint;
-      const opaque = await startOpaque(input.password);
+      let signedIn: V11SignInResult | null = null;
       try {
+        signedIn = await signInV11({
+          apiBaseUrl: endpoint.apiBaseUrl,
+          nodeId: parsedInvite.nodeId,
+          nodePublicKey: parsedInvite.nodePublicKey,
+          bootstrapPublicKey,
+          capability: parsedInvite.capability,
+          accountContext: parsedInvite.accountContext,
+          password: input.password,
+          identity: cipherRef.current,
+          ensureActive: ensureLoginActive,
+          signal: loginAbort.signal,
+        });
         ensureLoginActive();
-        const start = await startOpaqueAccount(
-          endpoint,
-          parsedInvite.capability,
-          opaque.registrationRequest,
-          opaque.credentialRequest,
-          loginAbort.signal,
-        );
-        ensureLoginActive();
-        if (start.node_id !== parsedInvite.nodeId) {
-          throw new Error("Node identity mismatch");
-        }
-        let context: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-        let response: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-        try {
-          context = parsedInvite.accountContext.slice();
-          response = base64ToBytes(start.response_b64!);
-          if (start.mode === "registration") {
-            const result = await finishOpaqueRegistration(input.password, opaque, response);
-            try {
-              const identity = cipherRef.current.createIdentity(result.exportKey, context);
-              const challenge = base64ToBytes(start.challenge_b64!);
-              let identityProof: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-              try {
-                ensureLoginActive();
-                identityProof = cipherRef.current.signRegistrationIdentityProof(
-                  start.node_id,
-                  start.handshake_id!,
-                  challenge,
-                  result.registrationUpload,
-                  identity.publicKey,
-                  identity.prekeyId,
-                  identity.envelope,
-                );
-                nextSession = await finishOpaqueAccount(endpoint, {
-                  handshakeId: start.handshake_id!,
-                  registrationUpload: result.registrationUpload,
-                  identityPublicKey: identity.publicKey,
-                  identityPrekeyId: identity.prekeyId,
-                  identityEnvelope: identity.envelope,
-                  identityProof,
-                }, loginAbort.signal);
-                ensureLoginActive();
-              } finally {
-                wipeBytes(challenge);
-                wipeBytes(identityProof);
-                wipeBytes(identity.publicKey);
-                wipeBytes(identity.envelope);
-              }
-            } finally {
-              wipeBytes(result.registrationUpload);
-              wipeBytes(result.exportKey);
-            }
-          } else {
-            const result = await finishOpaqueLogin(input.password, opaque, response);
-            let identityPublic: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-            let identityEnvelope: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-            try {
-              identityPublic = base64ToBytes(start.identity_public_b64!);
-              identityEnvelope = base64ToBytes(start.identity_envelope_b64!);
-              cipherRef.current.recoverIdentity(
-                result.exportKey,
-                context,
-                identityEnvelope,
-                identityPublic,
-              );
-              ensureLoginActive();
-              nextSession = await finishOpaqueAccount(endpoint, {
-                handshakeId: start.handshake_id!,
-                credentialFinalization: result.credentialFinalization,
-              }, loginAbort.signal);
-              ensureLoginActive();
-            } finally {
-              wipeBytes(result.credentialFinalization);
-              wipeBytes(result.exportKey);
-              wipeBytes(identityPublic);
-              wipeBytes(identityEnvelope);
-            }
-          }
-        } finally {
-          wipeBytes(context);
-          wipeBytes(response);
-        }
-        if (
-          !nextSession ||
-          nextSession.nodeId !== start.node_id ||
-          nextSession.created !== (start.mode === "registration")
-        ) {
+        const account = signedIn.session;
+        if (account.created !== (signedIn.mode === "registration") ||
+          !/^[A-Za-z0-9_-]{1,80}$/u.test(account.username) ||
+          account.identityPublic.byteLength !== IDENTITY_PUBLIC_KEY_BYTES ||
+          !/^[A-Za-z0-9_-]{1,32}$/u.test(account.identityPrekeyId)) {
           throw new Error("Wrong information");
         }
+        nextSession = {
+          // A local identity for this session only; v11 authenticates with the transport keys.
+          token: crypto.randomUUID(),
+          transport: signedIn.keys,
+          nodeId: parsedInvite.nodeId,
+          username: account.username,
+          maxRoomsPerUser: account.maxRoomsPerUser,
+          sessionInactivitySec: account.sessionInactivitySec,
+          endpoint,
+          created: account.created,
+          identityPublicKey: account.identityPublic.slice(),
+          identityPrekeyId: account.identityPrekeyId,
+        };
+      } catch (error) {
+        // An authenticated session the client will not use is logged out, not left to expire.
+        if (signedIn && !nextSession) await revokeTransportKeys(endpoint.apiBaseUrl, signedIn.keys);
+        throw error;
       } finally {
-        wipeOpaqueStart(opaque);
+        if (signedIn) wipeBootstrapSession(signedIn.session);
+        bootstrapPublicKey.fill(0);
       }
     } catch (error) {
       cipherRef.current.clear();

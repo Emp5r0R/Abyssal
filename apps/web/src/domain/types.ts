@@ -1,4 +1,5 @@
 import type { ReactionEmoji } from "./messageActions";
+import type { TransportKeys } from "../transport/v11Account";
 import type { SenderClient } from "./senderClient";
 
 export type ConnectionState = "connecting" | "connected" | "disconnected";
@@ -13,7 +14,13 @@ export interface NodeEndpoint {
 
 export interface AccountSession {
   displayName?: string;
+  /**
+   * A random local identifier for this signed-in session, used to tell sessions
+   * apart in memory. It is never sent: protocol v11 authenticates with [transport].
+   */
   token: string;
+  /** Protocol-v11 keys for control, WebSocket and attachment records. */
+  transport: TransportKeys;
   nodeId: string;
   username: string;
   maxRoomsPerUser: number;
@@ -22,33 +29,6 @@ export interface AccountSession {
   created: boolean;
   identityPublicKey: Uint8Array;
   identityPrekeyId: string;
-}
-
-export interface AccountResponse {
-  accepted: boolean;
-  created: boolean;
-  token?: string | null;
-  node_id: string;
-  username?: string | null;
-  max_rooms_per_user: number;
-  session_inactivity_sec: number;
-  identity_public_b64?: string | null;
-  identity_prekey_id?: string | null;
-  identity_envelope_b64?: string | null;
-  error?: string | null;
-}
-
-export interface OpaqueAccountStartResponse {
-  accepted: boolean;
-  mode?: "registration" | "login" | null;
-  handshake_id?: string | null;
-  response_b64?: string | null;
-  challenge_b64?: string | null;
-  node_id: string;
-  identity_public_b64?: string | null;
-  identity_prekey_id?: string | null;
-  identity_envelope_b64?: string | null;
-  error?: string | null;
 }
 
 export interface PresenceUser {

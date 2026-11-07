@@ -5889,7 +5889,11 @@ sealed class AccountBootstrapResponse {
         val `username`: kotlin.String,
         val `identityPublic`: kotlin.ByteArray,
         val `identityPrekeyId`: kotlin.String,
-        val `identityEnvelope`: kotlin.ByteArray) : AccountBootstrapResponse()
+        val `identityEnvelope`: kotlin.ByteArray,
+        /**
+         * The relay's RAM-only device-storage share when it allows device storage.
+         */
+        val `deviceStorageShare`: kotlin.ByteArray?) : AccountBootstrapResponse()
 
     {
 
@@ -5939,6 +5943,7 @@ public object FfiConverterTypeAccountBootstrapResponse : FfiConverterRustBuffer<
                 FfiConverterByteArray.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterByteArray.read(buf),
+                FfiConverterOptionalByteArray.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -5991,6 +5996,7 @@ public object FfiConverterTypeAccountBootstrapResponse : FfiConverterRustBuffer<
                 + FfiConverterByteArray.allocationSize(value.`identityPublic`)
                 + FfiConverterString.allocationSize(value.`identityPrekeyId`)
                 + FfiConverterByteArray.allocationSize(value.`identityEnvelope`)
+                + FfiConverterOptionalByteArray.allocationSize(value.`deviceStorageShare`)
             )
         }
     }
@@ -6033,6 +6039,7 @@ public object FfiConverterTypeAccountBootstrapResponse : FfiConverterRustBuffer<
                 FfiConverterByteArray.write(value.`identityPublic`, buf)
                 FfiConverterString.write(value.`identityPrekeyId`, buf)
                 FfiConverterByteArray.write(value.`identityEnvelope`, buf)
+                FfiConverterOptionalByteArray.write(value.`deviceStorageShare`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -6262,6 +6269,18 @@ sealed class ControlResponse {
     object Failure : ControlResponse()
 
 
+    /**
+     * The relay refused this build: the app must update.
+     */
+    object BuildRejected : ControlResponse()
+
+
+    /**
+     * The account is bound to another platform for this session.
+     */
+    object PlatformConflict : ControlResponse()
+
+
     data class WsTicket(
         val `ticket`: kotlin.String,
         val `expiresInSec`: kotlin.UInt) : ControlResponse()
@@ -6292,17 +6311,31 @@ public object FfiConverterTypeControlResponse : FfiConverterRustBuffer<ControlRe
     override fun read(buf: ByteBuffer): ControlResponse {
         return when(buf.getInt()) {
             1 -> ControlResponse.Failure
-            2 -> ControlResponse.WsTicket(
+            2 -> ControlResponse.BuildRejected
+            3 -> ControlResponse.PlatformConflict
+            4 -> ControlResponse.WsTicket(
                 FfiConverterString.read(buf),
                 FfiConverterUInt.read(buf),
                 )
-            3 -> ControlResponse.LoggedOut
+            5 -> ControlResponse.LoggedOut
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
     }
 
     override fun allocationSize(value: ControlResponse): ULong = when(value) {
         is ControlResponse.Failure -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is ControlResponse.BuildRejected -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is ControlResponse.PlatformConflict -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -6330,14 +6363,22 @@ public object FfiConverterTypeControlResponse : FfiConverterRustBuffer<ControlRe
                 buf.putInt(1)
                 Unit
             }
-            is ControlResponse.WsTicket -> {
+            is ControlResponse.BuildRejected -> {
                 buf.putInt(2)
+                Unit
+            }
+            is ControlResponse.PlatformConflict -> {
+                buf.putInt(3)
+                Unit
+            }
+            is ControlResponse.WsTicket -> {
+                buf.putInt(4)
                 FfiConverterString.write(value.`ticket`, buf)
                 FfiConverterUInt.write(value.`expiresInSec`, buf)
                 Unit
             }
             is ControlResponse.LoggedOut -> {
-                buf.putInt(3)
+                buf.putInt(5)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

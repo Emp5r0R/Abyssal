@@ -165,6 +165,16 @@ export class WasmAccountBootstrapResponse {
         return ret !== 0;
     }
     /**
+     * The relay's device-storage share; empty when the relay does not allow device storage.
+     * @returns {Uint8Array}
+     */
+    get deviceStorageShare() {
+        const ret = wasm.wasmaccountbootstrapresponse_deviceStorageShare(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
      * @returns {Uint8Array}
      */
     get handshakeId() {

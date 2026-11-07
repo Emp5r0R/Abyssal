@@ -252,6 +252,7 @@ export const wasmaccountbootstrapexchange_requestBytes: (a: number) => [number, 
 export const wasmaccountbootstrapexchange_start: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
 export const wasmaccountbootstrapresponse_challenge: (a: number) => [number, number];
 export const wasmaccountbootstrapresponse_created: (a: number) => number;
+export const wasmaccountbootstrapresponse_deviceStorageShare: (a: number) => [number, number];
 export const wasmaccountbootstrapresponse_handshakeId: (a: number) => [number, number];
 export const wasmaccountbootstrapresponse_identityEnvelope: (a: number) => [number, number];
 export const wasmaccountbootstrapresponse_identityPrekeyId: (a: number) => [number, number];

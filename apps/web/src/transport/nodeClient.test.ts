@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ControlRejected } from "./v11Control";
 import type { AccountSession, IncomingFrame, NodeEndpoint } from "../domain/types";
 import {
   bytesToBase64,
@@ -6,11 +7,8 @@ import {
   IDENTITY_PUBLIC_KEY_BYTES,
 } from "../security/crypto";
 import {
-  finishOpaqueAccount,
   RelaySocket,
-  relayTicketRejection,
   revokeSession,
-  startOpaqueAccount,
   streamEncryptedAttachmentRecords,
   completeAttachmentDownload,
   decryptAndCompleteAttachment,
@@ -28,16 +26,64 @@ import {
   padOutgoingControlFrame,
 } from "./messagePadding";
 
+// Protocol-v11 records are sealed in WASM; these tests cover the client logic
+// around them with the sealing modules replaced by controllable fakes.
+const v11 = vi.hoisted(() => ({
+  issue: vi.fn(),
+  logout: vi.fn(),
+  upload: vi.fn(),
+  download: vi.fn(),
+  complete: vi.fn(),
+  release: vi.fn(),
+  remove: vi.fn(),
+}));
+vi.mock("./v11Control", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./v11Control")>()),
+  issueWsTicketV11: v11.issue,
+  logoutV11: v11.logout,
+}));
+vi.mock("./v11Attachment", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./v11Attachment")>()),
+  uploadAttachmentV11: v11.upload,
+  downloadAttachmentV11: v11.download,
+  completeDownloadV11: v11.complete,
+  releaseDownloadV11: v11.release,
+  deleteAttachmentV11: v11.remove,
+}));
+vi.mock("./v11Socket", () => ({
+  WS_PROTOCOL_V11: "abyssal-v11",
+  /** A channel that is ready at once and passes text through, like the pre-v11 socket. */
+  V11SocketChannel: class {
+    readonly ready = true;
+    clientHello() { return null; }
+    receive(data: unknown) {
+      if (typeof data !== "string") throw new Error("Transport unavailable");
+      return data;
+    }
+    seal(text: string) { return text; }
+    destroy() { return undefined; }
+  },
+}));
+
+beforeEach(() => {
+  Object.values(v11).forEach((mock) => mock.mockReset());
+  v11.issue.mockResolvedValue({ ticket: WS_TICKET_V11, expiresInSec: 30 });
+});
+
 const endpoint: NodeEndpoint = {
   apiBaseUrl: "https://node.example",
   wsBaseUrl: "wss://node.example",
   displayHost: "node.example",
 };
-const CAPABILITY = new Uint8Array(32).fill(4);
 const SESSION_TOKEN = "87fced9a-30b1-42f4-9f9d-b75381e03af7";
 
 const session: AccountSession = {
   token: SESSION_TOKEN,
+  transport: {
+    nodePublicKey: new Uint8Array(32).fill(1),
+    sessionId: new Uint8Array(32).fill(2),
+    transportRoot: new Uint8Array(32).fill(3),
+  },
   nodeId: "node-1",
   username: "Alice",
   maxRoomsPerUser: 3,
@@ -70,7 +116,7 @@ async function downloadEncryptedAttachment(
     records.forEach((record) => record.fill(0));
   }
 }
-const WS_TICKET = bytesToBase64(new Uint8Array(32).fill(7));
+const WS_TICKET_V11 = "T".repeat(43);
 const ACK_SIGNATURE = new Uint8Array(64).fill(9);
 const DIRECTORY_STAMP = {
   directory_node_id: "node-1",
@@ -144,19 +190,6 @@ function unpaddedControlFrame(text: string | undefined): Record<string, unknown>
   return frame;
 }
 
-function websocketTicketResponse(expiresInSec = 30): Response {
-  return new Response(JSON.stringify({
-    ticket: WS_TICKET,
-    expires_in_sec: expiresInSec,
-  }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-const CLAIM_TRUNCATED = "11111111-1111-4111-8111-111111111111";
-const CLAIM_EXTRA = "22222222-2222-4222-8222-222222222222";
-const CLAIM_EMPTY = "33333333-3333-4333-8333-333333333333";
 const CLAIM_PRIMARY = "44444444-4444-4444-8444-444444444444";
 const CLAIM_FAILED = "55555555-5555-4555-8555-555555555555";
 const CLAIM_DECRYPT = "66666666-6666-4666-8666-666666666666";
@@ -165,931 +198,134 @@ const ATTACHMENT_SECONDARY = "123e4567-e89b-42d3-a456-426614174001";
 const ATTACHMENT_TERTIARY = "123e4567-e89b-42d3-a456-426614174002";
 const ATTACHMENT_EMPTY = "123e4567-e89b-42d3-a456-426614174003";
 const ATTACHMENT_EXACT = "123e4567-e89b-42d3-a456-426614174004";
-const FILE_THREE_BYTE_POLICY = { mediaType: "FILE" as const, expectedPlaintextBytes: 3 };
-const exactEncryptedRecord = (fill: number) => new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES).fill(fill);
-const OPAQUE_CHALLENGE_B64 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("account transport", () => {
-  it("starts OPAQUE without sending password or browser credentials", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      accepted: true,
-      mode: "login",
-      handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      response_b64: "AQID",
-      challenge_b64: null,
-      node_id: "node-1",
-      identity_public_b64: bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7)),
-      identity_prekey_id: "test-prekey",
-      identity_envelope_b64: "AQID",
-      error: null,
-    }), { status: 200, headers: { "Content-Type": "application/json" } }));
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).resolves.toMatchObject({
-      mode: "login",
-      node_id: "node-1",
-    });
-    expect(fetchMock).toHaveBeenCalledWith("https://node.example/v2/account/start", expect.objectContaining({
-      method: "POST",
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      body: JSON.stringify({
-        capability_b64: bytesToBase64(CAPABILITY),
-        registration_request_b64: "AQ",
-        credential_request_b64: "Ag",
-      }),
-    }));
-    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("password1");
-  });
-
-  it("uses the same vague error for malformed and rejected responses", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not-json", { status: 401 }));
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).rejects.toThrow("Wrong information");
-  });
-
-  it("rejects non-canonical and malformed base64url in OPAQUE/account responses", async () => {
-    const registrationResponse = (response_b64: string) => new Response(JSON.stringify({
-      accepted: true,
-      mode: "registration",
-      handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      response_b64,
-      challenge_b64: OPAQUE_CHALLENGE_B64,
-      node_id: "node-1",
-      identity_public_b64: null,
-      identity_prekey_id: null,
-      identity_envelope_b64: null,
-      error: null,
-    }), { status: 200 });
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      // AR decodes to the same byte as AQ, but has non-zero unused bits.
-      .mockResolvedValueOnce(registrationResponse("AR"))
-      // Base64url lengths modulo four equal to one are never valid.
-      .mockResolvedValueOnce(registrationResponse("A"));
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).rejects.toThrow("Wrong information");
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).rejects.toThrow("Wrong information");
-
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    const canonicalPublic = bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7));
-    const lastIndex = alphabet.indexOf(canonicalPublic.at(-1)!);
-    const nonCanonicalPublic = `${canonicalPublic.slice(0, -1)}${alphabet[(lastIndex & 0x30) | 1]}`;
-    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
-      accepted: true,
-      created: true,
-      token: SESSION_TOKEN,
-      node_id: "node-1",
-      username: "Alice",
-      max_rooms_per_user: 3,
-      session_inactivity_sec: 900,
-      identity_public_b64: nonCanonicalPublic,
-      identity_prekey_id: "test-prekey",
-      identity_envelope_b64: "AQID",
-      error: null,
-    }), { status: 200 }));
-
-    await expect(finishOpaqueAccount(endpoint, {
-      handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      credentialFinalization: new Uint8Array([9]),
-    })).rejects.toThrow("Wrong information");
-  });
-
-  it("fails closed on the retired 128-byte account identity bundle", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      accepted: true,
-      created: false,
-      token: SESSION_TOKEN,
-      node_id: "node-1",
-      username: "Alice",
-      max_rooms_per_user: 3,
-      session_inactivity_sec: 900,
-      identity_public_b64: bytesToBase64(new Uint8Array(128).fill(7)),
-      identity_prekey_id: "test-prekey",
-      identity_envelope_b64: "AQID",
-      error: null,
-    }), { status: 200 }));
-    await expect(finishOpaqueAccount(endpoint, {
-      handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      credentialFinalization: new Uint8Array([9]),
-    })).rejects.toThrow("Wrong information");
-  });
-
-  it("cancels an oversized streamed OPAQUE response", async () => {
-    let cancelled = false;
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array(768 * 1024 + 1));
-      },
-      cancel() {
-        cancelled = true;
-      },
-    });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream, { status: 200 }));
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).rejects.toThrow("Wrong information");
-    expect(cancelled).toBe(true);
-  });
-
-  it("rejects truncated OPAQUE JSON using the declared content length", async () => {
-    const body = JSON.stringify({ accepted: true });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, {
-      status: 200,
-      headers: { "Content-Length": String(new TextEncoder().encode(body).byteLength + 4) },
-    }));
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).rejects.toThrow("Wrong information");
-  });
-
-  it("bounds decoded compressed responses without comparing their wire length", async () => {
-    const body = JSON.stringify({
-      accepted: true,
-      mode: "registration",
-      handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      response_b64: "AQID",
-      challenge_b64: OPAQUE_CHALLENGE_B64,
-      node_id: "node-1",
-      identity_public_b64: null,
-      identity_prekey_id: null,
-      identity_envelope_b64: null,
-      error: null,
-    });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, {
-      status: 200,
-      headers: { "Content-Encoding": "br", "Content-Length": "17" },
-    }));
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).resolves.toMatchObject({ mode: "registration", node_id: "node-1" });
-  });
-
-  it("rejects malformed or oversized content lengths and cancels the body", async () => {
-    let cancellations = 0;
-    const body = () => new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array([123]));
-      },
-      cancel() {
-        cancellations += 1;
-      },
-    });
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(body(), {
-        status: 200,
-        headers: { "Content-Length": "12x" },
-      }))
-      .mockResolvedValueOnce(new Response(body(), {
-        status: 200,
-        headers: { "Content-Length": String(768 * 1024 + 1) },
-      }));
-
-    await expect(startOpaqueAccount(endpoint, CAPABILITY, new Uint8Array([1]), new Uint8Array([2])))
-      .rejects.toThrow("Wrong information");
-    await expect(startOpaqueAccount(endpoint, CAPABILITY, new Uint8Array([1]), new Uint8Array([2])))
-      .rejects.toThrow("Wrong information");
-    expect(cancellations).toBe(2);
-  });
-
-  it("cancels the response body when the account request is aborted", async () => {
-    let cancelled = false;
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array([123]));
-      },
-      cancel() {
-        cancelled = true;
-      },
-    });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream, { status: 200 }));
-    const abort = new AbortController();
-    abort.abort();
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-      abort.signal,
-    )).rejects.toThrow("Wrong information");
-    expect(cancelled).toBe(true);
-  });
-
-  it("rejects malformed types, unknown fields, and invalid session tokens", async () => {
-    const invalidStart = new Response(JSON.stringify({
-      accepted: true,
-      mode: "registration",
-      handshake_id: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      response_b64: "AQID",
-      node_id: "node-1",
-      unexpected: "field",
-    }), { status: 200 });
-    const invalidFinish = new Response(JSON.stringify({
-      accepted: true,
-      created: false,
-      token: "not-a-session-token",
-      node_id: "node-1",
-      username: "Alice",
-      max_rooms_per_user: "3",
-      session_inactivity_sec: 900,
-      identity_public_b64: bytesToBase64(new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7)),
-      identity_prekey_id: "test-prekey",
-      identity_envelope_b64: "AQID",
-    }), { status: 200 });
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(invalidStart)
-      .mockResolvedValueOnce(invalidFinish);
-
-    await expect(startOpaqueAccount(
-      endpoint,
-      CAPABILITY,
-      new Uint8Array([1]),
-      new Uint8Array([2]),
-    )).rejects.toThrow("Wrong information");
-    await expect(finishOpaqueAccount(endpoint, {
-      handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      credentialFinalization: new Uint8Array([9]),
-    })).rejects.toThrow("Wrong information");
-  });
-
-  it("finishes OPAQUE and validates returned identity material", async () => {
-    const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      accepted: true,
-      created: true,
-      token: SESSION_TOKEN,
-      node_id: "node-1",
-      username: "Alice",
-      max_rooms_per_user: 3,
-      session_inactivity_sec: 900,
-      identity_public_b64: bytesToBase64(publicKey),
-      identity_prekey_id: "test-prekey",
-      identity_envelope_b64: "AQID",
-      error: null,
-    }), { status: 200, headers: { "Content-Type": "application/json" } }));
-
-    await expect(finishOpaqueAccount(endpoint, {
-      handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c",
-      credentialFinalization: new Uint8Array([9]),
-    })).resolves.toMatchObject({ username: "Alice", identityPublicKey: publicKey });
-    expect(fetchMock).toHaveBeenCalledWith("https://node.example/v2/account/finish", expect.objectContaining({
-      method: "POST",
-      credentials: "omit",
-    }));
-  });
-
-  it("accepts the optional device storage fields and rejects malformed ones", async () => {
-    const publicKey = new Uint8Array(IDENTITY_PUBLIC_KEY_BYTES).fill(7);
-    const base = {
-      accepted: true, created: true, token: SESSION_TOKEN, node_id: "node-1", username: "Alice",
-      max_rooms_per_user: 3, session_inactivity_sec: 900, identity_public_b64: bytesToBase64(publicKey),
-      identity_prekey_id: "test-prekey", identity_envelope_b64: "AQID", error: null,
-    };
-    const share = bytesToBase64(new Uint8Array(32).fill(5)).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
-    const finish = (body: Record<string, unknown>) => {
-      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(body), { status: 200 }));
-      return finishOpaqueAccount(endpoint, { handshakeId: "76f1b4b6-6dd8-4352-80b9-76fa0150484c", credentialFinalization: new Uint8Array([9]) });
-    };
-    await expect(finish({ ...base, device_storage: true, device_storage_share_b64: share })).resolves.toMatchObject({ username: "Alice" });
-    await expect(finish({ ...base, device_storage: "true" })).rejects.toThrow();
-    await expect(finish({ ...base, device_storage_share_b64: share })).rejects.toThrow();
-    await expect(finish({ ...base, device_storage: true, device_storage_share_b64: "AQID" })).rejects.toThrow();
-  });
-
-  it("revokes a token with a no-store bearer request", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+describe("account and attachment transport over protocol v11", () => {
+  it("revokes the session with a sealed control record, never a bearer token", async () => {
+    v11.logout.mockResolvedValue(true);
     await revokeSession(session);
-    expect(fetchMock).toHaveBeenCalledWith("https://node.example/v1/account/logout", expect.objectContaining({
-      method: "POST",
-      cache: "no-store",
-      credentials: "omit",
-      keepalive: true,
-      headers: { Authorization: `Bearer ${SESSION_TOKEN}` },
-    }));
+    expect(v11.logout).toHaveBeenCalledWith("https://node.example", session.transport, expect.any(AbortSignal));
   });
 
-  it("streams bounded attachment bodies and rejects an oversized declaration", async () => {
-    const encrypted = exactEncryptedRecord(7);
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
-      encrypted.slice(),
-      { status: 200, headers: { "content-length": String(encrypted.byteLength) } },
-    ));
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_PRIMARY,
-      FILE_THREE_BYTE_POLICY,
-    )).resolves.toEqual(
-      { bytes: encrypted },
-    );
-    expect(fetchMock).toHaveBeenCalledWith(
-      `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}`,
-      expect.objectContaining({ cache: "no-store", credentials: "omit" }),
-    );
-
-    fetchMock.mockResolvedValue(new Response(new Uint8Array([1]), {
-      status: 200,
-      headers: { "content-length": "999999999999999999999" },
-    }));
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_SECONDARY,
-      FILE_THREE_BYTE_POLICY,
-    )).rejects.toThrow(
-      "Attachment unavailable",
-    );
-  });
-
-  it("accepts an exact chunked body without Content-Length and rejects FILE-sized IMAGE metadata before fetch", async () => {
-    const exact = exactEncryptedRecord(6);
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(exact.slice(0, 13));
-        controller.enqueue(exact.slice(13));
-        controller.close();
-      },
+  it("uploads through the sealed attachment endpoint with the inner cipher version", async () => {
+    v11.upload.mockImplementation(async (_base, _keys, _input, onProgress) => {
+      onProgress(50, 100);
+      return ATTACHMENT_PRIMARY;
     });
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(stream, { status: 200 }));
-
-    await expect(downloadEncryptedAttachment(
+    const progress: number[] = [];
+    const encrypted = new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES).fill(5);
+    await expect(uploadEncryptedAttachment(
       session,
-      ATTACHMENT_PRIMARY,
-      FILE_THREE_BYTE_POLICY,
-    )).resolves.toEqual({ bytes: exact });
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_SECONDARY,
-      { mediaType: "IMAGE", expectedPlaintextBytes: 200 * 1024 * 1024 },
-    )).rejects.toThrow("Attachment unavailable");
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("frames arbitrary network chunks into fixed records and wipes callback buffers", async () => {
-    const encrypted = new Uint8Array(2 * ATTACHMENT_CHUNK_RECORD_BYTES);
-    encrypted.fill(0x11, 0, ATTACHMENT_CHUNK_RECORD_BYTES);
-    encrypted.fill(0x22, ATTACHMENT_CHUNK_RECORD_BYTES);
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(encrypted.slice(0, 17));
-        controller.enqueue(encrypted.slice(17, ATTACHMENT_CHUNK_RECORD_BYTES + 29));
-        controller.enqueue(encrypted.slice(ATTACHMENT_CHUNK_RECORD_BYTES + 29));
-        controller.close();
-      },
+      "dm_123",
+      "7f0bf6e6-2d60-4b33-9a4b-1a7c1d1b3c11",
+      "FILE",
+      encrypted,
+      { oneTime: true, deleteAfterDownload: false, ttlSec: 60 },
+      ({ loaded }) => progress.push(loaded),
+    )).resolves.toBe(ATTACHMENT_PRIMARY);
+    const [base, keys, input] = v11.upload.mock.calls[0];
+    expect(base).toBe("https://node.example");
+    expect(keys).toBe(session.transport);
+    expect(input).toMatchObject({
+      chatId: "dm_123",
+      mediaType: "FILE",
+      cipherVersion: 2,
+      oneTime: true,
+      deleteAfterDownload: true,
+      ttlSec: 60,
     });
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(stream, {
-      status: 200,
-      headers: { "content-length": String(encrypted.byteLength) },
-    }));
-    const callbackViews: Uint8Array[] = [];
-    const observed: number[] = [];
-
-    await expect(streamEncryptedAttachmentRecords(
-      session,
-      ATTACHMENT_PRIMARY,
-      {
-        mediaType: "FILE",
-        expectedPlaintextBytes: 256 * 1024 + 1,
-      },
-      (record, index) => {
-        callbackViews.push(record);
-        observed.push(index, record[0]);
-      },
-    )).resolves.toEqual({});
-
-    expect(observed).toEqual([0, 0x11, 1, 0x22]);
-    for (const view of callbackViews) expect(view.every((value) => value === 0)).toBe(true);
+    expect(input.ciphertext.size).toBe(ATTACHMENT_CHUNK_RECORD_BYTES);
+    expect(progress).toEqual([Math.floor(ATTACHMENT_CHUNK_RECORD_BYTES / 2)]);
   });
 
-  it("releases a destructive claim when record processing fails", async () => {
-    const encrypted = exactEncryptedRecord(9);
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(encrypted, {
-        status: 200,
-        headers: {
-          "content-length": String(encrypted.byteLength),
-          "X-Abyssal-Attachment-Claim": CLAIM_DECRYPT,
-        },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
-    let callbackView: Uint8Array | undefined;
-
-    await expect(streamEncryptedAttachmentRecords(
-      session,
-      ATTACHMENT_PRIMARY,
-      FILE_THREE_BYTE_POLICY,
-      (record) => {
-        callbackView = record;
-        throw new Error("decrypt failed");
-      },
-    )).rejects.toThrow("decrypt failed");
-
-    expect(callbackView?.every((value) => value === 0)).toBe(true);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}/claim`,
-      expect.objectContaining({ method: "DELETE" }),
-    );
+  it("rejects an upload without a valid message binding or exact cipher records before sending", async () => {
+    const options = { oneTime: false, deleteAfterDownload: false, ttlSec: 0 };
+    await expect(uploadEncryptedAttachment(session, "dm_123", "not-a-uuid", "FILE",
+      new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES), options, () => undefined)).rejects.toThrow("Upload rejected");
+    await expect(uploadEncryptedAttachment(session, "dm_123", "7f0bf6e6-2d60-4b33-9a4b-1a7c1d1b3c11", "FILE",
+      new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES - 1), options, () => undefined)).rejects.toThrow("Upload rejected");
+    expect(v11.upload).not.toHaveBeenCalled();
   });
 
-  it("rejects truncated bodies and mismatched encrypted Content-Length values", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(new Uint8Array([1]), { status: 200 }))
-      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2]), {
-        status: 200,
-        headers: {
-          "content-length": "4",
-          "X-Abyssal-Attachment-Claim": CLAIM_TRUNCATED,
-        },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
-      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]), {
-        status: 200,
-        headers: {
-          "content-length": "2",
-          "X-Abyssal-Attachment-Claim": CLAIM_EXTRA,
-        },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
-
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_PRIMARY,
-      FILE_THREE_BYTE_POLICY,
-    )).rejects.toThrow(
-      "Attachment unavailable",
-    );
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_SECONDARY,
-      FILE_THREE_BYTE_POLICY,
-    )).rejects.toThrow(
-      "Attachment unavailable",
-    );
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_TERTIARY,
-      FILE_THREE_BYTE_POLICY,
-    )).rejects.toThrow(
-      "Attachment unavailable",
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      3,
-      `https://node.example/v1/attachment/${ATTACHMENT_SECONDARY}/claim`,
-      expect.objectContaining({ method: "DELETE" }),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      5,
-      `https://node.example/v1/attachment/${ATTACHMENT_TERTIARY}/claim`,
-      expect.objectContaining({ method: "DELETE" }),
-    );
-  });
-
-  it("rejects an empty attachment and releases a reserved claim", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(new Uint8Array(0), {
-        status: 200,
-        headers: {
-          "content-length": "0",
-          "X-Abyssal-Attachment-Claim": CLAIM_EMPTY,
-        },
-      }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
-
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_EMPTY,
-      FILE_THREE_BYTE_POLICY,
-    )).rejects.toThrow(
-      "Attachment unavailable",
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      `https://node.example/v1/attachment/${ATTACHMENT_EMPTY}/claim`,
-      expect.objectContaining({
-        method: "DELETE",
-        cache: "no-store",
-        credentials: "omit",
-        referrerPolicy: "no-referrer",
-        headers: {
-          Authorization: `Bearer ${SESSION_TOKEN}`,
-          "X-Abyssal-Attachment-Claim": CLAIM_EMPTY,
-        },
-      }),
-    );
-  });
-
-  it("returns an optional claim without changing exact encrypted bytes", async () => {
-    const encrypted = exactEncryptedRecord(5);
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
-      encrypted.slice(),
-      {
-        status: 200,
-        headers: {
-          "content-length": String(encrypted.byteLength),
-          "X-Abyssal-Attachment-Claim": CLAIM_PRIMARY,
-        },
-      },
-    ));
-
-    await expect(downloadEncryptedAttachment(
-      session,
-      ATTACHMENT_PRIMARY,
-      FILE_THREE_BYTE_POLICY,
-    )).resolves.toEqual({
-      bytes: encrypted,
-      claim: CLAIM_PRIMARY,
+  it("re-chunks sealed stream payloads into exact cipher records and maps the claim", async () => {
+    const recordBytes = ATTACHMENT_CHUNK_RECORD_BYTES;
+    v11.download.mockImplementation(async (_base, _keys, _id, _max, onData) => {
+      // Transport payloads do not line up with cipher records.
+      await onData(new Uint8Array(1000).fill(1));
+      await onData(new Uint8Array(recordBytes * 2 - 1000).fill(2));
+      return { total: recordBytes * 2, claimId: Uint8Array.from({ length: 16 }, (_, index) => index) };
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const result = await downloadEncryptedAttachment(session, ATTACHMENT_PRIMARY, { mediaType: "FILE", expectedPlaintextBytes: 300_000 });
+    expect(result.bytes.byteLength).toBe(recordBytes * 2);
+    expect(result.bytes[999]).toBe(1);
+    expect(result.bytes[1000]).toBe(2);
+    expect(result.claim).toBe("00010203-0405-0607-0809-0a0b0c0d0e0f");
   });
 
-  it("completes a claim with the authenticated bearer and claim header", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-
-    await expect(completeAttachmentDownload(session, ATTACHMENT_PRIMARY, CLAIM_PRIMARY)).resolves.toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledWith(
-      `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}/complete`,
-      expect.objectContaining({
-        method: "POST",
-        cache: "no-store",
-        credentials: "omit",
-        referrerPolicy: "no-referrer",
-        headers: {
-          Authorization: `Bearer ${SESSION_TOKEN}`,
-          "X-Abyssal-Attachment-Claim": CLAIM_PRIMARY,
-        },
-      }),
+  it("releases a claim when the downloaded size does not match the metadata", async () => {
+    v11.download.mockImplementation(async (_base, _keys, _id, _max, onData) => {
+      await onData(new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES));
+      return { total: ATTACHMENT_CHUNK_RECORD_BYTES, claimId: new Uint8Array(16).fill(0x44) };
+    });
+    v11.release.mockResolvedValue(true);
+    await expect(downloadEncryptedAttachment(session, ATTACHMENT_SECONDARY, {
+      mediaType: "FILE",
+      expectedPlaintextBytes: 600_000,
+    })).rejects.toThrow("Attachment unavailable");
+    expect(v11.release).toHaveBeenCalledWith(
+      "https://node.example", session.transport, ATTACHMENT_SECONDARY, expect.any(Uint8Array), expect.any(AbortSignal),
     );
   });
 
-  it("rejects noncanonical attachment claims before sending a mutation", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch");
-
-    await expect(completeAttachmentDownload(session, ATTACHMENT_PRIMARY, "claim-123"))
-      .rejects.toThrow("Attachment unavailable");
-    expect(fetchMock).not.toHaveBeenCalled();
+  it("completes and deletes through sealed actions and rejects noncanonical claims", async () => {
+    v11.complete.mockResolvedValue(true);
+    v11.remove.mockResolvedValue(true);
+    await completeAttachmentDownload(session, ATTACHMENT_PRIMARY, CLAIM_PRIMARY);
+    // The claim bytes are handed over, then wiped once the action finishes.
+    expect(v11.complete.mock.calls[0].slice(0, 3)).toEqual(["https://node.example", session.transport, ATTACHMENT_PRIMARY]);
+    expect(v11.complete.mock.calls[0][3]).toEqual(new Uint8Array(16));
+    await expect(completeAttachmentDownload(session, ATTACHMENT_PRIMARY, "not-a-claim")).rejects.toThrow("Attachment unavailable");
+    v11.complete.mockResolvedValueOnce(false);
+    await expect(completeAttachmentDownload(session, ATTACHMENT_PRIMARY, CLAIM_PRIMARY)).rejects.toThrow("Attachment unavailable");
+    await deleteUploadedAttachment(session, ATTACHMENT_TERTIARY);
+    expect(v11.remove).toHaveBeenCalledWith("https://node.example", session.transport, ATTACHMENT_TERTIARY, expect.any(AbortSignal));
   });
 
-  it("releases a claim when authenticated completion fails", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(null, { status: 409 }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
-    const plaintext = new Uint8Array([4, 5, 6]);
-
+  it("releases a destructive claim when decryption fails or the plaintext is empty", async () => {
+    v11.release.mockResolvedValue(true);
     await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_PRIMARY,
-      CLAIM_FAILED,
-      () => plaintext,
-    )).rejects.toThrow("Attachment unavailable");
-    expect(plaintext).toEqual(new Uint8Array(3));
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}/claim`,
-      expect.objectContaining({ method: "DELETE" }),
-    );
-  });
-
-  it("releases a claim when authenticated decryption fails", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-
-    await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_PRIMARY,
-      CLAIM_DECRYPT,
-      () => { throw new Error("bad ciphertext"); },
+      session, ATTACHMENT_PRIMARY, CLAIM_DECRYPT, () => { throw new Error("bad ciphertext"); },
     )).rejects.toThrow("bad ciphertext");
-    expect(fetchMock).toHaveBeenCalledWith(
-      `https://node.example/v1/attachment/${ATTACHMENT_PRIMARY}/claim`,
-      expect.objectContaining({ method: "DELETE" }),
-    );
-  });
-
-  it("rejects empty plaintext before completing and releases a destructive claim", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-    const plaintext = new Uint8Array(0);
-
     await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_EMPTY,
-      CLAIM_FAILED,
-      () => plaintext,
-      { expectedBytes: 1, maxBytes: 20 },
+      session, ATTACHMENT_EMPTY, CLAIM_FAILED, () => new Uint8Array(0), { expectedBytes: 1, maxBytes: 20 },
     )).rejects.toThrow("Attachment unavailable");
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith(
-      `https://node.example/v1/attachment/${ATTACHMENT_EMPTY}/claim`,
-      expect.objectContaining({ method: "DELETE" }),
-    );
-  });
-
-  it("rejects authenticated plaintext whose metadata size is mismatched or over the media limit", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-    const plaintext = new Uint8Array([1, 2, 3, 4]);
-
-    await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_SECONDARY,
-      CLAIM_FAILED,
-      () => plaintext,
-      { expectedBytes: 3, maxBytes: 4 },
-    )).rejects.toThrow("Attachment unavailable");
-    await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_TERTIARY,
-      CLAIM_DECRYPT,
-      () => plaintext,
-      { expectedBytes: 4, maxBytes: 3 },
-    )).rejects.toThrow("Attachment unavailable");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls.every(([url, init]) => (
-      String(url).endsWith("/claim") && (init as RequestInit).method === "DELETE"
-    ))).toBe(true);
+    expect(v11.release).toHaveBeenCalledTimes(2);
+    expect(v11.complete).not.toHaveBeenCalled();
   });
 
   it("completes a destructive claim only after exact plaintext policy validation", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    v11.complete.mockResolvedValue(true);
     const plaintext = new Uint8Array([9, 8, 7]);
-
     await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_EXACT,
-      CLAIM_PRIMARY,
-      () => plaintext,
-      { expectedBytes: 3, maxBytes: 3 },
+      session, ATTACHMENT_EXACT, CLAIM_PRIMARY, () => plaintext, { expectedBytes: 3, maxBytes: 3 },
     )).resolves.toBe(plaintext);
-    expect(fetchMock).toHaveBeenCalledWith(
-      `https://node.example/v1/attachment/${ATTACHMENT_EXACT}/complete`,
-      expect.objectContaining({ method: "POST" }),
-    );
+    expect(v11.complete).toHaveBeenCalledTimes(1);
+
+    v11.release.mockResolvedValue(true);
+    await expect(decryptAndCompleteAttachment(
+      session, ATTACHMENT_SECONDARY, CLAIM_PRIMARY, () => new Uint8Array([1, 2, 3, 4]), { expectedBytes: 3, maxBytes: 20 },
+    )).rejects.toThrow("Attachment unavailable");
+    expect(v11.release).toHaveBeenCalledTimes(1);
   });
 
   it("does not complete or release non-destructive downloads", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch");
     const plaintext = new Uint8Array([7, 8]);
-
-    await expect(decryptAndCompleteAttachment(
-      session,
-      ATTACHMENT_PRIMARY,
-      undefined,
-      () => plaintext,
-    )).resolves.toBe(plaintext);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("keeps upload metadata out of the URL and preserves the encrypted records", async () => {
-    const original = globalThis.XMLHttpRequest;
-    let sent: unknown;
-    let openedUrl = "";
-    const progress: Array<{ loaded: number; total: number }> = [];
-    class TestXmlHttpRequest {
-      readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
-      responseType = "";
-      status = 201;
-      responseText = JSON.stringify({ accepted: true, attachment_id: ATTACHMENT_PRIMARY, storage: "ram-only" });
-      onerror: (() => void) | null = null;
-      onabort: (() => void) | null = null;
-      onload: (() => void) | null = null;
-
-      open(_method: string, url: string): void {
-        openedUrl = url;
-      }
-
-      setRequestHeader(): void {}
-
-      getResponseHeader(): string | null { return null; }
-
-      send(body: unknown): void {
-        sent = body;
-        for (const loaded of [100, 1026, 1024 + encrypted.length]) {
-          this.upload.onprogress?.({ loaded, total: 1024 + encrypted.length } as ProgressEvent);
-        }
-        this.onload?.();
-      }
-    }
-    globalThis.XMLHttpRequest = TestXmlHttpRequest as unknown as typeof XMLHttpRequest;
-    const encrypted = exactEncryptedRecord(3);
-    try {
-      await expect(uploadEncryptedAttachment(
-        session,
-        "dm_Alice_Bob",
-        ATTACHMENT_PRIMARY,
-        "FILE",
-        encrypted,
-        { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
-        (event) => progress.push(event),
-      )).resolves.toBe(ATTACHMENT_PRIMARY);
-      expect(sent).toBeInstanceOf(Blob);
-      const bytes = new Uint8Array(await (sent as Blob).arrayBuffer());
-      expect(new TextDecoder().decode(bytes.subarray(0, 8))).toBe("ABYUP001");
-      const length = new DataView(bytes.buffer).getUint16(8, false);
-      expect(JSON.parse(new TextDecoder().decode(bytes.subarray(10, 10 + length)))).toEqual({
-        chat_id: "dm_Alice_Bob", message_id: ATTACHMENT_PRIMARY, media_type: "FILE",
-        one_time: false, delete_after_download: false, ttl_sec: 60,
-      });
-      expect(bytes.subarray(10 + length, 1024).every((byte) => byte === 0)).toBe(true);
-      expect(bytes.subarray(1024)).toEqual(encrypted);
-      expect(openedUrl).toBe(`${session.endpoint.apiBaseUrl}/v2/attachment`);
-      expect(progress).toEqual([
-        { loaded: 0, total: encrypted.length }, { loaded: 2, total: encrypted.length },
-        { loaded: encrypted.length, total: encrypted.length },
-      ]);
-    } finally {
-      globalThis.XMLHttpRequest = original;
-    }
-  });
-
-  it("rejects an upload without a valid message binding before opening XHR", async () => {
-    const original = globalThis.XMLHttpRequest;
-    let opened = false;
-    class UnusedXmlHttpRequest {
-      open(): void {
-        opened = true;
-      }
-    }
-    globalThis.XMLHttpRequest = UnusedXmlHttpRequest as unknown as typeof XMLHttpRequest;
-    try {
-      await expect(uploadEncryptedAttachment(
-        session,
-        "dm_Alice_Bob",
-        "not-a-uuid",
-        "FILE",
-        exactEncryptedRecord(3),
-        { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
-        () => undefined,
-      )).rejects.toThrow("Upload rejected");
-      expect(opened).toBe(false);
-    } finally {
-      globalThis.XMLHttpRequest = original;
-    }
-  });
-
-  it("aborts attachment uploads through the supplied signal", async () => {
-    const original = globalThis.XMLHttpRequest;
-    let aborted = false;
-    class TestXmlHttpRequest {
-      static readonly HEADERS_RECEIVED = 2;
-      readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
-      responseType = "";
-      responseText = "";
-      readyState = 1;
-      status = 0;
-      onerror: (() => void) | null = null;
-      onabort: (() => void) | null = null;
-      onload: (() => void) | null = null;
-      onprogress: ((event: ProgressEvent) => void) | null = null;
-      onreadystatechange: (() => void) | null = null;
-
-      open(): void {}
-      setRequestHeader(): void {}
-      getResponseHeader(): string | null { return null; }
-      send(): void {}
-      abort(): void {
-        aborted = true;
-        this.onabort?.();
-      }
-    }
-    globalThis.XMLHttpRequest = TestXmlHttpRequest as unknown as typeof XMLHttpRequest;
-    const controller = new AbortController();
-    try {
-      const pending = uploadEncryptedAttachment(
-        session,
-        "dm_Alice_Bob",
-        ATTACHMENT_PRIMARY,
-        "FILE",
-        exactEncryptedRecord(3),
-        { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
-        () => undefined,
-        controller.signal,
-      );
-      controller.abort();
-      await expect(pending).rejects.toThrow("Upload aborted");
-      expect(aborted).toBe(true);
-    } finally {
-      globalThis.XMLHttpRequest = original;
-    }
-  });
-
-  it("rejects oversized or non-exact attachment upload responses", async () => {
-    const original = globalThis.XMLHttpRequest;
-    class TestXmlHttpRequest {
-      static readonly HEADERS_RECEIVED = 2;
-      static responseText = "";
-      static declaredLength: string | null = null;
-      static responseProgressBytes: number | null = null;
-      readonly upload = { onprogress: null as ((event: ProgressEvent) => void) | null };
-      responseType = "";
-      responseText = TestXmlHttpRequest.responseText;
-      readyState = 1;
-      status = 201;
-      onerror: (() => void) | null = null;
-      onabort: (() => void) | null = null;
-      onload: (() => void) | null = null;
-      onprogress: ((event: ProgressEvent) => void) | null = null;
-      onreadystatechange: (() => void) | null = null;
-
-      open(): void {}
-      setRequestHeader(): void {}
-      getResponseHeader(name: string): string | null {
-        return name.toLowerCase() === "content-length" ? TestXmlHttpRequest.declaredLength : null;
-      }
-      send(): void {
-        if (TestXmlHttpRequest.responseProgressBytes !== null) {
-          this.onprogress?.({ loaded: TestXmlHttpRequest.responseProgressBytes } as ProgressEvent);
-          if (this.readyState === 0) return;
-        }
-        this.readyState = TestXmlHttpRequest.HEADERS_RECEIVED;
-        this.onreadystatechange?.();
-        if (this.readyState === TestXmlHttpRequest.HEADERS_RECEIVED) this.onload?.();
-      }
-      abort(): void {
-        this.readyState = 0;
-        this.onabort?.();
-      }
-    }
-    globalThis.XMLHttpRequest = TestXmlHttpRequest as unknown as typeof XMLHttpRequest;
-    const upload = () => uploadEncryptedAttachment(
-      session,
-      "dm_Alice_Bob",
-      ATTACHMENT_PRIMARY,
-      "FILE",
-      exactEncryptedRecord(3),
-      { oneTime: false, deleteAfterDownload: false, ttlSec: 60 },
-      () => undefined,
-    );
-    try {
-      TestXmlHttpRequest.responseText = JSON.stringify({
-        attachment_id: ATTACHMENT_PRIMARY,
-        unexpected: true,
-      });
-      await expect(upload()).rejects.toThrow("Upload rejected");
-
-      TestXmlHttpRequest.responseText = JSON.stringify({ accepted: true, attachment_id: ATTACHMENT_PRIMARY, storage: "ram-only" });
-      TestXmlHttpRequest.declaredLength = String(4 * 1024 + 1);
-      await expect(upload()).rejects.toThrow("Upload rejected");
-
-      TestXmlHttpRequest.declaredLength = null;
-      TestXmlHttpRequest.responseProgressBytes = 4 * 1024 + 1;
-      await expect(upload()).rejects.toThrow("Upload rejected");
-    } finally {
-      globalThis.XMLHttpRequest = original;
-    }
-  });
-
-  it("deletes an uploaded blob with the authenticated owner token", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-
-    const attachmentId = ATTACHMENT_PRIMARY;
-    await expect(deleteUploadedAttachment(session, attachmentId)).resolves.toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledWith(
-      `https://node.example/v1/attachment/${attachmentId}`,
-      expect.objectContaining({
-        method: "DELETE",
-        cache: "no-store",
-        credentials: "omit",
-        referrerPolicy: "no-referrer",
-        headers: { Authorization: `Bearer ${SESSION_TOKEN}` },
-      }),
-    );
-
-    await expect(deleteUploadedAttachment(session, "not-a-uuid")).rejects.toThrow(
-      "Attachment unavailable",
-    );
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(decryptAndCompleteAttachment(session, ATTACHMENT_PRIMARY, undefined, () => plaintext)).resolves.toBe(plaintext);
+    expect(v11.complete).not.toHaveBeenCalled();
+    expect(v11.release).not.toHaveBeenCalled();
   });
 });
 
@@ -1222,8 +458,8 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockImplementation(() => Promise.resolve(websocketTicketResponse()));
+    // Tickets come from the sealed control client; no plaintext fetch may happen.
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected fetch"));
     const frames: IncomingFrame[] = [];
     const states: string[] = [];
 
@@ -1231,29 +467,18 @@ describe("RelaySocket", () => {
       const relay = new RelaySocket(session, (frame) => frames.push(frame), (state) => states.push(state));
       relay.connect();
       await vi.waitFor(() => expect(sockets).toHaveLength(1));
-      expect(fetchMock).toHaveBeenCalledWith(
-        "https://node.example/v1/ws-ticket",
-        expect.objectContaining({
-          method: "POST",
-          cache: "no-store",
-          credentials: "omit",
-          referrerPolicy: "no-referrer",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${SESSION_TOKEN}`,
-          },
-          body: JSON.stringify({
-            platform: "web",
-            version: "0.0.0",
-            build_signature_b64: "",
-          }),
-          signal: expect.any(AbortSignal),
-        }),
+      expect(v11.issue).toHaveBeenCalledWith(
+        "https://node.example",
+        session.transport,
+        { platform: "web", version: "0.0.0", buildSignatureB64: "" },
+        expect.any(AbortSignal),
       );
+      expect(fetchMock).not.toHaveBeenCalled();
       const socket = sockets[0];
       expect(socket.url).toBe("wss://node.example/v1/ws");
-      expect(socket.protocols).toEqual(["abyssal-v2", `ticket.${WS_TICKET}`]);
-      expect(socket.protocols.join(" ")).not.toContain(SESSION_TOKEN);
+      // The ticket travels inside the sealed ClientHello, never as a subprotocol.
+      expect(socket.protocols).toEqual(["abyssal-v11"]);
+      expect(socket.protocols.join(" ")).not.toContain(WS_TICKET_V11);
       socket.readyState = 1;
       socket.onopen?.(new Event("open"));
       relay.setDirectoryStamp(DIRECTORY_STAMP);
@@ -1328,7 +553,7 @@ describe("RelaySocket", () => {
   it("treats release admission rejection as terminal and reports it once", async () => {
     const rejected = vi.fn();
     const states: string[] = [];
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 426 }));
+    v11.issue.mockRejectedValue(new ControlRejected("build"));
     const timeoutSpy = vi.spyOn(window, "setTimeout");
     const relay = new RelaySocket(
       session,
@@ -1351,20 +576,12 @@ describe("RelaySocket", () => {
     }
   });
 
-  it("maps ws-ticket statuses to terminal rejections and leaves transient failures retryable", () => {
-    expect(relayTicketRejection(401)).toBe("session-expired");
-    expect(relayTicketRejection(403)).toBe("build");
-    expect(relayTicketRejection(426)).toBe("build");
-    expect(relayTicketRejection(409)).toBe("platform-conflict");
-    for (const status of [200, 429, 500, 502, 503, 504]) expect(relayTicketRejection(status)).toBeNull();
-  });
-
   it.each([
-    [401, "session-expired"],
-    [409, "platform-conflict"],
-  ] as const)("reports a %i ticket response once as %s without retrying", async (status, expected) => {
+    ["session-expired"],
+    ["platform-conflict"],
+  ] as const)("reports a %s ticket refusal once without retrying", async (expected) => {
     const rejected = vi.fn();
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status }));
+    v11.issue.mockRejectedValue(new ControlRejected(expected));
     const timeoutSpy = vi.spyOn(window, "setTimeout");
     const relay = new RelaySocket(session, () => undefined, () => undefined, undefined, rejected);
     try {
@@ -1381,7 +598,8 @@ describe("RelaySocket", () => {
 
   it("retries a relay that is temporarily without a release manifest", async () => {
     const rejected = vi.fn();
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 503 }));
+    // A generic sealed failure (or a network error) is transient.
+    v11.issue.mockRejectedValue(new ControlRejected());
     const timeoutSpy = vi.spyOn(window, "setTimeout");
     const relay = new RelaySocket(session, () => undefined, () => undefined, undefined, rejected);
     try {
@@ -1406,8 +624,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch")
-      .mockImplementation(() => Promise.resolve(websocketTicketResponse()));
 
     try {
       const relay = new RelaySocket(session, () => undefined, () => undefined);
@@ -1445,8 +661,8 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch")
-      .mockImplementation(() => Promise.resolve(websocketTicketResponse(31)));
+    // An out-of-range ticket is refused inside the control client; the socket retries later.
+    v11.issue.mockRejectedValue(new ControlRejected());
     const timeoutSpy = vi.spyOn(window, "setTimeout");
     const states: string[] = [];
 
@@ -1472,8 +688,7 @@ describe("RelaySocket", () => {
         (values as Uint16Array)[0] = randomSamples.shift() ?? 0;
         return values;
       });
-    vi.spyOn(globalThis, "fetch")
-      .mockImplementation(() => Promise.resolve(websocketTicketResponse(31)));
+    v11.issue.mockRejectedValue(new ControlRejected());
     const timeoutSpy = vi.spyOn(window, "setTimeout");
 
     try {
@@ -1502,19 +717,18 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    let resolveTicket: ((response: Response) => void) | undefined;
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(() =>
-      new Promise<Response>((resolve) => {
-        resolveTicket = resolve;
-      }));
+    let resolveTicket: ((ticket: { ticket: string; expiresInSec: number }) => void) | undefined;
+    v11.issue.mockImplementation(() => new Promise((resolve) => {
+      resolveTicket = resolve;
+    }));
 
     try {
       const relay = new RelaySocket(session, () => undefined, () => undefined);
       relay.connect();
-      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(v11.issue).toHaveBeenCalledTimes(1));
       relay.close();
-      expect((fetchMock.mock.calls[0]?.[1] as RequestInit).signal?.aborted).toBe(true);
-      resolveTicket?.(websocketTicketResponse());
+      expect((v11.issue.mock.calls[0]?.[3] as AbortSignal).aborted).toBe(true);
+      resolveTicket?.({ ticket: WS_TICKET_V11, expiresInSec: 30 });
       await new Promise((resolve) => window.setTimeout(resolve, 0));
       expect(sockets).toHaveLength(0);
     } finally {
@@ -1533,7 +747,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
     const frames: IncomingFrame[] = [];
 
     try {
@@ -1624,7 +837,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
 
     try {
       const relay = new RelaySocket(session, () => undefined, () => undefined);
@@ -1658,7 +870,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
 
     try {
       const relay = new RelaySocket(session, () => undefined, () => undefined);
@@ -1695,7 +906,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
 
     try {
       const relay = new RelaySocket(session, () => undefined, () => undefined);
@@ -1736,7 +946,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
     const frames: IncomingFrame[] = [];
 
     try {
@@ -1775,7 +984,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
 
     try {
       const relay = new RelaySocket(session, () => undefined, () => undefined);
@@ -2099,7 +1307,6 @@ describe("RelaySocket", () => {
     }
     Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
     globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-    vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
     const frames: IncomingFrame[] = [];
     try {
       const relay = new RelaySocket(session, (frame) => frames.push(frame), () => undefined);
@@ -2244,7 +1451,6 @@ async function connectRelay(
   }
   Object.assign(TestWebSocket, { OPEN: 1, CLOSED: 3 });
   globalThis.WebSocket = TestWebSocket as unknown as typeof WebSocket;
-  vi.spyOn(globalThis, "fetch").mockImplementation(() => Promise.resolve(websocketTicketResponse()));
   const frames: IncomingFrame[] = [];
   const relay = new RelaySocket(session, (frame) => {
     frames.push(frame);

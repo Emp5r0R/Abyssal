@@ -527,7 +527,7 @@ async fn issue_ws_ticket_for_transport(
         .await
         .is_err()
     {
-        return ControlResult::Failure;
+        return ControlResult::BuildRejected;
     }
     let Some(client_platform) = ClientPlatform::parse(&attestation.platform) else {
         return ControlResult::Failure;
@@ -565,7 +565,7 @@ async fn issue_ws_ticket_for_transport(
         .client_platform
         .is_some_and(|bound| bound != client_platform)
     {
-        return ControlResult::Failure;
+        return ControlResult::PlatformConflict;
     }
 
     let now = now_ms();

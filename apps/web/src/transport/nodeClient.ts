@@ -1,21 +1,30 @@
-import { attachmentUploadEnvelope, decodeAttachmentUploadResponse, ATTACHMENT_UPLOAD_PREFIX_BYTES } from "./attachmentUploadEnvelope";
 import type {
-  AccountResponse,
   AccountSession,
   AttachmentOptions,
   DirectoryStamp,
   IncomingFrame,
   MediaType,
-  NodeEndpoint,
-  OpaqueAccountStartResponse,
   RoomRecord,
   UploadProgress,
 } from "../domain/types";
 import { currentBuildAttestation } from "../buildIdentity";
 import {
+  attachmentIdBytes,
+  attachmentIdString,
+  completeDownloadV11,
+  deleteAttachmentV11,
+  downloadAttachmentV11,
+  releaseDownloadV11,
+  uploadAttachmentV11,
+} from "./v11Attachment";
+import { ControlRejected, issueWsTicketV11, logoutV11 } from "./v11Control";
+import { wipeTransportKeys, type TransportKeys } from "./v11Account";
+import { V11SocketChannel, WS_PROTOCOL_V11 } from "./v11Socket";
+import {
   base64ToBytes,
   bytesToBase64,
   ATTACHMENT_CHUNK_RECORD_BYTES,
+  ATTACHMENT_CIPHER_VERSION,
   IDENTITY_PUBLIC_KEY_BYTES,
   maxSerializedAttachmentBytes,
   serializedAttachmentBytes,
@@ -34,20 +43,13 @@ import {
 } from "./messagePadding";
 import { MLS_MAX_FRAME_BYTES, parseMlsIncomingFrame, validMlsControlFrame } from "./mlsWire";
 
-const JSON_HEADERS = { "Content-Type": "application/json" } as const;
-const ATTACHMENT_CLAIM_HEADER = "X-Abyssal-Attachment-Claim";
 const ATTACHMENT_CLAIM_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ATTACHMENT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UUID_V4_PATTERN = ATTACHMENT_ID_PATTERN;
-const BASE64_URL_PATTERN = /^[A-Za-z0-9_-]+$/u;
-const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/u;
 const USERNAME_PATTERN = /^[A-Za-z0-9_-]{1,80}$/u;
 const CHAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
-const MAX_OPAQUE_JSON_BYTES = 768 * 1024;
-const MAX_OPAQUE_MESSAGE_BYTES = 16 * 1024;
-const MAX_IDENTITY_ENVELOPE_BYTES = 512 * 1024;
 export const MAX_RELAY_TEXT_BYTES = 1024 * 1024;
 export const PURGE_CLOSE_CODE = 4001;
 export const PURGE_CLOSE_REASON = "purge";
@@ -60,14 +62,8 @@ export const MAX_PENDING_PREKEY_LEASES = 256;
 const TRANSACTION_RETRY_INTERVAL_MS = 3_000;
 const TRANSACTION_RECOVERY_TIMEOUT_MS = 30_000;
 export const PREKEY_LEASE_TIMEOUT_MS = 10_000;
-const MAX_WS_TICKET_JSON_BYTES = 4 * 1024;
-const MAX_ATTACHMENT_UPLOAD_JSON_BYTES = 4 * 1024;
 const ATTACHMENT_CLEANUP_TIMEOUT_MS = 5_000;
 const SESSION_REVOKE_TIMEOUT_MS = 5_000;
-const WS_TICKET_BYTES = 32;
-const WS_TICKET_LENGTH = 43;
-const WS_TICKET_MIN_EXPIRY_SEC = 1;
-const WS_TICKET_MAX_EXPIRY_SEC = 30;
 const RECONNECT_JITTER_BOUND_MS = 500;
 const RECONNECT_JITTER_SAMPLE_RANGE = 2 ** 16;
 const RECONNECT_JITTER_SAMPLE_LIMIT =
@@ -169,151 +165,51 @@ interface PrekeyLeaseFrame {
   expires_at_ms: number;
 }
 
-export async function startOpaqueAccount(
-  endpoint: NodeEndpoint,
-  capability: Uint8Array,
-  registrationRequest: Uint8Array,
-  credentialRequest: Uint8Array,
+/**
+ * Best-effort logout for transport keys that will not be used again; the
+ * keys are wiped whether or not the relay answers.
+ */
+export async function revokeTransportKeys(
+  apiBaseUrl: string,
+  keys: TransportKeys,
   signal?: AbortSignal,
-): Promise<OpaqueAccountStartResponse> {
-  const response = await fetch(`${endpoint.apiBaseUrl}/v2/account/start`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "omit",
-    redirect: "error",
-    referrerPolicy: "no-referrer",
-    headers: JSON_HEADERS,
-    body: JSON.stringify({
-      capability_b64: bytesToBase64(capability),
-      registration_request_b64: bytesToBase64(registrationRequest),
-      credential_request_b64: bytesToBase64(credentialRequest),
-    }),
-    signal,
-  });
-  const payload = await readBoundedJson(response, MAX_OPAQUE_JSON_BYTES, signal).catch(() => null);
-  if (!response.ok || !validOpaqueStartResponse(payload)) {
-    throw new Error("Wrong information");
+): Promise<void> {
+  try {
+    await logoutV11(apiBaseUrl, keys, signal ?? AbortSignal.timeout(SESSION_REVOKE_TIMEOUT_MS)).catch(() => false);
+  } finally {
+    wipeTransportKeys(keys);
   }
-  return payload;
-}
-
-interface FinishOpaqueAccountInput {
-  handshakeId: string;
-  registrationUpload?: Uint8Array;
-  credentialFinalization?: Uint8Array;
-  identityPublicKey?: Uint8Array;
-  identityPrekeyId?: string;
-  identityEnvelope?: Uint8Array;
-  identityProof?: Uint8Array;
-}
-
-export async function finishOpaqueAccount(
-  endpoint: NodeEndpoint,
-  input: FinishOpaqueAccountInput,
-  signal?: AbortSignal,
-): Promise<AccountSession> {
-  const response = await fetch(`${endpoint.apiBaseUrl}/v2/account/finish`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "omit",
-    redirect: "error",
-    referrerPolicy: "no-referrer",
-    headers: JSON_HEADERS,
-    body: JSON.stringify({
-      handshake_id: input.handshakeId,
-      registration_upload_b64: input.registrationUpload
-        ? bytesToBase64(input.registrationUpload)
-        : undefined,
-      credential_finalization_b64: input.credentialFinalization
-        ? bytesToBase64(input.credentialFinalization)
-        : undefined,
-      identity_public_b64: input.identityPublicKey
-        ? bytesToBase64(input.identityPublicKey)
-        : undefined,
-      identity_prekey_id: input.identityPrekeyId,
-      identity_envelope_b64: input.identityEnvelope
-        ? bytesToBase64(input.identityEnvelope)
-        : undefined,
-      identity_proof_b64: input.identityProof
-        ? bytesToBase64(input.identityProof)
-        : undefined,
-    }),
-    signal,
-  });
-  const payload = await readBoundedJson(response, MAX_OPAQUE_JSON_BYTES, signal).catch(() => null);
-  if (!response.ok || !validAccountResponse(payload)) {
-    throw new Error("Wrong information");
-  }
-  const identityPublicKey = base64ToBytes(payload.identity_public_b64);
-  if (identityPublicKey.byteLength !== IDENTITY_PUBLIC_KEY_BYTES || !PREKEY_ID_PATTERN.test(payload.identity_prekey_id)) {
-    identityPublicKey.fill(0);
-    throw new Error("Wrong information");
-  }
-  return {
-    token: payload.token,
-    nodeId: payload.node_id,
-    username: payload.username,
-    maxRoomsPerUser: payload.max_rooms_per_user,
-    sessionInactivitySec: payload.session_inactivity_sec,
-    endpoint,
-    created: payload.created,
-    identityPublicKey,
-    identityPrekeyId: payload.identity_prekey_id,
-  };
 }
 
 export async function revokeSession(session: AccountSession, signal?: AbortSignal): Promise<void> {
-  await fetch(`${session.endpoint.apiBaseUrl}/v1/account/logout`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    keepalive: true,
-    headers: { Authorization: `Bearer ${session.token}` },
-    signal: signal ?? AbortSignal.timeout(SESSION_REVOKE_TIMEOUT_MS),
-  }).catch(() => undefined);
+  await revokeTransportKeys(session.endpoint.apiBaseUrl, session.transport, signal);
 }
 
 async function requestWebSocketTicket(
   session: AccountSession,
   signal: AbortSignal,
 ): Promise<string> {
-  const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/ws-ticket`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-    headers: { ...JSON_HEADERS, Authorization: `Bearer ${session.token}` },
-    body: JSON.stringify(currentBuildAttestation()),
-    signal,
-  });
-  const rejection = relayTicketRejection(response.status);
-  if (rejection) {
-    await response.body?.cancel().catch(() => undefined);
-    throw rejection === "build" ? new BuildAdmissionError() : new RelayRejectionError(rejection);
+  const attestation = currentBuildAttestation();
+  try {
+    const { ticket } = await issueWsTicketV11(session.endpoint.apiBaseUrl, session.transport, {
+      platform: attestation.platform,
+      version: attestation.version,
+      buildSignatureB64: attestation.build_signature_b64,
+    }, signal);
+    return ticket;
+  } catch (error) {
+    if (error instanceof ControlRejected && error.rejection) {
+      throw error.rejection === "build" ? new BuildAdmissionError() : new RelayRejectionError(error.rejection);
+    }
+    throw error;
   }
-  const payload = await readBoundedJson(response, MAX_WS_TICKET_JSON_BYTES, signal).catch(() => null);
-  if (!response.ok || !validWebSocketTicketResponse(payload)) {
-    throw new Error("Session unavailable");
-  }
-  return payload.ticket;
 }
 
 /**
- * Terminal ws-ticket outcomes. Anything else (5xx, 429, network) is transient
- * and retried with backoff.
+ * Terminal ws-ticket outcomes. Anything else (5xx, 429, network, an
+ * unexpected reply) is transient and retried with backoff.
  */
 export type RelayRejection = "build" | "session-expired" | "platform-conflict";
-
-export function relayTicketRejection(status: number): RelayRejection | null {
-  switch (status) {
-    case 401: return "session-expired";
-    case 403:
-    case 426: return "build";
-    case 409: return "platform-conflict";
-    default: return null;
-  }
-}
 
 export class RelayRejectionError extends Error {
   constructor(readonly rejection: RelayRejection) {
@@ -330,8 +226,43 @@ export class BuildAdmissionError extends RelayRejectionError {
   }
 }
 
+/** One socket's record layer: the v11 AEAD channel in production. */
+export interface SocketChannel {
+  /** True once frames may be sent (after the relay's handshake reply). */
+  readonly ready: boolean;
+  /** The first message to send when the socket opens, if the channel needs a handshake. */
+  clientHello(): Uint8Array | null;
+  /** Opens one incoming message; null for a handshake message. Throws if it does not authenticate. */
+  receive(data: unknown): string | null;
+  seal(text: string): Uint8Array | string;
+  destroy(): void;
+}
+
+/** How a RelaySocket obtains tickets and record channels; replaceable in tests. */
+export interface RelaySocketTransport {
+  subprotocols: readonly string[];
+  issueTicket(session: AccountSession, signal: AbortSignal): Promise<string>;
+  openChannel(session: AccountSession, ticket: string): SocketChannel;
+}
+
+export const V11_RELAY_TRANSPORT: RelaySocketTransport = {
+  subprotocols: [WS_PROTOCOL_V11],
+  issueTicket: (session, signal) => requestWebSocketTicket(session, signal),
+  openChannel: (session, ticket) => new V11SocketChannel(session.transport, ticket),
+};
+
 export class RelaySocket {
   #socket: WebSocket | null = null;
+  /** The record layer of each open socket. */
+  #channels = new WeakMap<WebSocket, SocketChannel>();
+
+  /** Seals one text frame for [socket]; throws before the handshake completes. */
+  #sendSealed(socket: WebSocket, text: string): void {
+    const channel = this.#channels.get(socket);
+    if (!channel?.ready) throw new Error("Transport unavailable");
+    const sealed = channel.seal(text);
+    socket.send(typeof sealed === "string" ? sealed : sealed as BufferSource);
+  }
   #socketGeneration = 0;
   #manualClose = false;
   #reconnectTimer: number | undefined;
@@ -353,6 +284,7 @@ export class RelaySocket {
     private readonly onState: (state: "connecting" | "connected" | "disconnected") => void,
     private readonly onPurge?: () => void,
     private readonly onRejected?: (rejection: RelayRejection) => void,
+    private readonly transport: RelaySocketTransport = V11_RELAY_TRANSPORT,
   ) {}
 
   connect(): void {
@@ -370,7 +302,7 @@ export class RelaySocket {
     const serialized = serializeRelayFrame(frame);
     if (serialized === null || this.#socket?.readyState !== WebSocket.OPEN) return false;
     try {
-      this.#socket.send(serialized);
+      this.#sendSealed(this.#socket, serialized);
       return true;
     } catch {
       return false;
@@ -412,7 +344,7 @@ export class RelaySocket {
       };
       this.#pendingResults.set(messageId, pending);
       try {
-        socket.send(serialized);
+        this.#sendSealed(socket, serialized);
         this.armRecoverableTimer(this.#pendingResults, messageId, pending, "message recovery expired");
       } catch {
         window.clearTimeout(pending.timer);
@@ -443,7 +375,7 @@ export class RelaySocket {
       };
       this.#pendingMlsResults.set(messageId, pending);
       try {
-        socket.send(serialized);
+        this.#sendSealed(socket, serialized);
         this.armRecoverableTimer(this.#pendingMlsResults, messageId, pending, "MLS recovery expired");
       }
       catch {
@@ -472,7 +404,7 @@ export class RelaySocket {
       };
       this.#pendingMlsResults.set(messageId, pending);
       try {
-        socket.send(serialized);
+        this.#sendSealed(socket, serialized);
         this.armRecoverableTimer(this.#pendingMlsResults, messageId, pending, "MLS snapshot recovery expired");
       } catch {
         window.clearTimeout(pending.timer);
@@ -487,7 +419,7 @@ export class RelaySocket {
     if (!plainRecord(frame) || !validMlsControlFrame(frame)) return false;
     const serialized = serializeRelayFrame(frame, MLS_MAX_FRAME_BYTES);
     if (serialized === null || this.#socket?.readyState !== WebSocket.OPEN) return false;
-    try { this.#socket.send(serialized); return true; } catch { return false; }
+    try { this.#sendSealed(this.#socket, serialized); return true; } catch { return false; }
   }
 
   requestPrekeyLease(
@@ -532,7 +464,7 @@ export class RelaySocket {
         timer,
       });
       try {
-        socket.send(serialized);
+        this.#sendSealed(socket, serialized);
       } catch {
         window.clearTimeout(timer);
         this.#pendingPrekeyLeases.delete(key);
@@ -630,7 +562,7 @@ export class RelaySocket {
       };
       this.#pendingAckResults.set(messageId, pending);
       try {
-        socket.send(serialized);
+        this.#sendSealed(socket, serialized);
         this.armRecoverableTimer(this.#pendingAckResults, messageId, pending, "ack recovery expired");
       } catch {
         window.clearTimeout(pending.timer);
@@ -691,29 +623,53 @@ export class RelaySocket {
     const ticketHolder = { value: "" };
     let protocols: string[] | null = null;
     try {
-      ticketHolder.value = await requestWebSocketTicket(this.session, ticketAbort.signal);
+      ticketHolder.value = await this.transport.issueTicket(this.session, ticketAbort.signal);
       if (!this.isCurrentConnectionAttempt(generation, ticketAbort)) return;
-      protocols = ["abyssal-v2", `ticket.${ticketHolder.value}`];
+      // The ticket travels inside the encrypted ClientHello, never in a header.
+      const channel = this.transport.openChannel(this.session, ticketHolder.value);
+      protocols = [...this.transport.subprotocols];
       const socket = new WebSocket(`${this.session.endpoint.wsBaseUrl}/v1/ws`, protocols);
-      protocols[1] = "ticket.";
+      socket.binaryType = "arraybuffer";
+      this.#channels.set(socket, channel);
       this.#socket = socket;
       this.#socketGeneration = generation;
-      socket.onopen = () => {
-        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
+      const markConnected = () => {
         this.#attempt = 0;
         this.onState("connected");
         this.resendPendingTransactions(socket, generation);
       };
+      socket.onopen = () => {
+        if (this.#socket !== socket || this.#socketGeneration !== generation) return;
+        try {
+          const hello = channel.clientHello();
+          if (hello) socket.send(hello as BufferSource);
+        } catch {
+          socket.close();
+          return;
+        }
+        if (channel.ready) markConnected();
+      };
       socket.onmessage = (event) => {
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
-        if (typeof event.data !== "string") return;
-        if (!utf8LengthWithin(event.data, CONTROL_TRANSPORT_MAX_BYTES) ||
-          (!utf8LengthWithin(event.data, MAX_RELAY_TEXT_BYTES) && !looksLikeMlsFrame(event.data))) {
+        let text: string | null;
+        try {
+          text = channel.receive(event.data);
+        } catch {
+          this.failClosed("unauthenticated relay frame");
+          return;
+        }
+        if (text === null) {
+          // The relay's handshake reply verified: the channel is ready.
+          if (channel.ready) markConnected();
+          return;
+        }
+        if (!utf8LengthWithin(text, CONTROL_TRANSPORT_MAX_BYTES) ||
+          (!utf8LengthWithin(text, MAX_RELAY_TEXT_BYTES) && !looksLikeMlsFrame(text))) {
           this.#manualClose = true;
           socket.close(1009, "frame too large");
           return;
         }
-        const parsed = parseRelayFrame(event.data);
+        const parsed = parseRelayFrame(text);
         if (parsed.kind === "invalid-result") {
           this.failClosed("invalid relay result");
           return;
@@ -749,6 +705,8 @@ export class RelaySocket {
         socket.close();
       };
       socket.onclose = (event) => {
+        this.#channels.get(socket)?.destroy();
+        this.#channels.delete(socket);
         if (this.#socket !== socket || this.#socketGeneration !== generation) return;
         if (event.code === PURGE_CLOSE_CODE && event.reason === PURGE_CLOSE_REASON) {
           this.terminateForPurge();
@@ -890,7 +848,7 @@ export class RelaySocket {
     }
     pending.generation = generation;
     try {
-      socket.send(pending.serialized);
+      this.#sendSealed(socket, pending.serialized);
     } catch {
       try { socket.close(); } catch { /* recovery timer remains authoritative */ }
     }
@@ -1029,70 +987,21 @@ export function uploadEncryptedAttachment(
     encryptedBytes % ATTACHMENT_CHUNK_RECORD_BYTES !== 0) {
     return Promise.reject(new Error("Upload rejected"));
   }
-  return new Promise((resolve, reject) => {
-    const body = attachmentUploadEnvelope({
-      chat_id: chatId,
-      message_id: messageId,
-      media_type: mediaType,
-      one_time: options.oneTime,
-      delete_after_download: options.deleteAfterDownload || options.oneTime,
-      ttl_sec: Math.max(0, options.ttlSec),
-    }, encrypted);
-    const request = new XMLHttpRequest();
-    let settled = false;
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", abort);
-      callback();
-    };
-    const fail = (message: string) => finish(() => reject(new Error(message)));
-    const abort = () => request.abort();
-    if (signal?.aborted) {
-      fail("Upload aborted");
-      return;
-    }
-    request.open("POST", `${session.endpoint.apiBaseUrl}/v2/attachment`);
-    request.responseType = "text";
-    request.setRequestHeader("Authorization", `Bearer ${session.token}`);
-    request.setRequestHeader("Content-Type", "application/octet-stream");
-    request.upload.onprogress = (event) => onProgress({
-      loaded: Math.min(encryptedBytes, Math.max(0, event.loaded - ATTACHMENT_UPLOAD_PREFIX_BYTES)),
-      total: encryptedBytes,
-    });
-    request.onprogress = (event) => {
-      if (event.loaded > MAX_ATTACHMENT_UPLOAD_JSON_BYTES) {
-        fail("Upload rejected");
-        request.abort();
-      }
-    };
-    request.onreadystatechange = () => {
-      if (request.readyState !== XMLHttpRequest.HEADERS_RECEIVED) return;
-      const declared = request.getResponseHeader("content-length");
-      if (declared !== null && !validBoundedResponseLength(declared, MAX_ATTACHMENT_UPLOAD_JSON_BYTES)) {
-        fail("Upload rejected");
-        request.abort();
-      }
-    };
-    request.onerror = () => fail("Upload failed");
-    request.onabort = () => fail("Upload aborted");
-    request.onload = () => {
-      if (request.status < 200 || request.status >= 300 ||
-        !utf8LengthWithin(request.responseText, MAX_ATTACHMENT_UPLOAD_JSON_BYTES)) {
-        fail("Upload rejected");
-        return;
-      }
-      try {
-        const payload = JSON.parse(request.responseText) as unknown;
-        const id = decodeAttachmentUploadResponse(payload);
-        finish(() => resolve(id));
-      } catch {
-        fail("Upload rejected");
-      }
-    };
-    signal?.addEventListener("abort", abort, { once: true });
-    request.send(body);
-  });
+  const ciphertext = encrypted instanceof Blob ? encrypted : new Blob([encrypted as BlobPart]);
+  return uploadAttachmentV11(session.endpoint.apiBaseUrl, session.transport, {
+    chatId,
+    messageId,
+    mediaType,
+    cipherVersion: ATTACHMENT_CIPHER_VERSION,
+    ciphertext,
+    oneTime: options.oneTime,
+    deleteAfterDownload: options.deleteAfterDownload || options.oneTime,
+    ttlSec: Math.max(0, options.ttlSec),
+  }, (loaded, total) => onProgress({
+    // The sealed body adds a header and padding; report progress over the attachment bytes.
+    loaded: Math.min(encryptedBytes, Math.floor((loaded / Math.max(1, total)) * encryptedBytes)),
+    total: encryptedBytes,
+  }), signal);
 }
 
 export async function streamEncryptedAttachmentRecords(
@@ -1105,49 +1014,23 @@ export async function streamEncryptedAttachmentRecords(
   const validatedAttachmentId = validateAttachmentId(attachmentId);
   const expectedEncryptedBytes = expectedAttachmentCiphertextBytes(policy);
   let claim: string | undefined;
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   const record = new Uint8Array(ATTACHMENT_CHUNK_RECORD_BYTES);
   let recordOffset = 0;
-  let totalBytes = 0;
   let chunkIndex = 0;
   try {
-    const response = await fetch(`${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}`, {
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      headers: { Authorization: `Bearer ${session.token}` },
-      signal,
-    });
-    claim = readAttachmentClaim(response.headers);
-    if (!response.ok) throw new Error("Attachment unavailable");
-    const advertisedLength = parseAttachmentContentLength(
-      response.headers.get("content-length"),
+    const result = await downloadAttachmentV11(
+      session.endpoint.apiBaseUrl,
+      session.transport,
+      validatedAttachmentId,
       maxSerializedAttachmentBytes(policy.mediaType),
-    );
-    if (advertisedLength !== undefined && advertisedLength !== expectedEncryptedBytes) {
-      throw new Error("Attachment unavailable");
-    }
-    reader = response.body?.getReader();
-    if (!reader) throw new Error("Attachment unavailable");
-    while (true) {
-      signal?.throwIfAborted();
-      const result = await reader.read();
-      if (result.done) break;
-      const networkChunk = result.value;
-      try {
-        if (totalBytes > expectedEncryptedBytes - networkChunk.byteLength) {
-          throw new Error("Attachment unavailable");
-        }
+      async (payload) => {
+        // Re-chunk the transport payloads into the inner cipher's fixed records.
         let sourceOffset = 0;
-        while (sourceOffset < networkChunk.byteLength) {
-          const copied = Math.min(
-            ATTACHMENT_CHUNK_RECORD_BYTES - recordOffset,
-            networkChunk.byteLength - sourceOffset,
-          );
-          record.set(networkChunk.subarray(sourceOffset, sourceOffset + copied), recordOffset);
+        while (sourceOffset < payload.byteLength) {
+          const copied = Math.min(ATTACHMENT_CHUNK_RECORD_BYTES - recordOffset, payload.byteLength - sourceOffset);
+          record.set(payload.subarray(sourceOffset, sourceOffset + copied), recordOffset);
           recordOffset += copied;
           sourceOffset += copied;
-          totalBytes += copied;
           if (recordOffset === ATTACHMENT_CHUNK_RECORD_BYTES) {
             await onRecord(record, chunkIndex);
             record.fill(0);
@@ -1155,24 +1038,25 @@ export async function streamEncryptedAttachmentRecords(
             chunkIndex += 1;
           }
         }
-      } finally {
-        networkChunk.fill(0);
-      }
+      },
+      signal,
+    );
+    if (result.claimId) {
+      claim = attachmentIdString(result.claimId);
+      result.claimId.fill(0);
     }
-    if (totalBytes !== expectedEncryptedBytes || recordOffset !== 0 ||
+    if (result.total !== expectedEncryptedBytes || recordOffset !== 0 ||
       chunkIndex !== expectedEncryptedBytes / ATTACHMENT_CHUNK_RECORD_BYTES) {
       throw new Error("Attachment unavailable");
     }
     return claim ? { claim } : {};
   } catch (error) {
-    if (reader) await reader.cancel().catch(() => undefined);
     if (claim) {
       await releaseAttachmentDownloadClaim(session, validatedAttachmentId, claim).catch(() => undefined);
     }
     throw error;
   } finally {
     record.fill(0);
-    reader?.releaseLock();
   }
 }
 
@@ -1182,20 +1066,14 @@ export async function completeAttachmentDownload(
   claim: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const validatedAttachmentId = validateAttachmentId(attachmentId);
-  const validatedClaim = validateAttachmentClaim(claim);
-  const response = await fetch(
-    `${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}/complete`,
-    {
-      method: "POST",
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      headers: attachmentClaimHeaders(session, validatedClaim),
-      signal,
-    },
-  );
-  if (!response.ok) throw new Error("Attachment unavailable");
+  const claimId = attachmentIdBytes(validateAttachmentClaim(claim));
+  try {
+    if (!await completeDownloadV11(session.endpoint.apiBaseUrl, session.transport, validateAttachmentId(attachmentId), claimId, signal)) {
+      throw new Error("Attachment unavailable");
+    }
+  } finally {
+    claimId.fill(0);
+  }
 }
 
 export async function releaseAttachmentDownloadClaim(
@@ -1204,20 +1082,20 @@ export async function releaseAttachmentDownloadClaim(
   claim: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const validatedAttachmentId = validateAttachmentId(attachmentId);
-  const validatedClaim = validateAttachmentClaim(claim);
-  const response = await fetch(
-    `${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}/claim`,
-    {
-      method: "DELETE",
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      headers: attachmentClaimHeaders(session, validatedClaim),
-      signal: signal ?? AbortSignal.timeout(ATTACHMENT_CLEANUP_TIMEOUT_MS),
-    },
-  );
-  if (!response.ok) throw new Error("Attachment unavailable");
+  const claimId = attachmentIdBytes(validateAttachmentClaim(claim));
+  try {
+    if (!await releaseDownloadV11(
+      session.endpoint.apiBaseUrl,
+      session.transport,
+      validateAttachmentId(attachmentId),
+      claimId,
+      signal ?? AbortSignal.timeout(ATTACHMENT_CLEANUP_TIMEOUT_MS),
+    )) {
+      throw new Error("Attachment unavailable");
+    }
+  } finally {
+    claimId.fill(0);
+  }
 }
 
 export async function deleteUploadedAttachment(
@@ -1225,19 +1103,13 @@ export async function deleteUploadedAttachment(
   attachmentId: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const validatedAttachmentId = validateAttachmentId(attachmentId);
-  const response = await fetch(
-    `${session.endpoint.apiBaseUrl}/v1/attachment/${validatedAttachmentId}`,
-    {
-      method: "DELETE",
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer",
-      headers: { Authorization: `Bearer ${session.token}` },
-      signal: signal ?? AbortSignal.timeout(ATTACHMENT_CLEANUP_TIMEOUT_MS),
-    },
+  // Deleting an attachment that is already gone counts as done.
+  await deleteAttachmentV11(
+    session.endpoint.apiBaseUrl,
+    session.transport,
+    validateAttachmentId(attachmentId),
+    signal ?? AbortSignal.timeout(ATTACHMENT_CLEANUP_TIMEOUT_MS),
   );
-  if (!response.ok && response.status !== 404) throw new Error("Attachment unavailable");
 }
 
 export async function decryptAndCompleteAttachment(
@@ -1284,30 +1156,6 @@ export async function decryptAndCompleteAttachment(
   }
 }
 
-function validBoundedResponseLength(value: string, maxBytes: number): boolean {
-  const normalized = value.trim();
-  if (!/^\d+$/u.test(normalized)) return false;
-  const length = Number(normalized);
-  return Number.isSafeInteger(length) && length > 0 && length <= maxBytes;
-}
-
-function readAttachmentClaim(headers: Headers): string | undefined {
-  const value = headers.get(ATTACHMENT_CLAIM_HEADER);
-  if (value === null) return undefined;
-  return validateAttachmentClaim(value);
-}
-
-function parseAttachmentContentLength(value: string | null, maxBytes: number): number | undefined {
-  if (value === null) return undefined;
-  const normalized = value.trim();
-  if (!/^\d+$/.test(normalized)) throw new Error("Attachment unavailable");
-  const length = Number(normalized);
-  if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
-    throw new Error("Attachment unavailable");
-  }
-  return length;
-}
-
 function expectedAttachmentCiphertextBytes(policy: AttachmentDownloadPolicy): number {
   if (policy.mediaType !== "IMAGE" && policy.mediaType !== "VIDEO" && policy.mediaType !== "FILE") {
     throw new Error("Attachment unavailable");
@@ -1340,191 +1188,8 @@ function validateAttachmentId(attachmentId: string): string {
   return normalized;
 }
 
-async function readBoundedJson(
-  response: Response,
-  maxBytes: number,
-  signal?: AbortSignal,
-): Promise<unknown> {
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("Wrong information");
-  let bytes = new Uint8Array(0);
-  let length = 0;
-  try {
-    signal?.throwIfAborted();
-    const declared = parseBoundedContentLength(response.headers.get("content-length"), maxBytes);
-    const contentEncoding = response.headers.get("content-encoding")?.trim().toLowerCase();
-    const exactDeclaredLength = !contentEncoding || contentEncoding === "identity";
-    bytes = new Uint8Array(declared ?? Math.min(4_096, maxBytes));
-    while (true) {
-      signal?.throwIfAborted();
-      const { done, value } = await reader.read();
-      if (done) break;
-      try {
-        const nextLength = length + value.byteLength;
-        if (!Number.isSafeInteger(nextLength) || nextLength > maxBytes) {
-          throw new Error("Wrong information");
-        }
-        if (nextLength > bytes.byteLength) {
-          const nextCapacity = Math.min(maxBytes, Math.max(nextLength, bytes.byteLength * 2 || 4_096));
-          const expanded = new Uint8Array(nextCapacity);
-          expanded.set(bytes.subarray(0, length));
-          bytes.fill(0);
-          bytes = expanded;
-        }
-        bytes.set(value, length);
-        length = nextLength;
-      } finally {
-        value.fill(0);
-      }
-    }
-    signal?.throwIfAborted();
-    if (length === 0 || (exactDeclaredLength && declared !== undefined && declared !== length)) {
-      throw new Error("Wrong information");
-    }
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length));
-    return JSON.parse(text) as unknown;
-  } catch (error) {
-    await reader.cancel().catch(() => undefined);
-    throw error;
-  } finally {
-    bytes.fill(0);
-    reader.releaseLock();
-  }
-}
-
-function parseBoundedContentLength(value: string | null, maxBytes: number): number | undefined {
-  if (value === null) return undefined;
-  const normalized = value.trim();
-  if (!/^\d+$/u.test(normalized)) throw new Error("Wrong information");
-  const length = Number(normalized);
-  if (!Number.isSafeInteger(length) || length <= 0 || length > maxBytes) {
-    throw new Error("Wrong information");
-  }
-  return length;
-}
-
-function validOpaqueStartResponse(value: unknown): value is OpaqueAccountStartResponse {
-  if (!plainObjectWithKeys(value, [
-    "accepted", "mode", "handshake_id", "response_b64", "challenge_b64", "node_id",
-    "identity_public_b64", "identity_prekey_id", "identity_envelope_b64", "error",
-  ])) return false;
-  const payload = value as Record<string, unknown>;
-  if (
-    payload.accepted !== true ||
-    (payload.mode !== "registration" && payload.mode !== "login") ||
-    !validUuid(payload.handshake_id) ||
-    !validBase64Url(payload.response_b64, 1, MAX_OPAQUE_MESSAGE_BYTES) ||
-    !validNodeId(payload.node_id) ||
-    !nullish(payload.error)
-  ) return false;
-  if (payload.mode === "registration") {
-    return nullish(payload.identity_public_b64) &&
-      nullish(payload.identity_prekey_id) &&
-      nullish(payload.identity_envelope_b64) &&
-      validBase64Url(payload.challenge_b64, 32, 32);
-  }
-  return nullish(payload.challenge_b64) &&
-    validBase64Url(payload.identity_public_b64, IDENTITY_PUBLIC_KEY_BYTES, IDENTITY_PUBLIC_KEY_BYTES) &&
-    typeof payload.identity_prekey_id === "string" &&
-    /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
-    validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES);
-}
-
-function validWebSocketTicketResponse(value: unknown): value is {
-  ticket: string;
-  expires_in_sec: number;
-} {
-  if (!plainObjectWithKeys(value, ["ticket", "expires_in_sec"])) return false;
-  const payload = value as Record<string, unknown>;
-  return typeof payload.ticket === "string" &&
-    payload.ticket.length === WS_TICKET_LENGTH &&
-    validBase64Url(payload.ticket, WS_TICKET_BYTES, WS_TICKET_BYTES) &&
-    typeof payload.expires_in_sec === "number" &&
-    Number.isInteger(payload.expires_in_sec) &&
-    payload.expires_in_sec >= WS_TICKET_MIN_EXPIRY_SEC &&
-    payload.expires_in_sec <= WS_TICKET_MAX_EXPIRY_SEC;
-}
-
-function validAccountResponse(value: unknown): value is AccountResponse & {
-  token: string;
-  username: string;
-  identity_public_b64: string;
-  identity_prekey_id: string;
-  identity_envelope_b64: string;
-} {
-  if (!plainObjectWithKeys(value, [
-    "accepted", "created", "token", "node_id", "username", "max_rooms_per_user",
-    "session_inactivity_sec", "identity_public_b64", "identity_prekey_id",
-    "identity_envelope_b64", "error",
-  ], ["device_storage", "device_storage_share_b64"])) return false;
-  const payload = value as Record<string, unknown>;
-  // Device storage is Android-only; the web client checks the fields' shape and keeps nothing.
-  if (payload.device_storage !== undefined && typeof payload.device_storage !== "boolean") return false;
-  if (payload.device_storage_share_b64 !== undefined &&
-    (payload.device_storage !== true || !validBase64Url(payload.device_storage_share_b64, 32, 32))) return false;
-  return payload.accepted === true &&
-    typeof payload.created === "boolean" &&
-    validUuid(payload.token) &&
-    validNodeId(payload.node_id) &&
-    typeof payload.username === "string" && USERNAME_PATTERN.test(payload.username) &&
-    Number.isInteger(payload.max_rooms_per_user) &&
-    (payload.max_rooms_per_user as number) >= 1 &&
-    (payload.max_rooms_per_user as number) <= 100 &&
-    Number.isInteger(payload.session_inactivity_sec) &&
-    (payload.session_inactivity_sec as number) >= 60 &&
-    (payload.session_inactivity_sec as number) <= 86_400 &&
-    validBase64Url(payload.identity_public_b64, IDENTITY_PUBLIC_KEY_BYTES, IDENTITY_PUBLIC_KEY_BYTES) &&
-    typeof payload.identity_prekey_id === "string" &&
-    /^[A-Za-z0-9_-]{1,32}$/u.test(payload.identity_prekey_id) &&
-    validBase64Url(payload.identity_envelope_b64, 1, MAX_IDENTITY_ENVELOPE_BYTES) &&
-    nullish(payload.error);
-}
-
-/** Exactly [requiredKeys], plus any of [optionalKeys]. */
-function plainObjectWithKeys(
-  value: unknown,
-  requiredKeys: readonly string[],
-  optionalKeys: readonly string[] = [],
-): value is Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
-    return false;
-  }
-  return Object.keys(value).every((key) => requiredKeys.includes(key) || optionalKeys.includes(key)) &&
-    requiredKeys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
-}
-
 function validUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_V4_PATTERN.test(value);
-}
-
-function validNodeId(value: unknown): value is string {
-  return typeof value === "string" && NODE_ID_PATTERN.test(value);
-}
-
-function validBase64Url(value: unknown, minBytes: number, maxBytes: number): value is string {
-  if (
-    typeof value !== "string" ||
-    !BASE64_URL_PATTERN.test(value) ||
-    value.length > Math.ceil(maxBytes / 3) * 4
-  ) return false;
-  let decoded: Uint8Array | null = null;
-  try {
-    decoded = base64ToBytes(value);
-    // Decoders can accept non-canonical unused bits (and some malformed
-    // modulo-four lengths). Re-encoding is the strict, allocation-bounded
-    // canonicality check for every security-sensitive response field.
-    return decoded.byteLength >= minBytes &&
-      decoded.byteLength <= maxBytes &&
-      bytesToBase64(decoded) === value;
-  } catch {
-    return false;
-  } finally {
-    decoded?.fill(0);
-  }
-}
-
-function nullish(value: unknown): boolean {
-  return value === undefined || value === null;
 }
 
 type ParsedRelayFrame =
@@ -1720,11 +1385,4 @@ function utf8LengthWithin(value: string, maxBytes: number): boolean {
 
 function looksLikeMlsFrame(value: string): boolean {
   return /^\s*\{\s*"type"\s*:\s*"mls_[a-z_]+"/u.test(value.slice(0, 160));
-}
-
-function attachmentClaimHeaders(session: AccountSession, claim: string): Record<string, string> {
-  return {
-    Authorization: `Bearer ${session.token}`,
-    [ATTACHMENT_CLAIM_HEADER]: claim,
-  };
 }

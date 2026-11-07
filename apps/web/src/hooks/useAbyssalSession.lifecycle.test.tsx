@@ -438,19 +438,6 @@ const mocks = vi.hoisted(() => {
   return {
     identityPublicKey,
     nodeEndpoint,
-    accountSession: {
-      token: "123e4567-e89b-42d3-a456-426614174000",
-      nodeId: "node-one",
-      username: "Alice",
-      maxRoomsPerUser: 2,
-      sessionInactivitySec: 900,
-      endpoint: nodeEndpoint,
-      // Keep this fixture mutable because lifecycle tests exercise both
-      // registration and login responses.
-      created: true as boolean,
-      identityPublicKey: identityPublicKey.slice(),
-      identityPrekeyId: "prekey-one",
-    } satisfies AccountSession,
     FakeCipher,
     FakeMlsManager,
     FakeRelay,
@@ -484,19 +471,28 @@ const mocks = vi.hoisted(() => {
       };
       FakeCipher.lastSnapshot = null;
     },
-    startOpaqueAccount: vi.fn(async () => ({
-      accepted: true,
-      mode: "registration" as const,
-      handshake_id: "handshake-one",
-      response_b64: "AQ",
-      challenge_b64: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
-      node_id: "node-one",
-    })),
-    finishOpaqueAccount: vi.fn(async () => ({
-      ...mocks.accountSession,
-      identityPublicKey: mocks.identityPublicKey.slice(),
-    })),
+    v11SignInResult: (overrides: { mode?: "registration" | "login"; created?: boolean; username?: string } = {}) => ({
+      mode: overrides.mode ?? ("registration" as const),
+      session: {
+        created: overrides.created ?? true,
+        username: overrides.username ?? "Alice",
+        maxRoomsPerUser: 2,
+        sessionInactivitySec: 900,
+        identityPublic: identityPublicKey.slice(),
+        identityPrekeyId: "prekey-one",
+        identityEnvelope: new Uint8Array([1, 2, 3]),
+        deviceStorageShare: new Uint8Array(0),
+        sessionId: new Uint8Array(32).fill(1),
+      },
+      keys: {
+        nodePublicKey: new Uint8Array(32).fill(9),
+        sessionId: new Uint8Array(32).fill(1),
+        transportRoot: new Uint8Array(32).fill(2),
+      },
+    }),
+    signInV11: vi.fn(),
     revokeSession: vi.fn(async () => undefined),
+    revokeTransportKeys: vi.fn(async () => undefined),
     downloadEncryptedAttachment: vi.fn(async () => ({ bytes: new Uint8Array([1, 2, 3]) })),
     streamEncryptedAttachmentRecords: vi.fn(async (...args: unknown[]) => {
       const onRecord = args[3] as (record: Uint8Array, index: number) => void | Promise<void>;
@@ -515,16 +511,6 @@ vi.mock("../security/crypto", async () => {
     ...actual,
     conversationSafetyNumber: vi.fn(() => "1234 5678 9012"),
     conversationVerificationToken: vi.fn(() => "abyssal:verify:v1:test-token"),
-    startOpaque: vi.fn(async () => ({
-      registrationState: new Uint8Array([1]),
-      registrationRequest: new Uint8Array([2]),
-      loginState: new Uint8Array([3]),
-      credentialRequest: new Uint8Array([4]),
-    })),
-    finishOpaqueRegistration: vi.fn(async () => ({
-      registrationUpload: new Uint8Array([5]),
-      exportKey: new Uint8Array([6]),
-    })),
     InMemoryPayloadCipher: mocks.FakeCipher,
     payloadToFrame: vi.fn(() => ({
       version: 9,
@@ -547,7 +533,7 @@ vi.mock("../security/invite", () => ({
     capability: new Uint8Array(32).fill(4),
     accountContext: new Uint8Array(32).fill(5),
   })),
-  verifyConnectedInviteNode: vi.fn(async () => undefined),
+  verifyConnectedInviteNode: vi.fn(async () => new Uint8Array(32).fill(8)),
   wipeParsedInvite: vi.fn((invite: { capability: Uint8Array; accountContext: Uint8Array; nodePublicKey: Uint8Array } | null) => {
     invite?.capability.fill(0);
     invite?.accountContext.fill(0);
@@ -560,9 +546,8 @@ vi.mock("../transport/nodeClient", async () => {
   return {
     ...actual,
     RelaySocket: mocks.FakeRelay,
-    startOpaqueAccount: mocks.startOpaqueAccount,
-    finishOpaqueAccount: mocks.finishOpaqueAccount,
     revokeSession: mocks.revokeSession,
+    revokeTransportKeys: mocks.revokeTransportKeys,
     downloadEncryptedAttachment: mocks.downloadEncryptedAttachment,
     streamEncryptedAttachmentRecords: mocks.streamEncryptedAttachmentRecords,
     decryptAndCompleteAttachment: mocks.decryptAndCompleteAttachment,
@@ -570,6 +555,10 @@ vi.mock("../transport/nodeClient", async () => {
     deleteUploadedAttachment: mocks.deleteUploadedAttachment,
   };
 });
+
+vi.mock("../transport/v11Login", () => ({
+  signInV11: mocks.signInV11,
+}));
 
 import { FatalCipherError } from "../security/crypto";
 import { rememberBoundedId, useAbyssalSession } from "./useAbyssalSession";
@@ -696,6 +685,10 @@ afterEach(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.signInV11.mockImplementation(async (input: { identity: { createIdentity(a: Uint8Array, b: Uint8Array): unknown } }) => {
+    input.identity.createIdentity(new Uint8Array(32), new Uint8Array(32));
+    return mocks.v11SignInResult();
+  });
   vi.stubGlobal("URL", originalURL);
   Object.defineProperty(originalURL, "createObjectURL", {
     configurable: true,
@@ -1994,35 +1987,43 @@ describe("useAbyssalSession lifecycle cleanup", () => {
     unmount();
   });
 
-  it("rejects a start response from a different node before creating a candidate session", async () => {
-    mocks.startOpaqueAccount.mockResolvedValueOnce({
-      accepted: true,
-      mode: "registration",
-      handshake_id: "handshake-one",
-      response_b64: "AQ",
-      challenge_b64: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
-      node_id: "different-node",
-    });
+  it("signs in over the v11 bootstrap with the verified node key and leaves nothing on failure", async () => {
+    mocks.signInV11.mockRejectedValueOnce(new Error("Wrong information"));
     const { result, unmount } = renderHook(() => useAbyssalSession());
+    const password = new TextEncoder().encode("password");
 
     await act(async () => {
-      await expect(result.current.login({
-        invite: "fixture-invite",
-        password: new TextEncoder().encode("password"),
-      })).rejects.toThrow("Node identity mismatch");
+      await expect(result.current.login({ invite: "fixture-invite", password })).rejects.toThrow("Wrong information");
     });
 
+    const input = mocks.signInV11.mock.calls[0]?.[0] as {
+      apiBaseUrl: string;
+      nodeId: string;
+      bootstrapPublicKey: Uint8Array;
+      signal: AbortSignal;
+    };
+    expect(input.apiBaseUrl).toBe(mocks.nodeEndpoint.apiBaseUrl);
+    expect(input.nodeId).toBe("node-one");
+    expect(input.signal).toBeInstanceOf(AbortSignal);
+    // The verified bootstrap key and the password are wiped once sign-in ends.
+    expect(input.bootstrapPublicKey.every((byte) => byte === 0)).toBe(true);
+    expect(password.every((byte) => byte === 0)).toBe(true);
     expect(result.current.session).toBeNull();
     expect(mocks.revokeSession).not.toHaveBeenCalled();
+    expect(mocks.revokeTransportKeys).not.toHaveBeenCalled();
     expect(mocks.getLastRelay()).toBeNull();
     unmount();
   });
 
-  it("rejects a registration finish marked as an existing login", async () => {
-    mocks.finishOpaqueAccount.mockResolvedValueOnce({
-      ...mocks.accountSession,
-      created: false,
-      identityPublicKey: mocks.identityPublicKey.slice(),
+  it.each([
+    ["a registration marked as an existing account", { mode: "registration" as const, created: false }],
+    ["a login marked as a new account", { mode: "login" as const, created: true }],
+    ["a malformed username", { username: "Alice Smith" }],
+  ])("logs out and wipes an authenticated session with %s", async (_label, overrides) => {
+    const signedIn = mocks.v11SignInResult(overrides);
+    mocks.signInV11.mockImplementationOnce(async (input: { identity: { createIdentity(a: Uint8Array, b: Uint8Array): unknown } }) => {
+      input.identity.createIdentity(new Uint8Array(32), new Uint8Array(32));
+      return signedIn;
     });
     const { result, unmount } = renderHook(() => useAbyssalSession());
 
@@ -2033,8 +2034,10 @@ describe("useAbyssalSession lifecycle cleanup", () => {
       })).rejects.toThrow("Wrong information");
     });
 
+    expect(mocks.revokeTransportKeys).toHaveBeenCalledWith(mocks.nodeEndpoint.apiBaseUrl, signedIn.keys);
+    expect(signedIn.session.identityEnvelope.every((byte) => byte === 0)).toBe(true);
+    expect(signedIn.session.sessionId.every((byte) => byte === 0)).toBe(true);
     expect(result.current.session).toBeNull();
-    expect(mocks.revokeSession).toHaveBeenCalledOnce();
     expect(mocks.getLastRelay()).toBeNull();
     unmount();
   });

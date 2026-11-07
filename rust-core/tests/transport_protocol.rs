@@ -57,6 +57,7 @@ fn session_policy_boundaries_and_tampering_are_rejected_or_preserved() {
             identity_public: zeroize::Zeroizing::new(vec![2; 32]),
             identity_prekey_id: zeroize::Zeroizing::new("key".to_owned()),
             identity_envelope: zeroize::Zeroizing::new(vec![3; 32]),
+            device_storage_share: None,
         };
         let encoded = encode_account_bootstrap_result(&result).unwrap();
         assert!(decode_account_bootstrap_result(&encoded).is_ok());
@@ -79,8 +80,8 @@ fn session_policy_boundaries_and_tampering_are_rejected_or_preserved() {
 }
 
 #[test]
-fn sealed_session_response_preserves_created_and_policy_fields() {
-    for created in [false, true] {
+fn sealed_session_response_preserves_created_policy_and_storage_share() {
+    for (created, share) in [(false, None), (true, Some([0x5a_u8; 32]))] {
         let server = generate_bootstrap_keypair();
         let exchange = AccountBootstrapExchange::start(
             vec![3; 32],
@@ -112,6 +113,7 @@ fn sealed_session_response_preserves_created_and_policy_fields() {
             identity_public: zeroize::Zeroizing::new(vec![8; 32]),
             identity_prekey_id: zeroize::Zeroizing::new("key".to_owned()),
             identity_envelope: zeroize::Zeroizing::new(vec![9; 32]),
+            device_storage_share: share.map(zeroize::Zeroizing::new),
         })
         .unwrap();
         let response = opened.response_sealer.seal(&plaintext).unwrap();
@@ -119,12 +121,14 @@ fn sealed_session_response_preserves_created_and_policy_fields() {
             created: actual_created,
             max_rooms_per_user,
             session_inactivity_sec,
+            device_storage_share,
             ..
         } = exchange.open_response(response).unwrap()
         else {
             panic!("session response was not preserved");
         };
         assert_eq!(actual_created, created);
+        assert_eq!(device_storage_share, share.map(|bytes| bytes.to_vec()));
         assert_eq!(max_rooms_per_user, 100);
         assert_eq!(session_inactivity_sec, 86_400);
     }

@@ -310,6 +310,10 @@ async fn issue_transport_session(
             account.identity_public.clone(),
             account.prekey_id.clone(),
             account.identity_envelope.clone(),
+            state
+                .device_storage
+                .allowed()
+                .then_some(account.device_storage_share),
         )
     };
     let random_session_id = random_nonzero_session_id();
@@ -355,6 +359,7 @@ async fn issue_transport_session(
         identity_public: Zeroizing::new(identity.0),
         identity_prekey_id: Zeroizing::new(identity.1),
         identity_envelope: Zeroizing::new(identity.2),
+        device_storage_share: identity.3.map(Zeroizing::new),
     })
 }
 

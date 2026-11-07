@@ -13,6 +13,8 @@ import {
 const DEEP_LINK = "abyssal:invite:glh3igFwb3JnLmFieXNzYWwuY2hhdAFYINBKsjJ0K7SrOhNovUYV5ObQIkq3GgFrr4UgozLJd4c3gYMBcG5vZGUuZXhhbXBsZS5jb20ZAbtYICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiCQoAGn0rdQBYQDgZJxVYJlrtgAJBj4VbdykqYpymbDWTNY0Uz-18fOOxGzi6fwKTPzEnVkJ6QldbfyY0pl1JJchNJv3TknkT-Qs";
 const MANUAL = "ABY1-G9C7F-2G1E1-QQ4SS-EC5H7-JWVKC-5P2WR-V8C5T-02P10-T15B4-CKM5E-TAPEG-KD2YM-C5F4W-V824J-NQ380-PQBW5-42HK5-JBQGW-VR30R-1E1Q6-YS355-SJQGR-BDE1P-6ABK3-DXPHJ-0DVB0-G248H-248H2-48H24-8H248-H248H-248H2-48H24-8H248-H248H-248H2-48G91-801MZ-9BEM0-5GG1R-34KHA-P16BB-PR00J-1HY2N-PXS95-9H9S9-KC6P9-KB38M-SZPQR-Z73P4-DKHEK-Z0A9K-YC97A-S17MG-JQBDZ-JCD56-BN4JB-J2D4V-YX74K-S2FWG-PB8D2-V6G";
 const DESCRIPTOR_HEX = "8258508801706f72672e6162797373616c2e636861745820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737818301706e6f64652e6578616d706c652e636f6d1901bb01090a00584011d674f2075930853f2ae2ea008d7787de469c3d1e954ea8aea6ae5a19e31a2c7d790ce0c473036e3bb016c3bc50c96e85b214659d994da7a8a43dfcff383401";
+/** Protocol-v11 descriptor for the same node, carrying bootstrap key 0x33 x 32 (pinned in abyssal-invite/tests/capsule.rs). */
+const TRANSPORT_DESCRIPTOR_HEX = "8258738a02706f72672e6162797373616c2e636861745820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873758203333333333333333333333333333333333333333333333333333333333333333818301706e6f64652e6578616d706c652e636f6d1901bb01090b0a00584005dd7bd4584b58cc7441ccd9a008cc5d91025970fd1eda173466dc7bc163d0e3be5f4083328ca7f740fd388c333fd39c31afd29bf609791d8257444133728308";
 const VECTOR_LOCATION = {
   protocol: "https:",
   hostname: "node.example.com",
@@ -49,18 +51,19 @@ describe("Invite Capsule bootstrap", () => {
 
   it("accepts only the bounded signed descriptor for the invited node", async () => {
     const invite = await parseInvite(DEEP_LINK, 2_000_000_000_000);
-    const descriptor = hexToBytes(DESCRIPTOR_HEX);
+    const descriptor = hexToBytes(TRANSPORT_DESCRIPTOR_HEX);
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(ownedBuffer(descriptor), {
       status: 200,
       headers: { "content-type": "application/cbor", "content-length": String(descriptor.length) },
     }));
     vi.stubGlobal("fetch", fetcher);
 
-    await expect(verifyConnectedInviteNode(
+    const bootstrapKey = await verifyConnectedInviteNode(
       invite,
       new AbortController().signal,
       VECTOR_LOCATION,
-    )).resolves.toBeUndefined();
+    );
+    expect(Array.from(bootstrapKey)).toEqual(Array(32).fill(0x33));
     expect(fetcher).toHaveBeenCalledWith("https://node.example.com/v1/node", expect.objectContaining({
       method: "GET",
       cache: "no-store",
@@ -84,7 +87,18 @@ describe("Invite Capsule bootstrap", () => {
       VECTOR_LOCATION,
     )).rejects.toThrow("Node descriptor rejected");
 
-    const descriptor = hexToBytes(DESCRIPTOR_HEX);
+    // A pre-v11 descriptor carries no bootstrap key and cannot start a session.
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(new Response(ownedBuffer(hexToBytes(DESCRIPTOR_HEX)), {
+      status: 200,
+      headers: { "content-type": "application/cbor" },
+    })));
+    await expect(verifyConnectedInviteNode(
+      invite,
+      new AbortController().signal,
+      VECTOR_LOCATION,
+    )).rejects.toThrow();
+
+    const descriptor = hexToBytes(TRANSPORT_DESCRIPTOR_HEX);
     descriptor[descriptor.length - 1] ^= 1;
     vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(new Response(ownedBuffer(descriptor), {
       status: 200,

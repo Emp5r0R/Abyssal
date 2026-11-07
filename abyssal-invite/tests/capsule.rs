@@ -1,8 +1,8 @@
 use abyssal_invite::{
     account_context_v1, decode_invite_text, derive_node_id, encode_deep_link, encode_manual,
     locator_from_public_url, node_key_fingerprint, InviteCapsuleV1, InviteError, NodeDescriptorV1,
-    NodeLocator, SignedInviteCapsule, SignedNodeDescriptor, DIRECT_PROTOCOL_VERSION,
-    ROOM_PROTOCOL_VERSION,
+    NodeDescriptorV2, NodeLocator, SignedInviteCapsule, SignedNodeDescriptor,
+    SignedNodeDescriptorV2, DIRECT_PROTOCOL_VERSION, ROOM_PROTOCOL_VERSION,
 };
 use ed25519_dalek::SigningKey;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
@@ -221,6 +221,37 @@ fn node_ids_contexts_and_text_vectors_are_stable() {
     );
     assert_eq!(decode_invite_text(&deep, None).unwrap(), invite);
     assert_eq!(decode_invite_text(&manual, None).unwrap(), invite);
+}
+
+/// The protocol-v11 descriptor for the shared invite vector, carrying the
+/// relay's bootstrap HPKE key. Web and Android tests verify these exact bytes.
+#[test]
+fn transport_descriptor_vector_binds_the_bootstrap_key() {
+    let (key, invite) = fixture();
+    let descriptor = SignedNodeDescriptorV2::sign(
+        NodeDescriptorV2::abyssal(
+            invite.capsule.node_public_key,
+            [0x33; 32],
+            invite.capsule.locators.clone(),
+        )
+        .unwrap(),
+        &key,
+    )
+    .unwrap()
+    .canonical_binary()
+    .unwrap();
+    assert_eq!(
+        hex(&descriptor),
+        "8258738a02706f72672e6162797373616c2e636861745820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873758203333333333333333333333333333333333333333333333333333333333333333818301706e6f64652e6578616d706c652e636f6d1901bb01090b0a00584005dd7bd4584b58cc7441ccd9a008cc5d91025970fd1eda173466dc7bc163d0e3be5f4083328ca7f740fd388c333fd39c31afd29bf609791d8257444133728308"
+    );
+    let locator = locator_from_public_url("https://node.example.com").unwrap();
+    let decoded = SignedNodeDescriptorV2::decode_for_invite(
+        &descriptor,
+        &invite.capsule.node_public_key,
+        &locator,
+    )
+    .unwrap();
+    assert_eq!(decoded.descriptor.bootstrap_hpke_public_key, [0x33; 32]);
 }
 
 #[test]

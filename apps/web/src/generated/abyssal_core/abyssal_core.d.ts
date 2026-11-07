@@ -19,6 +19,10 @@ export class WasmAccountBootstrapResponse {
     [Symbol.dispose](): void;
     readonly challenge: Uint8Array;
     readonly created: boolean;
+    /**
+     * The relay's device-storage share; empty when the relay does not allow device storage.
+     */
+    readonly deviceStorageShare: Uint8Array;
     readonly handshakeId: Uint8Array;
     readonly identityEnvelope: Uint8Array;
     readonly identityPrekeyId: string;
@@ -516,6 +520,7 @@ export interface InitOutput {
     readonly wasmaccountbootstrapexchange_start: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly wasmaccountbootstrapresponse_challenge: (a: number) => [number, number];
     readonly wasmaccountbootstrapresponse_created: (a: number) => number;
+    readonly wasmaccountbootstrapresponse_deviceStorageShare: (a: number) => [number, number];
     readonly wasmaccountbootstrapresponse_handshakeId: (a: number) => [number, number];
     readonly wasmaccountbootstrapresponse_identityEnvelope: (a: number) => [number, number];
     readonly wasmaccountbootstrapresponse_identityPrekeyId: (a: number) => [number, number];

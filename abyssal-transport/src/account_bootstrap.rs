@@ -72,6 +72,8 @@ pub enum AccountBootstrapResult {
         identity_public: Zeroizing<Vec<u8>>,
         identity_prekey_id: Zeroizing<String>,
         identity_envelope: Zeroizing<Vec<u8>>,
+        /// The relay's RAM-only device-storage share, when the relay allows device storage.
+        device_storage_share: Option<Zeroizing<[u8; 32]>>,
     },
 }
 
@@ -199,6 +201,7 @@ pub fn encode_account_bootstrap_result(
             identity_public,
             identity_prekey_id,
             identity_envelope,
+            device_storage_share,
         } => {
             require_nonzero(session_id)?;
             validate_session_policy(*max_rooms_per_user, *session_inactivity_sec)?;
@@ -210,6 +213,14 @@ pub fn encode_account_bootstrap_result(
             put_bytes(&mut payload, identity_public)?;
             put_text(&mut payload, identity_prekey_id)?;
             put_bytes(&mut payload, identity_envelope)?;
+            match device_storage_share {
+                Some(share) => {
+                    require_nonzero(share)?;
+                    payload.push(1);
+                    payload.extend_from_slice(share.as_ref());
+                }
+                None => payload.push(0),
+            }
             RESULT_SESSION
         }
     };
@@ -247,6 +258,11 @@ pub fn decode_account_bootstrap_result(
             identity_public: Zeroizing::new(reader.take_bytes()?),
             identity_prekey_id: Zeroizing::new(reader.take_text()?),
             identity_envelope: Zeroizing::new(reader.take_bytes()?),
+            device_storage_share: if reader.take_bool()? {
+                Some(Zeroizing::new(reader.take_nonzero_array::<32>()?))
+            } else {
+                None
+            },
         },
         _ => return Err(TransportError::NonCanonical),
     };
@@ -484,6 +500,7 @@ mod tests {
                 identity_public: bytes(11),
                 identity_prekey_id: Zeroizing::new("prekey".to_owned()),
                 identity_envelope: bytes(12),
+                device_storage_share: None,
             },
         ];
         for result in results {
@@ -556,6 +573,7 @@ mod tests {
                 identity_public: bytes(1),
                 identity_prekey_id: Zeroizing::new("key".to_owned()),
                 identity_envelope: bytes(2),
+                device_storage_share: None,
             })
             .is_err()
         );
@@ -577,6 +595,7 @@ mod tests {
             identity_public: bytes(1),
             identity_prekey_id: Zeroizing::new("key".to_owned()),
             identity_envelope: bytes(2),
+            device_storage_share: None,
         };
         let encoded = encode_account_bootstrap_result(&result).unwrap();
         let mut noncanonical = encoded.to_vec();
@@ -595,9 +614,36 @@ mod tests {
                     identity_public: bytes(1),
                     identity_prekey_id: Zeroizing::new("key".to_owned()),
                     identity_envelope: bytes(2),
+                    device_storage_share: None,
                 })
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn session_result_carries_an_optional_device_storage_share() {
+        let session = |share: Option<[u8; 32]>| AccountBootstrapResult::Session {
+            session_id: Zeroizing::new([1; 32]),
+            created: true,
+            max_rooms_per_user: 5,
+            session_inactivity_sec: 900,
+            username: Zeroizing::new("user".to_owned()),
+            identity_public: bytes(1),
+            identity_prekey_id: Zeroizing::new("key".to_owned()),
+            identity_envelope: bytes(2),
+            device_storage_share: share.map(Zeroizing::new),
+        };
+        for share in [None, Some([7_u8; 32])] {
+            let encoded = encode_account_bootstrap_result(&session(share)).unwrap();
+            match decode_account_bootstrap_result(&encoded).unwrap() {
+                AccountBootstrapResult::Session {
+                    device_storage_share,
+                    ..
+                } => assert_eq!(device_storage_share.map(|value| *value), share),
+                _ => panic!("session expected"),
+            }
+        }
+        assert!(encode_account_bootstrap_result(&session(Some([0_u8; 32]))).is_err());
     }
 }

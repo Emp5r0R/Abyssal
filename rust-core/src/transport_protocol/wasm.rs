@@ -423,6 +423,8 @@ impl WasmControlResponse {
             ControlResponse::Failure => 0,
             ControlResponse::WsTicket { .. } => 1,
             ControlResponse::LoggedOut => 2,
+            ControlResponse::BuildRejected => 3,
+            ControlResponse::PlatformConflict => 4,
         }
     }
 
@@ -579,6 +581,7 @@ impl Drop for WasmAccountBootstrapResponse {
                 identity_public,
                 identity_prekey_id,
                 identity_envelope,
+                device_storage_share,
                 ..
             } => {
                 session_id.zeroize();
@@ -586,6 +589,9 @@ impl Drop for WasmAccountBootstrapResponse {
                 identity_public.zeroize();
                 identity_prekey_id.zeroize();
                 identity_envelope.zeroize();
+                if let Some(share) = device_storage_share {
+                    share.zeroize();
+                }
             }
         }
     }
@@ -711,6 +717,18 @@ impl WasmAccountBootstrapResponse {
                 identity_prekey_id, ..
             } => identity_prekey_id.clone(),
             _ => String::new(),
+        }
+    }
+
+    /// The relay's device-storage share; empty when the relay does not allow device storage.
+    #[wasm_bindgen::prelude::wasm_bindgen(getter, js_name = deviceStorageShare)]
+    pub fn device_storage_share(&self) -> Vec<u8> {
+        match &self.inner {
+            AccountBootstrapResponse::Session {
+                device_storage_share: Some(share),
+                ..
+            } => share.clone(),
+            _ => Vec::new(),
         }
     }
 

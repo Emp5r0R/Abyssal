@@ -64,6 +64,8 @@ export interface OpaqueRegistrationResult {
 export interface OpaqueLoginResult {
   credentialFinalization: Uint8Array;
   exportKey: Uint8Array;
+  /** Root key for protocol-v11 records, derived from the OPAQUE session key. */
+  transportRoot: Uint8Array;
 }
 
 export interface RecipientKey {
@@ -129,6 +131,7 @@ interface RustRegistrationFinish {
 interface RustLoginFinish {
   credential_finalization: number[];
   export_key: number[];
+  transport_root: number[];
 }
 
 interface RustAttachmentCiphertext {
@@ -212,6 +215,7 @@ export async function finishOpaqueLogin(
     return {
       credentialFinalization: bytes(result.credential_finalization),
       exportKey: bytes(result.export_key),
+      transportRoot: bytes(result.transport_root),
     };
   } finally {
     wipeOpaqueStart(state);
