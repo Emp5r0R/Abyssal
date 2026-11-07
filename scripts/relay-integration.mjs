@@ -6,6 +6,7 @@ import {
   decryptAttachment,
   encryptAttachment,
   initSync,
+  opaqueClientFinishLogin,
   opaqueClientFinishRegistration,
   opaqueClientStart,
   parseInviteCapsule,
@@ -859,6 +860,68 @@ async function opaqueStartStatus(invite, password) {
   parsed.account_context.fill(0);
   parsed.node_public_key.fill(0);
   return response.status;
+}
+
+/** Full OPAQUE login over the HTTP account path; returns the finish status. */
+async function loginStatus(invite, password) {
+  const parsed = parseIntegrationInvite(invite);
+  const passwordBytes = encoder.encode(password);
+  const opaque = JSON.parse(opaqueClientStart(passwordBytes));
+  try {
+    const startResponse = await fetch(`${baseUrl}/v2/account/start`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        capability_b64: encode(parsed.capability),
+        registration_request_b64: encode(opaque.registration_request),
+        credential_request_b64: encode(opaque.credential_request),
+      }),
+    });
+    assert.equal(startResponse.status, 200);
+    const start = await startResponse.json();
+    assert.equal(start.mode, "login");
+    let finalization;
+    try {
+      finalization = new Uint8Array(JSON.parse(opaqueClientFinishLogin(
+        passwordBytes,
+        new Uint8Array(opaque.login_state),
+        decode(start.response_b64),
+      )).credential_finalization);
+    } catch {
+      // A wrong password fails on the client; send a junk finalization so the relay rejects it too.
+      finalization = randomFillSync(new Uint8Array(64));
+    }
+    const finishResponse = await fetch(`${baseUrl}/v2/account/finish`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        handshake_id: start.handshake_id,
+        credential_finalization_b64: encode(finalization),
+      }),
+    });
+    finalization.fill(0);
+    return finishResponse.status;
+  } finally {
+    passwordBytes.fill(0);
+    opaque.registration_state.fill(0);
+    opaque.registration_request.fill(0);
+    opaque.login_state.fill(0);
+    opaque.credential_request.fill(0);
+    parsed.capability.fill(0);
+    parsed.account_context.fill(0);
+    parsed.node_public_key.fill(0);
+  }
+}
+
+function requestWsTicketResponse(account) {
+  return fetch(`${baseUrl}/v1/ws-ticket`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { authorization: `Bearer ${account.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ platform: "web", version: "2.2.0", build_signature_b64: buildSignatureB64 }),
+  });
 }
 
 async function requestWsTicket(account) {
@@ -2138,8 +2201,9 @@ aliceParsed.account_context.fill(0);
 aliceParsed.node_public_key.fill(0);
 const alice = await register(aliceInvite, "alice-password");
 const bob = await register(bobInvite, "bob-password");
-assert.equal(await opaqueStartStatus(aliceInvite, "alice-password"), 409);
-assert.equal(await opaqueStartStatus(aliceInvite, "other-password"), 409);
+// A live session no longer blocks a new sign-in; only a proven login replaces it (checked at the end).
+assert.equal(await opaqueStartStatus(aliceInvite, "alice-password"), 200);
+assert.equal(await opaqueStartStatus(aliceInvite, "other-password"), 200);
 
 await expectBuildAdmissionRejected(alice);
 const aliceTicket = await requestWsTicket(alice);
@@ -2726,6 +2790,13 @@ try {
 }
 
 assert.equal(releasedPrekeysAwaitingReuse.size, 0);
+
+// Newest sign-in wins: a wrong password changes nothing, and a correct one
+// replaces the live session, revoking the old token.
+assert.equal(await loginStatus(aliceInvite, "wrong-password"), 401);
+assert.equal((await requestWsTicketResponse(alice)).status, 200);
+assert.equal(await loginStatus(aliceInvite, "alice-password"), 200);
+assert.equal((await requestWsTicketResponse(alice)).status, 401);
 
 console.log(
   "relay integration passed: OPAQUE auth, v9 E2EE DM, v10 MLS rooms, offline recovery/replay, and access control",
