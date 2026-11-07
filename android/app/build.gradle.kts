@@ -39,8 +39,8 @@ android {
         applicationId = "com.abyssal.chat"
         minSdk = 26
         targetSdk = 34
-        versionCode = 36
-        versionName = "3.6.0"
+        versionCode = 37
+        versionName = "4.0.0"
 
         buildConfigField(
             "String",
