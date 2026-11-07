@@ -58,9 +58,10 @@ research. Typing indicators are deliberately not built: they leak activity timin
   the audio player, a 15-minute re-sign-in lockout (now newest sign-in wins,
   user-approved), media timers not following the room timer, and stale
   store files after relay restarts (`f7e39ff`).
-- 3.6.0 (`1173b3c`) release in progress; production gets
-  `ABYSSAL_DEVICE_STORAGE=true` (user-approved; previous env kept on the
-  server as `mirage-server/.env.before-3.6.0`).
+- 3.6.0 released and deployed 2026-11-07 (`0449a28`, manifest sequence 20);
+  production serves `web@3.6.0` with `ABYSSAL_DEVICE_STORAGE=true`
+  (user-approved; previous env kept on the server as
+  `mirage-server/.env.before-3.6.0`).
 - Phase 4 (v11 client adoption) work breakdown, each step shippable because
   the relay serves v2 and v11 routes side by side:
   1. Add the device-storage share to the v11 session result codec.
